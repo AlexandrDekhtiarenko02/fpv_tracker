@@ -495,7 +495,9 @@ _FLIGHT_LOG_COLUMNS = (
     "sent_r,sent_p,sent_t,sent_y,"
     "fc_roll,fc_pitch,fc_yaw,att_age_ms,"
     "m1,m2,m3,m4,rc_r,rc_p,rc_y,rc_t,dt_ms,cb_ms,armed,"
-    "launch_target_deg,launch_reached,k"
+    "launch_target_deg,launch_reached,k,"
+    "alt_cm,vario_cms,alt_age_ms,"
+    "box_size_px,box_growth,tau_s,range_m,depression_deg,dy_alt_decoupled"
 )
 
 # Снимок внутренностей управления за текущий кадр. Заполняется в
@@ -545,6 +547,8 @@ class FlightLogger:
             "frames": 0, "tracked": 0, "override": 0,
             "roll_sat": 0, "pitch_sat": 0, "yaw_sat": 0,
             "comp_dominant": 0, "att_stale": 0,
+            "tau_seen": 0, "tau_sum": 0.0, "range_seen": 0, "range_sum": 0.0,
+            "alt_seen": 0, "vario_min": None, "vario_max": None,
             "sum_abs_dx": 0.0, "sum_abs_dy": 0.0,
             "first_frac": None, "last_frac": None,
             "best_frac": 0.0, "states": {},
@@ -769,6 +773,20 @@ class FlightLogger:
             a["comp_dominant"] += 1
         if (r[_C_ATT_AGE] or 0.0) > 300.0:
             a["att_stale"] += 1
+        # Новые измерения: копим, чтобы в разборе было видно, годятся ли они.
+        if r[_C_TAU] is not None and r[_C_TAU] != "":
+            a["tau_seen"] += 1
+            a["tau_sum"] += float(r[_C_TAU])
+        if r[_C_RANGE] is not None and r[_C_RANGE] != "":
+            a["range_seen"] += 1
+            a["range_sum"] += float(r[_C_RANGE])
+        v = r[_C_VARIO]
+        if v is not None and v != "":
+            a["alt_seen"] += 1
+            v = float(v)
+            a["vario_min"] = v if a["vario_min"] is None else min(a["vario_min"], v)
+            a["vario_max"] = v if a["vario_max"] is None else max(a["vario_max"], v)
+
         frac = r[_C_BOX_FRAC] or 0.0
         if a["first_frac"] is None:
             a["first_frac"] = frac
@@ -838,6 +856,30 @@ class FlightLogger:
                         % (100 * a["comp_dominant"] // n))
                 f.write("MSP attitude протухал: %d%% кадров\n"
                         % (100 * a["att_stale"] // n))
+                f.write("\n-- оценка сближения (пока не управляет полётом) --\n")
+                if a["tau_seen"]:
+                    f.write("время до контакта: оценено на %d%% кадров, "
+                            "среднее %.1f с\n"
+                            % (100 * a["tau_seen"] // n,
+                               a["tau_sum"] / a["tau_seen"]))
+                else:
+                    f.write("время до контакта: НЕ оценено ни разу "
+                            "(коробка не росла = сближения не было)\n")
+                if a["alt_seen"]:
+                    f.write("высотомер: данные есть, вертикальная скорость "
+                            "от %.0f до %.0f см/с\n"
+                            % (a["vario_min"], a["vario_max"]))
+                    if a["range_seen"]:
+                        f.write("дальность: оценена на %d%% кадров, "
+                                "средняя %.0f м\n"
+                                % (100 * a["range_seen"] // n,
+                                   a["range_sum"] / a["range_seen"]))
+                    else:
+                        f.write("дальность: НЕ оценена (угол снижения меньше "
+                                "порога либо высота слишком мала)\n")
+                else:
+                    f.write("высотомер: данных НЕТ — барометра нет или "
+                            "выключен\n")
         try:
             print("[flightlog] %d rows -> %s" % (self._written, self.dir), flush=True)
         except Exception:
@@ -904,6 +946,9 @@ _C_PITCH_SAT = 43
 _C_YAW_SAT = 53
 _C_ATT_AGE = 69
 _C_ARMED = 80
+_C_VARIO = 85
+_C_TAU = 89
+_C_RANGE = 90
 
 flight_log = FlightLogger(FLIGHT_LOG_DIR)
 
@@ -922,6 +967,10 @@ MSP_RC_PERIOD = 0.04
 RC_FRESH_WINDOW = 0.35
 # Опрос состояния «заармлен» — нужен, чтобы писать разбор вылета по дизарму.
 MSP_STATUS_PERIOD = 0.25
+# Опрос высоты и вариометра. MSP_ALTITUDE отдаёт ОЦЕНКУ Betaflight (баро,
+# сплавленное с акселерометром), а не сырое давление — она заметно чище.
+# 10 Гц достаточно: вертикальная динамика квада куда медленнее кадра.
+MSP_ALTITUDE_PERIOD = 0.10
 # Номера битов режимов в flightModeFlags НЕ фиксированы: Betaflight укладывает
 # туда только НАСТРОЕННЫЕ режимы, в порядке, который отдаёт MSP_BOXIDS. Позиция
 # зависит от конкретного конфига, поэтому её надо спросить, а не угадать —
@@ -952,6 +1001,12 @@ app_state = {
     # сюда замкнула бы выход оверрайда на его собственный вход.
     "receiver_channels": [1500, 1500, 1500, 1000, 1500, 1500, 1500, 1500],
     "receiver_ts": 0.0,
+    # Высота и вертикальная скорость от FC. alt_seen остаётся False, если
+    # барометра на плате нет — по логу это будет видно сразу.
+    "alt_cm": None,
+    "vario_cms": None,
+    "alt_ts": 0.0,
+    "alt_seen": False,
     "fc_pitch_deg": None,
     "fc_pitch_ts": 0.0,
     "motors": [],
@@ -989,6 +1044,10 @@ prev_control_mono = None
 
 # Прошлый тангаж от FC — для демпфирования углового контура разгона.
 prev_launch_pitch_deg = None
+
+# Оценка сближения: прошлый размер коробки и сглаженная скорость роста.
+prev_box_size_px = None
+box_growth_smoothed = 0.0
 
 # Состояние упреждения. prev_box_* — позиция в прошлом кадре, target_v*_smoothed —
 # сглаженная межкадровая скорость цели в пикселях/кадр. stable_track_frames
@@ -1154,6 +1213,9 @@ def fc_io_loop():
     next_motor_t = 0.0
     next_status_t = 0.0
     next_boxids_t = 0.0
+    next_alt_t = 0.0
+    alt_warned = False
+    loop_started = time.monotonic()
 
     while not io_thread_stop.is_set():
         if fc is None:
@@ -1242,6 +1304,29 @@ def fc_io_loop():
                             app_state["fc_override_on"] = bool(
                                 mode_flags & (1 << ovr_bit))
                             app_state["fc_override_ts"] = now
+
+            if (not alt_warned and now - loop_started > 8.0
+                    and not app_state.get("alt_seen")):
+                alt_warned = True
+                flight_log.event(
+                    "ВЫСОТОМЕР не отвечает: барометра на плате нет либо он "
+                    "не включён. Оценка дальности работать не будет.")
+
+            if now >= next_alt_t:
+                next_alt_t = now + MSP_ALTITUDE_PERIOD
+                alt_data = msp_request(109)  # MSP_ALTITUDE
+                if alt_data is not None and len(alt_data) >= 6:
+                    # u32 высота в см + i16 вертикальная скорость в см/с.
+                    alt_cm, vario_cms = struct.unpack('<ih', alt_data[:6])
+                    with state_lock:
+                        app_state["alt_cm"] = int(alt_cm)
+                        app_state["vario_cms"] = int(vario_cms)
+                        app_state["alt_ts"] = now
+                        if not app_state.get("alt_seen"):
+                            app_state["alt_seen"] = True
+                            flight_log.event(
+                                "ВЫСОТОМЕР отвечает: alt=%d см vario=%d см/с"
+                                % (alt_cm, vario_cms))
 
             if MOTOR_DEBUG_ENABLED and now >= next_motor_t:
                 mot_data = msp_request(104)  # MSP_MOTOR
@@ -1681,6 +1766,62 @@ def _pid_axis_step(error, prev_error, integral, ff_value,
     return out, err_f, integral
 
 
+def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
+    """Оценка сближения с целью. Возвращает словарь измерений.
+
+    tau_s     — время до контакта, с. Из скорости роста коробки; реальный
+                размер цели не нужен, он сокращается в отношении.
+    range_m   — дальность по земле до цели, м. Из высоты и угла визирования.
+    depression_deg — угол снижения линии визирования ниже горизонта.
+
+    Величина None означает «оценить нельзя», а не «ноль»: не сближаемся,
+    нет высоты, слишком малый угол. Смешивать эти случаи с нулём нельзя —
+    ноль дальности означал бы «мы в цели».
+    """
+    global prev_box_size_px, box_growth_smoothed
+    out = {"size_px": None, "growth": None, "tau_s": None,
+           "range_m": None, "depression_deg": None}
+
+    # --- время до контакта ---
+    # Берём геометрическое среднее сторон: устойчивее к тому, что коробка
+    # меняет пропорции при смене ракурса.
+    size = math.sqrt(max(float(box_w), 1.0) * max(float(box_h), 1.0))
+    out["size_px"] = size
+    if prev_box_size_px is not None and prev_box_size_px > 0.0:
+        # Относительный прирост за номинальный кадр.
+        rel = ((size - prev_box_size_px) / prev_box_size_px) / k
+        a = alpha_for_dt(TAU_GROWTH_ALPHA, k)
+        box_growth_smoothed += a * (rel - box_growth_smoothed)
+    prev_box_size_px = size
+    out["growth"] = box_growth_smoothed
+    if box_growth_smoothed > TAU_MIN_GROWTH:
+        # Кадров до контакта -> секунд.
+        out["tau_s"] = (1.0 / box_growth_smoothed) * NOMINAL_DT
+
+    # --- дальность по наземной цели ---
+    if not RANGE_ESTIMATE_ENABLED:
+        return out
+    with state_lock:
+        alt_cm = app_state.get("alt_cm")
+        alt_ts = app_state.get("alt_ts", 0.0)
+        fc_pitch = app_state.get("fc_pitch_deg")
+    if alt_cm is None or fc_pitch is None or (now_mono - alt_ts) > 1.0:
+        return out
+
+    # Угол цели относительно оси камеры: пиксели -> градусы.
+    deg_per_px = CAMERA_VFOV_DEG / float(MAIN_H)
+    off_deg = (float(box_cy) - CENTER_Y) * deg_per_px   # вниз по кадру = вниз
+    # Нос вниз приходит от FC отрицательным, поэтому знак инвертируется:
+    # чем сильнее опущен нос, тем больше угол снижения.
+    depression = (-float(fc_pitch)) - CAMERA_TILT_DEG + off_deg
+    out["depression_deg"] = depression
+
+    alt_m = alt_cm / 100.0
+    if depression >= RANGE_MIN_DEPRESSION_DEG and alt_m > 0.3:
+        out["range_m"] = alt_m / math.tan(math.radians(depression))
+    return out
+
+
 def _pitch_angle_hold_pwm(target_deg, now_mono, k):
     """Команда тангажа, удерживающая ЗАДАННЫЙ УГОЛ наклона носа.
 
@@ -1770,7 +1911,7 @@ def update_control_from_target():
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
     global overlay_text, overlay_color, _ctl_dbg, prev_control_mono
-    global prev_launch_pitch_deg
+    global prev_launch_pitch_deg, prev_box_size_px, box_growth_smoothed
 
     with state_lock:
         box = target_box_main
@@ -1818,6 +1959,10 @@ def update_control_from_target():
         smoothed_pitch_deg = 0.0
         prev_control_mono = None
         prev_launch_pitch_deg = None
+        # Оценку сближения тоже сбрасываем: размер коробки после нового
+        # захвата не связан с прежним, и прирост между ними — мусор.
+        prev_box_size_px = None
+        box_growth_smoothed = 0.0
         prev_box_cx = None
         prev_box_cy = None
         target_vx_smoothed = 0.0
@@ -1957,6 +2102,10 @@ def update_control_from_target():
     box_h_main = box[3] - box[1]
     box_frac = (box_w_main * box_h_main) / float(MAIN_W * MAIN_H)
     in_terminal = TERMINAL_MODE_ENABLED and box_frac >= TERMINAL_BOX_FRAC_THRESHOLD
+
+    # Оценка сближения. Пока ТОЛЬКО измеряется и пишется в лог — в закон
+    # управления не входит (см. блок про оценку сближения выше).
+    closure = _estimate_closure(box_w_main, box_h_main, box_cy, now_mono, k)
 
     if in_terminal:
         p_roll_eff = P_GAIN_ROLL * TERMINAL_P_MULTIPLIER
@@ -2130,6 +2279,15 @@ def update_control_from_target():
         "launch_target_deg": LAUNCH_TARGET_PITCH_DEG * launch_intensity,
         "launch_reached": launch_angle_reached,
         "k": k,
+        "size_px": closure["size_px"], "growth": closure["growth"],
+        "tau_s": closure["tau_s"], "range_m": closure["range_m"],
+        "depression_deg": closure["depression_deg"],
+        # Вертикальная ошибка газа, ОЧИЩЕННАЯ от собственного наклона.
+        # Сейчас регулятор газа работает по сырому dy_alt, и наклон носа он
+        # читает как «цель ушла вверх» — то есть разгон сам себе подкручивает
+        # газ. Пишем очищенный вариант рядом, чтобы на живых заходах увидеть,
+        # насколько это расходится, прежде чем менять закон управления.
+        "dy_alt_decoupled": dy_alt + pitch_comp_px,
     }
 
 # =========================================================
@@ -2562,8 +2720,12 @@ def _capture_flight_row(cb_t0):
             fc_yaw = app_state.get("fc_yaw_deg")
             att_ts = app_state.get("fc_pitch_ts", 0.0)
             armed = app_state.get("armed")
+            alt_cm = app_state.get("alt_cm")
+            vario_cms = app_state.get("vario_cms")
+            alt_ts = app_state.get("alt_ts", 0.0)
 
         att_age = (now - att_ts) * 1000.0 if att_ts else None
+        alt_age = (now - alt_ts) * 1000.0 if alt_ts else None
 
         # Переходы пишем событиями: по CSV их искать глазами неудобно,
         # а именно они отвечают на «когда всё сломалось».
@@ -2604,6 +2766,9 @@ def _capture_flight_row(cb_t0):
             _idx(rc, 0), _idx(rc, 1), _idx(rc, 2), _idx(rc, 3),
             dt_ms, (time.monotonic() - cb_t0) * 1000.0, armed,
             g("launch_target_deg"), g("launch_reached"), g("k"),
+            alt_cm, vario_cms, alt_age,
+            g("size_px"), g("growth"), g("tau_s"), g("range_m"),
+            g("depression_deg"), g("dy_alt_decoupled"),
         ))
     except Exception:
         # Лог не имеет права мешать полёту.
