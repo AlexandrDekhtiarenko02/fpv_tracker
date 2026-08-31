@@ -163,9 +163,19 @@ FLOW_MIN_POINTS = 3
 FLOW_ERR_MAX = 20.0 * TRACK_SCALE
 FLOW_MAX_STEP = 30.0 * TRACK_SCALE
 FLOW_REFRESH_EVERY = 1
-# Запас окна оптического потока вокруг точек, пиксели. Должен покрывать
-# смещение цели между кадрами, иначе точка уедет за край окна и потеряется.
-FLOW_WINDOW_PAD = 24 * TRACK_SCALE
+# Запас окна оптического потока вокруг точек, пиксели.
+#
+# ВАЖНО: запас должен покрывать не только смещение цели, но и КОНТЕКСТ,
+# который нужен самой пирамиде. При winSize=15 и maxLevel=2 окно 15 px на
+# верхнем уровне соответствует 60 px на исходном изображении. С запасом 24 px
+# точки у края окна теряли контекст, и поток по ним считался хуже, чем по
+# полному кадру — средний score упал с 0.726 до 0.643.
+FLOW_WINDOW_PAD = 72 * TRACK_SCALE
+# Окно имеет смысл только когда оно заметно меньше кадра. На 320x240 с
+# честным запасом оно занимает почти весь кадр, экономии нет, а риск
+# краевых эффектов остаётся — поэтому там считаем по полному кадру, как и
+# раньше. Экономия нужна на 640x480, где окно действительно мельче.
+FLOW_WINDOW_ENABLED = (TRACK_SCALE > 1)
 
 HOLD_FRAMES = 10
 LOST_LIMIT = 28
@@ -1594,13 +1604,14 @@ def flow_predict(prev_g, cur_g, pts, cx, cy):
         # снаружи функции ничего не меняется.
         pad = FLOW_WINDOW_PAD
         h_img, w_img = cur_g.shape[:2]
+        use_window = FLOW_WINDOW_ENABLED
         xs, ys = pts[:, 0, 0], pts[:, 0, 1]
         wx1 = max(0, int(xs.min()) - pad)
         wy1 = max(0, int(ys.min()) - pad)
         wx2 = min(w_img, int(xs.max()) + pad + 1)
         wy2 = min(h_img, int(ys.max()) + pad + 1)
         # Слишком узкое окно пирамиде не годится — тогда работаем по кадру.
-        if (wx2 - wx1) < 32 or (wy2 - wy1) < 32:
+        if not use_window or (wx2 - wx1) < 32 or (wy2 - wy1) < 32:
             wx1, wy1, wx2, wy2 = 0, 0, w_img, h_img
         prev_win = prev_g[wy1:wy2, wx1:wx2]
         cur_win = cur_g[wy1:wy2, wx1:wx2]
@@ -2724,12 +2735,24 @@ def process_locked_tracker(gray):
             #
             # Теперь при смене размера шаблон пересчитывается в новый масштаб,
             # а не выбрасывается: накопленный вид цели сохраняется.
-            if cur_tmpl.shape != template_gray.shape:
-                template_gray = cv2.resize(
-                    template_gray, (cur_tmpl.shape[1], cur_tmpl.shape[0]),
-                    interpolation=cv2.INTER_LINEAR)
-            template_gray = cv2.addWeighted(template_gray, 1 - TEMPLATE_UPDATE_ALPHA,
-                                            cur_tmpl, TEMPLATE_UPDATE_ALPHA, 0)
+            if cur_tmpl.shape == template_gray.shape:
+                template_gray = cv2.addWeighted(
+                    template_gray, 1 - TEMPLATE_UPDATE_ALPHA,
+                    cur_tmpl, TEMPLATE_UPDATE_ALPHA, 0)
+            else:
+                # Размер изменился. Пересчитывать НАКОПЛЕННЫЙ шаблон нельзя:
+                # каждый cv2.resize — это интерполяция, то есть размытие, и
+                # оно накапливается. Размер коробки гуляет (в логе 16 -> 43 ->
+                # 16 -> 40), значит пересчётов десятки, и шаблон превращался в
+                # кашу — средний score упал с 0.643 до 0.498.
+                #
+                # Вместо этого берём ЧИСТЫЙ шаблон текущего кадра в новом
+                # масштабе. Накопленный вид теряется, но это разовое событие
+                # на смену масштаба, а не деградация каждые несколько кадров.
+                # Прежний код в этом месте не делал НИЧЕГО, из-за чего на
+                # сближении шаблон застревал в старом масштабе — здесь мы
+                # по-прежнему следуем за размером, но без размытия.
+                template_gray = cur_tmpl
 
         # Периодическая адаптация размера коробки. Раз в SIZE_ADAPT_EVERY_FRAMES
         # при уверенном матче запрашиваем заново связную компоненту под текущим
