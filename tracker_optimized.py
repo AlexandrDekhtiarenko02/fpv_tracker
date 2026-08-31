@@ -63,6 +63,7 @@ import time
 import threading
 import os
 import math
+import signal
 
 cv2.setNumThreads(1)
 
@@ -359,6 +360,419 @@ MOTOR_DEBUG_ENABLED = True
 MOTOR_DEBUG_PERIOD = 0.10
 DEBUG_PERIOD = 0.50
 
+# --- ПОЛЁТНОЕ ЛОГИРОВАНИЕ (аналитика донаведения) ---
+# Пишет по строке на кадр в CSV + журнал событий + итоговый разбор.
+# Цель: по логу однозначно ответить «шёл ли дрон в цель, и если нет — где
+# порвалась цепочка»: видим цель -> считаем ошибку -> PID -> отдали в FC ->
+# аппарат отработал -> ошибка падает и цель растёт.
+#
+# Zero 2W слабый, поэтому в камерном колбэке НЕ делается ни форматирования,
+# ни записи на диск: там только сборка кортежа чисел (единицы микросекунд).
+# Форматирование, запись и аналитика живут в фоновом потоке.
+FLIGHT_LOG_ENABLED = True
+FLIGHT_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flight_logs")
+FLIGHT_LOG_FLUSH_PERIOD = 1.0     # с, как часто фоновый поток сбрасывает на диск
+FLIGHT_LOG_VERDICT_PERIOD = 2.0   # с, как часто писать промежуточный вердикт
+FLIGHT_LOG_MAX_ROWS = 20000       # предохранитель очереди, если диск не успевает
+# Окно (кадров) для оценки трендов: сходится ли ошибка, растёт ли цель.
+FLIGHT_LOG_TREND_WINDOW = 45
+# Дописывать ли данные на физический носитель (fsync), а не только отдавать
+# ОС. Дрон часто заканчивает полёт обрывом питания, и всё, что осталось в
+# кэше ОС, пропадает — а это последние секунды, ровно те, ради которых лог и
+# ведётся. Ценой является лишняя нагрузка на SD-карту раз в секунду.
+FLIGHT_LOG_FSYNC = True
+
+# =========================================================
+# 3b. ПОЛЁТНОЕ ЛОГИРОВАНИЕ / АНАЛИТИКА ДОНАВЕДЕНИЯ
+# =========================================================
+# Что именно нужно, чтобы понять «летит ли дрон в цель»: наведение — это
+# цепочка, и обрыв на любом звене выглядит снаружи одинаково («не наводится»).
+# Поэтому логируется КАЖДОЕ звено, чтобы виновника было видно, а не угадывать:
+#
+#   1. ВИЖУ      state / match_score / flow_ok / lost_frames  — есть ли захват
+#   2. СЧИТАЮ    dx_raw,dy_raw + comp + lead -> dx_aim,dy_aim — из чего ошибка
+#   3. РЕШАЮ     P/D/I/FF по осям + флаги насыщения           — что выдал PID
+#   4. ОТДАЮ     cmd_* и реально ушедшие sent_*               — дошло ли до FC
+#   5. ОТРАБОТАЛ fc_roll/pitch/yaw + моторы                   — послушался ли
+#   6. СХОЖУСЬ   ошибка падает? box_frac растёт?              — идём ли в цель
+#
+# Пункт 2 разложен на слагаемые не случайно: если comp/lead окажутся больше
+# самой ошибки, прицел уводит не цель, а собственные поправки — по одной лишь
+# итоговой dy_aim этого не увидеть.
+
+_FLIGHT_LOG_COLUMNS = (
+    "t,frame,fps,state,controllable,aux4,override,launch_phase,launch_int,"
+    "match_score,flow_ok,lost_frames,reacq,"
+    "box_cx,box_cy,box_w,box_h,box_frac,"
+    "dx_raw,dy_raw,pitch_comp_px,lead_x,lead_y,dx_aim,dy_aim,adx,ady,dy_alt,"
+    "tgt_vx,tgt_vy,stable_frames,in_terminal,"
+    "roll_p,roll_d,roll_i,roll_ff,roll_off,roll_sat,"
+    "pitch_p,pitch_d,pitch_i,pitch_ff,pitch_off,pitch_sat,"
+    "launch_pwm,cruise_pwm,pitch_comb,"
+    "yaw_filt,yaw_weight,yaw_pd,yaw_ff,yaw_i,yaw_off,yaw_sat,"
+    "base_thr,thr_adjust,thr_i,rc_fresh,"
+    "cmd_roll,cmd_pitch,cmd_yaw,cmd_thr,"
+    "sent_r,sent_p,sent_t,sent_y,"
+    "fc_roll,fc_pitch,fc_yaw,att_age_ms,"
+    "m1,m2,m3,m4,rc_r,rc_p,rc_y,rc_t,dt_ms,cb_ms,armed"
+)
+
+# Снимок внутренностей управления за текущий кадр. Заполняется в
+# update_control_from_target()/fast_idle_update(), читается один раз в
+# camera_callback. Обычный dict: ~3 мкс на кадр, на фоне 33 мс кадра — ничто.
+_ctl_dbg = {}
+# Слагаемые PID по осям, складывает _pid_axis_step.
+_pid_dbg = {}
+
+
+class FlightLogger:
+    """CSV по кадрам + журнал событий + разбор.
+
+    Раскладка по потокам продиктована Zero 2W: камерный колбэк только кладёт
+    готовый кортеж в очередь (без форматирования и без диска), а фоновый поток
+    форматирует, пишет и считает тренды. Иначе запись на SD-карту встанет
+    прямо в тракте обработки кадра и просадит FPS — то есть логирование
+    испортило бы ровно то, что измеряет.
+    """
+
+    def __init__(self, directory):
+        self.dir = directory
+        self.enabled = False
+        self._rows = []
+        self._events = []
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+        self._csv = None
+        self._evt = None
+        self._written = 0
+        self._dropped = 0
+        self._session = None
+        # Хвост для трендов; сюда кладём только то, что нужно для вердикта.
+        self._trend = []
+        self._prev_armed = None
+        self._flight_index = 0
+        self._drain_error_reported = False
+        self._next_verdict = 0.0
+        self._t0 = time.monotonic()
+        # Агрегаты для разбора. Сбрасываются на каждом ARM, чтобы разбор
+        # относился к одному вылету, а не к сумме всех за сессию.
+        self._reset_agg()
+
+    def _reset_agg(self):
+        self._agg = {
+            "frames": 0, "tracked": 0, "override": 0,
+            "roll_sat": 0, "pitch_sat": 0, "yaw_sat": 0,
+            "comp_dominant": 0, "att_stale": 0,
+            "sum_abs_dx": 0.0, "sum_abs_dy": 0.0,
+            "first_frac": None, "last_frac": None,
+            "best_frac": 0.0, "states": {},
+        }
+        self._trend = []
+
+    # ---------- жизненный цикл ----------
+    def start(self):
+        if not FLIGHT_LOG_ENABLED:
+            return
+        try:
+            os.makedirs(self.dir, exist_ok=True)
+            self._session = time.strftime("%Y%m%d_%H%M%S")
+            base = os.path.join(self.dir, "flight_" + self._session)
+            self._csv = open(base + ".csv", "w", buffering=1 << 16)
+            self._csv.write(_FLIGHT_LOG_COLUMNS + "\n")
+            self._evt = open(base + ".events.log", "w", buffering=1 << 14)
+            self.enabled = True
+            self.event("session start pid=%d" % os.getpid())
+            self._log_config()
+            self._thread = threading.Thread(target=self._writer, daemon=True)
+            self._thread.start()
+        except Exception as exc:
+            # Логирование не имеет права уронить полёт.
+            self.enabled = False
+            try:
+                print("[flightlog] disabled: %s" % exc, flush=True)
+            except Exception:
+                pass
+
+    def _log_config(self):
+        """Снимок настроек: без него цифры из CSV нечем объяснить через месяц."""
+        self.event("CONFIG override R=%s P=%s Y=%s T=%s | signs roll=%+d pitch=%+d yaw=%+d"
+                   % (OVERRIDE_ROLL, OVERRIDE_PITCH, OVERRIDE_YAW, OVERRIDE_THROTTLE,
+                      ROLL_SIGN, PITCH_SIGN, YAW_SIGN))
+        self.event("CONFIG deflect roll=%d pitch=%d yaw=%d | gains P r=%.2f p=%.2f y=%.2f"
+                   % (MAX_ROLL_DEFLECT, MAX_PITCH_DEFLECT, MAX_YAW_DEFLECT,
+                      P_GAIN_ROLL, P_GAIN_PITCH, P_GAIN_YAW))
+        self.event("CONFIG pitch_comp=%s px_per_deg=%.2f max_comp=%.0f | lead=%s frames=%d"
+                   % (PITCH_ATTITUDE_COMP_ENABLED, PIXELS_PER_PITCH_DEG,
+                      MAX_PITCH_COMP_PX, LEAD_AIM_ENABLED, LEAD_FRAMES))
+        self.event("CONFIG launch=%s nose_down=%d thr_boost=%.1f%% | cruise=%s nose_down=%d"
+                   % (LAUNCH_ENABLED, LAUNCH_NOSE_DOWN_PWM, LAUNCH_THR_BOOST_PCT,
+                      CRUISE_ENABLED, CRUISE_NOSE_DOWN_PWM))
+        self.event("CONFIG camera %dx%d rot180=%s | center=(%d,%d)"
+                   % (MAIN_W, MAIN_H, CAMERA_ROTATE_180, CENTER_X, CENTER_Y))
+
+    def stop(self):
+        if not self.enabled:
+            return
+        self._stop.set()
+        try:
+            if self._thread is not None:
+                self._thread.join(timeout=2.0)
+        except Exception:
+            pass
+        try:
+            self._drain()
+            if self._prev_armed:
+                # Программу остановили, не дизармившись (или сняли питание в
+                # воздухе) — разбора этого вылета ещё нет, дописываем.
+                self._write_summary(tag="flight%d" % max(self._flight_index, 1))
+            elif self._flight_index == 0:
+                # Армирование ни разу не наблюдалось (нет связи с FC или
+                # наземный прогон) — тогда полезен разбор всей сессии.
+                self._write_summary()
+        except Exception:
+            pass
+        for f in (self._csv, self._evt):
+            try:
+                if f is not None:
+                    f.close()
+            except Exception:
+                pass
+        self.enabled = False
+
+    # ---------- горячий путь ----------
+    def row(self, values):
+        """Вызывается из камерного колбэка. Никакого I/O и форматирования."""
+        if not self.enabled:
+            return
+        # Под замком: _drain() подменяет список целиком, и без замка строка,
+        # добавленная ровно в момент подмены, потерялась бы. Захват незанятого
+        # замка стоит доли микросекунды — на 30 кадрах/с это ничто.
+        with self._lock:
+            if len(self._rows) >= FLIGHT_LOG_MAX_ROWS:
+                # Лучше потерять строки, чем расти в памяти на Zero 2W.
+                self._dropped += 1
+                return
+            self._rows.append(values)
+
+    def event(self, text):
+        if not FLIGHT_LOG_ENABLED:
+            return
+        try:
+            with self._lock:
+                self._events.append(
+                    "%8.3f  %s" % (time.monotonic() - self._t0, text))
+        except Exception:
+            pass
+
+    # ---------- фоновый поток ----------
+    def _writer(self):
+        while not self._stop.is_set():
+            self._stop.wait(FLIGHT_LOG_FLUSH_PERIOD)
+            try:
+                self._drain()
+            except Exception:
+                # Пишем ОДИН раз: молча глохнущий логгер выглядит как «лог
+                # пустой» и съедает вылет, пока причина не найдена.
+                if not self._drain_error_reported:
+                    self._drain_error_reported = True
+                    try:
+                        import traceback
+                        traceback.print_exc()
+                        print("[flightlog] writer failed; log incomplete",
+                              flush=True)
+                    except Exception:
+                        pass
+
+    def _drain(self):
+        with self._lock:
+            rows, self._rows = self._rows, []
+        out = []
+        for r in rows:
+            out.append(",".join(_fmt(v) for v in r))
+            # Может добавить события (ARMED/DISARMED), поэтому события
+            # забираем ПОСЛЕ разбора строк — иначе на последнем сбросе перед
+            # выходом отметка о дизарме потерялась бы.
+            self._accumulate(r)
+        with self._lock:
+            events, self._events = self._events, []
+        if events and self._evt is not None:
+            self._evt.write("\n".join(events) + "\n")
+            self._evt.flush()
+        if not rows:
+            return
+        self._csv.write("\n".join(out) + "\n")
+        # Без flush строки лежат в 64-КБ буфере и теряются при обрыве питания —
+        # то есть терялся бы именно хвост перед падением.
+        self._csv.flush()
+        if FLIGHT_LOG_FSYNC:
+            try:
+                os.fsync(self._csv.fileno())
+                os.fsync(self._evt.fileno())
+            except Exception:
+                pass
+        self._written += len(rows)
+        now = time.monotonic()
+        if now >= self._next_verdict:
+            self._next_verdict = now + FLIGHT_LOG_VERDICT_PERIOD
+            try:
+                self._verdict()
+            except Exception:
+                pass
+
+    # ---------- аналитика ----------
+    def _accumulate(self, r):
+        a = self._agg
+        # Разбор вылета пишется по ДИЗАРМУ, а не только на выходе из
+        # программы: питание с дрона обычно снимают позже (или вообще
+        # дёргают), и ждать штатного завершения — значит часто не получить
+        # разбор вовсе. Переход ловим здесь, в потоке записи, чтобы он был
+        # согласован с потоком строк и не требовал ещё одной блокировки.
+        armed = r[_C_ARMED]
+        if armed is not None and armed != self._prev_armed:
+            prev = self._prev_armed
+            self._prev_armed = armed
+            if armed:
+                self._flight_index += 1
+                self.event("ARMED -> вылет #%d, счётчики разбора сброшены"
+                           % self._flight_index)
+                self._reset_agg()
+            elif prev is not None:
+                self.event("DISARMED -> разбор вылета #%d записан"
+                           % self._flight_index)
+                try:
+                    self._write_summary(tag="flight%d" % self._flight_index)
+                except Exception:
+                    pass
+
+        # Считаем кадр ПОСЛЕ разбора перехода: иначе кадр, на котором пришёл
+        # дизарм, попадал бы в статистику только что завершённого вылета.
+        a = self._agg
+        a["frames"] += 1
+        st = r[_C_STATE]
+        a["states"][st] = a["states"].get(st, 0) + 1
+        if r[_C_OVERRIDE]:
+            a["override"] += 1
+
+        if st != "TRACKED":
+            return
+        a["tracked"] += 1
+        a["sum_abs_dx"] += abs(r[_C_DX_AIM] or 0.0)
+        a["sum_abs_dy"] += abs(r[_C_DY_AIM] or 0.0)
+        if r[_C_ROLL_SAT]:
+            a["roll_sat"] += 1
+        if r[_C_PITCH_SAT]:
+            a["pitch_sat"] += 1
+        if r[_C_YAW_SAT]:
+            a["yaw_sat"] += 1
+        # Поправка перевешивает саму ошибку — прицел ведут не по цели.
+        if abs(r[_C_COMP] or 0.0) > max(8.0, abs(r[_C_DY_RAW] or 0.0)):
+            a["comp_dominant"] += 1
+        if (r[_C_ATT_AGE] or 0.0) > 300.0:
+            a["att_stale"] += 1
+        frac = r[_C_BOX_FRAC] or 0.0
+        if a["first_frac"] is None:
+            a["first_frac"] = frac
+        a["last_frac"] = frac
+        if frac > a["best_frac"]:
+            a["best_frac"] = frac
+        t = self._trend
+        t.append((r[_C_DX_AIM] or 0.0, r[_C_DY_AIM] or 0.0, frac))
+        if len(t) > FLIGHT_LOG_TREND_WINDOW:
+            del t[:-FLIGHT_LOG_TREND_WINDOW]
+
+    def _verdict(self):
+        """Промежуточный ответ на вопрос «идём ли в цель» + почему нет."""
+        t = self._trend
+        if len(t) < 10:
+            return
+        half = len(t) // 2
+        err0 = sum(abs(x) + abs(y) for x, y, _ in t[:half]) / half
+        err1 = sum(abs(x) + abs(y) for x, y, _ in t[half:]) / (len(t) - half)
+        frac0 = sum(f for _, _, f in t[:half]) / half
+        frac1 = sum(f for _, _, f in t[half:]) / (len(t) - half)
+        closing = frac1 > frac0 * 1.02
+        converging = err1 < err0 * 0.95
+        a = self._agg
+        n = max(a["tracked"], 1)
+        why = []
+        if a["pitch_sat"] * 4 > n:
+            why.append("pitch saturated %d%%" % (100 * a["pitch_sat"] // n))
+        if a["roll_sat"] * 4 > n:
+            why.append("roll saturated %d%%" % (100 * a["roll_sat"] // n))
+        if a["comp_dominant"] * 4 > n:
+            why.append("pitch-comp outweighs real error %d%%"
+                       % (100 * a["comp_dominant"] // n))
+        if a["att_stale"] * 4 > n:
+            why.append("MSP attitude stale %d%%" % (100 * a["att_stale"] // n))
+        if not a["override"]:
+            why.append("override never active")
+        verdict = "CLOSING" if (closing and converging) else (
+            "closing-not-aiming" if closing else (
+                "aiming-not-closing" if converging else "NOT CONVERGING"))
+        self.event("VERDICT %s | aim_err %.1f->%.1f px | box %.4f->%.4f%s"
+                   % (verdict, err0, err1, frac0, frac1,
+                      (" | " + "; ".join(why)) if why else ""))
+
+    def _write_summary(self, tag=None):
+        a = self._agg
+        if not a["frames"]:
+            return
+        n = max(a["tracked"], 1)
+        name = "flight_%s.summary.txt" % self._session if tag is None \
+            else "flight_%s.%s.summary.txt" % (self._session, tag)
+        path = os.path.join(self.dir, name)
+        with open(path, "w") as f:
+            f.write("frames=%d  tracked=%d  override=%d  dropped=%d\n"
+                    % (a["frames"], a["tracked"], a["override"], self._dropped))
+            f.write("states: %s\n" % ", ".join(
+                "%s=%d" % kv for kv in sorted(a["states"].items())))
+            if a["tracked"]:
+                f.write("mean|dx_aim|=%.1f px  mean|dy_aim|=%.1f px\n"
+                        % (a["sum_abs_dx"] / n, a["sum_abs_dy"] / n))
+                f.write("box_frac first=%.5f last=%.5f best=%.5f  (растёт = подходим)\n"
+                        % (a["first_frac"] or 0.0, a["last_frac"] or 0.0, a["best_frac"]))
+                f.write("saturation: roll=%d%% pitch=%d%% yaw=%d%%\n"
+                        % (100 * a["roll_sat"] // n, 100 * a["pitch_sat"] // n,
+                           100 * a["yaw_sat"] // n))
+                f.write("pitch-comp сильнее реальной ошибки: %d%% кадров\n"
+                        % (100 * a["comp_dominant"] // n))
+                f.write("MSP attitude протухал: %d%% кадров\n"
+                        % (100 * a["att_stale"] // n))
+        try:
+            print("[flightlog] %d rows -> %s" % (self._written, self.dir), flush=True)
+        except Exception:
+            pass
+
+
+def _fmt(v):
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, float):
+        return "%.3f" % v
+    return str(v)
+
+
+# Индексы колонок, которые читает аналитика. Держим рядом с порядком в
+# _FLIGHT_LOG_COLUMNS — при добавлении колонки правится одно место.
+_C_STATE = 3
+_C_OVERRIDE = 6
+_C_BOX_FRAC = 17
+_C_DY_RAW = 19
+_C_COMP = 20
+_C_DX_AIM = 23
+_C_DY_AIM = 24
+_C_ROLL_SAT = 37
+_C_PITCH_SAT = 43
+_C_YAW_SAT = 53
+_C_ATT_AGE = 69
+_C_ARMED = 80
+
+flight_log = FlightLogger(FLIGHT_LOG_DIR)
+
+
 # =========================================================
 # 4. SERIAL / MSP
 # =========================================================
@@ -367,6 +781,14 @@ PORT = PORT_BY_ID if os.path.exists(PORT_BY_ID) else "/dev/ttyACM0"
 BAUD = 115200
 
 MSP_RC_PERIOD = 0.04
+# Опрос состояния «заармлен» — нужен, чтобы писать разбор вылета по дизарму.
+MSP_STATUS_PERIOD = 0.25
+# Номер бита ARM в flightModeFlags НЕ фиксирован: Betaflight укладывает туда
+# только НАСТРОЕННЫЕ режимы, в порядке, который отдаёт MSP_BOXIDS. Позиция
+# зависит от конкретного конфига, поэтому её надо спросить, а не угадать —
+# иначе «дизарм» будет срабатывать от постороннего режима.
+ARM_BOX_PERMANENT_ID = 0
+_arm_bit_index = None
 
 fc = None
 try:
@@ -546,9 +968,11 @@ def fc_io_loop():
        Write: MSP_SET_RAW_RC ждёт rcmap-порядок (default AETR) →
        channels[0]=Roll, [1]=Pitch, [2]=Throttle, [3]=Yaw.
     """
-    global aux4_state
+    global aux4_state, _arm_bit_index
     next_t = time.monotonic()
     next_motor_t = 0.0
+    next_status_t = 0.0
+    next_boxids_t = 0.0
 
     while not io_thread_stop.is_set():
         if fc is None:
@@ -568,12 +992,40 @@ def fc_io_loop():
 
             att_data = msp_request(108)  # MSP_ATTITUDE
             if att_data is not None and len(att_data) >= 6:
-                _roll_t, pitch_t, _heading = struct.unpack('<3h', att_data[:6])
+                roll_t, pitch_t, heading_t = struct.unpack('<3h', att_data[:6])
                 with state_lock:
                     app_state["fc_pitch_deg"] = pitch_t / 10.0
                     app_state["fc_pitch_ts"] = time.monotonic()
+                    # Крен и курс приходят в том же пакете и ничего не стоят,
+                    # а без них не проверить, отработал ли аппарат команду:
+                    # «PID просил крен, аппарат не накренился» — это диагноз.
+                    app_state["fc_roll_deg"] = roll_t / 10.0
+                    app_state["fc_yaw_deg"] = float(heading_t)
 
             now = time.monotonic()
+
+            # Один раз узнаём, в каком бите живёт ARM.
+            if _arm_bit_index is None and now >= next_boxids_t:
+                next_boxids_t = now + 2.0
+                box_data = msp_request(119)  # MSP_BOXIDS
+                if box_data:
+                    pos = box_data.find(ARM_BOX_PERMANENT_ID)
+                    if pos >= 0:
+                        _arm_bit_index = pos
+                        flight_log.event(
+                            "MSP_BOXIDS: ARM в бите %d (боксов %d)"
+                            % (pos, len(box_data)))
+
+            if _arm_bit_index is not None and now >= next_status_t:
+                next_status_t = now + MSP_STATUS_PERIOD
+                st_data = msp_request(101)  # MSP_STATUS
+                if st_data is not None and len(st_data) >= 10:
+                    mode_flags = struct.unpack_from('<I', st_data, 6)[0]
+                    with state_lock:
+                        app_state["armed"] = bool(
+                            mode_flags & (1 << _arm_bit_index))
+                        app_state["armed_ts"] = now
+
             if MOTOR_DEBUG_ENABLED and now >= next_motor_t:
                 mot_data = msp_request(104)  # MSP_MOTOR
                 if mot_data is not None and len(mot_data) >= 2:
@@ -964,7 +1416,7 @@ def reset_tracking(to_acq=False):
 def _pid_axis_step(error, prev_error, integral, ff_value,
                    p_gain, d_gain, i_gain, ff_gain,
                    integral_max, integral_decay,
-                   sign, max_deflect):
+                   sign, max_deflect, dbg_key=None):
     """Один шаг PID+FF по одной оси с условным anti-windup.
 
     Anti-windup: I-компонент НЕ накапливается, если P+D+FF+I-выход уже
@@ -1001,10 +1453,19 @@ def _pid_axis_step(error, prev_error, integral, ff_value,
     integral *= integral_decay
 
     out = sign * (pd_part + ff_part + integral)
+    saturated = False
     if out > max_deflect:
         out = max_deflect
+        saturated = True
     elif out < -max_deflect:
         out = -max_deflect
+        saturated = True
+
+    if dbg_key is not None:
+        # Раздельно P, D, I и FF: по сумме не понять, кто именно увёл ось —
+        # а это первый вопрос, когда наведение промахивается.
+        _pid_dbg[dbg_key] = (err_f * p_gain, d_err * d_gain, integral,
+                             ff_part, out, saturated)
 
     return out, err_f, integral
 
@@ -1054,7 +1515,7 @@ def update_control_from_target():
     global smoothed_pitch_deg
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
-    global overlay_text, overlay_color
+    global overlay_text, overlay_color, _ctl_dbg
 
     with state_lock:
         box = target_box_main
@@ -1100,6 +1561,9 @@ def update_control_from_target():
             global_pitch_cmd = 1500.0
             global_yaw_cmd = 1500.0
             global_throttle_cmd = base_thr
+        # Кадр без управления — тоже данные: по ним видно, сколько времени
+        # наведение простояло и в каком состоянии, вместо дыры в логе.
+        _ctl_dbg = {"active": False, "base_thr": base_thr}
         return
 
     # --- Геометрия. РАЗДЕЛЬНЫЕ dy для pitch и для газа. ---
@@ -1230,7 +1694,7 @@ def update_control_from_target():
         target_vx_smoothed,
         p_roll_eff, D_GAIN_ROLL, i_roll_eff, ff_roll_eff,
         ROLL_INTEGRAL_MAX, ROLL_INTEGRAL_DECAY,
-        ROLL_SIGN, MAX_ROLL_DEFLECT,
+        ROLL_SIGN, MAX_ROLL_DEFLECT, dbg_key="roll",
     )
     target_roll = max(1000, min(2000, 1500 + roll_offset))
 
@@ -1240,7 +1704,7 @@ def update_control_from_target():
         target_vy_smoothed,
         p_pitch_eff, D_GAIN_PITCH, i_pitch_eff, ff_pitch_eff,
         PITCH_INTEGRAL_MAX, PITCH_INTEGRAL_DECAY,
-        PITCH_SIGN, MAX_PITCH_DEFLECT,
+        PITCH_SIGN, MAX_PITCH_DEFLECT, dbg_key="pitch",
     )
     # Поверх PID — launch boost и cruise. Они могут вытолкнуть target_pitch
     # за MAX_PITCH_DEFLECT, но финальный clamp 1000-2000 остаётся.
@@ -1282,6 +1746,7 @@ def update_control_from_target():
     target_yaw = max(1000, min(2000, 1500 + yaw_offset))
 
     # --- THROTTLE ---
+    thr_adjust = 0.0
     if not OVERRIDE_THROTTLE:
         target_throttle = base_thr
         smooth_throttle_out = float(base_thr)
@@ -1342,6 +1807,35 @@ def update_control_from_target():
         global_pitch_cmd = target_pitch
         global_yaw_cmd = target_yaw
         global_throttle_cmd = target_throttle
+
+    # Снимок для лога. Собирается здесь, потому что это единственное место, где
+    # видны все промежуточные величины сразу; снаружи их уже не восстановить.
+    r_p, r_d, r_i, r_ff, r_off, r_sat = _pid_dbg.get("roll", (0.0,) * 5 + (False,))
+    p_p, p_d, p_i, p_ff, p_off, p_sat = _pid_dbg.get("pitch", (0.0,) * 5 + (False,))
+    _ctl_dbg = {
+        "active": True,
+        "box_cx": box_cx, "box_cy": box_cy,
+        "box_w": box_w_main, "box_h": box_h_main, "box_frac": box_frac,
+        "dx_raw": box_cx - CENTER_X, "dy_raw": box_cy - CENTER_Y,
+        "comp": pitch_comp_px, "lead_x": lead_x, "lead_y": lead_y,
+        "dx_aim": dx_aim, "dy_aim": dy_aim, "adx": adx, "ady": ady,
+        "dy_alt": dy_alt,
+        "tgt_vx": target_vx_smoothed, "tgt_vy": target_vy_smoothed,
+        "stable": stable_track_frames, "terminal": in_terminal,
+        "roll_p": r_p, "roll_d": r_d, "roll_i": r_i, "roll_ff": r_ff,
+        "roll_off": r_off, "roll_sat": r_sat,
+        "pitch_p": p_p, "pitch_d": p_d, "pitch_i": p_i, "pitch_ff": p_ff,
+        "pitch_off": p_off, "pitch_sat": p_sat,
+        "launch_pwm": launch_pitch_pwm, "cruise_pwm": cruise_pitch_pwm,
+        "pitch_comb": combined_pitch,
+        "yaw_filt": filtered_dx_yaw, "yaw_weight": yaw_weight,
+        "yaw_pd": yaw_pd, "yaw_ff": yaw_ff, "yaw_i": yaw_integral,
+        "yaw_off": yaw_offset,
+        "yaw_sat": abs(yaw_offset) >= MAX_YAW_DEFLECT,
+        "base_thr": base_thr, "thr_adjust": thr_adjust,
+        "thr_i": throttle_integral, "rc_fresh": rc_fresh,
+        "launch_phase": launch_phase, "launch_int": launch_intensity,
+    }
 
 # =========================================================
 # 9. DRAWING
@@ -1717,6 +2211,7 @@ def print_debug_once_per_second():
 def fast_idle_update():
     global prev_aux_on, track_state, override_active
     global global_roll_cmd, global_pitch_cmd, global_yaw_cmd, global_throttle_cmd
+    global _ctl_dbg
 
     with state_lock:
         live_thr = app_state.get("rc_throttle", 1500)
@@ -1728,13 +2223,106 @@ def fast_idle_update():
     with state_lock:
         app_state["dyn_throttle"] = live_thr
         override_active = False
+        _ctl_dbg = {"active": False, "base_thr": live_thr}
         global_roll_cmd = 1500.0
         global_pitch_cmd = 1500.0
         global_yaw_cmd = 1500.0
         global_throttle_cmd = live_thr
 
 
+_flight_prev_t = None
+_flight_prev_state = None
+_flight_prev_launch = None
+_flight_prev_override = None
+
+
+def _capture_flight_row(cb_t0):
+    """Одна строка лога за кадр. Вызывается в камерном потоке, поэтому здесь
+    только чтение переменных и сборка кортежа — ни форматирования, ни диска."""
+    global _flight_prev_t, _flight_prev_state, _flight_prev_launch, _flight_prev_override
+    if not flight_log.enabled:
+        return
+    try:
+        now = time.monotonic()
+        dt_ms = 0.0 if _flight_prev_t is None else (now - _flight_prev_t) * 1000.0
+        _flight_prev_t = now
+
+        c = _ctl_dbg
+        active = c.get("active", False)
+
+        with state_lock:
+            st = track_state
+            ctrl = target_controllable
+            aux = aux4_state
+            ov = override_active
+            r_cmd = int(global_roll_cmd)
+            p_cmd = int(global_pitch_cmd)
+            y_cmd = int(global_yaw_cmd)
+            t_cmd = int(global_throttle_cmd)
+            sent = app_state.get("last_sent_channels", (1500,) * 8)
+            rc = app_state.get("rc_channels", (1500,) * 8)
+            motors = app_state.get("motors", ())
+            fc_roll = app_state.get("fc_roll_deg")
+            fc_pitch = app_state.get("fc_pitch_deg")
+            fc_yaw = app_state.get("fc_yaw_deg")
+            att_ts = app_state.get("fc_pitch_ts", 0.0)
+            armed = app_state.get("armed")
+
+        att_age = (now - att_ts) * 1000.0 if att_ts else None
+
+        # Переходы пишем событиями: по CSV их искать глазами неудобно,
+        # а именно они отвечают на «когда всё сломалось».
+        if st != _flight_prev_state:
+            flight_log.event("STATE %s -> %s" % (_flight_prev_state, st))
+            _flight_prev_state = st
+        lp = c.get("launch_phase")
+        if lp != _flight_prev_launch:
+            flight_log.event("LAUNCH %s -> %s" % (_flight_prev_launch, lp))
+            _flight_prev_launch = lp
+        if ov != _flight_prev_override:
+            flight_log.event("OVERRIDE -> %s" % ov)
+            _flight_prev_override = ov
+
+        def g(k, d=None):
+            return c.get(k, d) if active else None
+
+        flight_log.row((
+            now - flight_log._t0, frame_index, fps_current, st, ctrl, aux, ov,
+            c.get("launch_phase") if active else "", g("launch_int"),
+            last_match_score, last_flow_ok, lost_frames, auto_reacq_attempts,
+            g("box_cx"), g("box_cy"), g("box_w"), g("box_h"), g("box_frac"),
+            g("dx_raw"), g("dy_raw"), g("comp"), g("lead_x"), g("lead_y"),
+            g("dx_aim"), g("dy_aim"), g("adx"), g("ady"), g("dy_alt"),
+            g("tgt_vx"), g("tgt_vy"), g("stable"), g("terminal"),
+            g("roll_p"), g("roll_d"), g("roll_i"), g("roll_ff"),
+            g("roll_off"), g("roll_sat"),
+            g("pitch_p"), g("pitch_d"), g("pitch_i"), g("pitch_ff"),
+            g("pitch_off"), g("pitch_sat"),
+            g("launch_pwm"), g("cruise_pwm"), g("pitch_comb"),
+            g("yaw_filt"), g("yaw_weight"), g("yaw_pd"), g("yaw_ff"),
+            g("yaw_i"), g("yaw_off"), g("yaw_sat"),
+            c.get("base_thr"), g("thr_adjust"), g("thr_i"), g("rc_fresh"),
+            r_cmd, p_cmd, y_cmd, t_cmd,
+            _idx(sent, 0), _idx(sent, 1), _idx(sent, 2), _idx(sent, 3),
+            fc_roll, fc_pitch, fc_yaw, att_age,
+            _idx(motors, 0), _idx(motors, 1), _idx(motors, 2), _idx(motors, 3),
+            _idx(rc, 0), _idx(rc, 1), _idx(rc, 2), _idx(rc, 3),
+            dt_ms, (time.monotonic() - cb_t0) * 1000.0, armed,
+        ))
+    except Exception:
+        # Лог не имеет права мешать полёту.
+        pass
+
+
+def _idx(seq, i):
+    try:
+        return int(seq[i])
+    except Exception:
+        return None
+
+
 def camera_callback(request):
+    _cb_t0 = time.monotonic()
     try:
         with state_lock:
             aux_snapshot = aux4_state
@@ -1744,6 +2332,7 @@ def camera_callback(request):
             print_debug_once_per_second()
             with MappedArray(request, "main") as mm:
                 draw_overlay_on_frame(mm.array)
+            _capture_flight_row(_cb_t0)
             return
 
         with MappedArray(request, "lores") as lm:
@@ -1755,6 +2344,7 @@ def camera_callback(request):
 
         with MappedArray(request, "main") as mm:
             draw_overlay_on_frame(mm.array)
+        _capture_flight_row(_cb_t0)
     except Exception:
         pass
 
@@ -1829,15 +2419,39 @@ def main():
     except Exception:
         pass
 
+    # Автозапуск (systemd / rc.local / автологин) останавливает программу
+    # СИГНАЛОМ, а не Ctrl+C. По умолчанию Python на SIGTERM умирает мгновенно,
+    # минуя finally, — тогда лог не дописывается и итоговый разбор не
+    # создаётся. Превращаем сигнал в обычный выход, чтобы finally отработал.
+    def _on_terminate(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    for _sig in ("SIGTERM", "SIGHUP"):
+        try:
+            signal.signal(getattr(signal, _sig), _on_terminate)
+        except Exception:
+            # Не на всех платформах есть оба сигнала — не повод падать.
+            pass
+
+    flight_log.start()
+
     io_thread = threading.Thread(target=fc_io_loop, daemon=True)
     io_thread.start()
 
     try:
         while True:
             time.sleep(0.5)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
+        # SystemExit сюда приходит из обработчика сигнала выше. Гасим его,
+        # чтобы выйти штатно с кодом 0: для systemd это нормальная остановка.
         pass
     finally:
+        # Первым делом дописываем лог: если ниже что-то зависнет на закрытии
+        # железа, разбор полёта всё равно останется на диске.
+        try:
+            flight_log.stop()
+        except Exception:
+            pass
         io_thread_stop.set()
         try:
             if io_thread.is_alive():
