@@ -695,7 +695,7 @@ _FLIGHT_LOG_COLUMNS = (
     "fc_roll,fc_pitch,fc_yaw,att_age_ms,"
     "m1,m2,m3,m4,rc_r,rc_p,rc_y,rc_t,dt_ms,cb_ms,armed,"
     "launch_target_deg,launch_reached,k,match_psr,match_second,search_margin,"
-    "match_flow_gap,"
+    "match_flow_gap,size_est,size_skip,"
     "alt_cm,vario_cms,alt_age_ms,"
     "box_size_px,box_growth,tau_s,range_m,depression_deg,dy_alt_decoupled"
 )
@@ -3089,6 +3089,24 @@ def process_locked_tracker(gray):
         # при уверенном матче запрашиваем заново связную компоненту под текущим
         # центром лока и сдвигаем lock_w/lock_h в её сторону. Решает «дрейф
         # зацепом за край» при сближении — коробка растёт вместе с целью.
+        # Измеряем, ПОЧЕМУ адаптация размера не срабатывает. По логам борта
+        # коробка стоит на значении по умолчанию (8 px в координатах трекинга)
+        # в 76%% кадров и почти не растёт, хотя объект бывает крупным. Гейта
+        # два — порог score и допустимый диапазон оценки, — и без записи
+        # непонятно, какой именно закрыт.
+        if SIZE_ADAPT_ENABLED and frame_index % SIZE_ADAPT_EVERY_FRAMES == 0:
+            _e_w, _e_h = estimate_size_at_position(gray, lock_cx, lock_cy)
+            _match_dbg["size_est"] = float(_e_w)
+            if not match_ok:
+                _match_dbg["size_skip"] = 1        # матча нет
+            elif score < SIZE_ADAPT_MIN_SCORE:
+                _match_dbg["size_skip"] = 2        # score ниже порога
+            elif not (SIZE_ADAPT_MIN_W <= _e_w <= SIZE_ADAPT_MAX_W
+                      and SIZE_ADAPT_MIN_W <= _e_h <= SIZE_ADAPT_MAX_W):
+                _match_dbg["size_skip"] = 3        # оценка вне допустимого
+            else:
+                _match_dbg["size_skip"] = 0        # применена
+
         if (SIZE_ADAPT_ENABLED and frame_index % SIZE_ADAPT_EVERY_FRAMES == 0
                 and match_ok and score >= SIZE_ADAPT_MIN_SCORE):
             est_w, est_h = estimate_size_at_position(gray, lock_cx, lock_cy)
@@ -3303,6 +3321,7 @@ def _capture_flight_row(cb_t0):
             g("launch_target_deg"), g("launch_reached"), g("k"),
             _match_dbg.get("psr"), _match_dbg.get("second"),
             _match_dbg.get("margin"), _match_dbg.get("flow_gap"),
+            _match_dbg.get("size_est"), _match_dbg.get("size_skip"),
             alt_cm, vario_cms, alt_age,
             g("size_px"), g("growth"), g("tau_s"), g("range_m"),
             g("depression_deg"), g("dy_alt_decoupled"),
