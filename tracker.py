@@ -977,6 +977,11 @@ MSP_ALTITUDE_PERIOD = 0.10
 # иначе состояние будет считываться с постороннего режима.
 ARM_BOX_PERMANENT_ID = 0
 MSP_OVERRIDE_BOX_PERMANENT_ID = 50   # msp_box.c: { BOXMSPOVERRIDE, permanentId 50 }
+# Перечень датчиков лежит в MSP_STATUS по смещению 4 (msp.c). Спросить у самой
+# прошивки надёжнее, чем судить по названию платы: у одной модели бывают
+# ревизии и с барометром, и без.
+SENSOR_BITS = ((0, "ACC"), (1, "BARO"), (2, "MAG"), (3, "GPS"),
+               (4, "RANGEFINDER"), (5, "GYRO"), (6, "OPTICALFLOW"))
 _box_bits = {}                       # постоянный id -> номер бита
 
 fc = None
@@ -1290,6 +1295,18 @@ def fc_io_loop():
                 next_status_t = now + MSP_STATUS_PERIOD
                 st_data = msp_request(101)  # MSP_STATUS
                 if st_data is not None and len(st_data) >= 10:
+                    if not app_state.get("sensors_logged"):
+                        app_state["sensors_logged"] = True
+                        sensor_mask = struct.unpack_from('<H', st_data, 4)[0]
+                        have = [n for b, n in SENSOR_BITS if sensor_mask & (1 << b)]
+                        with state_lock:
+                            app_state["has_baro"] = bool(sensor_mask & (1 << 1))
+                        flight_log.event("ДАТЧИКИ НА ПЛАТЕ: %s"
+                                         % (", ".join(have) or "нет данных"))
+                        if not (sensor_mask & (1 << 1)):
+                            flight_log.event(
+                                "БАРОМЕТРА НЕТ -> оценка дальности недоступна, "
+                                "останется только время до контакта")
                     mode_flags = struct.unpack_from('<I', st_data, 6)[0]
                     arm_bit = _box_bits.get(ARM_BOX_PERMANENT_ID)
                     ovr_bit = _box_bits.get(MSP_OVERRIDE_BOX_PERMANENT_ID)
