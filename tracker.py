@@ -313,18 +313,54 @@ AUTO_REACQ_MIN_SCORE = 0.50          # выше обычного MATCH_GOOD_SCOR
 # секунд после первого LOCK. PID при этом продолжает работать — курсовая
 # коррекция активна, но физика разгоняет квад вперёд за счёт постоянного
 # наклона носа. После RAMP_DOWN всё возвращается в обычное наведение.
+# КАК ЭТО РАБОТАЕТ И ПОЧЕМУ ИМЕННО ТАК.
+#
+# Разгон из виса даёт наклон носа вниз: горизонтальная составляющая тяги и
+# есть ускорение вперёд. Значит нужен НАКЛОН НА УГОЛ и удержание этого угла.
+#
+# Прежняя реализация добавляла постоянное смещение стика (-80 PWM) на 2
+# секунды, считая, что это задаёт угол. Но квад летит в ACRO, где стик задаёт
+# УГЛОВУЮ СКОРОСТЬ, а не угол. Постоянное смещение = непрерывное вращение:
+# по логам борта суммарно выходило -150 от центра, удерживаемых 2 с, то есть
+# сотни градусов вращения. Квад проворачивался за вертикаль, трекер терял
+# цель, аппарат расшатывало — ровно то, что наблюдалось в полёте.
+#
+# Здесь launch задаёт ЦЕЛЕВОЙ УГОЛ и замыкает по нему контур через реальный
+# тангаж из MSP_ATTITUDE: пока угол не достигнут — команда на вращение есть,
+# угол достигнут — команда уходит в ноль, и квад ДЕРЖИТ наклон, а не крутится
+# дальше. Это маленький угловой контур поверх acro; прицельный PID при этом
+# продолжает работать как раньше.
 LAUNCH_ENABLED = True
+# Целевой наклон носом вниз на разгоне, градусы. 15-25 даёт заметное
+# ускорение, оставаясь далеко от опасных углов.
+LAUNCH_TARGET_PITCH_DEG = 20.0
+# Коэффициент углового контура: PWM на градус ошибки. При 20° ошибки даёт
+# 20*8 = 160 PWM — быстрый выход на угол без рывка.
+LAUNCH_ANGLE_P = 8.0
+# Демпфирование по скорости изменения угла: гасит перелёт через целевой угол.
+LAUNCH_ANGLE_D = 2.0
+# Потолок вклада углового контура. Ограничивает и скорость выхода на угол.
+LAUNCH_MAX_PWM = 180.0
+# Если тангаж от FC старше этого, угловой контур молчит: без обратной связи
+# он выродился бы в то самое разомкнутое смещение, которое мы и убираем.
+LAUNCH_ATT_TIMEOUT = 0.30
+# Знак связи «PWM тангажа -> угол, который сообщает FC».
+# +1 означает: уменьшение PWM опускает нос, и fc_pitch_deg при этом убывает.
+#
+# Это ОТДЕЛЬНАЯ константа, а не PITCH_SIGN. PITCH_SIGN описывает связь
+# «ошибка в ПИКСЕЛЯХ -> PWM» и потому зависит ещё и от ориентации камеры.
+# Здесь ошибка измеряется в ГРАДУСАХ от самого полётника, камера ни при чём.
+# Смешать их — значит поймать разгон в обратную сторону при первой же смене
+# крепления камеры.
+PITCH_PWM_TO_FC_ANGLE_SIGN = +1
 # Структура манёвра: 0.5 сек плавного нарастания → 2 сек полной тяги → 1 сек спада.
 # В кадрах при 30 FPS:
 LAUNCH_RAMP_UP_FRAMES = 15
 LAUNCH_HOLD_FRAMES = 60
 LAUNCH_RAMP_DOWN_FRAMES = 30
-# Величина дополнительного pitch-вниз смещения. 80 PWM соответствует примерно
-# 15-20° наклона (от стика). Подбери под свой rcrate в Betaflight.
-LAUNCH_NOSE_DOWN_PWM = 80
 # Дополнительный газ во время launch (в % от текущего стика). Применяется
 # ТОЛЬКО если OVERRIDE_THROTTLE=True; иначе газ остаётся под управлением пилота.
-# При LAUNCH_NOSE_DOWN_PWM ≠ 0 квад при низком тротле трейдит высоту на скорость
+# При наклоне носа квад на низком газе трейдит высоту на скорость
 # (дайвит и разгоняется), что для камикадзе нормально. Если хочешь сохранять
 # высоту во время launch — включай boost.
 LAUNCH_THR_BOOST_PCT = 10.0
@@ -338,7 +374,8 @@ LAUNCH_THR_BOOST_PCT = 10.0
 # Работает в паре с pitch_attitude_compensation: aim-точка сама учитывает
 # наклон, лишних корректировок не возникает.
 CRUISE_ENABLED = False
-CRUISE_NOSE_DOWN_PWM = 25         # ~5° постоянный наклон
+# Крейсерский наклон — тоже УГОЛ, а не смещение стика, по той же причине.
+CRUISE_TARGET_PITCH_DEG = 8.0
 
 YAW_FILTER_ALPHA = 0.05
 YAW_ROLL_CROSSOVER = 25
@@ -457,7 +494,8 @@ _FLIGHT_LOG_COLUMNS = (
     "cmd_roll,cmd_pitch,cmd_yaw,cmd_thr,"
     "sent_r,sent_p,sent_t,sent_y,"
     "fc_roll,fc_pitch,fc_yaw,att_age_ms,"
-    "m1,m2,m3,m4,rc_r,rc_p,rc_y,rc_t,dt_ms,cb_ms,armed"
+    "m1,m2,m3,m4,rc_r,rc_p,rc_y,rc_t,dt_ms,cb_ms,armed,"
+    "launch_target_deg,launch_reached,k"
 )
 
 # Снимок внутренностей управления за текущий кадр. Заполняется в
@@ -537,7 +575,12 @@ class FlightLogger:
                 print("[tracker] ВЕРСИЯ КОДА %s" % version, flush=True)
             except Exception:
                 self.event("ВЕРСИЯ КОДА не определена")
-            self._log_config()
+            # Снимок настроек — тоже вспомогательный. Любая опечатка в имени
+            # константы здесь не должна оставлять вылет вообще без логов.
+            try:
+                self._log_config()
+            except Exception:
+                self.event("снимок настроек не записан")
             self._thread = threading.Thread(target=self._writer, daemon=True)
             self._thread.start()
         except Exception as exc:
@@ -559,9 +602,11 @@ class FlightLogger:
         self.event("CONFIG pitch_comp=%s px_per_deg=%.2f max_comp=%.0f | lead=%s frames=%d"
                    % (PITCH_ATTITUDE_COMP_ENABLED, PIXELS_PER_PITCH_DEG,
                       MAX_PITCH_COMP_PX, LEAD_AIM_ENABLED, LEAD_FRAMES))
-        self.event("CONFIG launch=%s nose_down=%d thr_boost=%.1f%% | cruise=%s nose_down=%d"
-                   % (LAUNCH_ENABLED, LAUNCH_NOSE_DOWN_PWM, LAUNCH_THR_BOOST_PCT,
-                      CRUISE_ENABLED, CRUISE_NOSE_DOWN_PWM))
+        self.event("CONFIG launch=%s target=%.0fdeg P=%.1f D=%.1f max=%.0f "
+                   "thr_boost=%.1f%% | cruise=%s target=%.0fdeg"
+                   % (LAUNCH_ENABLED, LAUNCH_TARGET_PITCH_DEG, LAUNCH_ANGLE_P,
+                      LAUNCH_ANGLE_D, LAUNCH_MAX_PWM, LAUNCH_THR_BOOST_PCT,
+                      CRUISE_ENABLED, CRUISE_TARGET_PITCH_DEG))
         self.event("CONFIG camera %dx%d rot180=%s | center=(%d,%d)"
                    % (MAIN_W, MAIN_H, CAMERA_ROTATE_180, CENTER_X, CENTER_Y))
 
@@ -941,6 +986,9 @@ smoothed_pitch_deg = 0.0
 # Момент прошлого вызова управления — из него берётся фактическая длительность
 # кадра. None = первый кадр после захвата, длительность ещё не измерить.
 prev_control_mono = None
+
+# Прошлый тангаж от FC — для демпфирования углового контура разгона.
+prev_launch_pitch_deg = None
 
 # Состояние упреждения. prev_box_* — позиция в прошлом кадре, target_v*_smoothed —
 # сглаженная межкадровая скорость цели в пикселях/кадр. stable_track_frames
@@ -1633,6 +1681,48 @@ def _pid_axis_step(error, prev_error, integral, ff_value,
     return out, err_f, integral
 
 
+def _pitch_angle_hold_pwm(target_deg, now_mono, k):
+    """Команда тангажа, удерживающая ЗАДАННЫЙ УГОЛ наклона носа.
+
+    Квад летит в ACRO: стик задаёт угловую СКОРОСТЬ. Чтобы получить угол,
+    нужен внешний контур — он здесь и реализован, по реальному тангажу из
+    MSP_ATTITUDE.
+
+    Знак: нос вниз приходит от FC отрицательным (см. блок про MSP_ATTITUDE),
+    поэтому цель тоже берётся отрицательной. К выходу применяется
+    PITCH_PWM_TO_FC_ANGLE_SIGN, а НЕ PITCH_SIGN: последний описывает связь
+    «пиксели -> PWM» и зависит от ориентации камеры, которая здесь ни при чём.
+
+    Возвращает (pwm_offset, достигнут_ли_угол). Без свежего тангажа выдаёт 0:
+    разомкнутый вариант — это ровно та ошибка, от которой уходим, и лучше не
+    дать разгона совсем, чем крутить квад вслепую.
+    """
+    global prev_launch_pitch_deg
+    with state_lock:
+        fc_pitch = app_state.get("fc_pitch_deg")
+        fc_ts = app_state.get("fc_pitch_ts", 0.0)
+
+    if fc_pitch is None or (now_mono - fc_ts) > LAUNCH_ATT_TIMEOUT:
+        prev_launch_pitch_deg = None
+        return 0.0, False
+
+    cur = float(fc_pitch)
+    err = (-abs(target_deg)) - cur      # цель «нос вниз» в единицах FC
+
+    d_term = 0.0
+    if prev_launch_pitch_deg is not None:
+        # Скорость изменения угла, приведённая к номинальному кадру.
+        d_term = -((cur - prev_launch_pitch_deg) / k) * LAUNCH_ANGLE_D
+    prev_launch_pitch_deg = cur
+
+    out = PITCH_PWM_TO_FC_ANGLE_SIGN * (err * LAUNCH_ANGLE_P + d_term)
+    if out > LAUNCH_MAX_PWM:
+        out = LAUNCH_MAX_PWM
+    elif out < -LAUNCH_MAX_PWM:
+        out = -LAUNCH_MAX_PWM
+    return out, abs(err) <= 2.0
+
+
 def _compute_pitch_attitude_comp_px(now_mono, k=1.0):
     """Возвращает (compensation_px, обновлено?). Compensation добавляется
     к aim_y. Положительное значение = aim сдвигается ВНИЗ в кадре (бóльшая y),
@@ -1680,6 +1770,7 @@ def update_control_from_target():
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
     global overlay_text, overlay_color, _ctl_dbg, prev_control_mono
+    global prev_launch_pitch_deg
 
     with state_lock:
         box = target_box_main
@@ -1692,8 +1783,21 @@ def update_control_from_target():
     k = dt_ratio(None if prev_control_mono is None
                  else now_mono - prev_control_mono)
     prev_control_mono = now_mono
-    rc_fresh = ((now_mono - live_thr_ts) <= RC_FRESH_WINDOW) and (885 <= int(live_thr) <= 2115)
-    base_thr = int(live_thr) if rc_fresh else int(app_state.get("dyn_throttle", 1500))
+    # ОПОРНЫЙ ГАЗ — это стик пилота, и только он.
+    #
+    # Раньше при неактуальном RC сюда подставлялся dyn_throttle, то есть
+    # СОБСТВЕННЫЙ выход прошлого кадра: target = base + поправка, затем
+    # dyn_throttle = target, а на следующем кадре base = dyn_throttle. Газ
+    # накручивал сам себя и упирался в 2000 — на борту это выглядело как
+    # «при локе газ уходит в 100%», причём даже при стике на минимуме и при
+    # нулевой поправке регулятора (thr_adj=0 в логах).
+    #
+    # Во время оверрайда стик законно «замирает»: Betaflight не отдаёт сырой
+    # приёмник по подменяемым каналам. Замерший стик пилота — корректная
+    # опора, а вот собственный выход опорой быть не может никогда.
+    rc_valid = (885 <= int(live_thr) <= 2115) and live_thr_ts > 0.0
+    base_thr = int(live_thr) if rc_valid else THROTTLE_MIN_PWM
+    rc_fresh = rc_valid and ((now_mono - live_thr_ts) <= RC_FRESH_WINDOW)
     if base_thr < THROTTLE_MIN_PWM:
         base_thr = THROTTLE_MIN_PWM
     elif base_thr > THROTTLE_MAX_PWM:
@@ -1713,6 +1817,7 @@ def update_control_from_target():
         yaw_integral = 0.0
         smoothed_pitch_deg = 0.0
         prev_control_mono = None
+        prev_launch_pitch_deg = None
         prev_box_cx = None
         prev_box_cy = None
         target_vx_smoothed = 0.0
@@ -1777,14 +1882,19 @@ def update_control_from_target():
             launch_intensity = 0.0
     # else: NONE — launch_intensity остаётся 0
 
-    # Pitch-вклад launch: нос вниз с тем же знаком, что и нормальное наведение
-    # на «цель снизу» (PITCH_SIGN — корректирующий знак для PWM).
-    launch_pitch_pwm = PITCH_SIGN * LAUNCH_NOSE_DOWN_PWM * launch_intensity
-    # Cruise — постоянная тяга вперёд, действует только когда launch неактивен.
-    if CRUISE_ENABLED and launch_phase == "NONE":
-        cruise_pitch_pwm = PITCH_SIGN * CRUISE_NOSE_DOWN_PWM
-    else:
-        cruise_pitch_pwm = 0.0
+    # Целевой угол: launch_intensity плавно поднимает его от 0 до
+    # LAUNCH_TARGET_PITCH_DEG и так же плавно возвращает. Плавность теперь
+    # относится к УГЛУ, а не к скорости вращения — поэтому раньше «плавный»
+    # разгон и возврат и получались рывками.
+    launch_pitch_pwm = 0.0
+    cruise_pitch_pwm = 0.0
+    launch_angle_reached = False
+    if launch_intensity > 0.0:
+        launch_pitch_pwm, launch_angle_reached = _pitch_angle_hold_pwm(
+            LAUNCH_TARGET_PITCH_DEG * launch_intensity, now_mono, k)
+    elif CRUISE_ENABLED and launch_phase == "NONE":
+        cruise_pitch_pwm, _ = _pitch_angle_hold_pwm(
+            CRUISE_TARGET_PITCH_DEG, now_mono, k)
 
     # --- Упреждение по скорости цели ---
     # Считаем межкадровую скорость, прогоняем через фильтр, отбрасываем глитчи.
@@ -1963,6 +2073,9 @@ def update_control_from_target():
     # Launch throttle boost — применяется ТОЛЬКО при OVERRIDE_THROTTLE=True,
     # чтобы не наступать на ручное управление пилота.
     if OVERRIDE_THROTTLE and launch_intensity > 0.0 and LAUNCH_THR_BOOST_PCT > 0.0:
+        # Буст считается от опорного стика пилота. Пока base_thr брался из
+        # собственного выхода, буст начислялся на уже забустованное значение —
+        # это давало не прибавку в 10%, а экспоненциальный разгон до упора.
         boost = base_thr * (LAUNCH_THR_BOOST_PCT / 100.0) * launch_intensity
         boosted = target_throttle + boost
         if boosted > THROTTLE_MAX_PWM:
@@ -2012,6 +2125,11 @@ def update_control_from_target():
         "base_thr": base_thr, "thr_adjust": thr_adjust,
         "thr_i": throttle_integral, "rc_fresh": rc_fresh,
         "launch_phase": launch_phase, "launch_int": launch_intensity,
+        # Целевой угол разгона и признак его достижения: по ним видно,
+        # вышел ли квад на угол или контур всё ещё догоняет.
+        "launch_target_deg": LAUNCH_TARGET_PITCH_DEG * launch_intensity,
+        "launch_reached": launch_angle_reached,
+        "k": k,
     }
 
 # =========================================================
@@ -2485,6 +2603,7 @@ def _capture_flight_row(cb_t0):
             _idx(motors, 0), _idx(motors, 1), _idx(motors, 2), _idx(motors, 3),
             _idx(rc, 0), _idx(rc, 1), _idx(rc, 2), _idx(rc, 3),
             dt_ms, (time.monotonic() - cb_t0) * 1000.0, armed,
+            g("launch_target_deg"), g("launch_reached"), g("k"),
         ))
     except Exception:
         # Лог не имеет права мешать полёту.
