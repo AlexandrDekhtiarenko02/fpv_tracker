@@ -185,6 +185,18 @@ REQUIRE_AUX_TOGGLE_AFTER_LOST = True
 
 FREEZE_TEMPLATE = False    # было True — шаблон плавно адаптируется под рост цели на сближении
 TEMPLATE_UPDATE_ALPHA = 0.010   # доля нового кадра в шаблоне на каждом «уверенном» матче
+# Следовать ли шаблону за масштабом цели при сближении.
+#
+# ВЫКЛЮЧЕНО, и это вывод из измерений на борту: любое вмешательство сюда
+# ухудшало трекинг (0.726 -> 0.498 при пересчёте накопленного шаблона,
+# 0.726 -> 0.561 при пересборке из текущего кадра). Исходное поведение — не
+# трогать шаблон при смене размера — оказалось лучше обоих вариантов.
+#
+# Флаг оставлен, потому что исходная проблема реальна: на сближении шаблон
+# застревает в старом масштабе и рамка уползает к краю объекта. Вариант с
+# масштабированием ЭТАЛОНА свободен от обеих найденных причин, но в деле не
+# проверен. Включать только для замера, сравнивая score с текущим.
+TEMPLATE_RESCALE_ON_SIZE_CHANGE = False
 
 # =========================================================
 # 3. УПРАВЛЕНИЕ
@@ -1198,6 +1210,8 @@ lock_h = None
 tmpl_w = None
 tmpl_h = None
 template_gray = None
+# Эталон, снятый в момент захвата: не обновляется и не размывается.
+template_base = None
 template_std = 0.0
 prev_gray = None
 prev_pts = None
@@ -1802,6 +1816,7 @@ def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0):
 def reset_tracking(to_acq=False):
     global track_state, target_visible, target_controllable, overlay_text, overlay_color, target_box_main
     global lock_cx, lock_cy, lock_w, lock_h, tmpl_w, tmpl_h, template_gray, template_std
+    global template_base
     global prev_gray, prev_pts, lost_frames, last_match_score, last_flow_ok
     global acq_wait_left
     global filtered_dx_yaw, prev_adx, prev_ady_ctrl
@@ -1821,6 +1836,7 @@ def reset_tracking(to_acq=False):
     lock_cx = lock_cy = lock_w = lock_h = None
     tmpl_w = tmpl_h = None
     template_gray = None
+    template_base = None
     template_std = 0.0
     prev_gray = None
     prev_pts = None
@@ -2532,6 +2548,7 @@ def draw_overlay_on_frame(frame):
 def process_locked_tracker(gray):
     global track_state, target_visible, target_controllable, overlay_text, overlay_color, target_box_main
     global lock_cx, lock_cy, lock_w, lock_h, template_gray, prev_gray, prev_pts
+    global template_base
     global lost_frames, frame_index, last_match_score, last_flow_ok
     global fps_t0, fps_frames, fps_current
     global prev_aux_on, acq_wait_left, lock_sequence
@@ -2644,6 +2661,7 @@ def process_locked_tracker(gray):
             lock_w = float(lw)
             lock_h = float(lh)
             template_gray = build_template(gray, lock_cx, lock_cy, lock_w, lock_h)
+            template_base = template_gray.copy()
             prev_gray = gray.copy()
             prev_pts = refresh_flow_points(gray, lock_cx, lock_cy, lock_w, lock_h)
             lost_frames = 0
@@ -2739,7 +2757,7 @@ def process_locked_tracker(gray):
                 template_gray = cv2.addWeighted(
                     template_gray, 1 - TEMPLATE_UPDATE_ALPHA,
                     cur_tmpl, TEMPLATE_UPDATE_ALPHA, 0)
-            else:
+            elif TEMPLATE_RESCALE_ON_SIZE_CHANGE and template_base is not None:
                 # Размер изменился. Пересчитывать НАКОПЛЕННЫЙ шаблон нельзя:
                 # каждый cv2.resize — это интерполяция, то есть размытие, и
                 # оно накапливается. Размер коробки гуляет (в логе 16 -> 43 ->
@@ -2752,7 +2770,23 @@ def process_locked_tracker(gray):
                 # Прежний код в этом месте не делал НИЧЕГО, из-за чего на
                 # сближении шаблон застревал в старом масштабе — здесь мы
                 # по-прежнему следуем за размером, но без размытия.
-                template_gray = cur_tmpl
+                # Масштабируем ЭТАЛОН, снятый при захвате, а не текущий кадр
+                # и не накопленный шаблон.
+                #
+                # Не текущий кадр: TEMPLATE_SCALE=2.0 значит, что шаблон
+                # вчетверо больше коробки — три четверти его площади это фон.
+                # Свежий вырез приносит В ШАБЛОН текущий фон, и матчер потом
+                # честно находит этот фон. Так лок и уходил на похожий по
+                # цвету фон (score 0.726 -> 0.561, замерено на борту).
+                #
+                # Не накопленный: каждый resize размывает, размытие копится,
+                # 30 пересчётов съедали всю детализацию (1043 -> 4.7).
+                #
+                # Эталон снят на цели при захвате и не меняется, поэтому
+                # масштабируется ровно один раз в любой новый размер.
+                template_gray = cv2.resize(
+                    template_base, (cur_tmpl.shape[1], cur_tmpl.shape[0]),
+                    interpolation=cv2.INTER_LINEAR)
 
         # Периодическая адаптация размера коробки. Раз в SIZE_ADAPT_EVERY_FRAMES
         # при уверенном матче запрашиваем заново связную компоненту под текущим
