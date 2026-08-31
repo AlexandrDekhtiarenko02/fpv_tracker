@@ -103,11 +103,25 @@ flight_logs/           логи (в git не попадают)
 | Логи | `/home/alex243/fpv_tracker/flight_logs` |
 | Служба | `tracker.service` (systemd, автозапуск) |
 
-Обновить код на малине:
+Обновить код на малине.
+
+**С компьютера** — обязателен флаг `-t`, иначе sudo не сможет спросить пароль
+(«a terminal is required to read the password»):
 
 ```bash
-ssh alex243@Monolith.local 'cd ~/fpv_tracker && git pull && sudo systemctl restart tracker'
+ssh -t alex243@Monolith.local 'cd ~/fpv_tracker && git pull && sudo systemctl restart tracker && sleep 5 && ./status.sh'
 ```
+
+**Уже находясь на малине** — без ssh:
+
+```bash
+cd ~/fpv_tracker && git pull && sudo systemctl restart tracker && sleep 5 && ./status.sh
+```
+
+Перезапуск обязателен: `git pull` меняет файл на диске, но служба продолжает
+выполнять код, загруженный в память при старте. `status.sh` в конце это и
+проверяет — он скажет «СОВПАДАЕТ» только если летит действительно новая
+версия.
 
 Полезное для службы:
 
