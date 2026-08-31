@@ -203,7 +203,7 @@ COLOR_PENALTY = 0.25
 COLOR_REF_DIST = 40.0
 # Минимальный размер цели в пикселях ЦВЕТНОСТИ: она вдвое грубее яркости, и у
 # мелкой цели цветных пикселей единицы — оценка становится ненадёжной.
-COLOR_MIN_TARGET_CHROMA_PX = 3
+COLOR_MIN_TARGET_CHROMA_PX = 2
 
 MATCH_MIN_SCORE = 0.22
 # Доверие к матчу падает, если на карте откликов есть конкурент НЕ ХУЖЕ
@@ -1302,6 +1302,7 @@ chroma_v = None
 target_uv = None          # (U, V) цели, снятые при захвате
 color_active = False      # различает ли цвет цель и фон в этом захвате
 color_separation = 0.0
+chroma_fail_reason = ""   # почему цвет не сработал — для журнала
 template_std = 0.0
 prev_gray = None
 prev_pts = None
@@ -1834,13 +1835,22 @@ def extract_chroma(yuv):
     на V — каждая строка шириной LORES_W содержит две строки по LORES_W/2.
     Цветность вдвое грубее яркости по обеим осям.
     """
+    global chroma_fail_reason
     try:
         h, w = LORES_H, LORES_W
         q = h // 4
-        u = yuv[h:h + q, :].reshape(h // 2, w // 2)
-        v = yuv[h + q:h + 2 * q, :].reshape(h // 2, w // 2)
+        # ВАЖНО: строки буфера могут быть ШИРЕ кадра (выравнивание, stride).
+        # На это прямо намекает то, что яркость берётся как [:H, :W], а не
+        # целиком. Раньше цветность бралась строками ЦЕЛИКОМ, и на выравненном
+        # буфере reshape падал, исключение проглатывалось — цвет молча не
+        # работал, различимость всегда выходила ровно 0.0.
+        u = yuv[h:h + q, :w].reshape(h // 2, w // 2)
+        v = yuv[h + q:h + 2 * q, :w].reshape(h // 2, w // 2)
+        chroma_fail_reason = ""
         return u, v
-    except Exception:
+    except Exception as exc:
+        chroma_fail_reason = "разбор буфера: %s (форма %s)" % (
+            exc, getattr(yuv, "shape", "?"))
         return None, None
 
 
@@ -1854,12 +1864,16 @@ def measure_color_separation(cx, cy, box_w, box_h):
 
     Возвращает (подпись_цели, различимость).
     """
+    global chroma_fail_reason
     if chroma_u is None or chroma_v is None:
+        chroma_fail_reason = chroma_fail_reason or "цветность не прочитана"
         return None, 0.0
-    # Переходим в координаты цветности: она вдвое грубее.
     ccx, ccy = int(cx) // 2, int(cy) // 2
-    rw, rh = max(1, int(box_w) // 4), max(1, int(box_h) // 4)
+    rw, rh = max(2, int(box_w) // 4), max(2, int(box_h) // 4)
     if rw < COLOR_MIN_TARGET_CHROMA_PX or rh < COLOR_MIN_TARGET_CHROMA_PX:
+        chroma_fail_reason = ("цель мала: %dx%d px, радиус в цветности %d при "
+                              "пороге %d" % (box_w, box_h, rw,
+                                             COLOR_MIN_TARGET_CHROMA_PX))
         return None, 0.0
     H, W = chroma_u.shape
     def mean_box(arr, x0, y0, x1, y1):
@@ -1874,7 +1888,9 @@ def measure_color_separation(cx, cy, box_w, box_h):
     ou = mean_box(chroma_u, ccx - 3 * rw, ccy - 3 * rh, ccx + 3 * rw, ccy + 3 * rh)
     ov = mean_box(chroma_v, ccx - 3 * rw, ccy - 3 * rh, ccx + 3 * rw, ccy + 3 * rh)
     if None in (tu, tv, ou, ov):
+        chroma_fail_reason = "область за границей кадра"
         return None, 0.0
+    chroma_fail_reason = ""
     # Среднее по кольцу включает саму цель, поэтому отличие занижено — но нам
     # нужен именно консервативный критерий: лучше не включить цвет, чем
     # включить там, где он не различает.
@@ -2895,10 +2911,16 @@ def process_locked_tracker(gray):
                     lock_cx, lock_cy, lock_w, lock_h)
                 color_active = (target_uv is not None
                                 and color_separation >= COLOR_MIN_SEPARATION)
-                flight_log.event(
-                    "ЦВЕТ %s: различимость цели и фона %.1f (порог %.1f)"
-                    % ("включён" if color_active else "не используется",
-                       color_separation, COLOR_MIN_SEPARATION))
+                if color_active:
+                    flight_log.event(
+                        "ЦВЕТ включён: различимость %.1f (порог %.1f)"
+                        % (color_separation, COLOR_MIN_SEPARATION))
+                else:
+                    flight_log.event(
+                        "ЦВЕТ не используется: различимость %.1f (порог %.1f)%s"
+                        % (color_separation, COLOR_MIN_SEPARATION,
+                           (" | причина: " + chroma_fail_reason)
+                           if chroma_fail_reason else ""))
             else:
                 color_active = False
             prev_gray = gray.copy()
