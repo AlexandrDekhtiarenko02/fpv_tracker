@@ -684,6 +684,7 @@ _FLIGHT_LOG_COLUMNS = (
     "fc_roll,fc_pitch,fc_yaw,att_age_ms,"
     "m1,m2,m3,m4,rc_r,rc_p,rc_y,rc_t,dt_ms,cb_ms,armed,"
     "launch_target_deg,launch_reached,k,match_psr,match_second,search_margin,"
+    "match_flow_gap,"
     "alt_cm,vario_cms,alt_age_ms,"
     "box_size_px,box_growth,tau_s,range_m,depression_deg,dy_alt_decoupled"
 )
@@ -2832,6 +2833,14 @@ def process_locked_tracker(gray):
 
     if flow_ok and match_ok:
         dist_fm = math.hypot(match_cx - pred_cx, match_cy - pred_cy)
+        # Насколько матч ТЯНЕТ в сторону от предсказания потока.
+        #
+        # Поток следит за реальным движением цели и на фон не смотрит, поэтому
+        # устойчивое расхождение означает, что матч зацепился за что-то другое.
+        # В отличие от score, эта величина различает «держит цель» и «уверенно
+        # держит не то»: сидя на фоне, матч даёт высокий score, но расходится с
+        # потоком. Ни score, ни доля провалов такого показать не могут.
+        _match_dbg["flow_gap"] = float(dist_fm)
         if score >= MATCH_GOOD_SCORE and dist_fm <= MAX_LOCK_STEP:
             w_m = MATCH_WEIGHT
             if MATCH_AMBIGUITY_GUARD:
@@ -3148,7 +3157,7 @@ def _capture_flight_row(cb_t0):
             dt_ms, (time.monotonic() - cb_t0) * 1000.0, armed,
             g("launch_target_deg"), g("launch_reached"), g("k"),
             _match_dbg.get("psr"), _match_dbg.get("second"),
-            _match_dbg.get("margin"),
+            _match_dbg.get("margin"), _match_dbg.get("flow_gap"),
             alt_cm, vario_cms, alt_age,
             g("size_px"), g("growth"), g("tau_s"), g("range_m"),
             g("depression_deg"), g("dy_alt_decoupled"),
