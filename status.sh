@@ -45,6 +45,16 @@ if [ "$LOG_PID" != "$MAINPID" ]; then
     echo "  запущен не службой. Подожди пару секунд и повтори."
     exit 1
 fi
+if [ -z "$RUN_LINE" ]; then
+    # Запущенная версия старше самого штампа версии — она про него не знает.
+    echo "  Процесс $MAINPID не сообщил версию: он запущен кодом, в котором"
+    echo "  штампа версии ещё не было."
+    echo
+    echo "=== Вывод ==="
+    echo "  ЗАПУЩЕН УСТАРЕВШИЙ КОД (старее, чем коммит $HEAD_SHA)."
+    echo "      sudo systemctl restart tracker"
+    exit 1
+fi
 echo "  $RUN_LINE"
 
 RUN_MD5=$(echo "$RUN_LINE" | sed -n 's/.*md5=\([0-9a-f]*\).*/\1/p')
