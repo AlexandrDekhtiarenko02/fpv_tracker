@@ -606,7 +606,7 @@ _FLIGHT_LOG_COLUMNS = (
     "sent_r,sent_p,sent_t,sent_y,"
     "fc_roll,fc_pitch,fc_yaw,att_age_ms,"
     "m1,m2,m3,m4,rc_r,rc_p,rc_y,rc_t,dt_ms,cb_ms,armed,"
-    "launch_target_deg,launch_reached,k,"
+    "launch_target_deg,launch_reached,k,match_psr,match_second,search_margin,"
     "alt_cm,vario_cms,alt_age_ms,"
     "box_size_px,box_growth,tau_s,range_m,depression_deg,dy_alt_decoupled"
 )
@@ -617,6 +617,9 @@ _FLIGHT_LOG_COLUMNS = (
 _ctl_dbg = {}
 # Слагаемые PID по осям, складывает _pid_axis_step.
 _pid_dbg = {}
+# Внутренности сопоставления шаблона за текущий кадр. Нужны, чтобы понять
+# ПОЧЕМУ матч встал именно сюда, а не просто насколько он уверенный.
+_match_dbg = {}
 
 
 class FlightLogger:
@@ -1043,23 +1046,28 @@ def _fmt(v):
     return str(v)
 
 
-# Индексы колонок, которые читает аналитика. Держим рядом с порядком в
-# _FLIGHT_LOG_COLUMNS — при добавлении колонки правится одно место.
-_C_STATE = 3
-_C_OVERRIDE = 6
-_C_BOX_FRAC = 17
-_C_DY_RAW = 19
-_C_COMP = 20
-_C_DX_AIM = 23
-_C_DY_AIM = 24
-_C_ROLL_SAT = 37
-_C_PITCH_SAT = 43
-_C_YAW_SAT = 53
-_C_ATT_AGE = 69
-_C_ARMED = 80
-_C_VARIO = 85
-_C_TAU = 89
-_C_RANGE = 90
+# Индексы колонок для аналитики вычисляются ИЗ ЗАГОЛОВКА по именам.
+#
+# Раньше они были записаны числами, и вставка колонки в середину списка
+# молча сдвигала часть из них: аналитика начинала читать соседнее поле и
+# делать выводы по чужим данным. Ошибка тихая — ничего не падает, просто
+# разбор врёт. Теперь такое невозможно по построению.
+_COLS = [c.strip() for c in _FLIGHT_LOG_COLUMNS.split(",") if c.strip()]
+_C_STATE = _COLS.index("state")
+_C_OVERRIDE = _COLS.index("override")
+_C_BOX_FRAC = _COLS.index("box_frac")
+_C_DY_RAW = _COLS.index("dy_raw")
+_C_COMP = _COLS.index("pitch_comp_px")
+_C_DX_AIM = _COLS.index("dx_aim")
+_C_DY_AIM = _COLS.index("dy_aim")
+_C_ROLL_SAT = _COLS.index("roll_sat")
+_C_PITCH_SAT = _COLS.index("pitch_sat")
+_C_YAW_SAT = _COLS.index("yaw_sat")
+_C_ATT_AGE = _COLS.index("att_age_ms")
+_C_ARMED = _COLS.index("armed")
+_C_VARIO = _COLS.index("vario_cms")
+_C_TAU = _COLS.index("tau_s")
+_C_RANGE = _COLS.index("range_m")
 
 flight_log = FlightLogger(FLIGHT_LOG_DIR)
 
@@ -1798,6 +1806,33 @@ def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0):
     _, max_val, _, max_loc = cv2.minMaxLoc(penalized.astype(np.float32))
     mx, my = max_loc
     raw_score = float(score_map[my, mx])
+
+    # Насколько пик ОДИНОК. Если рядом есть почти такой же по силе кандидат,
+    # матч неоднозначен: на фактурном фоне таких кандидатов много, и матчер
+    # уверенно садится не на ту деталь, сохраняя приличный score. Обычная
+    # уверенность этого не показывает — нужен именно контраст пика с фоном
+    # карты откликов (это классический peak-to-sidelobe ratio).
+    try:
+        sm = score_map.astype(np.float32)
+        mask = np.ones(sm.shape, dtype=bool)
+        r = max(2, int(min(sm.shape) * 0.15))
+        y0, y1 = max(0, my - r), min(sm.shape[0], my + r + 1)
+        x0, x1 = max(0, mx - r), min(sm.shape[1], mx + r + 1)
+        mask[y0:y1, x0:x1] = False           # исключаем окрестность пика
+        side = sm[mask]
+        if side.size > 8:
+            sd = float(side.std())
+            psr = (raw_score - float(side.mean())) / sd if sd > 1e-6 else 0.0
+            second = float(side.max())
+        else:
+            psr, second = 0.0, 0.0
+        _match_dbg["psr"] = psr
+        _match_dbg["second"] = second
+        _match_dbg["margin"] = float(margin)
+    except Exception:
+        _match_dbg["psr"] = None
+        _match_dbg["second"] = None
+        _match_dbg["margin"] = float(margin)
 
     # Субпиксельное уточнение пика: убирает пиксельную квантовку матчера
     # (точность теперь ~0.1 px вместо ±0.5 px), особенно важно с маленьким
@@ -3004,6 +3039,8 @@ def _capture_flight_row(cb_t0):
             _idx(rc, 0), _idx(rc, 1), _idx(rc, 2), _idx(rc, 3),
             dt_ms, (time.monotonic() - cb_t0) * 1000.0, armed,
             g("launch_target_deg"), g("launch_reached"), g("k"),
+            _match_dbg.get("psr"), _match_dbg.get("second"),
+            _match_dbg.get("margin"),
             alt_cm, vario_cms, alt_age,
             g("size_px"), g("growth"), g("tau_s"), g("range_m"),
             g("depression_deg"), g("dy_alt_decoupled"),
