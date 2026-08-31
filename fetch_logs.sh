@@ -5,8 +5,8 @@
 #   PI=192.168.1.50 ./fetch_logs.sh
 set -euo pipefail
 
-PI="${PI:-raspberrypi.local}"
-PI_USER="${PI_USER:-pi}"
+PI="${PI:-Monolith.local}"
+PI_USER="${PI_USER:-alex243}"
 PI_DIR="${PI_DIR:-~/fpv_tracker}"
 
 mkdir -p flight_logs

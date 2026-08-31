@@ -7,8 +7,8 @@
 #   PI_USER=alex PI_DIR=~/code ./deploy.sh
 set -euo pipefail
 
-PI="${PI:-raspberrypi.local}"
-PI_USER="${PI_USER:-pi}"
+PI="${PI:-Monolith.local}"
+PI_USER="${PI_USER:-alex243}"
 PI_DIR="${PI_DIR:-~/fpv_tracker}"
 
 echo "==> Отправляю на ${PI_USER}@${PI}:${PI_DIR}"

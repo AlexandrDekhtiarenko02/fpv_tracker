@@ -93,3 +93,39 @@ fetch_logs.sh          забрать логи с малины
 docs/flight_log.md     описание колонок лога
 flight_logs/           логи (в git не попадают)
 ```
+
+## Малина
+
+| | |
+|---|---|
+| Вход | `ssh alex243@Monolith.local` |
+| Код | `/home/alex243/fpv_tracker` |
+| Логи | `/home/alex243/fpv_tracker/flight_logs` |
+| Служба | `tracker.service` (systemd, автозапуск) |
+
+Обновить код на малине:
+
+```bash
+ssh alex243@Monolith.local 'cd ~/fpv_tracker && git pull && sudo systemctl restart tracker'
+```
+
+Полезное для службы:
+
+```bash
+sudo systemctl status tracker     # работает ли
+sudo systemctl restart tracker    # перезапустить после git pull
+journalctl -u tracker -n 50       # последние строки вывода
+```
+
+Малине выдан ключ **только на чтение**: она может забирать код, но не может
+ничего изменить в репозитории.
+
+### Откат на старую версию
+
+Прежний файл сохранён как `/home/alex243/tracker.py.backup`. Вернуться:
+
+```bash
+sudo sed -i 's|/home/alex243/fpv_tracker/tracker.py|/home/alex243/tracker.py.backup|' \
+  /etc/systemd/system/tracker.service
+sudo systemctl daemon-reload && sudo systemctl restart tracker
+```
