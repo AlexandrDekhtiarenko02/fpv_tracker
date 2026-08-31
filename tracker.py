@@ -178,6 +178,33 @@ TEMPLATE_MIN = 14
 TEMPLATE_MAX = 58 * TRACK_SCALE
 
 SEARCH_MARGIN = 24 * TRACK_SCALE         # было 28 — чуть тише search-окно, меньше шансов уцепиться за фоновый паттерн
+# --- ОТСЕВ ПО ЦВЕТУ ---
+# Трекинг идёт по яркости, а поток с камеры — YUV420: плоскости цветности УЖЕ
+# лежат в том же буфере, сразу под яркостью. Мы их выбрасывали. Брать их
+# бесплатно — ни лишнего захвата, ни конвертации.
+#
+# Зачем: сползание на фон происходит, когда фоновое пятно похоже на цель ПО
+# УЗОРУ ЯРКОСТИ. Цвет — независимый признак, он отсекает такого кандидата,
+# даже если рисунок совпал.
+#
+# ГЛАВНОЕ ТРЕБОВАНИЕ — не сделать хуже. Обеспечивается тем, что цвет
+# включается НЕ ВСЕГДА, а только когда он реально различает цель и фон. При
+# захвате цветность цели сравнивается с цветностью её окружения; если они
+# близки (серая цель на сером фоне), цвет информации не несёт и остаётся
+# ВЫКЛЮЧЕННЫМ до конца этого захвата — поведение тогда в точности прежнее.
+COLOR_GUARD_ENABLED = True
+# Насколько цветность цели должна отличаться от окружения, чтобы цвету верить.
+# Единицы — сумма отклонений по U и V (каждая 0..255, серому отвечает 128).
+COLOR_MIN_SEPARATION = 12.0
+# Вес цветового штрафа. Намеренно меньше штрафа за расстояние (0.55): цвет
+# только помогает отсеивать, но не перебивает яркость.
+COLOR_PENALTY = 0.25
+# Отклонение цветности, считающееся полным несовпадением.
+COLOR_REF_DIST = 40.0
+# Минимальный размер цели в пикселях ЦВЕТНОСТИ: она вдвое грубее яркости, и у
+# мелкой цели цветных пикселей единицы — оценка становится ненадёжной.
+COLOR_MIN_TARGET_CHROMA_PX = 3
+
 MATCH_MIN_SCORE = 0.22
 # Доверие к матчу падает, если на карте откликов есть конкурент НЕ ХУЖЕ
 # выбранного. Замерено на борту в момент срыва:
@@ -1269,6 +1296,12 @@ tmpl_h = None
 template_gray = None
 # Эталон, снятый в момент захвата: не обновляется и не размывается.
 template_base = None
+# Плоскости цветности текущего кадра и цветовая подпись цели.
+chroma_u = None
+chroma_v = None
+target_uv = None          # (U, V) цели, снятые при захвате
+color_active = False      # различает ли цвет цель и фон в этом захвате
+color_separation = 0.0
 template_std = 0.0
 prev_gray = None
 prev_pts = None
@@ -1794,6 +1827,95 @@ def estimate_initial_target(gray):
             float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H), True)
 
 
+def extract_chroma(yuv):
+    """Достать плоскости U и V из буфера YUV420.
+
+    Раскладка: сначала LORES_H строк яркости, затем по LORES_H/4 строк на U и
+    на V — каждая строка шириной LORES_W содержит две строки по LORES_W/2.
+    Цветность вдвое грубее яркости по обеим осям.
+    """
+    try:
+        h, w = LORES_H, LORES_W
+        q = h // 4
+        u = yuv[h:h + q, :].reshape(h // 2, w // 2)
+        v = yuv[h + q:h + 2 * q, :].reshape(h // 2, w // 2)
+        return u, v
+    except Exception:
+        return None, None
+
+
+def measure_color_separation(cx, cy, box_w, box_h):
+    """Различает ли цвет цель и её окружение. Вызывается один раз при захвате.
+
+    Сравнивается средняя цветность ЦЕЛИ со средней цветностью кольца вокруг
+    неё. Если они близки — цвет информации не несёт (серое на сером), и его
+    использование только добавило бы шума в решение. Тогда отсев по цвету
+    остаётся выключенным до конца захвата, и поведение прежнее.
+
+    Возвращает (подпись_цели, различимость).
+    """
+    if chroma_u is None or chroma_v is None:
+        return None, 0.0
+    # Переходим в координаты цветности: она вдвое грубее.
+    ccx, ccy = int(cx) // 2, int(cy) // 2
+    rw, rh = max(1, int(box_w) // 4), max(1, int(box_h) // 4)
+    if rw < COLOR_MIN_TARGET_CHROMA_PX or rh < COLOR_MIN_TARGET_CHROMA_PX:
+        return None, 0.0
+    H, W = chroma_u.shape
+    def mean_box(arr, x0, y0, x1, y1):
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(W, x1), min(H, y1)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return float(arr[y0:y1, x0:x1].mean())
+    tu = mean_box(chroma_u, ccx - rw, ccy - rh, ccx + rw, ccy + rh)
+    tv = mean_box(chroma_v, ccx - rw, ccy - rh, ccx + rw, ccy + rh)
+    # Кольцо вокруг цели — втрое шире по каждой оси.
+    ou = mean_box(chroma_u, ccx - 3 * rw, ccy - 3 * rh, ccx + 3 * rw, ccy + 3 * rh)
+    ov = mean_box(chroma_v, ccx - 3 * rw, ccy - 3 * rh, ccx + 3 * rw, ccy + 3 * rh)
+    if None in (tu, tv, ou, ov):
+        return None, 0.0
+    # Среднее по кольцу включает саму цель, поэтому отличие занижено — но нам
+    # нужен именно консервативный критерий: лучше не включить цвет, чем
+    # включить там, где он не различает.
+    sep = abs(tu - ou) + abs(tv - ov)
+    return (tu, tv), sep
+
+
+def color_penalty_map(sx1, sy1, tw, th, shape):
+    """Штраф за несовпадение цвета для каждой позиции кандидата.
+
+    Для каждой позиции берётся средняя цветность области размером с цель и
+    сравнивается с подписью, снятой при захвате. Считается на разрешении
+    цветности (вдвое меньше) и растягивается до размера карты откликов.
+    """
+    if not color_active or target_uv is None or chroma_u is None:
+        return None
+    try:
+        rh, rw = shape
+        tu, tv = target_uv
+        # Область цветности, покрывающая все центры кандидатов.
+        cx0 = max(0, (sx1 + tw // 2) // 2 - 1)
+        cy0 = max(0, (sy1 + th // 2) // 2 - 1)
+        cx1 = min(chroma_u.shape[1], cx0 + rw // 2 + 3)
+        cy1 = min(chroma_u.shape[0], cy0 + rh // 2 + 3)
+        if cx1 - cx0 < 2 or cy1 - cy0 < 2:
+            return None
+        u = chroma_u[cy0:cy1, cx0:cx1].astype(np.float32)
+        v = chroma_v[cy0:cy1, cx0:cx1].astype(np.float32)
+        # Усредняем по площади цели: одиночный пиксель цветности слишком шумен.
+        k = max(1, min(int(tw) // 4, min(u.shape) ))
+        if k > 1:
+            u = cv2.blur(u, (k, k))
+            v = cv2.blur(v, (k, k))
+        d = np.abs(u - tu) + np.abs(v - tv)
+        d = np.clip(d / COLOR_REF_DIST, 0.0, 1.0)
+        # Растягиваем до размера карты откликов (цветность вдвое грубее).
+        return cv2.resize(d, (rw, rh), interpolation=cv2.INTER_LINEAR)
+    except Exception:
+        return None
+
+
 def build_template(gray, cx, cy, box_w, box_h):
     global tmpl_w, tmpl_h, template_std
     tw = clamp(max(box_w * TEMPLATE_SCALE, TEMPLATE_MIN), TEMPLATE_MIN, TEMPLATE_MAX)
@@ -1851,6 +1973,12 @@ def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0):
     # Нормируем штраф по фактическому margin, не по константе.
     norm = max(margin, 1)
     penalized = score_map - DIST_PENALTY * (dist / norm) ** 2
+    # Цветовой отсев. Добавляется к тому же штрафу, что и расстояние, поэтому
+    # выбор пика учитывает цвет, но сама величина score остаётся чисто
+    # яркостной — сравнимой с прежними логами.
+    cmap = color_penalty_map(sx1, sy1, tmpl_w, tmpl_h, score_map.shape)
+    if cmap is not None:
+        penalized = penalized - COLOR_PENALTY * cmap
 
     _, max_val, _, max_loc = cv2.minMaxLoc(penalized.astype(np.float32))
     mx, my = max_loc
@@ -1911,7 +2039,7 @@ def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0):
 def reset_tracking(to_acq=False):
     global track_state, target_visible, target_controllable, overlay_text, overlay_color, target_box_main
     global lock_cx, lock_cy, lock_w, lock_h, tmpl_w, tmpl_h, template_gray, template_std
-    global template_base
+    global template_base, target_uv, color_active, color_separation
     global prev_gray, prev_pts, lost_frames, last_match_score, last_flow_ok
     global acq_wait_left
     global filtered_dx_yaw, prev_adx, prev_ady_ctrl
@@ -1932,6 +2060,9 @@ def reset_tracking(to_acq=False):
     tmpl_w = tmpl_h = None
     template_gray = None
     template_base = None
+    target_uv = None
+    color_active = False
+    color_separation = 0.0
     template_std = 0.0
     prev_gray = None
     prev_pts = None
@@ -2643,7 +2774,7 @@ def draw_overlay_on_frame(frame):
 def process_locked_tracker(gray):
     global track_state, target_visible, target_controllable, overlay_text, overlay_color, target_box_main
     global lock_cx, lock_cy, lock_w, lock_h, template_gray, prev_gray, prev_pts
-    global template_base
+    global template_base, target_uv, color_active, color_separation
     global lost_frames, frame_index, last_match_score, last_flow_ok
     global fps_t0, fps_frames, fps_current
     global prev_aux_on, acq_wait_left, lock_sequence
@@ -2757,6 +2888,19 @@ def process_locked_tracker(gray):
             lock_h = float(lh)
             template_gray = build_template(gray, lock_cx, lock_cy, lock_w, lock_h)
             template_base = template_gray.copy()
+            # Один раз на захват решаем, помогает ли цвет. Если цель и её
+            # окружение одного цвета — цвет не включаем, поведение прежнее.
+            if COLOR_GUARD_ENABLED:
+                target_uv, color_separation = measure_color_separation(
+                    lock_cx, lock_cy, lock_w, lock_h)
+                color_active = (target_uv is not None
+                                and color_separation >= COLOR_MIN_SEPARATION)
+                flight_log.event(
+                    "ЦВЕТ %s: различимость цели и фона %.1f (порог %.1f)"
+                    % ("включён" if color_active else "не используется",
+                       color_separation, COLOR_MIN_SEPARATION))
+            else:
+                color_active = False
             prev_gray = gray.copy()
             prev_pts = refresh_flow_points(gray, lock_cx, lock_cy, lock_w, lock_h)
             lost_frames = 0
@@ -3133,6 +3277,7 @@ def _idx(seq, i):
 
 
 def camera_callback(request):
+    global chroma_u, chroma_v
     _cb_t0 = time.monotonic()
     try:
         with state_lock:
@@ -3149,6 +3294,12 @@ def camera_callback(request):
         with MappedArray(request, "lores") as lm:
             yuv = lm.array
             gray = yuv[:LORES_H, :LORES_W].copy()
+            if COLOR_GUARD_ENABLED:
+                # Цветность уже в этом же буфере — копируем вместе с яркостью.
+                cu, cv_ = extract_chroma(yuv)
+                if cu is not None:
+                    chroma_u = cu.copy()
+                    chroma_v = cv_.copy()
 
         process_locked_tracker(gray)
         print_debug_once_per_second()
