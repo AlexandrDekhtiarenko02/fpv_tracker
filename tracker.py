@@ -64,6 +64,8 @@ import threading
 import os
 import math
 import signal
+import subprocess
+import hashlib
 
 cv2.setNumThreads(1)
 
@@ -483,6 +485,14 @@ class FlightLogger:
             self._evt = open(base + ".events.log", "w", buffering=1 << 14)
             self.enabled = True
             self.event("session start pid=%d" % os.getpid())
+            version = _code_version()
+            self.event("ВЕРСИЯ КОДА %s" % version)
+            # Дублируем в stdout: службу смотрят через journalctl, и там
+            # версия должна быть видна сразу, без раскопок в файлах логов.
+            try:
+                print("[tracker] ВЕРСИЯ КОДА %s" % version, flush=True)
+            except Exception:
+                pass
             self._log_config()
             self._thread = threading.Thread(target=self._writer, daemon=True)
             self._thread.start()
@@ -743,6 +753,39 @@ class FlightLogger:
             print("[flightlog] %d rows -> %s" % (self._written, self.dir), flush=True)
         except Exception:
             pass
+
+
+def _code_version():
+    """Какой именно код сейчас в воздухе.
+
+    Без этого после `git pull` невозможно доказать, что служба перезапущена и
+    летит новая версия, а не та, что была загружена в память час назад. Берём
+    три независимых признака:
+      * коммит — что лежит в репозитории;
+      * пометка "изменён" — правили ли файл поверх коммита;
+      * md5 самого файла — единственное, что нельзя подделать перезаписью
+        репозитория: он считается по тому файлу, который реально запущен.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    commit, dirty = "нет-git", ""
+    try:
+        commit = subprocess.check_output(
+            ["git", "-C", here, "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL, timeout=5).decode().strip()
+        changed = subprocess.check_output(
+            ["git", "-C", here, "status", "--porcelain", "--", __file__],
+            stderr=subprocess.DEVNULL, timeout=5).decode().strip()
+        dirty = " ИЗМЕНЁН-ПОВЕРХ-КОММИТА" if changed else ""
+    except Exception:
+        pass
+    digest = "?"
+    try:
+        with open(os.path.abspath(__file__), "rb") as f:
+            digest = hashlib.md5(f.read()).hexdigest()[:12]
+    except Exception:
+        pass
+    return "commit=%s%s md5=%s file=%s" % (commit, dirty, digest,
+                                           os.path.abspath(__file__))
 
 
 def _fmt(v):

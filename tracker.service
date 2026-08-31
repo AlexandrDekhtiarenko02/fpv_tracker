@@ -1,0 +1,19 @@
+[Unit]
+Description=FPV Camera Tracker
+After=multi-user.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__DIR__
+ExecStart=/usr/bin/python3 __DIR__/tracker.py
+Restart=always
+RestartSec=2
+# Остановка идёт по SIGTERM; трекер его перехватывает и дописывает лог.
+# Даём на это время: при KillSignal по умолчанию и коротком таймауте разбор
+# вылета не успел бы записаться.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
