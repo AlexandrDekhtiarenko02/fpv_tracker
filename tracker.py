@@ -357,6 +357,47 @@ DY_INTEGRAL_RATE = 0.04
 DY_INTEGRAL_MAX = 60.0
 DY_INTEGRAL_DECAY = 0.985
 
+# --- ПРИВЯЗКА КОНТУРА КО ВРЕМЕНИ ---
+# Вся математика управления исторически считалась «за кадр»: D — разница
+# между соседними кадрами, I — накопление за кадр, упреждение — в пикселях
+# за кадр. Но частота кадров плавает: камере разрешено 30-60 к/с, и реальный
+# темп зависит от выдержки, то есть от освещённости. По логам борта разброс
+# составил 1.1-60.5 к/с при медиане 47.9.
+#
+# Из-за этого тюнинг менялся сам собой: при 60 к/с относительно 30 к/с D
+# слабее вдвое, I набегает вдвое быстрее, горизонт упреждения вдвое короче,
+# постоянные времени фильтров вдвое меньше. Один и тот же коэффициент днём и
+# вечером давал разное поведение.
+#
+# Ниже всё пересчитывается к НОМИНАЛЬНОМУ кадру. Смысл коэффициентов не
+# меняется: при 30 к/с формулы дают в точности прежние числа (это закреплено
+# тестом), а при других частотах поведение остаётся тем же по времени.
+NOMINAL_FPS = 30.0
+NOMINAL_DT = 1.0 / NOMINAL_FPS
+# Границы на случай выбросов: подвисший кадр не должен разово провернуть
+# интегратор на несколько секунд вперёд, а слишком мелкий dt — взорвать D.
+DT_MIN = 1.0 / 120.0
+DT_MAX = 0.25
+
+
+def dt_ratio(dt):
+    """Длительность кадра в единицах номинального кадра (1.0 при 30 к/с)."""
+    if dt is None or dt <= 0.0:
+        return 1.0
+    return max(DT_MIN, min(DT_MAX, float(dt))) / NOMINAL_DT
+
+
+def alpha_for_dt(alpha, k):
+    """Пересчёт коэффициента сглаживания под фактическую длительность кадра.
+
+    Фильтр вида x += alpha*(new-x) за k номинальных кадров сходится как
+    1-(1-alpha)^k — это и есть эквивалентный однокадровый коэффициент.
+    """
+    if k == 1.0:
+        return alpha
+    return 1.0 - (1.0 - alpha) ** k
+
+
 # --- ОТЛАДКА ---
 MOTOR_DEBUG_ENABLED = True
 MOTOR_DEBUG_PERIOD = 0.10
@@ -485,14 +526,17 @@ class FlightLogger:
             self._evt = open(base + ".events.log", "w", buffering=1 << 14)
             self.enabled = True
             self.event("session start pid=%d" % os.getpid())
-            version = _code_version()
-            self.event("ВЕРСИЯ КОДА %s" % version)
-            # Дублируем в stdout: службу смотрят через journalctl, и там
-            # версия должна быть видна сразу, без раскопок в файлах логов.
+            # Штамп версии — вспомогательный, и он НЕ должен иметь права
+            # отключить логирование: снаружи это выглядело бы как «логи не
+            # пишутся» без всякой связи с настоящей причиной.
             try:
+                version = _code_version()
+                self.event("ВЕРСИЯ КОДА %s" % version)
+                # Дублируем в stdout: службу смотрят через journalctl, и там
+                # версия должна быть видна сразу, без раскопок в файлах.
                 print("[tracker] ВЕРСИЯ КОДА %s" % version, flush=True)
             except Exception:
-                pass
+                self.event("ВЕРСИЯ КОДА не определена")
             self._log_config()
             self._thread = threading.Thread(target=self._writer, daemon=True)
             self._thread.start()
@@ -766,7 +810,11 @@ def _code_version():
       * md5 самого файла — единственное, что нельзя подделать перезаписью
         репозитория: он считается по тому файлу, который реально запущен.
     """
-    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        me = os.path.abspath(__file__)
+    except NameError:
+        return "версия неизвестна (нет __file__)"
+    here = os.path.dirname(me)
     commit, dirty = "нет-git", ""
     try:
         commit = subprocess.check_output(
@@ -780,12 +828,11 @@ def _code_version():
         pass
     digest = "?"
     try:
-        with open(os.path.abspath(__file__), "rb") as f:
+        with open(me, "rb") as f:
             digest = hashlib.md5(f.read()).hexdigest()[:12]
     except Exception:
         pass
-    return "commit=%s%s md5=%s file=%s" % (commit, dirty, digest,
-                                           os.path.abspath(__file__))
+    return "commit=%s%s md5=%s file=%s" % (commit, dirty, digest, me)
 
 
 def _fmt(v):
@@ -824,14 +871,19 @@ PORT = PORT_BY_ID if os.path.exists(PORT_BY_ID) else "/dev/ttyACM0"
 BAUD = 115200
 
 MSP_RC_PERIOD = 0.04
+# Единое окно свежести RC. Раньше поток обмена считал данные живыми 0.50 с, а
+# расчёт газа — 0.35 с; в этом зазоре газ уже брался из dyn_throttle, а
+# passthrough считался живым, и при потере связи поведение расходилось.
+RC_FRESH_WINDOW = 0.35
 # Опрос состояния «заармлен» — нужен, чтобы писать разбор вылета по дизарму.
 MSP_STATUS_PERIOD = 0.25
-# Номер бита ARM в flightModeFlags НЕ фиксирован: Betaflight укладывает туда
-# только НАСТРОЕННЫЕ режимы, в порядке, который отдаёт MSP_BOXIDS. Позиция
+# Номера битов режимов в flightModeFlags НЕ фиксированы: Betaflight укладывает
+# туда только НАСТРОЕННЫЕ режимы, в порядке, который отдаёт MSP_BOXIDS. Позиция
 # зависит от конкретного конфига, поэтому её надо спросить, а не угадать —
-# иначе «дизарм» будет срабатывать от постороннего режима.
+# иначе состояние будет считываться с постороннего режима.
 ARM_BOX_PERMANENT_ID = 0
-_arm_bit_index = None
+MSP_OVERRIDE_BOX_PERMANENT_ID = 50   # msp_box.c: { BOXMSPOVERRIDE, permanentId 50 }
+_box_bits = {}                       # постоянный id -> номер бита
 
 fc = None
 try:
@@ -849,6 +901,12 @@ app_state = {
     "rc_throttle": 1000,
     "rc_throttle_ts": 0.0,
     "dyn_throttle": 1500,
+    # Последние значения, ПРИШЕДШИЕ С ПРИЁМНИКА. Обновляются только пока на
+    # FC неактивен MSP OVERRIDE: при активном оверрайде MSP_RC отдаёт наши же
+    # присланные значения (rxMspOverrideReadRawRc в Betaflight), и запись их
+    # сюда замкнула бы выход оверрайда на его собственный вход.
+    "receiver_channels": [1500, 1500, 1500, 1000, 1500, 1500, 1500, 1500],
+    "receiver_ts": 0.0,
     "fc_pitch_deg": None,
     "fc_pitch_ts": 0.0,
     "motors": [],
@@ -879,6 +937,10 @@ yaw_integral = 0.0
 
 # Сглаженное значение fc_pitch_deg для расчёта компенсации тангажа.
 smoothed_pitch_deg = 0.0
+
+# Момент прошлого вызова управления — из него берётся фактическая длительность
+# кадра. None = первый кадр после захвата, длительность ещё не измерить.
+prev_control_mono = None
 
 # Состояние упреждения. prev_box_* — позиция в прошлом кадре, target_v*_smoothed —
 # сглаженная межкадровая скорость цели в пикселях/кадр. stable_track_frames
@@ -933,8 +995,6 @@ last_flow_ok = False
 filtered_dx_yaw = 0.0
 prev_adx = 0.0
 prev_ady_ctrl = 0.0
-prev_target_pitch = 1500
-
 fps_t0 = time.monotonic()
 fps_frames = 0
 fps_current = 0.0
@@ -1005,13 +1065,43 @@ def send_msp_set_raw_rc(channels):
         pass
 
 
+def build_output_channels(receiver, r_cmd, p_cmd, y_cmd, t_cmd, apply_ov):
+    """Собрать 8 каналов для MSP_SET_RAW_RC.
+
+    receiver — значения С ПРИЁМНИКА (внутренний порядок Betaflight RPYT+AUX),
+    а не то, что вернул MSP_RC при активном оверрайде.
+    apply_ov — трекер сейчас управляет (TRACKED и AUX4 подняты).
+
+    Ось подменяется только если оверрайд применяется И включён её флаг
+    OVERRIDE_*; иначе уходит значение приёмника. Возвращает список из 8.
+    """
+    live_roll  = int(receiver[0]) if len(receiver) > 0 else 1500
+    live_pitch = int(receiver[1]) if len(receiver) > 1 else 1500
+    live_yaw   = int(receiver[2]) if len(receiver) > 2 else 1500
+    live_thr   = int(receiver[3]) if len(receiver) > 3 else 1000
+
+    out_roll  = int(r_cmd) if (apply_ov and OVERRIDE_ROLL)     else live_roll
+    out_pitch = int(p_cmd) if (apply_ov and OVERRIDE_PITCH)    else live_pitch
+    out_yaw   = int(y_cmd) if (apply_ov and OVERRIDE_YAW)      else live_yaw
+    out_thr   = int(t_cmd) if (apply_ov and OVERRIDE_THROTTLE) else live_thr
+
+    # MSP_SET_RAW_RC ждёт rcmap external (default AETR): ch0=R, ch1=P,
+    # ch2=T, ch3=Y — порядок отличается от того, в котором пришёл receiver.
+    channels = (list(receiver) + [1500] * 8)[:8]
+    channels[0] = out_roll
+    channels[1] = out_pitch
+    channels[2] = out_thr
+    channels[3] = out_yaw
+    return channels
+
+
 def fc_io_loop():
     """Read: MSP_RC возвращает RPYT (внутренний порядок Betaflight) →
        ch[0]=Roll, ch[1]=Pitch, ch[2]=Yaw, ch[3]=Throttle.
        Write: MSP_SET_RAW_RC ждёт rcmap-порядок (default AETR) →
        channels[0]=Roll, [1]=Pitch, [2]=Throttle, [3]=Yaw.
     """
-    global aux4_state, _arm_bit_index
+    global aux4_state
     next_t = time.monotonic()
     next_motor_t = 0.0
     next_status_t = 0.0
@@ -1027,11 +1117,32 @@ def fc_io_loop():
             if rc_data is not None and len(rc_data) >= 16:
                 ch = struct.unpack('<' + 'H' * (len(rc_data) // 2), rc_data)
                 if len(ch) >= 8:
+                    now_rc = time.monotonic()
                     with state_lock:
                         app_state["rc_channels"] = list(ch[:8])
+                        # Признак ЖИВОЙ связи с FC. Обновляется всегда, в том
+                        # числе при активном оверрайде. Отделён от возраста
+                        # кэша приёмника намеренно: кэш во время оверрайда
+                        # законно замирает, и если завязать на него отправку
+                        # MSP-кадров, поток прервётся прямо посреди лока —
+                        # а Betaflight ждёт его непрерывно.
+                        app_state["rc_link_ts"] = now_rc
+                        # AUX-каналы в маску оверрайда не входят, поэтому
+                        # приходят с приёмника всегда — читать их можно и при
+                        # активном оверрайде.
                         aux4_state = ch[7] > 1500
-                        app_state["rc_throttle"] = ch[3]
-                        app_state["rc_throttle_ts"] = time.monotonic()
+                        fc_ovr = app_state.get("fc_override_on", False)
+                        fc_ovr_ts = app_state.get("fc_override_ts", 0.0)
+                        # Пока неизвестно, активен ли оверрайд на FC (первые
+                        # мгновения после старта или режим не настроен),
+                        # считаем данные чистыми: до подъёма AUX4 оверрайд
+                        # физически не может быть включён.
+                        stale_ovr = (now_rc - fc_ovr_ts) > 1.0
+                        if not fc_ovr or stale_ovr:
+                            app_state["receiver_channels"] = list(ch[:8])
+                            app_state["receiver_ts"] = now_rc
+                            app_state["rc_throttle"] = ch[3]
+                            app_state["rc_throttle_ts"] = now_rc
 
             att_data = msp_request(108)  # MSP_ATTITUDE
             if att_data is not None and len(att_data) >= 6:
@@ -1047,27 +1158,42 @@ def fc_io_loop():
 
             now = time.monotonic()
 
-            # Один раз узнаём, в каком бите живёт ARM.
-            if _arm_bit_index is None and now >= next_boxids_t:
+            # Один раз узнаём, в каких битах живут нужные нам режимы.
+            if not _box_bits and now >= next_boxids_t:
                 next_boxids_t = now + 2.0
                 box_data = msp_request(119)  # MSP_BOXIDS
                 if box_data:
-                    pos = box_data.find(ARM_BOX_PERMANENT_ID)
-                    if pos >= 0:
-                        _arm_bit_index = pos
-                        flight_log.event(
-                            "MSP_BOXIDS: ARM в бите %d (боксов %d)"
-                            % (pos, len(box_data)))
+                    for pid, name in ((ARM_BOX_PERMANENT_ID, "ARM"),
+                                      (MSP_OVERRIDE_BOX_PERMANENT_ID,
+                                       "MSP OVERRIDE")):
+                        pos = box_data.find(pid)
+                        if pos >= 0:
+                            _box_bits[pid] = pos
+                            flight_log.event(
+                                "MSP_BOXIDS: %s в бите %d (боксов %d)"
+                                % (name, pos, len(box_data)))
+                        else:
+                            flight_log.event(
+                                "MSP_BOXIDS: %s НЕ НАСТРОЕН на этом FC" % name)
 
-            if _arm_bit_index is not None and now >= next_status_t:
+            if _box_bits and now >= next_status_t:
                 next_status_t = now + MSP_STATUS_PERIOD
                 st_data = msp_request(101)  # MSP_STATUS
                 if st_data is not None and len(st_data) >= 10:
                     mode_flags = struct.unpack_from('<I', st_data, 6)[0]
+                    arm_bit = _box_bits.get(ARM_BOX_PERMANENT_ID)
+                    ovr_bit = _box_bits.get(MSP_OVERRIDE_BOX_PERMANENT_ID)
                     with state_lock:
-                        app_state["armed"] = bool(
-                            mode_flags & (1 << _arm_bit_index))
-                        app_state["armed_ts"] = now
+                        if arm_bit is not None:
+                            app_state["armed"] = bool(mode_flags & (1 << arm_bit))
+                            app_state["armed_ts"] = now
+                        # Активен ли MSP OVERRIDE на самом FC. Знать это
+                        # обязательно: пока он активен, MSP_RC отдаёт НАШИ же
+                        # присланные значения, а не стики (см. ниже).
+                        if ovr_bit is not None:
+                            app_state["fc_override_on"] = bool(
+                                mode_flags & (1 << ovr_bit))
+                            app_state["fc_override_ts"] = now
 
             if MOTOR_DEBUG_ENABLED and now >= next_motor_t:
                 mot_data = msp_request(104)  # MSP_MOTOR
@@ -1081,8 +1207,17 @@ def fc_io_loop():
             with state_lock:
                 ov = override_active
                 aux_now = aux4_state
-                live = list(app_state.get("rc_channels", [1500] * 8))
-                rc_ts = app_state.get("rc_throttle_ts", 0.0)
+                # ИСТОЧНИК PASSTHROUGH — кэш приёмника, а НЕ MSP_RC.
+                #
+                # Пока на FC активен MSP OVERRIDE, MSP_RC отдаёт по маскируемым
+                # каналам то, что прислали мы сами (Betaflight,
+                # rxMspOverrideReadRawRc). Если брать passthrough оттуда, то в
+                # фазах ACQ/HOLD/LOST — когда трекер НЕ управляет, но AUX4
+                # поднят — мы возвращали бы на FC собственную последнюю
+                # команду вместо стика. Стики переставали отвечать, а квад
+                # держал последний манёвр до опускания AUX4.
+                live = list(app_state.get("receiver_channels", [1500] * 8))
+                rc_ts = app_state.get("rc_link_ts", 0.0)
                 r_cmd = global_roll_cmd
                 p_cmd = global_pitch_cmd
                 y_cmd = global_yaw_cmd
@@ -1094,34 +1229,17 @@ def fc_io_loop():
             # непрерывный поток MSP-кадров. Если мы вдруг перестаём слать,
             # он держит последние значения / уходит в failsafe.
             #
-            # По умолчанию всё passthrough — живой стик во все 4 канала.
-            # Per-axis флаги OVERRIDE_* подменяют ось только когда AUX4 ON
-            # и трекер в TRACKED (override_active=True).
-            have_fresh_rc = (time.monotonic() - rc_ts) <= 0.50
+            # Passthrough идёт из кэша приёмника. Оси подменяются только
+            # когда AUX4 поднят И трекер в TRACKED (override_active=True).
+            have_fresh_rc = (time.monotonic() - rc_ts) <= RC_FRESH_WINDOW
             if have_fresh_rc:
-                # MSP_RC возвращает RPYT internal: ch0=R, ch1=P, ch2=Y, ch3=T.
-                live_roll  = int(live[0]) if len(live) > 0 else 1500
-                live_pitch = int(live[1]) if len(live) > 1 else 1500
-                live_yaw   = int(live[2]) if len(live) > 2 else 1500
-                live_thr   = int(live[3]) if len(live) > 3 else 1000
-
                 apply_ov = ov and aux_now
-                out_roll  = int(r_cmd) if (apply_ov and OVERRIDE_ROLL)     else live_roll
-                out_pitch = int(p_cmd) if (apply_ov and OVERRIDE_PITCH)    else live_pitch
-                out_yaw   = int(y_cmd) if (apply_ov and OVERRIDE_YAW)      else live_yaw
-                out_thr   = int(t_cmd) if (apply_ov and OVERRIDE_THROTTLE) else live_thr
-
-                # MSP_SET_RAW_RC ждёт rcmap external (default AETR):
-                # ch0=R, ch1=P, ch2=T, ch3=Y.
-                channels = (live + [1500] * 8)[:8]
-                channels[0] = out_roll
-                channels[1] = out_pitch
-                channels[2] = out_thr
-                channels[3] = out_yaw
+                channels = build_output_channels(
+                    live, r_cmd, p_cmd, y_cmd, t_cmd, apply_ov)
                 with state_lock:
                     app_state["last_sent_channels"] = list(channels[:8])
                 send_msp_set_raw_rc(channels)
-            # Без свежих RC-данных вообще ничего не шлём — иначе FC получит
+            # Без связи с FC вообще ничего не шлём — иначе он получит
             # стартовое «среднее» из app_state.
         except Exception:
             pass
@@ -1403,7 +1521,7 @@ def reset_tracking(to_acq=False):
     global lock_cx, lock_cy, lock_w, lock_h, tmpl_w, tmpl_h, template_gray, template_std
     global prev_gray, prev_pts, lost_frames, last_match_score, last_flow_ok
     global acq_wait_left
-    global filtered_dx_yaw, prev_adx, prev_ady_ctrl, prev_target_pitch
+    global filtered_dx_yaw, prev_adx, prev_ady_ctrl
     global smooth_throttle_out, throttle_integral, prev_ady
     global roll_integral, pitch_integral, yaw_integral
     global smoothed_pitch_deg
@@ -1431,7 +1549,6 @@ def reset_tracking(to_acq=False):
     filtered_dx_yaw = 0.0
     prev_adx = 0.0
     prev_ady_ctrl = 0.0
-    prev_target_pitch = 1500
 
     smooth_throttle_out = None
     throttle_integral = 0.0
@@ -1459,7 +1576,7 @@ def reset_tracking(to_acq=False):
 def _pid_axis_step(error, prev_error, integral, ff_value,
                    p_gain, d_gain, i_gain, ff_gain,
                    integral_max, integral_decay,
-                   sign, max_deflect, dbg_key=None):
+                   sign, max_deflect, dbg_key=None, k=1.0):
     """Один шаг PID+FF по одной оси с условным anti-windup.
 
     Anti-windup: I-компонент НЕ накапливается, если P+D+FF+I-выход уже
@@ -1476,8 +1593,11 @@ def _pid_axis_step(error, prev_error, integral, ff_value,
     err_f = float(error)
     d_err = err_f - prev_error
 
-    pd_part = err_f * p_gain + d_err * d_gain
-    ff_part = float(ff_value) * ff_gain
+    # D и FF делятся на k, I умножается: при удвоенной частоте кадров разница
+    # между кадрами вдвое меньше (её надо вернуть к номиналу), а накоплений за
+    # ту же секунду вдвое больше (каждое должно быть вдвое меньше).
+    pd_part = err_f * p_gain + (d_err / k) * d_gain
+    ff_part = (float(ff_value) / k) * ff_gain
 
     # Сначала смотрим, где бы оказался выход с ТЕКУЩИМ интегратором.
     total_unsat = sign * (pd_part + ff_part + integral)
@@ -1488,12 +1608,12 @@ def _pid_axis_step(error, prev_error, integral, ff_value,
     push_further = (sat_pos and i_dir > 0) or (sat_neg and i_dir < 0)
 
     if err_f != 0.0 and not push_further:
-        integral += err_f * i_gain
+        integral += err_f * i_gain * k
         if integral > integral_max:
             integral = integral_max
         elif integral < -integral_max:
             integral = -integral_max
-    integral *= integral_decay
+    integral *= integral_decay ** k
 
     out = sign * (pd_part + ff_part + integral)
     saturated = False
@@ -1513,7 +1633,7 @@ def _pid_axis_step(error, prev_error, integral, ff_value,
     return out, err_f, integral
 
 
-def _compute_pitch_attitude_comp_px(now_mono):
+def _compute_pitch_attitude_comp_px(now_mono, k=1.0):
     """Возвращает (compensation_px, обновлено?). Compensation добавляется
     к aim_y. Положительное значение = aim сдвигается ВНИЗ в кадре (бóльшая y),
     что соответствует ситуации «квад завален носом вниз → цель в кадре сверху,
@@ -1532,7 +1652,8 @@ def _compute_pitch_attitude_comp_px(now_mono):
     if fc_pitch is None or (now_mono - fc_pitch_ts) > FC_PITCH_TIMEOUT:
         return 0.0
 
-    smoothed_pitch_deg += PITCH_COMP_ALPHA * (float(fc_pitch) - smoothed_pitch_deg)
+    smoothed_pitch_deg += alpha_for_dt(PITCH_COMP_ALPHA, k) * (
+        float(fc_pitch) - smoothed_pitch_deg)
     comp_px = -smoothed_pitch_deg * PIXELS_PER_PITCH_DEG
     if comp_px > MAX_PITCH_COMP_PX:
         comp_px = MAX_PITCH_COMP_PX
@@ -1552,13 +1673,13 @@ def update_control_from_target():
        Реальная отправка на FC решается в fc_io_loop по флагам OVERRIDE_*.
     """
     global global_yaw_cmd, global_pitch_cmd, global_roll_cmd, global_throttle_cmd, override_active
-    global filtered_dx_yaw, prev_adx, prev_ady_ctrl, prev_target_pitch
+    global filtered_dx_yaw, prev_adx, prev_ady_ctrl
     global smooth_throttle_out, throttle_integral, prev_ady
     global roll_integral, pitch_integral, yaw_integral
     global smoothed_pitch_deg
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
-    global overlay_text, overlay_color, _ctl_dbg
+    global overlay_text, overlay_color, _ctl_dbg, prev_control_mono
 
     with state_lock:
         box = target_box_main
@@ -1567,7 +1688,11 @@ def update_control_from_target():
         live_thr_ts = app_state.get("rc_throttle_ts", 0.0)
 
     now_mono = time.monotonic()
-    rc_fresh = ((now_mono - live_thr_ts) <= 0.35) and (885 <= int(live_thr) <= 2115)
+    # Фактическая длительность кадра в единицах номинального (k=1 при 30 к/с).
+    k = dt_ratio(None if prev_control_mono is None
+                 else now_mono - prev_control_mono)
+    prev_control_mono = now_mono
+    rc_fresh = ((now_mono - live_thr_ts) <= RC_FRESH_WINDOW) and (885 <= int(live_thr) <= 2115)
     base_thr = int(live_thr) if rc_fresh else int(app_state.get("dyn_throttle", 1500))
     if base_thr < THROTTLE_MIN_PWM:
         base_thr = THROTTLE_MIN_PWM
@@ -1581,13 +1706,13 @@ def update_control_from_target():
         prev_adx = 0.0
         prev_ady_ctrl = 0.0
         prev_ady = 0.0
-        prev_target_pitch = 1500
         smooth_throttle_out = None
         throttle_integral = 0.0
         roll_integral = 0.0
         pitch_integral = 0.0
         yaw_integral = 0.0
         smoothed_pitch_deg = 0.0
+        prev_control_mono = None
         prev_box_cx = None
         prev_box_cy = None
         target_vx_smoothed = 0.0
@@ -1629,13 +1754,15 @@ def update_control_from_target():
         launch_intensity = launch_counter / float(max(LAUNCH_RAMP_UP_FRAMES, 1))
         if launch_intensity > 1.0:
             launch_intensity = 1.0
-        launch_counter += 1
+        # Шаг счётчика — k, а не 1: иначе при 60 к/с фаза launch проходила бы
+        # вдвое быстрее по времени, чем задано константами.
+        launch_counter += k
         if launch_counter >= LAUNCH_RAMP_UP_FRAMES:
             launch_phase = "HOLD"
             launch_counter = 0
     elif launch_phase == "HOLD":
         launch_intensity = 1.0
-        launch_counter += 1
+        launch_counter += k
         if launch_counter >= LAUNCH_HOLD_FRAMES:
             launch_phase = "RAMP_DOWN"
             launch_counter = 0
@@ -1643,7 +1770,7 @@ def update_control_from_target():
         launch_intensity = 1.0 - launch_counter / float(max(LAUNCH_RAMP_DOWN_FRAMES, 1))
         if launch_intensity < 0.0:
             launch_intensity = 0.0
-        launch_counter += 1
+        launch_counter += k
         if launch_counter >= LAUNCH_RAMP_DOWN_FRAMES:
             launch_phase = "NONE"
             launch_counter = 0
@@ -1669,9 +1796,13 @@ def update_control_from_target():
         inst_vy = box_cy - prev_box_cy
         # Глитч-фильтр: re-lock / occlusion даёт скачок сильно больше реальной скорости цели.
         if abs(inst_vx) < LEAD_MAX_VEL_JUMP and abs(inst_vy) < LEAD_MAX_VEL_JUMP:
-            target_vx_smoothed += LEAD_VEL_ALPHA * (inst_vx - target_vx_smoothed)
-            target_vy_smoothed += LEAD_VEL_ALPHA * (inst_vy - target_vy_smoothed)
-            stable_track_frames += 1
+            # Мгновенная скорость измерена в пикселях ЗА КАДР; приводим к
+            # номинальному кадру, иначе при 60 к/с она вдвое меньше при той же
+            # физической скорости цели.
+            a_vel = alpha_for_dt(LEAD_VEL_ALPHA, k)
+            target_vx_smoothed += a_vel * (inst_vx / k - target_vx_smoothed)
+            target_vy_smoothed += a_vel * (inst_vy / k - target_vy_smoothed)
+            stable_track_frames += k
         else:
             # Подозрительный скачок — сбрасываем счётчик стабильности.
             stable_track_frames = 0
@@ -1679,6 +1810,9 @@ def update_control_from_target():
     prev_box_cy = box_cy
 
     if LEAD_AIM_ENABLED and stable_track_frames >= LEAD_MIN_STABLE_FRAMES and LEAD_FRAMES > 0:
+        # target_v* уже приведены к номинальному кадру, поэтому горизонт
+        # LEAD_FRAMES тоже трактуется в номинальных кадрах = фиксированное
+        # время (LEAD_FRAMES/30 с), независимо от текущего FPS.
         lead_x = target_vx_smoothed * float(LEAD_FRAMES)
         lead_y = target_vy_smoothed * float(LEAD_FRAMES)
         # Жёсткий потолок чтобы шумы по скорости не унесли прицел через полкадра.
@@ -1692,7 +1826,7 @@ def update_control_from_target():
             lead_y = -LEAD_MAX_PX
 
     # Динамическая компенсация наклона квада.
-    pitch_comp_px = _compute_pitch_attitude_comp_px(now_mono)
+    pitch_comp_px = _compute_pitch_attitude_comp_px(now_mono, k)
 
     # Прицельная точка: текущая позиция + статический оффсет + компенсация тангажа + упреждение.
     dx_aim = (box_cx + AIM_OFFSET_X + lead_x) - CENTER_X
@@ -1737,7 +1871,7 @@ def update_control_from_target():
         target_vx_smoothed,
         p_roll_eff, D_GAIN_ROLL, i_roll_eff, ff_roll_eff,
         ROLL_INTEGRAL_MAX, ROLL_INTEGRAL_DECAY,
-        ROLL_SIGN, MAX_ROLL_DEFLECT, dbg_key="roll",
+        ROLL_SIGN, MAX_ROLL_DEFLECT, dbg_key="roll", k=k,
     )
     target_roll = max(1000, min(2000, 1500 + roll_offset))
 
@@ -1747,18 +1881,17 @@ def update_control_from_target():
         target_vy_smoothed,
         p_pitch_eff, D_GAIN_PITCH, i_pitch_eff, ff_pitch_eff,
         PITCH_INTEGRAL_MAX, PITCH_INTEGRAL_DECAY,
-        PITCH_SIGN, MAX_PITCH_DEFLECT, dbg_key="pitch",
+        PITCH_SIGN, MAX_PITCH_DEFLECT, dbg_key="pitch", k=k,
     )
     # Поверх PID — launch boost и cruise. Они могут вытолкнуть target_pitch
     # за MAX_PITCH_DEFLECT, но финальный clamp 1000-2000 остаётся.
     combined_pitch = pitch_offset + launch_pitch_pwm + cruise_pitch_pwm
     target_pitch = max(1000, min(2000, 1500 + combined_pitch))
-    prev_target_pitch = target_pitch
 
     # --- YAW: фильтр + ослабление при больших adx + I + FF с anti-windup ---
     # Yaw не использует хелпер потому что error — это filtered_dx_yaw × yaw_weight,
     # а I-добавка тоже взвешивается. Логика та же, но с весом.
-    filtered_dx_yaw += YAW_FILTER_ALPHA * (float(adx) - filtered_dx_yaw)
+    filtered_dx_yaw += alpha_for_dt(YAW_FILTER_ALPHA, k) * (float(adx) - filtered_dx_yaw)
     abs_adx = abs(adx)
     if abs_adx < YAW_ROLL_CROSSOVER:
         yaw_weight = 1.0
@@ -1774,12 +1907,12 @@ def update_control_from_target():
     yaw_i_dir = YAW_SIGN * yaw_error_weighted
     yaw_push_further = (yaw_sat_pos and yaw_i_dir > 0) or (yaw_sat_neg and yaw_i_dir < 0)
     if adx != 0 and not yaw_push_further:
-        yaw_integral += yaw_error_weighted * I_GAIN_YAW
+        yaw_integral += yaw_error_weighted * I_GAIN_YAW * k
         if yaw_integral > YAW_INTEGRAL_MAX:
             yaw_integral = YAW_INTEGRAL_MAX
         elif yaw_integral < -YAW_INTEGRAL_MAX:
             yaw_integral = -YAW_INTEGRAL_MAX
-    yaw_integral *= YAW_INTEGRAL_DECAY
+    yaw_integral *= YAW_INTEGRAL_DECAY ** k
 
     yaw_offset = YAW_SIGN * (yaw_pd + yaw_ff + yaw_integral)
     if yaw_offset > MAX_YAW_DEFLECT:
@@ -1801,17 +1934,17 @@ def update_control_from_target():
         if abs(dy_alt) > THROTTLE_DEADBAND:
             active_dy = float(dy_alt - THROTTLE_DEADBAND if dy_alt > 0 else dy_alt + THROTTLE_DEADBAND)
             thr_adjust += -active_dy * DY_THROTTLE_GAIN
-            throttle_integral += -active_dy * DY_INTEGRAL_RATE
+            throttle_integral += -active_dy * DY_INTEGRAL_RATE * k
             throttle_integral = max(-DY_INTEGRAL_MAX, min(DY_INTEGRAL_MAX, throttle_integral))
         else:
-            throttle_integral *= 0.85
+            throttle_integral *= 0.85 ** k
 
-        throttle_integral *= DY_INTEGRAL_DECAY
+        throttle_integral *= DY_INTEGRAL_DECAY ** k
         thr_adjust += throttle_integral
 
         d_dy = float(dy_alt) - prev_ady
         prev_ady = float(dy_alt)
-        thr_adjust += d_dy * DY_THROTTLE_D_GAIN
+        thr_adjust += (d_dy / k) * DY_THROTTLE_D_GAIN
 
         max_adj = max(30.0, base_thr * THROTTLE_PERCENT / 100.0)
         thr_adjust = max(-max_adj, min(max_adj, thr_adjust))
@@ -1822,7 +1955,8 @@ def update_control_from_target():
         if smooth_throttle_out is None:
             smooth_throttle_out = float(raw_throttle)
         else:
-            smooth_throttle_out += THROTTLE_OUT_ALPHA * (raw_throttle - smooth_throttle_out)
+            smooth_throttle_out += alpha_for_dt(THROTTLE_OUT_ALPHA, k) * (
+                raw_throttle - smooth_throttle_out)
         target_throttle = int(round(smooth_throttle_out))
         target_throttle = max(THROTTLE_MIN_PWM, min(THROTTLE_MAX_PWM, target_throttle))
 
