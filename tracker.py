@@ -159,10 +159,10 @@ TEMPLATE_UPDATE_ALPHA = 0.010   # доля нового кадра в шабло
 #   2) потом включаешь по ОДНОЙ оси и смотришь, какая именно вызывает
 #      «спул моторов на локе» — обычно это PID-windup FC по неправильной
 #      команде угла, лечится не у нас, а в Betaflight (см. README ниже).
-OVERRIDE_ROLL = False
-OVERRIDE_PITCH = False
-OVERRIDE_YAW = False
-OVERRIDE_THROTTLE = False        # True = динамика газа по dy, иначе живой стик
+OVERRIDE_ROLL = True
+OVERRIDE_PITCH = True
+OVERRIDE_YAW = True
+OVERRIDE_THROTTLE = True        # True = динамика газа по dy, иначе живой стик
 
 # Знак pitch. Признак неправильного знака: задние моторы греются,
 # на низком стике моторы раскручиваются.

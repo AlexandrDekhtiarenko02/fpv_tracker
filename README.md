@@ -6,7 +6,7 @@
 ## Запуск на малине
 
 ```bash
-python3 tracker_optimized.py
+python3 tracker.py
 ```
 
 Логирование вшито в код, отдельно ничего запускать не нужно.
@@ -76,9 +76,9 @@ git pull                    # забрать с GitHub
 Откатиться, если что-то сломал:
 
 ```bash
-git checkout -- tracker_optimized.py   # вернуть файл к последнему коммиту
+git checkout -- tracker.py   # вернуть файл к последнему коммиту
 git log --oneline                      # найти нужный снимок, скопировать его номер
-git checkout <номер> -- tracker_optimized.py   # вернуть файл к тому снимку
+git checkout <номер> -- tracker.py   # вернуть файл к тому снимку
 ```
 
 Правило, которое экономит нервы: **коммить перед каждым вылетом**. Тогда
@@ -87,7 +87,7 @@ git checkout <номер> -- tracker_optimized.py   # вернуть файл к
 ## Что где
 
 ```
-tracker_optimized.py   весь код трекера
+tracker.py   весь код трекера
 deploy.sh              отправить код на малину без git
 fetch_logs.sh          забрать логи с малины
 docs/flight_log.md     описание колонок лога
