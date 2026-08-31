@@ -163,6 +163,9 @@ FLOW_MIN_POINTS = 3
 FLOW_ERR_MAX = 20.0 * TRACK_SCALE
 FLOW_MAX_STEP = 30.0 * TRACK_SCALE
 FLOW_REFRESH_EVERY = 1
+# Запас окна оптического потока вокруг точек, пиксели. Должен покрывать
+# смещение цели между кадрами, иначе точка уедет за край окна и потеряется.
+FLOW_WINDOW_PAD = 24 * TRACK_SCALE
 
 HOLD_FRAMES = 10
 LOST_LIMIT = 28
@@ -1575,11 +1578,41 @@ def flow_predict(prev_g, cur_g, pts, cx, cy):
     if prev_g is None or pts is None or len(pts) < FLOW_MIN_POINTS:
         return False, cx, cy
     try:
+        # Поток считаем по ОКНУ вокруг точек, а не по всему кадру.
+        #
+        # calcOpticalFlowPyrLK строит пирамиду по всей переданной картинке, и
+        # это стоит пропорционально её ПЛОЩАДИ — независимо от того, что точек
+        # всего два десятка. При переходе на 640x480 полный кадр обошёлся бы
+        # вчетверо дороже каждый кадр, а Zero 2W упирается именно в процессор.
+        #
+        # Окно берём по границам точек плюс запас на их смещение. Точки
+        # переводим в координаты окна, а результат возвращаем обратно —
+        # снаружи функции ничего не меняется.
+        pad = FLOW_WINDOW_PAD
+        h_img, w_img = cur_g.shape[:2]
+        xs, ys = pts[:, 0, 0], pts[:, 0, 1]
+        wx1 = max(0, int(xs.min()) - pad)
+        wy1 = max(0, int(ys.min()) - pad)
+        wx2 = min(w_img, int(xs.max()) + pad + 1)
+        wy2 = min(h_img, int(ys.max()) + pad + 1)
+        # Слишком узкое окно пирамиде не годится — тогда работаем по кадру.
+        if (wx2 - wx1) < 32 or (wy2 - wy1) < 32:
+            wx1, wy1, wx2, wy2 = 0, 0, w_img, h_img
+        prev_win = prev_g[wy1:wy2, wx1:wx2]
+        cur_win = cur_g[wy1:wy2, wx1:wx2]
+        pts_win = pts.copy()
+        pts_win[:, 0, 0] -= wx1
+        pts_win[:, 0, 1] -= wy1
+
         nxt, st, err = cv2.calcOpticalFlowPyrLK(
-            prev_g, cur_g, pts, None,
+            prev_win, cur_win, pts_win, None,
             winSize=(15, 15), maxLevel=2,
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 14, 0.03),
         )
+        if nxt is not None:
+            nxt = nxt.copy()
+            nxt[:, 0, 0] += wx1
+            nxt[:, 0, 1] += wy1
         if nxt is None or st is None:
             return False, cx, cy
         st = st.reshape(-1).astype(bool)
@@ -2416,13 +2449,29 @@ def draw_corners(frame, box, color, thickness=2):
     cv2.polylines(frame, [pts], True, COLOR_WHITE, 2, cv2.LINE_8)
 
 
-def draw_magnifier(frame):
+def draw_magnifier(frame, box=None):
+    """Лупа в углу. Центрируется на РАМКЕ ЦЕЛИ, а не на прицеле.
+
+    Смысл лупы — разглядеть цель. Пока лупа висела на прицеле, она была
+    полезна ровно до тех пор, пока рамка с прицелом совпадают, — а нужнее
+    всего она как раз в момент их расхождения, когда наведение не поспевает.
+    Тогда она показывала пустое место рядом с целью.
+
+    Прицел при этом не теряется: если он попадает в увеличенный участок, он
+    рисуется отдельной меткой. Так в лупе сразу видно и цель, и куда наведён
+    аппарат, то есть увеличенная ошибка прицеливания.
+    """
     if not MAG_ENABLED:
         return
     h, w = frame.shape[:2]
     src = max(MAG_SRC_MIN_SIZE, int(round(MAG_SIZE / MAG_ZOOM)))
-    sx1 = max(0, CENTER_X - src // 2)
-    sy1 = max(0, CENTER_Y - src // 2)
+    if box is not None:
+        cx = (box[0] + box[2]) // 2
+        cy = (box[1] + box[3]) // 2
+    else:
+        cx, cy = CENTER_X, CENTER_Y
+    sx1 = max(0, cx - src // 2)
+    sy1 = max(0, cy - src // 2)
     sx2 = min(w, sx1 + src)
     sy2 = min(h, sy1 + src)
     sx1 = max(0, sx2 - src)
@@ -2437,9 +2486,18 @@ def draw_magnifier(frame):
     dy2 = dy1 + MAG_SIZE
     if dx1 >= 0 and dy2 <= h:
         frame[dy1:dy2, dx1:dx2] = zoom
+        scale = MAG_SIZE / float(src)
+        # Центр лупы — центр рамки (или прицел, если рамки нет).
         mx, my = (dx1 + dx2) // 2, (dy1 + dy2) // 2
         cv2.line(frame, (mx-4, my), (mx+4, my), COLOR_RED, 1)
         cv2.line(frame, (mx, my-4), (mx, my+4), COLOR_RED, 1)
+        if box is not None:
+            # Прицел внутри увеличенного участка — видно ошибку наведения.
+            px = int(dx1 + (CENTER_X - sx1) * scale)
+            py = int(dy1 + (CENTER_Y - sy1) * scale)
+            if dx1 <= px < dx2 and dy1 <= py < dy2:
+                cv2.line(frame, (px-6, py), (px+6, py), COLOR_WHITE, 1)
+                cv2.line(frame, (px, py-6), (px, py+6), COLOR_WHITE, 1)
 
 
 def draw_overlay_on_frame(frame):
@@ -2451,7 +2509,7 @@ def draw_overlay_on_frame(frame):
     if vis and box is not None:
         draw_corners(frame, box, COLOR_WHITE, 2)
     if MAG_ENABLED and ((not MAG_ONLY_WHEN_AUX) or aux_for_mag):
-        draw_magnifier(frame)
+        draw_magnifier(frame, box if vis else None)
 
 # =========================================================
 # 10. TRACKING CORE (без изменений)
