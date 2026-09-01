@@ -98,6 +98,51 @@ def run(t, frames):
     return out
 
 
+
+def motion_mask(frames):
+    """Где в записи вообще что-то движется.
+
+    Камера на записях со стенда НЕПОДВИЖНА, значит движется только рука с
+    целью. Это даёт мерило, не зависящее ни от чьего мнения: если рамка стоит
+    на пикселях, которые за всю запись НИ РАЗУ не шевельнулись, — она на фоне,
+    а не на цели. Именно это оператор и называет 'сорвался на стеллаж'.
+
+    Берётся медиана по времени как образ неподвижной сцены, и каждый кадр
+    сравнивается с ней.
+    """
+    step = max(1, len(frames) // 60)
+    bg = np.median(frames[::step].astype(np.float32), axis=0)
+    masks = np.zeros(frames.shape, np.uint8)
+    for i, f in enumerate(frames):
+        d = np.abs(f.astype(np.float32) - bg)
+        masks[i] = (d > 18).astype(np.uint8)
+    # чуть расширим: край цели тоже её часть
+    k = np.ones((5, 5), np.uint8)
+    for i in range(len(masks)):
+        masks[i] = cv2.dilate(masks[i], k)
+    return masks
+
+
+def on_background(out, masks):
+    """Доля кадров, когда рамка стоит на неподвижном фоне."""
+    bad = 0
+    total = 0
+    for i, cx, cy, _w, _s in out:
+        if cx is None or i >= len(masks):
+            continue
+        total += 1
+        y = int(round(cy))
+        x = int(round(cx))
+        y = max(0, min(masks.shape[1] - 1, y))
+        x = max(0, min(masks.shape[2] - 1, x))
+        # смотрим не пиксель, а его окрестность: рамка может чуть не попасть
+        y0, y1 = max(0, y - 3), min(masks.shape[1], y + 4)
+        x0, x1 = max(0, x - 3), min(masks.shape[2], x + 4)
+        if masks[i, y0:y1, x0:x1].sum() == 0:
+            bad += 1
+    return (100.0 * bad / total) if total else float("nan"), total
+
+
 def compare(out, rows, scale):
     ok = [r for r in out if r[1] is not None]
     if not ok:
@@ -142,6 +187,8 @@ def main():
     print()
     out = run(t, frames)
     compare(out, rows, w / 640.0)
+    pct, total = on_background(out, motion_mask(frames))
+    print("  РАМКА НА НЕПОДВИЖНОМ ФОНЕ: %.1f%% кадров" % pct)
 
     if a.strip:
         n = len(frames)
