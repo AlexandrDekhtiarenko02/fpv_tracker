@@ -26,6 +26,7 @@ def main():
     ap.add_argument("--set", action="append", default=[],
                     help="ИМЯ=значение — подменить настройку перед прогоном")
     ap.add_argument("--dir", default=REC)
+    ap.add_argument("--only", help="брать только записи, чьё имя содержит это")
     a = ap.parse_args()
 
     t = offline.load_tracker()
@@ -40,6 +41,9 @@ def main():
 
     names = sorted(f[:-len(".meta.txt")] for f in os.listdir(a.dir)
                    if f.endswith(".meta.txt"))
+    if a.only:
+        pats = a.only.split(",")
+        names = [n for n in names if any(p in n for p in pats)]
     print("%-18s %7s %7s %9s %10s" % ("запись", "кадров", "совпад", "коробка", "НА ФОНЕ"))
     print("-" * 56)
     tot_bad = tot_n = 0
