@@ -8,10 +8,15 @@
 должна была расти.
 """
 import io
+import os
 import numpy as np
 import cv2
 
-src = io.open("/Users/aleksandrdehtarenko/Desktop/fpv_tracker/tracker.py",
+# Путь берём от самого файла теста: жёсткий путь к моей машине делал
+# тесты незапускаемыми на малине — а именно там их и нужно прогонять
+# после git pull, чтобы убедиться, что приехал рабочий код.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+src = io.open(os.path.join(_ROOT, "tracker.py"),
               encoding="utf-8").read()
 
 
