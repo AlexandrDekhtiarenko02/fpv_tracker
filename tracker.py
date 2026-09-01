@@ -631,6 +631,13 @@ SEARCH_MARGIN_VEL_REF = 12.0 * TRACK_SCALE         # flow-motion (px/кадр) �
 TEMPLATE_STARVED_STD = 10.0   # ниже этого эталон считается безликим
 TEMPLATE_STARVED_GROW = 1.30  # во столько раз растим коробку за одну проверку
 SIZE_BY_SCALE_ENABLED = True
+# Доля измеренного изменения масштаба, применяемая за одну проверку. Была
+# заодно с SIZE_ADAPT_ALPHA = 0.45 — слишком резко для величины, которая
+# ПЕРЕМНОЖАЕТСЯ, а не складывается.
+SIZE_SCALE_ALPHA = 0.30
+# Примерку масштабов считаем на уменьшенной вдвое копии. Масштаб — величина
+# грубая, полное разрешение для неё не нужно, а стоит она вчетверо дешевле.
+SIZE_SCALE_DOWNSAMPLE = 2
 SIZE_SCALE_STEP = 1.18        # во сколько раз примеряем крупнее и мельче
 SIZE_SCALE_MIN_LEAD = 0.012   # насколько сосед должен обойти текущий масштаб
 SIZE_ADAPT_ENABLED = True
@@ -1596,6 +1603,7 @@ tmpl_h = None
 template_gray = None
 # Эталон, снятый в момент захвата: не обновляется и не размывается.
 template_base = None
+template_scale_acc = 1.0
 # Плоскости цветности текущего кадра и цветовая подпись цели.
 chroma_u = None
 chroma_v = None
@@ -2623,7 +2631,8 @@ def measure_scale_change(gray, cx, cy):
     if template_gray is None or template_gray.size == 0:
         return None
     try:
-        th, tw = template_gray.shape[:2]
+        tmpl_src = template_gray
+        th, tw = tmpl_src.shape[:2]
         # Область должна вмещать самый крупный из примеряемых эталонов.
         big = int(max(tw, th) * SIZE_SCALE_STEP)
         margin = int(SEARCH_MARGIN_MIN)
@@ -2641,10 +2650,11 @@ def measure_scale_change(gray, cx, cy):
                 continue
             if w_ >= search.shape[1] or h_ >= search.shape[0]:
                 continue
-            tm = (template_gray if s_ == 1.0 else
-                  cv2.resize(template_gray, (w_, h_),
-                             interpolation=cv2.INTER_AREA if s_ < 1.0
-                             else cv2.INTER_LINEAR))
+            # ОДИНАКОВАЯ интерполяция для обеих сторон: разная давала бы
+            # перекос сама по себе, независимо от того, что в кадре.
+            tm = (tmpl_src if s_ == 1.0 else
+                  cv2.resize(tmpl_src, (w_, h_),
+                             interpolation=cv2.INTER_LINEAR))
             res = cv2.matchTemplate(search, tm, cv2.TM_CCOEFF_NORMED)
             v = float(res.max()) if res.size else -1.0
             if s_ == 1.0:
@@ -3785,6 +3795,7 @@ def process_locked_tracker(gray):
     global fps_t0, fps_frames, fps_current
     global prev_aux_on, acq_wait_left, lock_sequence
     global auto_reacq_attempts
+    global template_scale_acc
 
     frame_index += 1
 
@@ -3894,6 +3905,7 @@ def process_locked_tracker(gray):
             lock_h = float(lh)
             template_gray = build_template(gray, lock_cx, lock_cy, lock_w, lock_h)
             template_base = template_gray.copy()
+            template_scale_acc = 1.0
             # Один раз на захват решаем, помогает ли цвет. Если цель и её
             # окружение одного цвета — цвет не включаем, поведение прежнее.
             if COLOR_GUARD_ENABLED:
@@ -4103,12 +4115,34 @@ def process_locked_tracker(gray):
                     _match_dbg["size_skip"] = 5     # масштаб не изменился
                 else:
                     _match_dbg["size_skip"] = 0
-                    # Двигаем не к измеренному размеру, а НА измеренный
-                    # множитель: масштаб — величина относительная, и
-                    # накопление идёт само собой, шаг за шагом.
-                    grow = 1.0 + (k_scale - 1.0) * SIZE_ADAPT_ALPHA
+                    grow = 1.0 + (k_scale - 1.0) * SIZE_SCALE_ALPHA
                     lock_w = clamp(lock_w * grow, LOCK_MIN_W, LOCK_MAX_W)
                     lock_h = clamp(lock_h * grow, LOCK_MIN_H, LOCK_MAX_H)
+                    # ЗАМКНУТЬ ОБРАТНУЮ СВЯЗЬ. Без этого коробка росла, а
+                    # эталон — нет, и примерка каждый раз заново видела ту же
+                    # разницу: 1315 кадров подряд она говорила «крупнее» при
+                    # 60 «мельче», и коробка уезжала в предел сама по себе,
+                    # даже когда оператор остановился.
+                    #
+                    # Эталон пересчитывается ИЗ ИСХОДНОГО, снятого при
+                    # захвате, по накопленному множителю. Именно из исходного,
+                    # а не из текущего: каждый cv2.resize размывает, и
+                    # пересчёт по цепочке уже губил эталон — резкость падала
+                    # в двести раз. Здесь интерполяция всегда ОДНА, от
+                    # оригинала к нужному масштабу.
+                    if template_base is not None:
+                        template_scale_acc = clamp(
+                            template_scale_acc * grow, 0.25, 6.0)
+                        bh, bw = template_base.shape[:2]
+                        nw = int(round(clamp(bw * template_scale_acc,
+                                             TEMPLATE_MIN, TEMPLATE_MAX)))
+                        nh = int(round(clamp(bh * template_scale_acc,
+                                             TEMPLATE_MIN, TEMPLATE_MAX)))
+                        if (nw, nh) != (template_gray.shape[1],
+                                        template_gray.shape[0]):
+                            template_gray = cv2.resize(
+                                template_base, (nw, nh),
+                                interpolation=cv2.INTER_LINEAR)
         elif SIZE_ADAPT_ENABLED and frame_index % SIZE_ADAPT_EVERY_FRAMES == 0:
             # Область поиска растягиваем под ТЕКУЩИЙ размер коробки, иначе
             # крупная цель заведомо в неё не помещается и измерить её нельзя.
