@@ -25,7 +25,7 @@ ns = {"np": np, "cv2": cv2}
 ns["HIRES_TRACKING"] = eval(
     re.search(r"^HIRES_TRACKING = (.+?)(?:\s+#.*)?$", src, re.M).group(1))
 for name in ("TRACK_SCALE", "SIZE_SCALE_STEP", "SIZE_SCALE_MIN_LEAD",
-             "SIZE_SCALE_ALPHA", "SEARCH_MARGIN_MIN", "TEMPLATE_MIN",
+             "SIZE_SCALE_ALPHA", "SIZE_SCALE_DOWNSAMPLE", "SIZE_SCALE_DS_MIN", "SEARCH_MARGIN_MIN", "TEMPLATE_MIN",
              "TEMPLATE_MAX", "LOCK_MIN_W", "LOCK_MAX_W"):
     ns[name] = eval(
         re.search(r"^%s = (.+?)(?:\s+#.*)?$" % name, src, re.M).group(1), dict(ns))

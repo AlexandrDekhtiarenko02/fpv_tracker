@@ -638,6 +638,9 @@ SIZE_SCALE_ALPHA = 0.30
 # Примерку масштабов считаем на уменьшенной вдвое копии. Масштаб — величина
 # грубая, полное разрешение для неё не нужно, а стоит она вчетверо дешевле.
 SIZE_SCALE_DOWNSAMPLE = 2
+# С какого размера эталона включать уменьшение. Мелкий эталон уменьшать
+# нельзя: он теряет детали и масштаб перестаёт различаться.
+SIZE_SCALE_DS_MIN = 64
 SIZE_SCALE_STEP = 1.18        # во сколько раз примеряем крупнее и мельче
 SIZE_SCALE_MIN_LEAD = 0.012   # насколько сосед должен обойти текущий масштаб
 SIZE_ADAPT_ENABLED = True
@@ -663,7 +666,12 @@ SIZE_ADAPT_ENABLED = True
 #
 # Порог score НЕ трогаю: это отдельный множитель, и мешать две правки в один
 # замер нельзя. Сначала посмотрим, что скажет новая диагностика size_why.
-SIZE_ADAPT_EVERY_FRAMES = 4          # период проверки
+# Период проверки размера. Был 4, то есть шесть раз в секунду. По расчёту
+# роста это избыточно: при заходе длиной 20-30 с цель растёт на 3-5% в
+# СЕКУНДУ, а различаем мы шаг 18%. Чаще двух раз в секунду спрашивать нечего,
+# зато цена платится каждый раз. Замерено: при крупном эталоне примерка
+# съедала 9.3 мс на кадр.
+SIZE_ADAPT_EVERY_FRAMES = 8          # период проверки
 SIZE_ADAPT_MIN_SCORE = 0.55          # минимальный score для доверия размеру
 SIZE_ADAPT_ALPHA = 0.45              # доля нового размера в старом (per update)
 SIZE_ADAPT_MIN_W = 5                 # нижний предел осмысленного размера
@@ -2631,13 +2639,32 @@ def measure_scale_change(gray, cx, cy):
     if template_gray is None or template_gray.size == 0:
         return None
     try:
-        tmpl_src = template_gray
+        # Считаем на уменьшенной копии. Масштаб — величина грубая, полное
+        # разрешение для неё не нужно, а стоит она пропорционально ПЛОЩАДИ:
+        # уменьшение вдвое даёт вчетверо дешевле. Замерено на малине:
+        # эталон 110 стоил 9.3 мс на кадр, на половинном разрешении — 2.4.
+        ds = max(1, int(SIZE_SCALE_DOWNSAMPLE))
+        # Уменьшаем ТОЛЬКО крупный эталон. Мелкий и так дёшев, а на
+        # половинном разрешении он теряет детали и масштаб перестаёт
+        # различаться вовсе — проверено, коробка переставала расти.
+        if ds > 1 and min(template_gray.shape[:2]) >= SIZE_SCALE_DS_MIN:
+            tmpl_src = cv2.resize(
+                template_gray,
+                (template_gray.shape[1] // ds, template_gray.shape[0] // ds),
+                interpolation=cv2.INTER_AREA)
+        else:
+            ds = 1
+            tmpl_src = template_gray
         th, tw = tmpl_src.shape[:2]
         # Область должна вмещать самый крупный из примеряемых эталонов.
         big = int(max(tw, th) * SIZE_SCALE_STEP)
         margin = int(SEARCH_MARGIN_MIN)
-        sw = big + margin * 2
+        sw = (big + margin * 2) * ds
         search, _rect = crop_center(gray, cx, cy, sw, sw)
+        if ds > 1:
+            search = cv2.resize(
+                search, (search.shape[1] // ds, search.shape[0] // ds),
+                interpolation=cv2.INTER_AREA)
         if search.shape[0] < big + 2 or search.shape[1] < big + 2:
             return None
 
