@@ -82,6 +82,79 @@ def run_template(frames, rows, margin=24):
     return track
 
 
+
+def run_mosse(frames, rows, pad=2.0):
+    """Корреляционный фильтр (MOSSE): обучается отличать цель ОТ ОКРУЖЕНИЯ.
+
+    Отличие от совпадения с эталоном принципиальное. Эталон отвечает на вопрос
+    «где похоже на сохранённую картинку», и фон в этом вопросе не участвует
+    вовсе — оттого матч и садится на фон, когда фон похож. Фильтр обучается на
+    отклике: в центре цели он обязан дать пик, вокруг — ноль. То есть фон
+    входит в обучение как то, что надо ПОДАВИТЬ.
+    """
+    cx = as_float(rows[0], "box_cx")
+    cy = as_float(rows[0], "box_cy")
+    bw = as_float(rows[0], "box_w") or 24.0
+    if cx is None:
+        return None
+    sx = frames.shape[2] / 640.0
+    cx, cy, bw = cx * sx, cy * sx, bw * sx
+    size = int(max(16, min(96, bw * pad)))
+    size += size % 2
+
+    win = (np.hanning(size)[:, None] * np.hanning(size)[None, :]).astype(np.float32)
+    g = np.zeros((size, size), np.float32)
+    g[size // 2, size // 2] = 1.0
+    g = cv2.GaussianBlur(g, (0, 0), 2.0)
+    g /= g.max()
+    G = np.fft.fft2(g)
+
+    def crop(f, cx, cy):
+        x = int(round(cx - size / 2.0))
+        y = int(round(cy - size / 2.0))
+        x = max(0, min(f.shape[1] - size, x))
+        y = max(0, min(f.shape[0] - size, y))
+        return f[y:y + size, x:x + size], x, y
+
+    def prep(p_):
+        v = np.log(p_.astype(np.float32) + 1.0)
+        v = (v - v.mean()) / (v.std() + 1e-5)
+        return v * win
+
+    patch, _x, _y = crop(frames[0], cx, cy)
+    F = np.fft.fft2(prep(patch))
+    A = G * np.conj(F)
+    B = F * np.conj(F) + 1e-3
+
+    track = []
+    for f in frames:
+        patch, x, y = crop(f, cx, cy)
+        F = np.fft.fft2(prep(patch))
+        resp = np.real(np.fft.ifft2((A / B) * F))
+        dy, dx = np.unravel_index(resp.argmax(), resp.shape)
+        if dy > size // 2:
+            dy -= size
+        if dx > size // 2:
+            dx -= size
+        cx = x + size / 2.0 + dx
+        cy = y + size / 2.0 + dy
+        cx = max(size / 2.0, min(f.shape[1] - size / 2.0, cx))
+        cy = max(size / 2.0, min(f.shape[0] - size / 2.0, cy))
+        # Уверенность: насколько пик ОДИНОК. Это и есть та величина, которой
+        # нам не хватало у матча: она падает, когда фильтр «поплыл».
+        peak = resp.max()
+        m = resp.copy()
+        yy, xx = np.unravel_index(resp.argmax(), resp.shape)
+        m[max(0, yy - 5):yy + 6, max(0, xx - 5):xx + 6] = resp.min()
+        psr = (peak - m.mean()) / (m.std() + 1e-6)
+        track.append((cx, cy, psr))
+        patch, x, y = crop(f, cx, cy)
+        F = np.fft.fft2(prep(patch))
+        A = 0.875 * A + 0.125 * (G * np.conj(F))
+        B = 0.875 * B + 0.125 * (F * np.conj(F) + 1e-3)
+    return track
+
+
 def summarize(name, track, rows, scale):
     if not track:
         print("  %-22s не отработал" % name)
@@ -100,10 +173,37 @@ def summarize(name, track, rows, scale):
              (sum(drift) / len(drift)) if drift else float("nan")))
 
 
+
+def make_strip(frames, rows, tracks, out, scale, count=5):
+    """Полоса из нескольких кадров со всеми рамками — смотреть глазами."""
+    n = len(frames)
+    idx = [int(i * (n - 1) / (count - 1)) for i in range(count)]
+    colors = {"борт": (0, 255, 0), "эталон": (0, 200, 255), "фильтр": (255, 120, 0)}
+    tiles = []
+    for k, i in enumerate(idx):
+        vis = cv2.cvtColor(frames[i], cv2.COLOR_GRAY2BGR)
+        r = rows[i] if i < len(rows) else None
+        if r and r.get("box_cx"):
+            bx, by = as_float(r, "box_cx") * scale, as_float(r, "box_cy") * scale
+            bw = as_float(r, "box_w") * scale
+            cv2.rectangle(vis, (int(bx - bw / 2), int(by - bw / 2)),
+                          (int(bx + bw / 2), int(by + bw / 2)), colors["борт"], 1)
+        for name, tr in tracks.items():
+            if tr and i < len(tr):
+                cx, cy, _v = tr[i]
+                cv2.drawMarker(vis, (int(cx), int(cy)), colors[name],
+                               cv2.MARKER_TILTED_CROSS, 12, 1)
+        cv2.putText(vis, str(i), (4, 13), cv2.FONT_HERSHEY_PLAIN, 0.9,
+                    (255, 255, 255), 1)
+        tiles.append(vis)
+    cv2.imwrite(out, np.hstack(tiles))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("prefix", help="путь к записи без расширения")
     ap.add_argument("--save-frames", help="выгрузить кадры в png в этот каталог")
+    ap.add_argument("--strip", help="сохранить полосу кадров с рамками сюда")
     a = ap.parse_args()
 
     prefix = a.prefix
@@ -124,7 +224,13 @@ def main():
 
     scale = w / 640.0
     print("\nчто получилось на ЭТИХ кадрах:")
-    summarize("совпадение с эталоном", run_template(frames, rows), rows, scale)
+    tr_t = run_template(frames, rows)
+    tr_m = run_mosse(frames, rows)
+    summarize("совпадение с эталоном", tr_t, rows, scale)
+    summarize("корреляционный фильтр", tr_m, rows, scale)
+    if a.strip:
+        make_strip(frames, rows, {"эталон": tr_t, "фильтр": tr_m}, a.strip, scale)
+        print("\nполоса кадров: %s" % a.strip)
     print("\nСюда же добавляются другие варианты: пишется функция вида")
     print("run_<название>(frames, rows) -> [(cx, cy, уверенность), ...]")
     print("и строка summarize(...). Кадры одни и те же, значит сравнение честное.")
