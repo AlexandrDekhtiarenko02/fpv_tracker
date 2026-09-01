@@ -2586,7 +2586,8 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
     """
     global prev_box_size_px, box_growth_smoothed
     out = {"size_px": None, "growth": None, "tau_s": None,
-           "range_m": None, "depression_deg": None, "alt_min_m": None}
+           "range_m": None, "depression_deg": None, "alt_min_m": None,
+           "alt_reason": None}
 
     # --- время до контакта ---
     # Берём геометрическое среднее сторон: устойчивее к тому, что коробка
@@ -2611,7 +2612,20 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
         alt_cm = app_state.get("alt_cm")
         alt_ts = app_state.get("alt_ts", 0.0)
         fc_pitch = app_state.get("fc_pitch_deg")
+        armed = app_state.get("armed")
     if alt_cm is None or fc_pitch is None or (now_mono - alt_ts) > 1.0:
+        return out
+    # БЕЗ АРМА ВЫСОТЫ НЕТ ВОВСЕ. Опросник tools/baro_probe.py показал прямо:
+    # без арма вариометр РОВНО ноль во всех отсчётах, а высота стоит на
+    # -44/-52 см и не двигается. Оценщик высоты в Betaflight попросту не
+    # работает до арма. Под армом он оживает: размах 199 см, вариометр до
+    # 1.5 м/с.
+    #
+    # Раньше это спасало случайно: разброс замороженных значений мал, планка
+    # годности упиралась в нижний предел 0.5 м, и отрицательная высота её не
+    # проходила. Полагаться на такое совпадение нельзя — проверяем прямо.
+    if not armed:
+        out["alt_reason"] = "no arm"
         return out
 
     # Угол цели относительно оси камеры: пиксели -> градусы.
@@ -3158,6 +3172,7 @@ def update_control_from_target():
         # насколько это расходится, прежде чем менять закон управления.
         "dy_alt_decoupled": dy_alt + pitch_comp_px,
         "alt_min_m": closure["alt_min_m"],
+        "alt_reason": closure["alt_reason"],
     }
 
 # =========================================================
@@ -3260,7 +3275,11 @@ def _range_readout_lines():
             alt_ts = app_state.get("alt_ts", 0.0)
             fc_pitch = app_state.get("fc_pitch_deg")
         dep = c.get("depression_deg")
-        if alt_cm is None:
+        if c.get("alt_reason") == "no arm":
+            # Самая частая причина на стенде, и её надо называть прямо:
+            # без арма высотомер в Betaflight не считает вовсе.
+            why = "R no arm"
+        elif alt_cm is None:
             why = "R no alt"
         elif fc_pitch is None:
             why = "R no att"
