@@ -114,6 +114,7 @@ COLOR_GREEN = (0, 255, 0, 0)
 COLOR_RED = (0, 0, 255, 0)
 COLOR_WHITE = (255, 255, 255, 0)
 COLOR_YELLOW = (0, 255, 255, 0)
+COLOR_BLACK = (0, 0, 0, 0)
 COLOR_CYAN = (255, 255, 0, 0)
 CROSS_COLOR = COLOR_WHITE
 
@@ -586,6 +587,9 @@ DY_INTEGRAL_DECAY = 0.985
 #       дальность = высота / tg(угол снижения)
 #    Точность растёт при сближении, то есть там, где она и нужна.
 RANGE_ESTIMATE_ENABLED = True
+# Показывать дальность и время до контакта текстом у рамки цели. Только
+# показ: в управление эти величины по-прежнему не подаются.
+RANGE_READOUT_ENABLED = True
 # Вертикальный угол обзора IMX219 в этом режиме, градусы.
 CAMERA_VFOV_DEG = 41.4
 # Наклон камеры на раме, градусы (вверх положительный). 0 = смотрит вперёд.
@@ -3060,6 +3064,90 @@ def draw_magnifier(frame, box=None):
                 cv2.line(frame, (px, py-6), (px, py+6), COLOR_WHITE, 1)
 
 
+def _range_readout_lines():
+    """Строки телеметрии сближения для показа у рамки.
+
+    Подписи ЛАТИНИЦЕЙ намеренно: шрифты OpenCV (FONT_HERSHEY_*) кириллицы не
+    знают и рисуют вместо неё знаки вопроса — проверено, «Дальность»
+    получается как «??????????????????».
+
+    Когда величину измерить нельзя, показывается ПРИЧИНА, а не прочерк.
+    Разница между «далеко» и «нечем мерить» — именно то, ради чего эти
+    величины и считаются; замазать её одинаковым прочерком значит потерять
+    единственное, что здесь можно узнать.
+    """
+    c = _ctl_dbg
+    lines = []
+
+    rng = c.get("range_m")
+    if rng is not None:
+        lines.append(("R %.0fm" % rng, COLOR_GREEN))
+    else:
+        # Разбираем, чего именно не хватило: высоты, свежести высоты или угла.
+        with state_lock:
+            alt_cm = app_state.get("alt_cm")
+            alt_ts = app_state.get("alt_ts", 0.0)
+            fc_pitch = app_state.get("fc_pitch_deg")
+        dep = c.get("depression_deg")
+        if alt_cm is None:
+            why = "R no alt"
+        elif fc_pitch is None:
+            why = "R no att"
+        elif alt_ts and (time.monotonic() - alt_ts) > 1.0:
+            why = "R alt old"
+        elif alt_cm / 100.0 <= 0.3:
+            why = "R low %dcm" % int(alt_cm)
+        elif dep is None:
+            why = "R no ang"
+        else:
+            # Самый частый случай на стенде: смотрим почти горизонтально,
+            # и тангенс угла превращает любую ошибку в километры.
+            why = "R ang %.1f<%.0f" % (dep, RANGE_MIN_DEPRESSION_DEG)
+        lines.append((why, COLOR_YELLOW))
+
+    tau = c.get("tau_s")
+    if tau is not None:
+        lines.append(("T %.1fs" % tau, COLOR_GREEN))
+    else:
+        # Ноль здесь означал бы «мы в цели», поэтому пишем словом.
+        lines.append(("T no close", COLOR_YELLOW))
+
+    size = c.get("size_px")
+    growth = c.get("growth")
+    if size is not None:
+        g = "" if growth is None else " %+.1f%%" % (growth * 100.0)
+        lines.append(("sz %.0f%s" % (size, g), COLOR_WHITE))
+    return lines
+
+
+def draw_range_readout(frame, box):
+    """Телеметрия сближения текстом рядом с рамкой цели."""
+    if not RANGE_READOUT_ENABLED or box is None:
+        return
+    try:
+        lines = _range_readout_lines()
+        if not lines:
+            return
+        x1, y1, x2, y2 = box
+        # Справа от рамки; если там край кадра — слева.
+        w_est = 9 * max(len(t) for t, _ in lines)
+        x = int(x2) + 10
+        if x + w_est > frame.shape[1] - 4:
+            x = max(4, int(x1) - 10 - w_est)
+        y = int(clamp(y1 + 12, 14, frame.shape[0] - 14 * len(lines)))
+        for i, (text, color) in enumerate(lines):
+            yy = y + i * 14
+            # Обводка чёрным: без неё текст пропадает на светлом фоне.
+            # Сглаживание (LINE_AA) НЕ включаем — замерено, оно стоит 8.8 мс
+            # на малине против 0.6 мс без него, при бюджете кадра 38 мс.
+            cv2.putText(frame, text, (x, yy), cv2.FONT_HERSHEY_PLAIN,
+                        1.0, COLOR_BLACK, 2)
+            cv2.putText(frame, text, (x, yy), cv2.FONT_HERSHEY_PLAIN,
+                        1.0, color, 1)
+    except Exception:
+        pass
+
+
 def draw_overlay_on_frame(frame):
     draw_crosshair(frame)
     with state_lock:
@@ -3068,6 +3156,7 @@ def draw_overlay_on_frame(frame):
         aux_for_mag = aux4_state
     if vis and box is not None:
         draw_corners(frame, box, COLOR_WHITE, 2)
+        draw_range_readout(frame, box)
     if MAG_ENABLED and ((not MAG_ONLY_WHEN_AUX) or aux_for_mag):
         draw_magnifier(frame, box if vis else None)
 
