@@ -155,8 +155,14 @@ SIZE_ACQ_AGREE_TOL = 0.25
 # оператор вёл руку. Заодно любую сегодняшнюю правку можно проверить задним
 # числом.
 #
-# Пишется яркость 320x240 без сжатия — для сравнения алгоритмов нужны кадры
-# как есть, без следов кодека. Это 75 КБ на кадр, около 1.9 МБ в секунду.
+# Пишется ВЕСЬ буфер YUV420 без сжатия — яркость И цветность. Сначала писалась
+# одна яркость, и это оказалось изъяном прибора: оператор снял случай, где
+# оранжевая флешка на сером стенде по ЯРКОСТИ почти неразличима (контраст цели
+# 359 против 667 у соседнего пятна), а по ЦВЕТУ различалась бы легко. Проверить
+# цветовой отсев по такой записи было нечем — цветность в неё не попадала.
+#
+# Цена: 115 КБ на кадр вместо 75, около 2.9 МБ в секунду. Полтора раза дороже,
+# зато на записи можно проверять ВСЁ, что делает трекер, а не половину.
 RECORD_FRAMES = False          # включается вручную, когда нужен образец
 RECORD_DIR = "recordings"      # внутри каталога полётных логов
 RECORD_MAX_SECONDS = 25.0      # предел одной записи
@@ -4554,12 +4560,16 @@ class FrameRecorder:
             d = os.path.join(self.dir, RECORD_DIR)
             os.makedirs(d, exist_ok=True)
             stamp = time.strftime("%Y%m%d_%H%M%S")
-            self._path = os.path.join(d, stamp + ".gray")
+            self._path = os.path.join(d, stamp + ".yuv")
             self._index = open(os.path.join(d, stamp + ".index.csv"), "w")
             self._index.write("frame,t,state,box_cx,box_cy,box_w,box_h,score\n")
             self.shape = shape
             with open(os.path.join(d, stamp + ".meta.txt"), "w") as f:
-                f.write("width=%d\nheight=%d\ndtype=uint8\n" % (shape[1], shape[0]))
+                # Высота буфера в полтора раза больше кадра: под яркостью лежит
+                # цветность. Разборщику надо знать и то, и другое.
+                f.write("width=%d\nheight=%d\nbuffer_height=%d\n"
+                        "format=YUV420\ndtype=uint8\n"
+                        % (LORES_W, LORES_H, shape[0]))
             self._n = 0
             self._bytes = 0
             self._t0 = time.monotonic()
@@ -4567,8 +4577,8 @@ class FrameRecorder:
             self.active = True
             self._thread = threading.Thread(target=self._run, daemon=True)
             self._thread.start()
-            flight_log.event("ЗАПИСЬ КАДРОВ начата: %s (%dx%d)"
-                             % (os.path.basename(self._path), shape[1], shape[0]))
+            flight_log.event("ЗАПИСЬ КАДРОВ начата: %s (%dx%d, с цветом)"
+                             % (os.path.basename(self._path), LORES_W, LORES_H))
         except Exception as exc:
             self.active = False
             flight_log.event("ЗАПИСЬ КАДРОВ не началась: %s" % exc)
@@ -4657,13 +4667,15 @@ def camera_callback(request):
         if RECORD_FRAMES:
             if track_state == TRACK_STATE_TRACKED:
                 if not frame_recorder.active:
-                    frame_recorder.start(gray.shape)
+                    frame_recorder.start(yuv.shape)
                 with state_lock:
                     _b = target_box_main
                 _bx = ("%.1f,%.1f,%.1f,%.1f" % (
                     (_b[0] + _b[2]) / 2.0, (_b[1] + _b[3]) / 2.0,
                     _b[2] - _b[0], _b[3] - _b[1])) if _b else ",,,"
-                frame_recorder.add(gray, "%.3f,%s,%s,%.4f" % (
+                # Пишем ВЕСЬ буфер: яркость плюс цветность.
+                frame_recorder.add(yuv[:LORES_H * 3 // 2, :LORES_W],
+                                   "%.3f,%s,%s,%.4f" % (
                     time.monotonic() - _cb_t0 + _cb_t0, track_state, _bx,
                     last_match_score))
             elif frame_recorder.active:

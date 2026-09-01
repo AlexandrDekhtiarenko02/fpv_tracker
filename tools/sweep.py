@@ -49,8 +49,8 @@ def main():
     tot_bad = tot_n = 0
     grows = []
     for nm in names:
-        frames, rows, w, h = offline.load_recording(os.path.join(a.dir, nm))
-        out = offline.run(t, frames)
+        frames, rows, w, h, chroma = offline.load_recording(os.path.join(a.dir, nm))
+        out = offline.run(t, frames, chroma)
         ok = [r for r in out if r[1] is not None]
         if not ok:
             print("%-18s  цель не удержана" % nm)

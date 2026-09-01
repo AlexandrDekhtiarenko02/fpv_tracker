@@ -60,8 +60,8 @@ def draw(frame, i, res, on_bg, total):
 
 def render_one(t, prefix, outdir, save_png=False):
     name = os.path.basename(prefix)
-    frames, rows, w, h = offline.load_recording(prefix)
-    out = offline.run(t, frames)
+    frames, rows, w, h, chroma = offline.load_recording(prefix)
+    out = offline.run(t, frames, chroma)
     masks = offline.motion_mask(frames)
 
     d = os.path.join(outdir, name)

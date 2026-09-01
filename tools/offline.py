@@ -61,6 +61,12 @@ def load_tracker():
 
 
 def load_recording(prefix):
+    """Прочитать запись. Понимает и старые (одна яркость), и новые (с цветом).
+
+    Новые записи содержат весь буфер YUV420: под яркостью лежит цветность.
+    Без неё нельзя проверить цветовой отсев — а он нужен именно там, где по
+    яркости цель неразличима: оранжевый предмет на сером стенде.
+    """
     meta = {}
     with open(prefix + ".meta.txt", encoding="utf-8") as f:
         for line in f:
@@ -68,17 +74,21 @@ def load_recording(prefix):
                 k, v = line.strip().split("=", 1)
                 meta[k] = v
     w, h = int(meta["width"]), int(meta["height"])
-    raw = np.fromfile(prefix + ".gray", dtype=np.uint8)
-    n = raw.size // (w * h)
-    frames = raw[:n * w * h].reshape(n, h, w)
+    bh = int(meta.get("buffer_height", h))
+    path = prefix + (".yuv" if os.path.exists(prefix + ".yuv") else ".gray")
+    raw = np.fromfile(path, dtype=np.uint8)
+    n = raw.size // (w * bh)
+    buf = raw[:n * w * bh].reshape(n, bh, w)
+    frames = buf[:, :h, :]                     # яркость
+    chroma = buf if bh > h else None           # весь буфер, если цвет есть
     rows = []
     with open(prefix + ".index.csv", encoding="utf-8") as f:
         for r in csv.DictReader(f):
             rows.append(r)
-    return frames, rows, w, h
+    return frames, rows, w, h, chroma
 
 
-def run(t, frames):
+def run(t, frames, chroma=None):
     """Прогон ровно того контура, что крутится на борту."""
     t.reset_tracking(to_acq=True)
     with t.state_lock:
@@ -88,6 +98,12 @@ def run(t, frames):
     t.track_state = t.TRACK_STATE_ACQ
     out = []
     for i, f in enumerate(frames):
+        if chroma is not None:
+            # То же, что делает камерный поток на борту: цветность кладётся
+            # в глобалы до вызова слежения.
+            cu, cv_ = t.extract_chroma(np.ascontiguousarray(chroma[i]))
+            if cu is not None:
+                t.chroma_u, t.chroma_v = cu, cv_
         t.process_locked_tracker(np.ascontiguousarray(f))
         box = t.target_box_main
         if t.track_state == t.TRACK_STATE_TRACKED and box:
@@ -177,15 +193,16 @@ def main():
             print("нет файла", a.prefix + ext)
             return 1
     t = load_tracker()
-    frames, rows, w, h = load_recording(a.prefix)
+    frames, rows, w, h, chroma = load_recording(a.prefix)
     if (w, h) != (t.LORES_W, t.LORES_H):
         print("запись %dx%d, а трекер настроен на %dx%d — не сравнить"
               % (w, h, t.LORES_W, t.LORES_H))
         return 1
-    print("запись: %d кадров %dx%d" % (len(frames), w, h))
+    print("запись: %d кадров %dx%d%s" % (len(frames), w, h,
+                                        ", с цветом" if chroma is not None else ", только яркость"))
     print("код: %s" % t._code_version())
     print()
-    out = run(t, frames)
+    out = run(t, frames, chroma)
     compare(out, rows, w / 640.0)
     pct, total = on_background(out, motion_mask(frames))
     print("  РАМКА НА НЕПОДВИЖНОМ ФОНЕ: %.1f%% кадров" % pct)
