@@ -6,8 +6,13 @@
 ведение оптическому потоку, а в обычной ситуации ничего не менять.
 """
 import io
+import os
 
-src = io.open("/Users/aleksandrdehtarenko/Desktop/fpv_tracker/tracker.py",
+# Путь берём от самого файла теста: жёсткий путь к моей машине делал
+# тесты незапускаемыми на малине — а именно там их и нужно прогонять
+# после git pull, чтобы убедиться, что приехал рабочий код.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+src = io.open(os.path.join(_ROOT, "tracker.py"),
               encoding="utf-8").read()
 MATCH_WEIGHT = 0.22
 MATCH_WEIGHT_MIN = 0.02

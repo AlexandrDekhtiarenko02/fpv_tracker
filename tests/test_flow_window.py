@@ -1,5 +1,8 @@
-import io, numpy as np, cv2, math
-src = io.open("/Users/aleksandrdehtarenko/Desktop/fpv_tracker/tracker.py", encoding="utf-8").read()
+import io, os, numpy as np, cv2, math
+# Путь от самого файла теста: вшитый путь к моей машине делал тест
+# незапускаемым на малине, а прогонять его нужно как раз там.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+src = io.open(os.path.join(_ROOT, "tracker.py"), encoding="utf-8").read()
 ns = {"cv2": cv2, "np": np, "math": math, "FLOW_MIN_POINTS": 3,
       "FLOW_ERR_MAX": 20.0, "FLOW_MAX_STEP": 30.0, "FLOW_WINDOW_PAD": 72, "FLOW_WINDOW_ENABLED": True}
 exec("def flow_predict(" + src.split("def flow_predict(")[1].split("\ndef estimate_size_at_position")[0], ns)

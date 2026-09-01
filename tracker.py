@@ -132,6 +132,9 @@ ACQ_RADIUS_LORES = max(8, int(round(ACQ_RADIUS_MAIN * LORES_W / MAIN_W)))
 
 ACQ_LOCK_AT_CROSSHAIR_EXACTLY = True
 ACQ_SIZE_SEARCH_RADIUS = 12 * TRACK_SCALE
+# Предел растяжения области поиска размера под крупную цель. Больше — дороже
+# по процессору и выше риск слить цель с фоном в одну связную компоненту.
+SIZE_SEARCH_RADIUS_MAX = 40 * TRACK_SCALE
 
 ACQ_FORCE_CENTER_LOCK = True
 ACQ_DEFAULT_LOCK_W = 8 * TRACK_SCALE
@@ -178,6 +181,79 @@ TEMPLATE_MIN = 14
 TEMPLATE_MAX = 58 * TRACK_SCALE
 
 SEARCH_MARGIN = 24 * TRACK_SCALE         # было 28 — чуть тише search-окно, меньше шансов уцепиться за фоновый паттерн
+# --- ОТСЕВ ПО ДВИЖЕНИЮ ---
+# Когда цель того же цвета и яркости, что фактурный фон, сравнивать по виду
+# нечего — особенно если цель МЕЛКАЯ: маленький шаблон это просто «кусочек
+# текстуры», а кусочки текстуры похожи друг на друга. Наращивание качества
+# сравнения тут упирается в потолок: информации в шаблоне мало.
+#
+# Движение свободно от этого ограничения. Оно НЕ ЗАВИСИТ ОТ РАЗМЕРА ЦЕЛИ:
+# даже трёхпиксельная цель движется иначе фона, и этого достаточно.
+#
+# Как считается: по сетке точек в окне поиска берётся оптический поток.
+# Медиана по всем точкам — это движение ФОНА (он занимает большую часть
+# площади). Дальше каждая точка сравнивается с фоном: движется как фон —
+# штраф, движется иначе — не штрафуется.
+#
+# ТО ЖЕ ТРЕБОВАНИЕ, ЧТО И К ЦВЕТУ: не сделать хуже. Признак включается только
+# когда цель ДЕЙСТВИТЕЛЬНО движется иначе фона. Если она стоит (или дрон
+# летит на неподвижную наземную цель — тогда цель часть неподвижного мира),
+# признак информации не несёт и остаётся выключенным.
+MOTION_GUARD_ENABLED = True
+# Шаг сетки точек в окне поиска, пиксели. Мельче — точнее и дороже.
+# Шаг сетки для оценки движения ФОНА. Фон крупный, частая сетка ему не нужна,
+# а стоимость растёт как квадрат: шаг 8 обходился в 12 мс на борту, шаг 12 —
+# в 5 мс. Измерено, а не прикинуто.
+MOTION_GRID_STEP = 12 * TRACK_SCALE
+# Насколько цель должна двигаться иначе фона, чтобы признаку верить, px/кадр.
+MOTION_MIN_SEPARATION = 1.5 * TRACK_SCALE
+# Отклонение от движения фона, считающееся полным различием, px/кадр.
+MOTION_REF_DIST = 3.0 * TRACK_SCALE
+# Разность яркости, считающаяся полным откликом движения. Мелкая цель той же
+# фактуры даёт слабый отклик, поэтому масштаб небольшой.
+MOTION_DIFF_REF = 4.0
+# Вес штрафа за движение вместе с фоном.
+MOTION_PENALTY = 0.5
+
+# --- ОТСЕВ ПО ЦВЕТУ ---
+# Трекинг идёт по яркости, а поток с камеры — YUV420: плоскости цветности УЖЕ
+# лежат в том же буфере, сразу под яркостью. Мы их выбрасывали. Брать их
+# бесплатно — ни лишнего захвата, ни конвертации.
+#
+# Зачем: сползание на фон происходит, когда фоновое пятно похоже на цель ПО
+# УЗОРУ ЯРКОСТИ. Цвет — независимый признак, он отсекает такого кандидата,
+# даже если рисунок совпал.
+#
+# ГЛАВНОЕ ТРЕБОВАНИЕ — не сделать хуже. Обеспечивается тем, что цвет
+# включается НЕ ВСЕГДА, а только когда он реально различает цель и фон. При
+# захвате цветность цели сравнивается с цветностью её окружения; если они
+# близки (серая цель на сером фоне), цвет информации не несёт и остаётся
+# ВЫКЛЮЧЕННЫМ до конца этого захвата — поведение тогда в точности прежнее.
+COLOR_GUARD_ENABLED = True
+# Насколько цветность цели должна отличаться от окружения, чтобы цвету верить.
+# Единицы — сумма отклонений по U и V (каждая 0..255, серому отвечает 128).
+COLOR_MIN_SEPARATION = 12.0
+# Вес цветового штрафа.
+#
+# ЗАМЕРЕНО: при 0.25 цвет включался (различимость 14-64), но поведение не
+# менялось. Причина видна из чисел момента срыва: выбранный пик 0.54,
+# конкурент 0.78, разрыв 0.24. Максимальный штраф 0.25 лишь ЕДВА перекрывал
+# этот разрыв, да и то при полностью чужом цвете. То есть цвет физически не
+# мог переломить решение — он был слабее задачи.
+#
+# 0.6 даёт запас: конкурент чужого цвета проигрывает уверенно. Это безопасно
+# именно потому, что цвет включается только когда различает цель и фон, а
+# самой цели штраф почти не достаётся (её цвет совпадает с подписью).
+COLOR_PENALTY = 0.6
+# Отклонение цветности, считающееся ПОЛНЫМ несовпадением.
+# Было 40 — слишком много: фон, отличающийся на 16 единиц, получал лишь 40%
+# штрафа. Наблюдаемая различимость цель/фон 14-64, поэтому 20 означает, что
+# заметно другой цвет штрафуется в полную силу.
+COLOR_REF_DIST = 20.0
+# Минимальный размер цели в пикселях ЦВЕТНОСТИ: она вдвое грубее яркости, и у
+# мелкой цели цветных пикселей единицы — оценка становится ненадёжной.
+COLOR_MIN_TARGET_CHROMA_PX = 2
+
 MATCH_MIN_SCORE = 0.22
 # Доверие к матчу падает, если на карте откликов есть конкурент НЕ ХУЖЕ
 # выбранного. Замерено на борту в момент срыва:
@@ -684,7 +760,8 @@ _FLIGHT_LOG_COLUMNS = (
     "fc_roll,fc_pitch,fc_yaw,att_age_ms,"
     "m1,m2,m3,m4,rc_r,rc_p,rc_y,rc_t,dt_ms,cb_ms,armed,"
     "launch_target_deg,launch_reached,k,match_psr,match_second,search_margin,"
-    "match_flow_gap,"
+    "match_flow_gap,size_est,size_skip,motion_sep,motion_on,"
+    "color_on,color_pen,color_best,"
     "alt_cm,vario_cms,alt_age_ms,"
     "box_size_px,box_growth,tau_s,range_m,depression_deg,dy_alt_decoupled"
 )
@@ -1094,11 +1171,16 @@ def _code_version():
     except NameError:
         return "версия неизвестна (нет __file__)"
     here = os.path.dirname(me)
-    commit, dirty = "нет-git", ""
+    commit, dirty, branch = "нет-git", "", "?"
     try:
         commit = subprocess.check_output(
             ["git", "-C", here, "rev-parse", "--short", "HEAD"],
             stderr=subprocess.DEVNULL, timeout=5).decode().strip()
+        # Ветка в лог: по хешу её каждый раз приходилось искать вручную, а
+        # ветка — это и есть то, что оператор держит в голове во время прогона.
+        branch = subprocess.check_output(
+            ["git", "-C", here, "rev-parse", "--abbrev-ref", "HEAD"],
+            stderr=subprocess.DEVNULL, timeout=5).decode().strip() or "?"
         changed = subprocess.check_output(
             ["git", "-C", here, "status", "--porcelain", "--", __file__],
             stderr=subprocess.DEVNULL, timeout=5).decode().strip()
@@ -1111,7 +1193,8 @@ def _code_version():
             digest = hashlib.md5(f.read()).hexdigest()[:12]
     except Exception:
         pass
-    return "commit=%s%s md5=%s file=%s" % (commit, dirty, digest, me)
+    return "ветка=%s commit=%s%s md5=%s file=%s" % (
+        branch, commit, dirty, digest, me)
 
 
 def _fmt(v):
@@ -1298,6 +1381,19 @@ tmpl_h = None
 template_gray = None
 # Эталон, снятый в момент захвата: не обновляется и не размывается.
 template_base = None
+# Плоскости цветности текущего кадра и цветовая подпись цели.
+chroma_u = None
+chroma_v = None
+target_uv = None          # (U, V) цели, снятые при захвате
+color_active = False      # различает ли цвет цель и фон в этом захвате
+color_separation = 0.0
+chroma_fail_reason = ""   # почему цвет не сработал — для журнала
+chroma_debug = ""         # измеренные цвета цели и фона, для журнала
+# Движение фона и цели за последний кадр, для отсева по движению.
+motion_bg = None          # (dx, dy) фона
+motion_target = None      # (dx, dy) цели
+motion_active = False     # движется ли цель иначе фона
+motion_separation = 0.0
 template_std = 0.0
 prev_gray = None
 prev_pts = None
@@ -1747,13 +1843,33 @@ def flow_predict(prev_g, cur_g, pts, cx, cy):
         return False, cx, cy
 
 
-def estimate_size_at_position(gray, cx, cy):
+def estimate_size_at_position(gray, cx, cy, cur_w=None):
     """Оценка размера цели вокруг точки (cx, cy) по связной компоненте.
-    Возвращает (lw, lh) или (default_w, default_h) если ничего не нашли.
-    Используется и при первом локе (с центром = прицел), и при периодической
-    адаптации размера в TRACKED-фазе.
+
+    Возвращает (lw, lh) либо (None, None), если ИЗМЕРИТЬ НЕ УДАЛОСЬ.
+
+    Различие принципиальное. Раньше при неудаче возвращался размер по
+    умолчанию (8 px) — то есть САМОЕ МАЛЕНЬКОЕ значение. А неудача происходит
+    ровно тогда, когда цель КРУПНАЯ и не помещается в область поиска: связная
+    компонента получалась шире R*1.6 и отвергалась. Адаптация это значение
+    применяла, и коробка каждые 10 кадров возвращалась к минимуму. По логам
+    борта она стояла на 16 px (в координатах кадра) в 76%% кадров.
+
+    Следствие для крупного объекта: трекер вёл участок 8x8 его текстуры, а
+    такой участок неотличим от участка фактурного фона — отсюда и «на крупном
+    фактурном объекте фон перебивает».
+
+    Теперь «не смог измерить» и «размер равен минимуму» — разные ответы, и
+    вызывающая сторона сама решает, что делать.
+
+    cur_w — текущий размер коробки. Область поиска растягивается под него,
+    иначе крупная цель заведомо не помещается и измерить её невозможно.
     """
     R = ACQ_SIZE_SEARCH_RADIUS
+    if cur_w:
+        # Область должна вмещать цель с запасом, иначе компонента упрётся в
+        # её границы и будет отвергнута как «слишком большая».
+        R = int(max(R, min(SIZE_SEARCH_RADIUS_MAX, cur_w * 1.6)))
     cxi = int(round(cx))
     cyi = int(round(cy))
     x1 = max(0, cxi - R)
@@ -1762,7 +1878,7 @@ def estimate_size_at_position(gray, cx, cy):
     y2 = min(gray.shape[0], cyi + R + 1)
     roi = gray[y1:y2, x1:x2]
     if roi.size == 0:
-        return float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H)
+        return None, None
 
     roi_f = roi.astype(np.float32)
     med = float(np.median(roi_f))
@@ -1797,11 +1913,16 @@ def estimate_size_at_position(gray, cx, cy):
             break
 
     if label == 0 or label >= num_labels:
-        return float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H)
+        return None, None
 
     x, y, w, h, area = stats[label]
-    if area < 1 or w > R * 1.6 or h > R * 1.6:
-        return float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H)
+    if area < 1:
+        return None, None
+    # Компонента упёрлась в границы области — значит цель как минимум такая,
+    # но измерить её здесь нельзя. Отвечаем «не знаю», а НЕ минимальным
+    # размером: подмена этих смыслов и ужимала коробку на крупных целях.
+    if w > R * 1.6 or h > R * 1.6:
+        return None, None
 
     lw = clamp(max(float(w) * LOCK_PAD, LOCK_MIN_W), LOCK_MIN_W, LOCK_MAX_W)
     lh = clamp(max(float(h) * LOCK_PAD, LOCK_MIN_H), LOCK_MIN_H, LOCK_MAX_H)
@@ -1818,9 +1939,280 @@ def estimate_size_at_crosshair(gray):
 def estimate_initial_target(gray):
     if ACQ_LOCK_AT_CROSSHAIR_EXACTLY:
         lw, lh = estimate_size_at_crosshair(gray)
+        # При захвате «не измерили» означает «берём размер по умолчанию»:
+        # цель ещё неизвестна, и начать с чего-то надо.
+        if lw is None or lh is None:
+            lw, lh = float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H)
         return float(CENTER_X_LORES), float(CENTER_Y_LORES), float(lw), float(lh), True
     return (float(CENTER_X_LORES), float(CENTER_Y_LORES),
             float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H), True)
+
+
+def extract_chroma(yuv):
+    """Достать плоскости U и V из буфера YUV420.
+
+    Раскладка: сначала LORES_H строк яркости, затем по LORES_H/4 строк на U и
+    на V — каждая строка шириной LORES_W содержит две строки по LORES_W/2.
+    Цветность вдвое грубее яркости по обеим осям.
+    """
+    global chroma_fail_reason
+    try:
+        h, w = LORES_H, LORES_W
+        q = h // 4
+        # ВАЖНО: строки буфера могут быть ШИРЕ кадра (выравнивание, stride).
+        # На это прямо намекает то, что яркость берётся как [:H, :W], а не
+        # целиком. Раньше цветность бралась строками ЦЕЛИКОМ, и на выравненном
+        # буфере reshape падал, исключение проглатывалось — цвет молча не
+        # работал, различимость всегда выходила ровно 0.0.
+        u = yuv[h:h + q, :w].reshape(h // 2, w // 2)
+        v = yuv[h + q:h + 2 * q, :w].reshape(h // 2, w // 2)
+        chroma_fail_reason = ""
+        return u, v
+    except Exception as exc:
+        chroma_fail_reason = "разбор буфера: %s (форма %s)" % (
+            exc, getattr(yuv, "shape", "?"))
+        return None, None
+
+
+def measure_color_separation(cx, cy, box_w, box_h):
+    """Различает ли цвет цель и её окружение. Вызывается один раз при захвате.
+
+    Сравнивается средняя цветность ЦЕЛИ со средней цветностью кольца вокруг
+    неё. Если они близки — цвет информации не несёт (серое на сером), и его
+    использование только добавило бы шума в решение. Тогда отсев по цвету
+    остаётся выключенным до конца захвата, и поведение прежнее.
+
+    Возвращает (подпись_цели, различимость).
+    """
+    global chroma_fail_reason, chroma_debug
+    if chroma_u is None or chroma_v is None:
+        chroma_fail_reason = chroma_fail_reason or "цветность не прочитана"
+        return None, 0.0
+    ccx, ccy = int(cx) // 2, int(cy) // 2
+    rw, rh = max(2, int(box_w) // 4), max(2, int(box_h) // 4)
+    if rw < COLOR_MIN_TARGET_CHROMA_PX or rh < COLOR_MIN_TARGET_CHROMA_PX:
+        chroma_fail_reason = ("цель мала: %dx%d px, радиус в цветности %d при "
+                              "пороге %d" % (box_w, box_h, rw,
+                                             COLOR_MIN_TARGET_CHROMA_PX))
+        return None, 0.0
+    H, W = chroma_u.shape
+    def box_sum(arr, x0, y0, x1, y1):
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(W, x1), min(H, y1)
+        if x1 <= x0 or y1 <= y0:
+            return 0.0, 0
+        sub = arr[y0:y1, x0:x1]
+        return float(sub.sum()), int(sub.size)
+
+    def mean_box(arr, x0, y0, x1, y1):
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(W, x1), min(H, y1)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return float(arr[y0:y1, x0:x1].mean())
+    tu = mean_box(chroma_u, ccx - rw, ccy - rh, ccx + rw, ccy + rh)
+    tv = mean_box(chroma_v, ccx - rw, ccy - rh, ccx + rw, ccy + rh)
+
+    # ФОН берётся НАСТОЯЩИМ КОЛЬЦОМ — внешняя область МИНУС область цели.
+    #
+    # Раньше это был просто квадрат втрое шире, ВКЛЮЧАВШИЙ саму цель. Из-за
+    # этого он сравнивался частично сам с собой, а если объект крупнее
+    # коробки — целиком лежал на объекте, и различимость выходила около нуля.
+    # На борту оранжевый предмет на коричневом фоне давал 2.9-5.7, тогда как
+    # по цветовой геометрии эта пара обязана давать 50-108.
+    #
+    # Внешний радиус увеличен с 3 до 4: кольцо должно доставать до фона даже
+    # когда коробка занижает размер объекта.
+    K = 4
+    def ring_mean(arr):
+        outer_sum, outer_n = box_sum(arr, ccx - K * rw, ccy - K * rh,
+                                     ccx + K * rw, ccy + K * rh)
+        inner_sum, inner_n = box_sum(arr, ccx - rw, ccy - rh,
+                                     ccx + rw, ccy + rh)
+        n = outer_n - inner_n
+        if n <= 0:
+            return None
+        return (outer_sum - inner_sum) / float(n)
+
+    ou = ring_mean(chroma_u)
+    ov = ring_mean(chroma_v)
+    if None in (tu, tv, ou, ov):
+        chroma_fail_reason = "область за границей кадра"
+        return None, 0.0
+    chroma_fail_reason = ""
+    sep = abs(tu - ou) + abs(tv - ov)
+    # Значения в журнал: без них «различимость мала» неотличимо от «меряем не
+    # то», а на этом мы уже обожглись.
+    chroma_debug = "цель U=%.0f V=%.0f | фон U=%.0f V=%.0f" % (tu, tv, ou, ov)
+    return (tu, tv), sep
+
+
+def motion_penalty_map(prev_g, cur_g, sx1, sy1, sx2, sy2, tw, th, shape,
+                       tgt_dx, tgt_dy):
+    """Штраф кандидатам, которые движутся ВМЕСТЕ С ФОНОМ.
+
+    Метод: оценить движение фона, скомпенсировать его сдвигом предыдущего
+    кадра и взять разность с текущим. Всё, что двигалось иначе фона, даёт
+    остаточный отклик; фон гасится.
+
+    Почему не оптический поток по точкам. Он измеряет смещение по градиентам в
+    окне 15x15 и принципиально не справляется с МЕЛКОЙ целью: при смещении
+    цели на её собственный размер она уходит из окна целиком, и измерять
+    нечего. Проверено: цель 6 px, сместившаяся на 6 px, давала 1.0 вместо 6.0
+    при любом размере окна. А мелкая цель — ровно тот случай, ради которого
+    признак и нужен. Разность кадров этим не ограничена: для цели 10-16 px
+    отклик выше фонового в 40-50 раз.
+
+    Признак НЕ ЗАВИСИТ ОТ РАЗМЕРА ЦЕЛИ, и этим ценен: когда цель мельче
+    деталей фона, сравнивать по виду уже нечего, а движение различает.
+
+    Возвращает (карта_штрафа, движение_фона, различимость) либо
+    (None, None, 0.0), если посчитать нельзя.
+    """
+    if prev_g is None or cur_g is None:
+        return None, None, 0.0
+    try:
+        # --- 1. движение фона ---
+        # Считается потоком по редкой сетке: фон крупный и фактурный, для него
+        # поток надёжен. Медиана описывает именно фон — он занимает большую
+        # часть площади окна.
+        step = max(6, int(MOTION_GRID_STEP))
+        xs = np.arange(sx1 + step // 2, sx2 - 1, step, dtype=np.float32)
+        ys = np.arange(sy1 + step // 2, sy2 - 1, step, dtype=np.float32)
+        if len(xs) < 3 or len(ys) < 3:
+            return None, None, 0.0
+        gx, gy = np.meshgrid(xs, ys)
+        pts = np.stack([gx.ravel(), gy.ravel()], axis=1).reshape(-1, 1, 2)
+        # Поток считаем по ОКНУ, а не по всему кадру: пирамида строится по
+        # всей переданной картинке, и полный кадр обходится вчетверо дороже
+        # без всякой пользы — точки всё равно лежат в окне поиска.
+        # Запас вокруг окна для пирамиды потока. 72 давало окно почти во весь
+        # кадр — дорого и без пользы: движение фона оценивается и по меньшей
+        # области.
+        gpad = 40
+        gx1 = max(0, int(sx1) - gpad); gy1 = max(0, int(sy1) - gpad)
+        gx2 = min(cur_g.shape[1], int(sx2) + gpad)
+        gy2 = min(cur_g.shape[0], int(sy2) + gpad)
+        pw = pts.copy()
+        pw[:, 0, 0] -= gx1
+        pw[:, 0, 1] -= gy1
+        nxt, st, _ = cv2.calcOpticalFlowPyrLK(
+            prev_g[gy1:gy2, gx1:gx2], cur_g[gy1:gy2, gx1:gx2], pw, None,
+            # Одного уровня пирамиды достаточно: оценивается движение ФОНА,
+            # а оно между соседними кадрами невелико. Второй уровень удваивал
+            # цену ради запаса, который здесь не нужен.
+            winSize=(15, 15), maxLevel=1,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+        if nxt is not None:
+            nxt = nxt.copy()
+            nxt[:, 0, 0] += gx1
+            nxt[:, 0, 1] += gy1
+            pts = pw.copy()
+            pts[:, 0, 0] += gx1
+            pts[:, 0, 1] += gy1
+        if nxt is None or st is None:
+            return None, None, 0.0
+        ok = st.reshape(-1).astype(bool)
+        if ok.sum() < 6:
+            return None, None, 0.0
+        d = (nxt - pts).reshape(-1, 2)
+        bg = np.array([float(np.median(d[ok, 0])), float(np.median(d[ok, 1]))])
+
+        # Если цель движется почти как фон, признак ничего не различает.
+        # Так бывает, когда цель стоит — и так будет в реальном применении,
+        # где дрон летит на НЕПОДВИЖНУЮ наземную цель. Тогда молчим.
+        sep = float(math.hypot(tgt_dx - bg[0], tgt_dy - bg[1]))
+        if sep < MOTION_MIN_SEPARATION:
+            return None, bg, sep
+
+        # --- 2. компенсация движения фона и разность ---
+        pad = 24
+        wx1 = max(0, int(sx1) - pad)
+        wy1 = max(0, int(sy1) - pad)
+        wx2 = min(cur_g.shape[1], int(sx2) + pad)
+        wy2 = min(cur_g.shape[0], int(sy2) + pad)
+        if wx2 - wx1 < 8 or wy2 - wy1 < 8:
+            return None, bg, sep
+        # Считаем разность в ПОЛОВИННОМ разрешении. Мы всё равно усредняем её
+        # по площади цели, поэтому полное разрешение здесь пропадает впустую, а
+        # стоит вчетверо дороже.
+        pa = prev_g[wy1:wy2, wx1:wx2]
+        ca = cur_g[wy1:wy2, wx1:wx2]
+        hw, hh = (wx2 - wx1) // 2, (wy2 - wy1) // 2
+        if hw < 8 or hh < 8:
+            return None, bg, sep
+        pa = cv2.resize(pa, (hw, hh), interpolation=cv2.INTER_AREA)
+        ca = cv2.resize(ca, (hw, hh), interpolation=cv2.INTER_AREA)
+        M = np.float32([[1, 0, float(bg[0]) / 2.0], [0, 1, float(bg[1]) / 2.0]])
+        warped = cv2.warpAffine(pa, M, (hw, hh), flags=cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_REPLICATE)
+        diff = cv2.absdiff(ca, warped).astype(np.float32)
+        # Усредняем по площади цели: одиночный пиксель разности слишком шумен.
+        k = max(3, int(tw / max(TEMPLATE_SCALE, 1.0) / 2.0) | 1)
+        diff = cv2.blur(diff, (k, k))
+
+        # --- 3. штраф там, где отклика НЕТ (значит движется как фон) ---
+        # Нормировка УСТОЙЧИВАЯ, а не по максимуму. Максимум задаётся редким
+        # выбросом (край, блик), и деление на него топит слабый сигнал: у цели
+        # 6 px той же текстуры отклик около 0.6 при выбросах в десятки —
+        # различие есть, но после деления исчезает.
+        # Опорой берём медиану (это уровень фона), а масштабом — фиксированную
+        # величину в единицах яркости.
+        base = float(np.median(diff))
+        resp = np.clip((diff - base) / MOTION_DIFF_REF, 0.0, 1.0)
+        if float(resp.max()) < 0.05:
+            return None, bg, sep          # ничего не движется, различать нечем
+        pen = 1.0 - resp
+        # Вырезаем часть, соответствующую ЦЕНТРАМ кандидатов.
+        # Кандидат (i, j) ставит шаблон углом в (sx1+j, sy1+i), значит центр
+        # цели у него в (sx1+j+tw/2, sy1+i+th/2). Раньше вырез брался от угла
+        # и растягивался — из-за этого он уезжал мимо цели тем сильнее, чем
+        # крупнее шаблон, и штраф ложился не туда.
+        # Карта в половинном разрешении, поэтому смещения тоже вдвое меньше.
+        rh, rw = shape
+        ox = (int(sx1) - wx1 + int(tw) // 2) // 2
+        oy = (int(sy1) - wy1 + int(th) // 2) // 2
+        sw, sh = (rw + 1) // 2, (rh + 1) // 2
+        if ox < 0 or oy < 0 or ox + sw > pen.shape[1] or oy + sh > pen.shape[0]:
+            return None, bg, sep
+        sub = pen[oy:oy + sh, ox:ox + sw]
+        return cv2.resize(sub, (rw, rh), interpolation=cv2.INTER_LINEAR), bg, sep
+    except Exception:
+        return None, None, 0.0
+
+
+def color_penalty_map(sx1, sy1, tw, th, shape):
+    """Штраф за несовпадение цвета для каждой позиции кандидата.
+
+    Для каждой позиции берётся средняя цветность области размером с цель и
+    сравнивается с подписью, снятой при захвате. Считается на разрешении
+    цветности (вдвое меньше) и растягивается до размера карты откликов.
+    """
+    if not color_active or target_uv is None or chroma_u is None:
+        return None
+    try:
+        rh, rw = shape
+        tu, tv = target_uv
+        # Область цветности, покрывающая все центры кандидатов.
+        cx0 = max(0, (sx1 + tw // 2) // 2 - 1)
+        cy0 = max(0, (sy1 + th // 2) // 2 - 1)
+        cx1 = min(chroma_u.shape[1], cx0 + rw // 2 + 3)
+        cy1 = min(chroma_u.shape[0], cy0 + rh // 2 + 3)
+        if cx1 - cx0 < 2 or cy1 - cy0 < 2:
+            return None
+        u = chroma_u[cy0:cy1, cx0:cx1].astype(np.float32)
+        v = chroma_v[cy0:cy1, cx0:cx1].astype(np.float32)
+        # Усредняем по площади цели: одиночный пиксель цветности слишком шумен.
+        k = max(1, min(int(tw) // 4, min(u.shape) ))
+        if k > 1:
+            u = cv2.blur(u, (k, k))
+            v = cv2.blur(v, (k, k))
+        d = np.abs(u - tu) + np.abs(v - tv)
+        d = np.clip(d / COLOR_REF_DIST, 0.0, 1.0)
+        # Растягиваем до размера карты откликов (цветность вдвое грубее).
+        return cv2.resize(d, (rw, rh), interpolation=cv2.INTER_LINEAR)
+    except Exception:
+        return None
 
 
 def build_template(gray, cx, cy, box_w, box_h):
@@ -1834,7 +2226,8 @@ def build_template(gray, cx, cy, box_w, box_h):
     return tmpl
 
 
-def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0):
+def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0,
+                          tgt_dx=0.0, tgt_dy=0.0):
     """Темплейт-матч с distance-penalty + субпиксельная интерполяция пика.
 
     flow_motion: модуль смещения flow-предсказания за кадр (px). Используется
@@ -1842,6 +2235,7 @@ def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0):
     (быстрее матч, меньше шансов уцепиться за фон), на быстрой — больше.
     """
     global template_gray, tmpl_w, tmpl_h
+    global motion_bg, motion_active, motion_separation
     if template_gray is None or tmpl_w is None or tmpl_h is None:
         return False, pred_cx, pred_cy, 0.0
 
@@ -1885,10 +2279,46 @@ def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0):
     # Нормируем штраф по фактическому margin, не по константе.
     norm = max(margin, 1)
     penalized = score_map - DIST_PENALTY * (dist / norm) ** 2
+    # Цветовой отсев. Добавляется к тому же штрафу, что и расстояние, поэтому
+    # выбор пика учитывает цвет, но сама величина score остаётся чисто
+    # яркостной — сравнимой с прежними логами.
+    cmap = color_penalty_map(sx1, sy1, tmpl_w, tmpl_h, score_map.shape)
+    _match_dbg["color_on"] = 1 if cmap is not None else 0
+    if cmap is not None:
+        penalized = penalized - COLOR_PENALTY * cmap
+
+    # Отсев по движению. Не зависит от размера цели, поэтому работает там, где
+    # сравнение по виду упирается в потолок: мелкая цель на фактурном фоне.
+    if MOTION_GUARD_ENABLED:
+        mmap, bg, sep = motion_penalty_map(
+            prev_gray, gray, sx1, sy1, sx2, sy2, tmpl_w, tmpl_h,
+            score_map.shape, tgt_dx, tgt_dy)
+        motion_bg = bg
+        motion_separation = sep
+        motion_active = mmap is not None
+        if mmap is not None:
+            penalized = penalized - MOTION_PENALTY * mmap
+        _match_dbg["motion_sep"] = sep
+        _match_dbg["motion_on"] = 1 if motion_active else 0
 
     _, max_val, _, max_loc = cv2.minMaxLoc(penalized.astype(np.float32))
     mx, my = max_loc
     raw_score = float(score_map[my, mx])
+
+    # Единственное измерение, которое отвечает на вопрос «работает ли цвет».
+    # color_pen — насколько выбранная точка НЕ похожа по цвету на цель (0 —
+    # цвет цели, 1 — совсем чужой). color_best — был ли в окне вообще хоть
+    # один кандидат нужного цвета. Их пара различает три разных исхода,
+    # которые снаружи выглядят одинаково как «цвет не помог»:
+    #   pen~0            — рамка стоит на нужном цвете, виновато что-то другое;
+    #   pen высок, best~0— цвет нашёл цель, но его перевесили: мал COLOR_PENALTY;
+    #   pen и best высоки— цели нужного цвета в окне нет, цвет тут бессилен.
+    if cmap is not None:
+        _match_dbg["color_pen"] = float(cmap[my, mx])
+        _match_dbg["color_best"] = float(cmap.min())
+    else:
+        _match_dbg["color_pen"] = None
+        _match_dbg["color_best"] = None
 
     # Насколько пик ОДИНОК. Если рядом есть почти такой же по силе кандидат,
     # матч неоднозначен: на фактурном фоне таких кандидатов много, и матчер
@@ -1945,7 +2375,7 @@ def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0):
 def reset_tracking(to_acq=False):
     global track_state, target_visible, target_controllable, overlay_text, overlay_color, target_box_main
     global lock_cx, lock_cy, lock_w, lock_h, tmpl_w, tmpl_h, template_gray, template_std
-    global template_base
+    global template_base, target_uv, color_active, color_separation
     global prev_gray, prev_pts, lost_frames, last_match_score, last_flow_ok
     global acq_wait_left
     global filtered_dx_yaw, prev_adx, prev_ady_ctrl
@@ -1966,6 +2396,9 @@ def reset_tracking(to_acq=False):
     tmpl_w = tmpl_h = None
     template_gray = None
     template_base = None
+    target_uv = None
+    color_active = False
+    color_separation = 0.0
     template_std = 0.0
     prev_gray = None
     prev_pts = None
@@ -2677,7 +3110,7 @@ def draw_overlay_on_frame(frame):
 def process_locked_tracker(gray):
     global track_state, target_visible, target_controllable, overlay_text, overlay_color, target_box_main
     global lock_cx, lock_cy, lock_w, lock_h, template_gray, prev_gray, prev_pts
-    global template_base
+    global template_base, target_uv, color_active, color_separation
     global lost_frames, frame_index, last_match_score, last_flow_ok
     global fps_t0, fps_frames, fps_current
     global prev_aux_on, acq_wait_left, lock_sequence
@@ -2791,6 +3224,28 @@ def process_locked_tracker(gray):
             lock_h = float(lh)
             template_gray = build_template(gray, lock_cx, lock_cy, lock_w, lock_h)
             template_base = template_gray.copy()
+            # Один раз на захват решаем, помогает ли цвет. Если цель и её
+            # окружение одного цвета — цвет не включаем, поведение прежнее.
+            if COLOR_GUARD_ENABLED:
+                target_uv, color_separation = measure_color_separation(
+                    lock_cx, lock_cy, lock_w, lock_h)
+                color_active = (target_uv is not None
+                                and color_separation >= COLOR_MIN_SEPARATION)
+                if color_active:
+                    flight_log.event(
+                        "ЦВЕТ включён: различимость %.1f (порог %.1f) | %s"
+                        % (color_separation, COLOR_MIN_SEPARATION,
+                           chroma_debug))
+                else:
+                    flight_log.event(
+                        "ЦВЕТ не используется: различимость %.1f (порог %.1f)"
+                        " | %s%s"
+                        % (color_separation, COLOR_MIN_SEPARATION,
+                           chroma_debug,
+                           (" | причина: " + chroma_fail_reason)
+                           if chroma_fail_reason else ""))
+            else:
+                color_active = False
             prev_gray = gray.copy()
             prev_pts = refresh_flow_points(gray, lock_cx, lock_cy, lock_w, lock_h)
             lost_frames = 0
@@ -2824,7 +3279,11 @@ def process_locked_tracker(gray):
     # Модуль flow-предсказанного смещения цели за кадр — используется
     # template_match_locked для адаптивного выбора search-окна.
     flow_motion = math.hypot(pred_cx - lock_cx, pred_cy - lock_cy) if flow_ok else 0.0
-    match_ok, match_cx, match_cy, score = template_match_locked(gray, pred_cx, pred_cy, flow_motion)
+    # Движение цели за кадр — разница между предсказанием потока и прежним
+    # положением. Именно с ним сравнивается движение фона.
+    match_ok, match_cx, match_cy, score = template_match_locked(
+        gray, pred_cx, pred_cy, flow_motion,
+        tgt_dx=pred_cx - lock_cx, tgt_dy=pred_cy - lock_cy)
     last_match_score = score
     last_flow_ok = flow_ok
 
@@ -2944,12 +3403,31 @@ def process_locked_tracker(gray):
         # при уверенном матче запрашиваем заново связную компоненту под текущим
         # центром лока и сдвигаем lock_w/lock_h в её сторону. Решает «дрейф
         # зацепом за край» при сближении — коробка растёт вместе с целью.
-        if (SIZE_ADAPT_ENABLED and frame_index % SIZE_ADAPT_EVERY_FRAMES == 0
-                and match_ok and score >= SIZE_ADAPT_MIN_SCORE):
-            est_w, est_h = estimate_size_at_position(gray, lock_cx, lock_cy)
-            # Sanity: оцениваем только если в разумных пределах.
-            if (SIZE_ADAPT_MIN_W <= est_w <= SIZE_ADAPT_MAX_W
-                    and SIZE_ADAPT_MIN_W <= est_h <= SIZE_ADAPT_MAX_W):
+        # Измеряем, ПОЧЕМУ адаптация размера не срабатывает. По логам борта
+        # коробка стоит на значении по умолчанию (8 px в координатах трекинга)
+        # в 76%% кадров и почти не растёт, хотя объект бывает крупным. Гейта
+        # два — порог score и допустимый диапазон оценки, — и без записи
+        # непонятно, какой именно закрыт.
+        if SIZE_ADAPT_ENABLED and frame_index % SIZE_ADAPT_EVERY_FRAMES == 0:
+            # Область поиска растягиваем под ТЕКУЩИЙ размер коробки, иначе
+            # крупная цель заведомо в неё не помещается и измерить её нельзя.
+            est_w, est_h = estimate_size_at_position(
+                gray, lock_cx, lock_cy, cur_w=max(lock_w, lock_h))
+            _match_dbg["size_est"] = est_w if est_w is not None else -1.0
+            if not match_ok:
+                _match_dbg["size_skip"] = 1        # матча нет
+            elif score < SIZE_ADAPT_MIN_SCORE:
+                _match_dbg["size_skip"] = 2        # score ниже порога
+            elif est_w is None:
+                _match_dbg["size_skip"] = 3        # измерить не удалось
+            elif not (SIZE_ADAPT_MIN_W <= est_w <= SIZE_ADAPT_MAX_W
+                      and SIZE_ADAPT_MIN_W <= est_h <= SIZE_ADAPT_MAX_W):
+                _match_dbg["size_skip"] = 4        # вне допустимого диапазона
+            else:
+                _match_dbg["size_skip"] = 0        # применена
+                # Размер меняем только когда его ДЕЙСТВИТЕЛЬНО измерили.
+                # Прежде при неудаче подставлялся минимум, и коробка каждые
+                # 10 кадров ужималась обратно.
                 lock_w = lock_w * (1.0 - SIZE_ADAPT_ALPHA) + est_w * SIZE_ADAPT_ALPHA
                 lock_h = lock_h * (1.0 - SIZE_ADAPT_ALPHA) + est_h * SIZE_ADAPT_ALPHA
 
@@ -3158,6 +3636,10 @@ def _capture_flight_row(cb_t0):
             g("launch_target_deg"), g("launch_reached"), g("k"),
             _match_dbg.get("psr"), _match_dbg.get("second"),
             _match_dbg.get("margin"), _match_dbg.get("flow_gap"),
+            _match_dbg.get("size_est"), _match_dbg.get("size_skip"),
+            _match_dbg.get("motion_sep"), _match_dbg.get("motion_on"),
+            _match_dbg.get("color_on"), _match_dbg.get("color_pen"),
+            _match_dbg.get("color_best"),
             alt_cm, vario_cms, alt_age,
             g("size_px"), g("growth"), g("tau_s"), g("range_m"),
             g("depression_deg"), g("dy_alt_decoupled"),
@@ -3175,6 +3657,7 @@ def _idx(seq, i):
 
 
 def camera_callback(request):
+    global chroma_u, chroma_v
     _cb_t0 = time.monotonic()
     try:
         with state_lock:
@@ -3191,6 +3674,12 @@ def camera_callback(request):
         with MappedArray(request, "lores") as lm:
             yuv = lm.array
             gray = yuv[:LORES_H, :LORES_W].copy()
+            if COLOR_GUARD_ENABLED:
+                # Цветность уже в этом же буфере — копируем вместе с яркостью.
+                cu, cv_ = extract_chroma(yuv)
+                if cu is not None:
+                    chroma_u = cu.copy()
+                    chroma_v = cv_.copy()
 
         process_locked_tracker(gray)
         print_debug_once_per_second()
