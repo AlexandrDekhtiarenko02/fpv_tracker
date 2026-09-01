@@ -733,6 +733,7 @@ _FLIGHT_LOG_COLUMNS = (
     "m1,m2,m3,m4,rc_r,rc_p,rc_y,rc_t,dt_ms,cb_ms,armed,"
     "launch_target_deg,launch_reached,k,match_psr,match_second,search_margin,"
     "match_flow_gap,size_est,size_skip,motion_sep,motion_on,"
+    "color_on,color_pen,color_best,"
     "alt_cm,vario_cms,alt_age_ms,"
     "box_size_px,box_growth,tau_s,range_m,depression_deg,dy_alt_decoupled"
 )
@@ -1142,11 +1143,16 @@ def _code_version():
     except NameError:
         return "версия неизвестна (нет __file__)"
     here = os.path.dirname(me)
-    commit, dirty = "нет-git", ""
+    commit, dirty, branch = "нет-git", "", "?"
     try:
         commit = subprocess.check_output(
             ["git", "-C", here, "rev-parse", "--short", "HEAD"],
             stderr=subprocess.DEVNULL, timeout=5).decode().strip()
+        # Ветка в лог: по хешу её каждый раз приходилось искать вручную, а
+        # ветка — это и есть то, что оператор держит в голове во время прогона.
+        branch = subprocess.check_output(
+            ["git", "-C", here, "rev-parse", "--abbrev-ref", "HEAD"],
+            stderr=subprocess.DEVNULL, timeout=5).decode().strip() or "?"
         changed = subprocess.check_output(
             ["git", "-C", here, "status", "--porcelain", "--", __file__],
             stderr=subprocess.DEVNULL, timeout=5).decode().strip()
@@ -1159,7 +1165,8 @@ def _code_version():
             digest = hashlib.md5(f.read()).hexdigest()[:12]
     except Exception:
         pass
-    return "commit=%s%s md5=%s file=%s" % (commit, dirty, digest, me)
+    return "ветка=%s commit=%s%s md5=%s file=%s" % (
+        branch, commit, dirty, digest, me)
 
 
 def _fmt(v):
@@ -2243,6 +2250,7 @@ def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0,
     # выбор пика учитывает цвет, но сама величина score остаётся чисто
     # яркостной — сравнимой с прежними логами.
     cmap = color_penalty_map(sx1, sy1, tmpl_w, tmpl_h, score_map.shape)
+    _match_dbg["color_on"] = 1 if cmap is not None else 0
     if cmap is not None:
         penalized = penalized - COLOR_PENALTY * cmap
 
@@ -2263,6 +2271,21 @@ def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0,
     _, max_val, _, max_loc = cv2.minMaxLoc(penalized.astype(np.float32))
     mx, my = max_loc
     raw_score = float(score_map[my, mx])
+
+    # Единственное измерение, которое отвечает на вопрос «работает ли цвет».
+    # color_pen — насколько выбранная точка НЕ похожа по цвету на цель (0 —
+    # цвет цели, 1 — совсем чужой). color_best — был ли в окне вообще хоть
+    # один кандидат нужного цвета. Их пара различает три разных исхода,
+    # которые снаружи выглядят одинаково как «цвет не помог»:
+    #   pen~0            — рамка стоит на нужном цвете, виновато что-то другое;
+    #   pen высок, best~0— цвет нашёл цель, но его перевесили: мал COLOR_PENALTY;
+    #   pen и best высоки— цели нужного цвета в окне нет, цвет тут бессилен.
+    if cmap is not None:
+        _match_dbg["color_pen"] = float(cmap[my, mx])
+        _match_dbg["color_best"] = float(cmap.min())
+    else:
+        _match_dbg["color_pen"] = None
+        _match_dbg["color_best"] = None
 
     # Насколько пик ОДИНОК. Если рядом есть почти такой же по силе кандидат,
     # матч неоднозначен: на фактурном фоне таких кандидатов много, и матчер
@@ -3582,6 +3605,8 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("margin"), _match_dbg.get("flow_gap"),
             _match_dbg.get("size_est"), _match_dbg.get("size_skip"),
             _match_dbg.get("motion_sep"), _match_dbg.get("motion_on"),
+            _match_dbg.get("color_on"), _match_dbg.get("color_pen"),
+            _match_dbg.get("color_best"),
             alt_cm, vario_cms, alt_age,
             g("size_px"), g("growth"), g("tau_s"), g("range_m"),
             g("depression_deg"), g("dy_alt_decoupled"),
