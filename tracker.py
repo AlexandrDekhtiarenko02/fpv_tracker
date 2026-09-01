@@ -1353,6 +1353,7 @@ target_uv = None          # (U, V) цели, снятые при захвате
 color_active = False      # различает ли цвет цель и фон в этом захвате
 color_separation = 0.0
 chroma_fail_reason = ""   # почему цвет не сработал — для журнала
+chroma_debug = ""         # измеренные цвета цели и фона, для журнала
 # Движение фона и цели за последний кадр, для отсева по движению.
 motion_bg = None          # (dx, dy) фона
 motion_target = None      # (dx, dy) цели
@@ -1948,7 +1949,7 @@ def measure_color_separation(cx, cy, box_w, box_h):
 
     Возвращает (подпись_цели, различимость).
     """
-    global chroma_fail_reason
+    global chroma_fail_reason, chroma_debug
     if chroma_u is None or chroma_v is None:
         chroma_fail_reason = chroma_fail_reason or "цветность не прочитана"
         return None, 0.0
@@ -1960,6 +1961,14 @@ def measure_color_separation(cx, cy, box_w, box_h):
                                              COLOR_MIN_TARGET_CHROMA_PX))
         return None, 0.0
     H, W = chroma_u.shape
+    def box_sum(arr, x0, y0, x1, y1):
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(W, x1), min(H, y1)
+        if x1 <= x0 or y1 <= y0:
+            return 0.0, 0
+        sub = arr[y0:y1, x0:x1]
+        return float(sub.sum()), int(sub.size)
+
     def mean_box(arr, x0, y0, x1, y1):
         x0, y0 = max(0, x0), max(0, y0)
         x1, y1 = min(W, x1), min(H, y1)
@@ -1968,17 +1977,38 @@ def measure_color_separation(cx, cy, box_w, box_h):
         return float(arr[y0:y1, x0:x1].mean())
     tu = mean_box(chroma_u, ccx - rw, ccy - rh, ccx + rw, ccy + rh)
     tv = mean_box(chroma_v, ccx - rw, ccy - rh, ccx + rw, ccy + rh)
-    # Кольцо вокруг цели — втрое шире по каждой оси.
-    ou = mean_box(chroma_u, ccx - 3 * rw, ccy - 3 * rh, ccx + 3 * rw, ccy + 3 * rh)
-    ov = mean_box(chroma_v, ccx - 3 * rw, ccy - 3 * rh, ccx + 3 * rw, ccy + 3 * rh)
+
+    # ФОН берётся НАСТОЯЩИМ КОЛЬЦОМ — внешняя область МИНУС область цели.
+    #
+    # Раньше это был просто квадрат втрое шире, ВКЛЮЧАВШИЙ саму цель. Из-за
+    # этого он сравнивался частично сам с собой, а если объект крупнее
+    # коробки — целиком лежал на объекте, и различимость выходила около нуля.
+    # На борту оранжевый предмет на коричневом фоне давал 2.9-5.7, тогда как
+    # по цветовой геометрии эта пара обязана давать 50-108.
+    #
+    # Внешний радиус увеличен с 3 до 4: кольцо должно доставать до фона даже
+    # когда коробка занижает размер объекта.
+    K = 4
+    def ring_mean(arr):
+        outer_sum, outer_n = box_sum(arr, ccx - K * rw, ccy - K * rh,
+                                     ccx + K * rw, ccy + K * rh)
+        inner_sum, inner_n = box_sum(arr, ccx - rw, ccy - rh,
+                                     ccx + rw, ccy + rh)
+        n = outer_n - inner_n
+        if n <= 0:
+            return None
+        return (outer_sum - inner_sum) / float(n)
+
+    ou = ring_mean(chroma_u)
+    ov = ring_mean(chroma_v)
     if None in (tu, tv, ou, ov):
         chroma_fail_reason = "область за границей кадра"
         return None, 0.0
     chroma_fail_reason = ""
-    # Среднее по кольцу включает саму цель, поэтому отличие занижено — но нам
-    # нужен именно консервативный критерий: лучше не включить цвет, чем
-    # включить там, где он не различает.
     sep = abs(tu - ou) + abs(tv - ov)
+    # Значения в журнал: без них «различимость мала» неотличимо от «меряем не
+    # то», а на этом мы уже обожглись.
+    chroma_debug = "цель U=%.0f V=%.0f | фон U=%.0f V=%.0f" % (tu, tv, ou, ov)
     return (tu, tv), sep
 
 
@@ -3147,12 +3177,15 @@ def process_locked_tracker(gray):
                                 and color_separation >= COLOR_MIN_SEPARATION)
                 if color_active:
                     flight_log.event(
-                        "ЦВЕТ включён: различимость %.1f (порог %.1f)"
-                        % (color_separation, COLOR_MIN_SEPARATION))
+                        "ЦВЕТ включён: различимость %.1f (порог %.1f) | %s"
+                        % (color_separation, COLOR_MIN_SEPARATION,
+                           chroma_debug))
                 else:
                     flight_log.event(
-                        "ЦВЕТ не используется: различимость %.1f (порог %.1f)%s"
+                        "ЦВЕТ не используется: различимость %.1f (порог %.1f)"
+                        " | %s%s"
                         % (color_separation, COLOR_MIN_SEPARATION,
+                           chroma_debug,
                            (" | причина: " + chroma_fail_reason)
                            if chroma_fail_reason else ""))
             else:
