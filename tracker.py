@@ -1597,7 +1597,20 @@ def fc_io_loop():
                     ovr_bit = _box_bits.get(MSP_OVERRIDE_BOX_PERMANENT_ID)
                     with state_lock:
                         if arm_bit is not None:
-                            app_state["armed"] = bool(mode_flags & (1 << arm_bit))
+                            _armed_now = bool(mode_flags & (1 << arm_bit))
+                            # АРМ ОБНУЛЯЕТ БАРОМЕТР. Замерено по логам: под
+                            # армом высота держится около нуля (среднее 2.8,
+                            # 2.5, 3.5, -0.4 см в разных заходах), без арма
+                            # уползает до +61 и -44 см. То есть Betaflight
+                            # заново берёт уровень земли при арме, и в этот
+                            # миг показание СКАЧЕТ. Скачок внутри окна оценки
+                            # шума дал бы огромную ложную сигму и запретил бы
+                            # дальность на десятки кадров — поэтому историю
+                            # шума на переходе арма начинаем заново.
+                            if _armed_now != app_state.get("armed"):
+                                _alt_hist.clear()
+                                app_state["alt_sigma_cm"] = None
+                            app_state["armed"] = _armed_now
                             app_state["armed_ts"] = now
                         # Активен ли MSP OVERRIDE на самом FC. Знать это
                         # обязательно: пока он активен, MSP_RC отдаёт НАШИ же
