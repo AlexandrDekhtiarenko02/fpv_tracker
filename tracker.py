@@ -136,7 +136,31 @@ ACQ_LOCK_AT_CROSSHAIR_EXACTLY = True
 ACQ_SIZE_SEARCH_RADIUS = 12 * TRACK_SCALE
 # Предел растяжения области поиска размера под крупную цель. Больше — дороже
 # по процессору и выше риск слить цель с фоном в одну связную компоненту.
-SIZE_SEARCH_RADIUS_MAX = 40 * TRACK_SCALE
+# ЗАМЕРЕНО по заходу 154500: 85% отказов оценки размера — код 2, «пятно
+# залило область поиска» (1302 кадра против 228 у «нет пятна в центре»).
+# За этим стоит ЗАМОК: область поиска считалась как cur_w * 1.6, а cur_w
+# упирался в LOCK_MAX_W = 38. Значит область не могла превысить 60 px, и
+# цель шире 64 px отвергалась КАК СЛИШКОМ БОЛЬШАЯ — навсегда. Коробка не
+# росла, потому что не могла измериться, и не могла измериться, потому что
+# не росла.
+SIZE_SEARCH_RADIUS_MAX = 100 * TRACK_SCALE
+# Как замок размыкается: если оценка отказала именно из-за «залило область»,
+# в следующий раз область берётся шире. Цена платится только когда она
+# действительно нужна — при мелкой цели область остаётся прежней.
+# Замерено на малине: область 81x81 стоит 5.2 мс, 161x161 — 15.1 мс,
+# 201x201 — 22.4 мс. При проверке раз в 4 кадра это 1.3 / 3.8 / 5.6 мс на
+# кадр при бюджете 38 мс.
+SIZE_R_BOOST_STEP = 1.5
+SIZE_R_BOOST_MAX = 4.0
+# Второй способ оказаться внутри цели, найденный при проверке. Когда область
+# целиком лежит на объекте, МЕДИАНОЙ становится сам объект, отклоняться от неё
+# нечему, и пятна в центре не находится вовсе — отказ приходит с кодом 1, а не
+# 2. То есть «нет пятна» бывает по двум противоположным причинам:
+#   слабый контраст цели   -> в области ЕСТЬ разброс яркости, расширять
+#                             бессмысленно;
+#   область внутри цели    -> область РОВНАЯ, и надо смотреть шире.
+# Различаем их по разбросу яркости в самой области.
+SIZE_UNIFORM_STD = 8.0
 
 ACQ_FORCE_CENTER_LOCK = True
 ACQ_DEFAULT_LOCK_W = 8 * TRACK_SCALE
@@ -151,8 +175,20 @@ ACQ_MIN_STD = 1.2
 # в потолок вдвое раньше и коробку начало бы обрезать.
 LOCK_MIN_W = 5
 LOCK_MIN_H = 5
-LOCK_MAX_W = 38 * TRACK_SCALE
-LOCK_MAX_H = 38 * TRACK_SCALE
+# Предел размера коробки. Был 38, и это делало невозможным сразу две вещи.
+#
+# Первое: крупная цель просто не могла быть представлена. Коробка упиралась
+# в 38 px, шаблон покрывал лишь кусок объекта, и матч гулял по его фактуре —
+# ровно то, что оператор видит как «бегает по объекту, а при отдалении
+# сползает на край или за него».
+#
+# Второе, и это хуже: ТЕРМИНАЛЬНЫЙ РЕЖИМ БЫЛ НЕДОСТИЖИМ. Он включается при
+# box_frac >= 0.18, то есть когда коробка занимает 18% площади кадра. При
+# пределе 38 на кадре 320x240 максимум составлял 1.9%. Порог нельзя было
+# перейти ни при какой цели и ни на каком расстоянии — и в логах он ни разу
+# и не сработал. Для 18% нужна коробка 118 px.
+LOCK_MAX_W = 120 * TRACK_SCALE
+LOCK_MAX_H = 120 * TRACK_SCALE
 LOCK_PAD = 2.05
 # Во сколько раз шаблон больше коробки цели. Значение важно тем, какую долю
 # шаблона занимает ФОН, а не цель:
@@ -1936,6 +1972,9 @@ def flow_predict(prev_g, cur_g, pts, cx, cy):
 # Без этого различия 'измерить не удалось' занимало 63% проверок и не
 # говорило ничего.
 _size_fail = {"why": 0, "R": 0, "w": 0}
+# Во сколько раз расширить область поиска после отказа «залило область».
+# Растёт только на этом отказе и сбрасывается, как только размер измерился.
+_size_R_boost = 1.0
 
 
 def estimate_size_at_position(gray, cx, cy, cur_w=None):
@@ -1960,11 +1999,13 @@ def estimate_size_at_position(gray, cx, cy, cur_w=None):
     cur_w — текущий размер коробки. Область поиска растягивается под него,
     иначе крупная цель заведомо не помещается и измерить её невозможно.
     """
+    global _size_R_boost
     R = ACQ_SIZE_SEARCH_RADIUS
     if cur_w:
         # Область должна вмещать цель с запасом, иначе компонента упрётся в
         # её границы и будет отвергнута как «слишком большая».
-        R = int(max(R, min(SIZE_SEARCH_RADIUS_MAX, cur_w * 1.6)))
+        R = int(max(R, min(SIZE_SEARCH_RADIUS_MAX,
+                           cur_w * 1.6 * _size_R_boost)))
     cxi = int(round(cx))
     cyi = int(round(cy))
     x1 = max(0, cxi - R)
@@ -1990,31 +2031,45 @@ def estimate_size_at_position(gray, cx, cy, cur_w=None):
 
     cx_local = cxi - x1
     cy_local = cyi - y1
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
 
-    label = 0
-    for r_search in (0, 1, 2):
-        for dy in range(-r_search, r_search + 1):
-            for dx in range(-r_search, r_search + 1):
-                if abs(dx) != r_search and abs(dy) != r_search and r_search != 0:
-                    continue
-                ny = cy_local + dy
-                nx = cx_local + dx
-                if 0 <= ny < labels.shape[0] and 0 <= nx < labels.shape[1]:
-                    lab = int(labels[ny, nx])
-                    if lab > 0:
-                        label = lab
-                        break
-            if label > 0:
-                break
-        if label > 0:
-            break
+    def blob_at_centre(m):
+        """Найти пятно под центром коробки. Ищем по расширяющемуся кольцу:
+        центр может попасть ровно на границу внутри объекта."""
+        n_lab, lab_img, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+        for r_search in (0, 1, 2):
+            for dy in range(-r_search, r_search + 1):
+                for dx in range(-r_search, r_search + 1):
+                    if abs(dx) != r_search and abs(dy) != r_search and r_search != 0:
+                        continue
+                    ny = cy_local + dy
+                    nx = cx_local + dx
+                    if 0 <= ny < lab_img.shape[0] and 0 <= nx < lab_img.shape[1]:
+                        l = int(lab_img[ny, nx])
+                        if l > 0:
+                            return l, n_lab, st
+        return 0, n_lab, st
+
+    label, num_labels, stats = blob_at_centre(mask)
+    if label == 0:
+        # Центр не попал ни в одно пятно. Это бывает не только когда цель
+        # слаба по контрасту, но и когда область ЦЕЛИКОМ ЛЕЖИТ НА ОБЪЕКТЕ:
+        # тогда медианой становится сам объект, отклоняться от неё нечему, и
+        # в маске остаётся лишь тонкая кайма фона по краю.
+        #
+        # Проверено: цель 60 px при области 65 px давала ровно это — отказ
+        # приходил как «нет пятна», хотя цель занимала почти всю область.
+        # Поэтому пробуем ОБРАТНУЮ маску: там центр попадёт во внутренность
+        # объекта, пятно окажется во всю область, сработает признак «залило
+        # область» — и он расширит поиск, вместо того чтобы молча сдаться.
+        label, num_labels, stats = blob_at_centre(255 - mask)
 
     if label == 0 or label >= num_labels:
-        # В центре коробки нет ни одного пятна: яркость там не отличается от
-        # медианы области больше порога. То есть либо цель слаба по контрасту,
-        # либо рамка стоит не на ней.
         _size_fail["why"] = 1
+        if std < SIZE_UNIFORM_STD:
+            # Область ровная — мы внутри объекта, а не на слабой цели.
+            _size_fail["why"] = 4
+            _size_R_boost = min(SIZE_R_BOOST_MAX,
+                                _size_R_boost * SIZE_R_BOOST_STEP)
         return None, None
 
     x, y, w, h, area = stats[label]
@@ -2029,8 +2084,12 @@ def estimate_size_at_position(gray, cx, cy, cur_w=None):
         # лечится совсем иначе: расширением области, а не порогом.
         _size_fail["why"] = 2
         _size_fail["w"] = int(w)
+        # Размыкаем замок: в следующий раз посмотрим шире.
+        _size_R_boost = min(SIZE_R_BOOST_MAX, _size_R_boost * SIZE_R_BOOST_STEP)
         return None, None
 
+    # Измерилось — расширение больше не нужно, возвращаемся к дешёвой области.
+    _size_R_boost = 1.0
     lw = clamp(max(float(w) * LOCK_PAD, LOCK_MIN_W), LOCK_MIN_W, LOCK_MAX_W)
     lh = clamp(max(float(h) * LOCK_PAD, LOCK_MIN_H), LOCK_MIN_H, LOCK_MAX_H)
     return float(lw), float(lh)
