@@ -15,7 +15,8 @@ import cv2
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 src = io.open(os.path.join(_ROOT, "tracker.py"), encoding="utf-8").read()
 
-ns = {"np": np, "cv2": cv2, "_size_fail": {"why": 0, "R": 0, "w": 0},
+ns = {"np": np, "cv2": cv2, "_size_fail": {"why": 0, "R": 0, "w": 0, "roi": None,
+                     "mask": None, "box": None}, "ACQ_DEBUG_DUMP": False,
       "_size_R_boost": 1.0}
 ns["HIRES_TRACKING"] = eval(
     re.search(r"^HIRES_TRACKING = (.+?)(?:\s+#.*)?$", src, re.M).group(1))

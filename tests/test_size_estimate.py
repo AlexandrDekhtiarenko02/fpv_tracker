@@ -21,7 +21,8 @@ src = io.open(os.path.join(_ROOT, "tracker.py"),
 
 
 def load(radius_max, adaptive):
-    ns = {"np": np, "cv2": cv2, "_size_fail": {"why": 0, "R": 0, "w": 0},
+    ns = {"np": np, "cv2": cv2, "_size_fail": {"why": 0, "R": 0, "w": 0, "roi": None,
+                     "mask": None, "box": None}, "ACQ_DEBUG_DUMP": False,
           "ACQ_SIZE_SEARCH_RADIUS": 12, "SIZE_SEARCH_RADIUS_MAX": radius_max,
           "_size_R_boost": 1.0, "SIZE_R_BOOST_STEP": 1.5,
           "SIZE_R_BOOST_MAX": 4.0, "SIZE_UNIFORM_STD": 8.0,

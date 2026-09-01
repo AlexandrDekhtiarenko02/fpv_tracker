@@ -141,6 +141,13 @@ ACQ_SIZE_SEARCH_RADIUS = 12 * TRACK_SCALE
 SIZE_ACQ_RADII = (12, 20, 32, 50, 80)
 # Насколько два измерения считаются одним и тем же размером.
 SIZE_ACQ_AGREE_TOL = 0.25
+# Снимок внутренностей захвата на диск. Ставится вручную, когда надо ПОСМОТРЕТЬ
+# ГЛАЗАМИ, что именно берётся за цель: сам кадр, область поиска, маска порога
+# и вырезанный эталон. Пишется только в момент захвата, поэтому не мешает.
+# Разбирать по числам мы уже пробовали и трижды починили не то.
+ACQ_DEBUG_DUMP = True
+ACQ_DEBUG_DIR = "acq_debug"   # внутри каталога полётных логов
+ACQ_DEBUG_MAX = 8
 # Предел растяжения области поиска размера под крупную цель. Больше — дороже
 # по процессору и выше риск слить цель с фоном в одну связную компоненту.
 # ЗАМЕРЕНО по заходу 154500: 85% отказов оценки размера — код 2, «пятно
@@ -1580,6 +1587,7 @@ motion_target = None      # (dx, dy) цели
 motion_active = False     # движется ли цель иначе фона
 motion_separation = 0.0
 template_std = 0.0
+_acq_debug_n = 0
 prev_gray = None
 prev_pts = None
 lost_frames = 0
@@ -2053,7 +2061,8 @@ def flow_predict(prev_g, cur_g, pts, cx, cy):
 # 2 — пятно залило область поиска (цель крупнее области).
 # Без этого различия 'измерить не удалось' занимало 63% проверок и не
 # говорило ничего.
-_size_fail = {"why": 0, "R": 0, "w": 0}
+_size_fail = {"why": 0, "R": 0, "w": 0, "roi": None, "mask": None,
+              "box": None}
 # Во сколько раз расширить область поиска после отказа «залило область».
 # Растёт только на этом отказе и сбрасывается, как только размер измерился.
 _size_R_boost = 1.0
@@ -2096,6 +2105,9 @@ def estimate_size_at_position(gray, cx, cy, cur_w=None):
     y2 = min(gray.shape[0], cyi + R + 1)
     _size_fail["why"] = 0
     _size_fail["R"] = R
+    _size_fail["roi"] = None
+    _size_fail["mask"] = None
+    _size_fail["box"] = None
     roi = gray[y1:y2, x1:x2]
     if roi.size == 0:
         _size_fail["why"] = 3
@@ -2110,6 +2122,9 @@ def estimate_size_at_position(gray, cx, cy, cur_w=None):
     _, mask = cv2.threshold(diff, thr, 255, cv2.THRESH_BINARY)
     kernel = np.ones((2, 2), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    if ACQ_DEBUG_DUMP:
+        _size_fail["roi"] = roi.copy()
+        _size_fail["mask"] = mask.copy()
 
     cx_local = cxi - x1
     cy_local = cyi - y1
@@ -2155,6 +2170,8 @@ def estimate_size_at_position(gray, cx, cy, cur_w=None):
         return None, None
 
     x, y, w, h, area = stats[label]
+    if ACQ_DEBUG_DUMP:
+        _size_fail["box"] = (int(x), int(y), int(w), int(h))
     if area < 1:
         return None, None
     # Компонента упёрлась в границы области — значит цель как минимум такая,
@@ -2188,6 +2205,51 @@ def estimate_size_at_position(gray, cx, cy, cur_w=None):
     return float(lw), float(lh)
 
 
+def _acq_debug_dump(gray, results):
+    """Сохранить на диск то, что трекер видит в момент захвата.
+
+    Пишутся: кадр целиком, и на каждую пробованную область — сама область,
+    маска порога и найденное пятно. По числам это разобрать не удалось, а
+    глазами видно сразу: берётся весь предмет или крупица его фактуры.
+    """
+    global _acq_debug_n
+    if not ACQ_DEBUG_DUMP or _acq_debug_n >= ACQ_DEBUG_MAX:
+        return
+    try:
+        d = os.path.join(FLIGHT_LOG_DIR, ACQ_DEBUG_DIR)
+        os.makedirs(d, exist_ok=True)
+        _acq_debug_n += 1
+        tag = "%s_lock%02d" % (
+            getattr(flight_log, "_session", "no_session"), _acq_debug_n)
+        cx, cy = int(CENTER_X_LORES), int(CENTER_Y_LORES)
+        full = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        cv2.drawMarker(full, (cx, cy), (0, 0, 255), cv2.MARKER_CROSS, 20, 1)
+        cv2.imwrite(os.path.join(d, tag + "_00_frame.png"), full)
+
+        lines = []
+        for radius, roi, mask, box, val in results:
+            R = int(radius)
+            vis = cv2.cvtColor(roi, cv2.COLOR_GRAY2BGR)
+            if box is not None:
+                x, y, w, h = box
+                cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 255, 0), 1)
+            k = 4 if R <= 30 else 2
+            cv2.imwrite(os.path.join(d, "%s_R%03d_roi.png" % (tag, R)),
+                        cv2.resize(vis, None, fx=k, fy=k,
+                                   interpolation=cv2.INTER_NEAREST))
+            cv2.imwrite(os.path.join(d, "%s_R%03d_mask.png" % (tag, R)),
+                        cv2.resize(mask, None, fx=k, fy=k,
+                                   interpolation=cv2.INTER_NEAREST))
+            lines.append("область %3d: пятно %s, размер %s"
+                         % (R, box, "нет" if val is None else "%.1f" % val))
+        with open(os.path.join(d, tag + "_итог.txt"), "w",
+                  encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        flight_log.event("СНИМОК ЗАХВАТА: %s (%d проб)" % (tag, len(results)))
+    except Exception as exc:
+        flight_log.event("СНИМОК ЗАХВАТА не удался: %s" % exc)
+
+
 def estimate_size_at_crosshair(gray):
     """Размер цели под прицелом в момент захвата.
 
@@ -2208,11 +2270,17 @@ def estimate_size_at_crosshair(gray):
     попыток с разной областью и взять первую, где предмет уместился целиком.
     """
     got = []
+    shots = []
     for radius in SIZE_ACQ_RADII:
         lw, lh = estimate_size_at_position(
             gray, CENTER_X_LORES, CENTER_Y_LORES, cur_w=radius / 1.6)
+        if ACQ_DEBUG_DUMP and _size_fail["roi"] is not None:
+            shots.append((_size_fail["R"], _size_fail["roi"],
+                          _size_fail["mask"], _size_fail["box"], lw))
         if lw is not None and lh is not None:
             got.append((lw, lh))
+    if shots:
+        _acq_debug_dump(gray, shots)
     if not got:
         return None, None
 
