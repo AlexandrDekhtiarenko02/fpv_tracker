@@ -145,6 +145,22 @@ SIZE_ACQ_AGREE_TOL = 0.25
 # ГЛАЗАМИ, что именно берётся за цель: сам кадр, область поиска, маска порога
 # и вырезанный эталон. Пишется только в момент захвата, поэтому не мешает.
 # Разбирать по числам мы уже пробовали и трижды починили не то.
+# --- ЗАПИСЬ КАДРОВ ---
+# Весь день мы сравнивали прогоны между собой и знаем, что это негодно: разные
+# цели, разный фон, разная манера водить. Из-за этого одна хорошая ветка была
+# зарезана, а одна плохая едва не принята.
+#
+# Запись сырых кадров всё меняет: по ОДНОМУ И ТОМУ ЖЕ участку можно прогнать
+# сколько угодно вариантов алгоритма и сравнить честно, а не через то, как
+# оператор вёл руку. Заодно любую сегодняшнюю правку можно проверить задним
+# числом.
+#
+# Пишется яркость 320x240 без сжатия — для сравнения алгоритмов нужны кадры
+# как есть, без следов кодека. Это 75 КБ на кадр, около 1.9 МБ в секунду.
+RECORD_FRAMES = False          # включается вручную, когда нужен образец
+RECORD_DIR = "recordings"      # внутри каталога полётных логов
+RECORD_MAX_SECONDS = 25.0      # предел одной записи
+RECORD_MAX_MB = 120.0          # и предел по месту на карте
 ACQ_DEBUG_DUMP = True
 ACQ_DEBUG_DIR = "acq_debug"   # внутри каталога полётных логов
 ACQ_DEBUG_MAX = 8
@@ -4488,6 +4504,111 @@ def _idx(seq, i):
         return None
 
 
+class FrameRecorder:
+    """Запись сырых кадров яркости для последующего разбора на земле.
+
+    В камерном потоке делается только копия кадра и укладка в очередь — около
+    0.1 мс. Всё остальное (запись на карту) идёт в отдельном потоке: диск на
+    карте бывает медленным, и его задержка не имеет права попасть в кадр.
+
+    Рядом с кадрами пишется опись: номер, время, состояние, коробка, score.
+    По ней потом видно, что трекер думал в каждый момент, и можно сравнить с
+    тем, что решит другой алгоритм на тех же кадрах.
+    """
+
+    def __init__(self, directory):
+        self.dir = directory
+        self.active = False
+        self._q = collections.deque()
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+        self._path = None
+        self._index = None
+        self._n = 0
+        self._bytes = 0
+        self._t0 = 0.0
+        self.shape = None
+
+    def start(self, shape):
+        if self.active or not RECORD_FRAMES:
+            return
+        try:
+            d = os.path.join(self.dir, RECORD_DIR)
+            os.makedirs(d, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            self._path = os.path.join(d, stamp + ".gray")
+            self._index = open(os.path.join(d, stamp + ".index.csv"), "w")
+            self._index.write("frame,t,state,box_cx,box_cy,box_w,box_h,score\n")
+            self.shape = shape
+            with open(os.path.join(d, stamp + ".meta.txt"), "w") as f:
+                f.write("width=%d\nheight=%d\ndtype=uint8\n" % (shape[1], shape[0]))
+            self._n = 0
+            self._bytes = 0
+            self._t0 = time.monotonic()
+            self._stop.clear()
+            self.active = True
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+            flight_log.event("ЗАПИСЬ КАДРОВ начата: %s (%dx%d)"
+                             % (os.path.basename(self._path), shape[1], shape[0]))
+        except Exception as exc:
+            self.active = False
+            flight_log.event("ЗАПИСЬ КАДРОВ не началась: %s" % exc)
+
+    def add(self, gray, row):
+        if not self.active:
+            return
+        if (time.monotonic() - self._t0) > RECORD_MAX_SECONDS:
+            self.stop("вышло время")
+            return
+        if self._bytes > RECORD_MAX_MB * 1024 * 1024:
+            self.stop("вышло место")
+            return
+        # Только копия и укладка в очередь: диск в камерном потоке недопустим.
+        with self._lock:
+            if len(self._q) > 90:      # карта не успевает — лучше пропустить кадр
+                return
+            self._q.append((gray.copy(), row))
+        self._bytes += gray.nbytes
+
+    def _run(self):
+        try:
+            with open(self._path, "wb") as f:
+                while not self._stop.is_set() or self._q:
+                    item = None
+                    with self._lock:
+                        if self._q:
+                            item = self._q.popleft()
+                    if item is None:
+                        time.sleep(0.005)
+                        continue
+                    gray, row = item
+                    f.write(gray.tobytes())
+                    self._index.write("%d,%s\n" % (self._n, row))
+                    self._n += 1
+        except Exception:
+            pass
+
+    def stop(self, why=""):
+        if not self.active:
+            return
+        self.active = False
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+        try:
+            self._index.close()
+        except Exception:
+            pass
+        flight_log.event("ЗАПИСЬ КАДРОВ окончена: %d кадров, %.1f МБ%s"
+                         % (self._n, self._bytes / 1048576.0,
+                            (" (" + why + ")") if why else ""))
+
+
+frame_recorder = FrameRecorder(FLIGHT_LOG_DIR)
+
+
 def camera_callback(request):
     global chroma_u, chroma_v
     _cb_t0 = time.monotonic()
@@ -4514,6 +4635,22 @@ def camera_callback(request):
                     chroma_v = cv_.copy()
 
         process_locked_tracker(gray)
+        # Запись кадров: начинается вместе со слежением, кончается вместе с
+        # ним. Пишем ровно то, что видел трекер, — ту же яркость, тот же кадр.
+        if RECORD_FRAMES:
+            if track_state == TRACK_STATE_TRACKED:
+                if not frame_recorder.active:
+                    frame_recorder.start(gray.shape)
+                with state_lock:
+                    _b = target_box_main
+                _bx = ("%.1f,%.1f,%.1f,%.1f" % (
+                    (_b[0] + _b[2]) / 2.0, (_b[1] + _b[3]) / 2.0,
+                    _b[2] - _b[0], _b[3] - _b[1])) if _b else ",,,"
+                frame_recorder.add(gray, "%.3f,%s,%s,%.4f" % (
+                    time.monotonic() - _cb_t0 + _cb_t0, track_state, _bx,
+                    last_match_score))
+            elif frame_recorder.active:
+                frame_recorder.stop("слежение окончено")
         print_debug_once_per_second()
 
         with MappedArray(request, "main") as mm:
