@@ -406,6 +406,10 @@ REQUIRE_AUX_TOGGLE_AFTER_LOST = True
 
 FREEZE_TEMPLATE = False    # было True — шаблон плавно адаптируется под рост цели на сближении
 TEMPLATE_UPDATE_ALPHA = 0.010   # доля нового кадра в шаблоне на каждом «уверенном» матче
+# Доля свежего вида, подмешиваемая в ИСХОДНЫЙ эталон при смене масштаба.
+# Больше, чем TEMPLATE_UPDATE_ALPHA, потому что случается редко — только когда
+# масштаб действительно изменился, а не каждый кадр.
+TEMPLATE_BASE_ALPHA = 0.15
 # Следовать ли шаблону за масштабом цели при сближении.
 #
 # ВЫКЛЮЧЕНО, и это вывод из измерений на борту: любое вмешательство сюда
@@ -2697,6 +2701,39 @@ def measure_scale_change(gray, cx, cy):
         return None
 
 
+def _adapt_template_base(gray):
+    """Подмешать текущий вид цели в ИСХОДНЫЙ эталон.
+
+    Зачем отдельно. Эталон нужного масштаба получается пересчётом из
+    исходного — только так удаётся не размывать его накопленными
+    интерполяциями. Но такой пересчёт каждый раз отбрасывает накопленную
+    адаптацию к свету и ракурсу, и эталон остаётся таким, каким был при
+    захвате. На однотонном фоне это сходит с рук, на фактурном устаревший
+    эталон начинает совпадать с фоном — качество слежения падает.
+
+    Здесь свежий кусок кадра приводится к размеру исходного эталона и
+    подмешивается в него. Интерполяция всегда одна и всегда по СВЕЖИМ данным:
+    исходный эталон не пересчитывается сам из себя, поэтому не мутнеет.
+    """
+    global template_base
+    if template_base is None:
+        return
+    try:
+        bh, bw = template_base.shape[:2]
+        fresh, _rect = crop_center(gray, lock_cx, lock_cy,
+                                   int(bw * template_scale_acc),
+                                   int(bh * template_scale_acc))
+        if fresh.size == 0:
+            return
+        if fresh.shape[:2] != (bh, bw):
+            fresh = cv2.resize(fresh, (bw, bh), interpolation=cv2.INTER_AREA)
+        template_base = cv2.addWeighted(
+            template_base, 1.0 - TEMPLATE_BASE_ALPHA,
+            fresh, TEMPLATE_BASE_ALPHA, 0)
+    except Exception:
+        pass
+
+
 def build_template(gray, cx, cy, box_w, box_h):
     global tmpl_w, tmpl_h, template_std
     tw = clamp(max(box_w * TEMPLATE_SCALE, TEMPLATE_MIN), TEMPLATE_MIN, TEMPLATE_MAX)
@@ -4170,6 +4207,17 @@ def process_locked_tracker(gray):
                             template_gray = cv2.resize(
                                 template_base, (nw, nh),
                                 interpolation=cv2.INTER_LINEAR)
+                            # Пересчёт из исходного ОТБРАСЫВАЕТ накопленный вид
+                            # цели: свет поменялся, ракурс поехал, а мы
+                            # возвращаемся к тому, что было при захвате.
+                            # На однотонном фоне это незаметно, на фактурном
+                            # устаревший эталон начинает совпадать с фоном.
+                            # Поэтому вид копим в САМОМ ИСХОДНОМ эталоне:
+                            # свежий кусок кадра приводится к его размеру и
+                            # подмешивается. Интерполяция при этом всегда одна
+                            # и всегда по СВЕЖИМ данным — исходный эталон не
+                            # пересчитывается сам из себя и не размывается.
+                            _adapt_template_base(gray)
         elif SIZE_ADAPT_ENABLED and frame_index % SIZE_ADAPT_EVERY_FRAMES == 0:
             # Область поиска растягиваем под ТЕКУЩИЙ размер коробки, иначе
             # крупная цель заведомо в неё не помещается и измерить её нельзя.
