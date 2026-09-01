@@ -132,6 +132,9 @@ ACQ_RADIUS_LORES = max(8, int(round(ACQ_RADIUS_MAIN * LORES_W / MAIN_W)))
 
 ACQ_LOCK_AT_CROSSHAIR_EXACTLY = True
 ACQ_SIZE_SEARCH_RADIUS = 12 * TRACK_SCALE
+# Предел растяжения области поиска размера под крупную цель. Больше — дороже
+# по процессору и выше риск слить цель с фоном в одну связную компоненту.
+SIZE_SEARCH_RADIUS_MAX = 40 * TRACK_SCALE
 
 ACQ_FORCE_CENTER_LOCK = True
 ACQ_DEFAULT_LOCK_W = 8 * TRACK_SCALE
@@ -1765,13 +1768,33 @@ def flow_predict(prev_g, cur_g, pts, cx, cy):
         return False, cx, cy
 
 
-def estimate_size_at_position(gray, cx, cy):
+def estimate_size_at_position(gray, cx, cy, cur_w=None):
     """Оценка размера цели вокруг точки (cx, cy) по связной компоненте.
-    Возвращает (lw, lh) или (default_w, default_h) если ничего не нашли.
-    Используется и при первом локе (с центром = прицел), и при периодической
-    адаптации размера в TRACKED-фазе.
+
+    Возвращает (lw, lh) либо (None, None), если ИЗМЕРИТЬ НЕ УДАЛОСЬ.
+
+    Различие принципиальное. Раньше при неудаче возвращался размер по
+    умолчанию (8 px) — то есть САМОЕ МАЛЕНЬКОЕ значение. А неудача происходит
+    ровно тогда, когда цель КРУПНАЯ и не помещается в область поиска: связная
+    компонента получалась шире R*1.6 и отвергалась. Адаптация это значение
+    применяла, и коробка каждые 10 кадров возвращалась к минимуму. По логам
+    борта она стояла на 16 px (в координатах кадра) в 76%% кадров.
+
+    Следствие для крупного объекта: трекер вёл участок 8x8 его текстуры, а
+    такой участок неотличим от участка фактурного фона — отсюда и «на крупном
+    фактурном объекте фон перебивает».
+
+    Теперь «не смог измерить» и «размер равен минимуму» — разные ответы, и
+    вызывающая сторона сама решает, что делать.
+
+    cur_w — текущий размер коробки. Область поиска растягивается под него,
+    иначе крупная цель заведомо не помещается и измерить её невозможно.
     """
     R = ACQ_SIZE_SEARCH_RADIUS
+    if cur_w:
+        # Область должна вмещать цель с запасом, иначе компонента упрётся в
+        # её границы и будет отвергнута как «слишком большая».
+        R = int(max(R, min(SIZE_SEARCH_RADIUS_MAX, cur_w * 1.6)))
     cxi = int(round(cx))
     cyi = int(round(cy))
     x1 = max(0, cxi - R)
@@ -1780,7 +1803,7 @@ def estimate_size_at_position(gray, cx, cy):
     y2 = min(gray.shape[0], cyi + R + 1)
     roi = gray[y1:y2, x1:x2]
     if roi.size == 0:
-        return float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H)
+        return None, None
 
     roi_f = roi.astype(np.float32)
     med = float(np.median(roi_f))
@@ -1815,11 +1838,16 @@ def estimate_size_at_position(gray, cx, cy):
             break
 
     if label == 0 or label >= num_labels:
-        return float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H)
+        return None, None
 
     x, y, w, h, area = stats[label]
-    if area < 1 or w > R * 1.6 or h > R * 1.6:
-        return float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H)
+    if area < 1:
+        return None, None
+    # Компонента упёрлась в границы области — значит цель как минимум такая,
+    # но измерить её здесь нельзя. Отвечаем «не знаю», а НЕ минимальным
+    # размером: подмена этих смыслов и ужимала коробку на крупных целях.
+    if w > R * 1.6 or h > R * 1.6:
+        return None, None
 
     lw = clamp(max(float(w) * LOCK_PAD, LOCK_MIN_W), LOCK_MIN_W, LOCK_MAX_W)
     lh = clamp(max(float(h) * LOCK_PAD, LOCK_MIN_H), LOCK_MIN_H, LOCK_MAX_H)
@@ -1836,6 +1864,10 @@ def estimate_size_at_crosshair(gray):
 def estimate_initial_target(gray):
     if ACQ_LOCK_AT_CROSSHAIR_EXACTLY:
         lw, lh = estimate_size_at_crosshair(gray)
+        # При захвате «не измерили» означает «берём размер по умолчанию»:
+        # цель ещё неизвестна, и начать с чего-то надо.
+        if lw is None or lh is None:
+            lw, lh = float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H)
         return float(CENTER_X_LORES), float(CENTER_Y_LORES), float(lw), float(lh), True
     return (float(CENTER_X_LORES), float(CENTER_Y_LORES),
             float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H), True)
@@ -3095,24 +3127,25 @@ def process_locked_tracker(gray):
         # два — порог score и допустимый диапазон оценки, — и без записи
         # непонятно, какой именно закрыт.
         if SIZE_ADAPT_ENABLED and frame_index % SIZE_ADAPT_EVERY_FRAMES == 0:
-            _e_w, _e_h = estimate_size_at_position(gray, lock_cx, lock_cy)
-            _match_dbg["size_est"] = float(_e_w)
+            # Область поиска растягиваем под ТЕКУЩИЙ размер коробки, иначе
+            # крупная цель заведомо в неё не помещается и измерить её нельзя.
+            est_w, est_h = estimate_size_at_position(
+                gray, lock_cx, lock_cy, cur_w=max(lock_w, lock_h))
+            _match_dbg["size_est"] = est_w if est_w is not None else -1.0
             if not match_ok:
                 _match_dbg["size_skip"] = 1        # матча нет
             elif score < SIZE_ADAPT_MIN_SCORE:
                 _match_dbg["size_skip"] = 2        # score ниже порога
-            elif not (SIZE_ADAPT_MIN_W <= _e_w <= SIZE_ADAPT_MAX_W
-                      and SIZE_ADAPT_MIN_W <= _e_h <= SIZE_ADAPT_MAX_W):
-                _match_dbg["size_skip"] = 3        # оценка вне допустимого
+            elif est_w is None:
+                _match_dbg["size_skip"] = 3        # измерить не удалось
+            elif not (SIZE_ADAPT_MIN_W <= est_w <= SIZE_ADAPT_MAX_W
+                      and SIZE_ADAPT_MIN_W <= est_h <= SIZE_ADAPT_MAX_W):
+                _match_dbg["size_skip"] = 4        # вне допустимого диапазона
             else:
                 _match_dbg["size_skip"] = 0        # применена
-
-        if (SIZE_ADAPT_ENABLED and frame_index % SIZE_ADAPT_EVERY_FRAMES == 0
-                and match_ok and score >= SIZE_ADAPT_MIN_SCORE):
-            est_w, est_h = estimate_size_at_position(gray, lock_cx, lock_cy)
-            # Sanity: оцениваем только если в разумных пределах.
-            if (SIZE_ADAPT_MIN_W <= est_w <= SIZE_ADAPT_MAX_W
-                    and SIZE_ADAPT_MIN_W <= est_h <= SIZE_ADAPT_MAX_W):
+                # Размер меняем только когда его ДЕЙСТВИТЕЛЬНО измерили.
+                # Прежде при неудаче подставлялся минимум, и коробка каждые
+                # 10 кадров ужималась обратно.
                 lock_w = lock_w * (1.0 - SIZE_ADAPT_ALPHA) + est_w * SIZE_ADAPT_ALPHA
                 lock_h = lock_h * (1.0 - SIZE_ADAPT_ALPHA) + est_h * SIZE_ADAPT_ALPHA
 
