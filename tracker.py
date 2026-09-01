@@ -534,6 +534,28 @@ SEARCH_MARGIN_VEL_REF = 12.0 * TRACK_SCALE         # flow-motion (px/кадр) �
 # под текущим центром лока и сдвигаем lock_w/lock_h в её сторону.
 # Это решает «дрейф зацепом за край» при сближении — коробка растёт вместе
 # с целью, и шаблон-матч продолжает якориться по центру, а не по краю.
+# --- РАЗМЕР ПО МАСШТАБУ СОВПАДЕНИЯ ---
+# Прежний способ мерил размер сегментацией: порог по яркости вокруг центра и
+# связная компонента. ПРОВЕРЕНО на загромождённой сцене — способ негоден в
+# принципе, а не по настройкам:
+#     цель  20 px -> намерил 120   (слился с соседним предметом)
+#     цель  38 px -> намерил  80
+#     цель  64 px -> намерил 120
+# Он либо упирается в край области, либо сливает цель с соседями и ВРЁТ. На
+# борту это и наблюдалось: размер менялся только когда предмет подносили на
+# 10-20 см, то есть когда он занимал почти весь кадр и соседей рядом не
+# оставалось.
+#
+# Здесь размер меряется тем же, чем ведётся слежение, — совпадением с
+# эталоном. Эталон примеряется в трёх масштабах, и побеждает тот, что
+# совпадает лучше. Сегментация не нужна вовсе, а загромождение не мешает:
+# эталон и так умеет отличать цель от фона, иначе слежение бы не работало.
+#
+# Цена замерена: одно сравнение с эталоном 58x58 стоит на малине 5.6 мс, два
+# лишних масштаба раз в 4 кадра дают 2.8 мс на кадр при бюджете 38 мс.
+SIZE_BY_SCALE_ENABLED = True
+SIZE_SCALE_STEP = 1.18        # во сколько раз примеряем крупнее и мельче
+SIZE_SCALE_MIN_LEAD = 0.012   # насколько сосед должен обойти текущий масштаб
 SIZE_ADAPT_ENABLED = True
 # ПОСЧИТАНО по заходу 152533 (383 с слежения, оператор водил цель на метр
 # туда-обратно, жалоба: «когда цель маленькая, sz вообще не меняется»):
@@ -873,7 +895,7 @@ _FLIGHT_LOG_COLUMNS = (
     "fc_roll,fc_pitch,fc_yaw,att_age_ms,"
     "m1,m2,m3,m4,rc_r,rc_p,rc_y,rc_t,dt_ms,cb_ms,armed,"
     "launch_target_deg,launch_reached,k,match_psr,match_second,search_margin,"
-    "match_flow_gap,size_est,size_skip,size_why,size_R,motion_sep,motion_on,"
+    "match_flow_gap,size_est,size_skip,size_why,size_R,size_scale,motion_sep,motion_on,"
     "color_on,color_pen,color_best,"
     "alt_cm,vario_cms,alt_age_ms,"
     "box_size_px,box_growth,tau_s,range_m,depression_deg,dy_alt_decoupled,"
@@ -2405,6 +2427,57 @@ def color_penalty_map(sx1, sy1, tw, th, shape):
         return None
 
 
+def measure_scale_change(gray, cx, cy):
+    """Во сколько раз цель изменилась в размере. Возвращает множитель или None.
+
+    Эталон примеряется в трёх масштабах — мельче, как есть, крупнее — и
+    побеждает тот, что совпадает лучше. Никакой сегментации: используется ровно
+    тот же признак, которым ведётся слежение, поэтому загромождённая сцена
+    мешает не больше, чем самому слежению.
+
+    Множитель возвращается только когда соседний масштаб обходит текущий
+    ЗАМЕТНО. Иначе шум масштабировал бы коробку на каждом кадре.
+    """
+    if template_gray is None or template_gray.size == 0:
+        return None
+    try:
+        th, tw = template_gray.shape[:2]
+        # Область должна вмещать самый крупный из примеряемых эталонов.
+        big = int(max(tw, th) * SIZE_SCALE_STEP)
+        margin = int(SEARCH_MARGIN_MIN)
+        sw = big + margin * 2
+        search, _rect = crop_center(gray, cx, cy, sw, sw)
+        if search.shape[0] < big + 2 or search.shape[1] < big + 2:
+            return None
+
+        best_s, best_v = 1.0, None
+        base_v = None
+        for s_ in (1.0 / SIZE_SCALE_STEP, 1.0, SIZE_SCALE_STEP):
+            w_ = int(round(tw * s_))
+            h_ = int(round(th * s_))
+            if w_ < 8 or h_ < 8:
+                continue
+            if w_ >= search.shape[1] or h_ >= search.shape[0]:
+                continue
+            tm = (template_gray if s_ == 1.0 else
+                  cv2.resize(template_gray, (w_, h_),
+                             interpolation=cv2.INTER_AREA if s_ < 1.0
+                             else cv2.INTER_LINEAR))
+            res = cv2.matchTemplate(search, tm, cv2.TM_CCOEFF_NORMED)
+            v = float(res.max()) if res.size else -1.0
+            if s_ == 1.0:
+                base_v = v
+            if best_v is None or v > best_v:
+                best_v, best_s = v, s_
+        if base_v is None or best_v is None:
+            return None
+        if best_s == 1.0 or (best_v - base_v) < SIZE_SCALE_MIN_LEAD:
+            return 1.0
+        return best_s
+    except Exception:
+        return None
+
+
 def build_template(gray, cx, cy, box_w, box_h):
     global tmpl_w, tmpl_h, template_std
     tw = clamp(max(box_w * TEMPLATE_SCALE, TEMPLATE_MIN), TEMPLATE_MIN, TEMPLATE_MAX)
@@ -3804,7 +3877,29 @@ def process_locked_tracker(gray):
         # в 76%% кадров и почти не растёт, хотя объект бывает крупным. Гейта
         # два — порог score и допустимый диапазон оценки, — и без записи
         # непонятно, какой именно закрыт.
-        if SIZE_ADAPT_ENABLED and frame_index % SIZE_ADAPT_EVERY_FRAMES == 0:
+        if (SIZE_BY_SCALE_ENABLED and SIZE_ADAPT_ENABLED
+                and frame_index % SIZE_ADAPT_EVERY_FRAMES == 0):
+            # Размер по масштабу совпадения. Сегментация не участвует.
+            if not match_ok:
+                _match_dbg["size_skip"] = 1
+            elif score < SIZE_ADAPT_MIN_SCORE:
+                _match_dbg["size_skip"] = 2
+            else:
+                k_scale = measure_scale_change(gray, lock_cx, lock_cy)
+                _match_dbg["size_scale"] = k_scale
+                if k_scale is None:
+                    _match_dbg["size_skip"] = 3     # примерить не удалось
+                elif k_scale == 1.0:
+                    _match_dbg["size_skip"] = 5     # масштаб не изменился
+                else:
+                    _match_dbg["size_skip"] = 0
+                    # Двигаем не к измеренному размеру, а НА измеренный
+                    # множитель: масштаб — величина относительная, и
+                    # накопление идёт само собой, шаг за шагом.
+                    grow = 1.0 + (k_scale - 1.0) * SIZE_ADAPT_ALPHA
+                    lock_w = clamp(lock_w * grow, LOCK_MIN_W, LOCK_MAX_W)
+                    lock_h = clamp(lock_h * grow, LOCK_MIN_H, LOCK_MAX_H)
+        elif SIZE_ADAPT_ENABLED and frame_index % SIZE_ADAPT_EVERY_FRAMES == 0:
             # Область поиска растягиваем под ТЕКУЩИЙ размер коробки, иначе
             # крупная цель заведомо в неё не помещается и измерить её нельзя.
             est_w, est_h = estimate_size_at_position(
@@ -4037,6 +4132,7 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("margin"), _match_dbg.get("flow_gap"),
             _match_dbg.get("size_est"), _match_dbg.get("size_skip"),
             _match_dbg.get("size_why"), _match_dbg.get("size_R"),
+            _match_dbg.get("size_scale"),
             _match_dbg.get("motion_sep"), _match_dbg.get("motion_on"),
             _match_dbg.get("color_on"), _match_dbg.get("color_pen"),
             _match_dbg.get("color_best"),
