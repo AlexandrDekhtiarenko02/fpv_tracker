@@ -399,6 +399,29 @@ PITCH_ATTITUDE_COMP_ENABLED = True
 # IMX219 в 640×480 (биннинг до 1640×1232, потом scale): VFOV ≈ 41° → 11.7 px/°.
 # Подбери под свой реальный масштаб, если разрешение / crop другой.
 PIXELS_PER_PITCH_DEG = 11.7
+# Знак компенсации. ЗАМЕРЕНО по заходу 141912, три захвата, регрессия по
+# уровню (не по разностям):
+#
+#   захват   цель в кадре   компенсация   ПРИЦЕЛ dy_aim
+#      1      -6.01 px/°     -0.50 px/°     -6.90 px/°
+#      2     -12.24 px/°     -4.30 px/°    -17.38 px/°
+#      3      -8.80 px/°     -7.64 px/°    -16.78 px/°
+#
+# Компенсация двигалась В ТУ ЖЕ сторону, что и цель, и прицельная ошибка
+# СКЛАДЫВАЛАСЬ вместо того, чтобы гаситься: dy_aim выходил примерно вдвое
+# круче самой цели вместо нуля.
+#
+# Этот вывод не зависит ни от знака тангажа в прошивке, ни от того,
+# перевёрнута камера или нет. Что бы там ни было, для гашения компенсация
+# ОБЯЗАНА идти против наблюдаемого смещения цели — а она шла вместе с ним.
+#
+# Совпадает с журналом: строка 'pitch-comp outweighs real error' стоит почти
+# в каждом VERDICT.
+PITCH_COMP_SIGN = +1
+# Раз в столько кадров слежения писать в журнал, ГАСИТ ли компенсация наклон.
+# Знак здесь зависит от физической установки камеры, а она может смениться —
+# поэтому правка проверяет себя сама на каждом заходе, а не один раз мной.
+PITCH_COMP_SELFCHECK_FRAMES = 300
 # Не даём компенсации улететь на полкадра при дёргании квада.
 MAX_PITCH_COMP_PX = 100.0
 # Низкочастотный фильтр на fc_pitch_deg — без него aim-точка прыгает на каждом твике.
@@ -1294,6 +1317,8 @@ yaw_integral = 0.0
 
 # Сглаженное значение fc_pitch_deg для расчёта компенсации тангажа.
 smoothed_pitch_deg = 0.0
+_pcs_n = 0
+_pcs_sx = _pcs_sxx = _pcs_sy = _pcs_sxy = _pcs_sz = _pcs_sxz = 0.0
 
 # Момент прошлого вызова управления — из него берётся фактическая длительность
 # кадра. None = первый кадр после захвата, длительность ещё не измерить.
@@ -2517,6 +2542,44 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
     return out
 
 
+def _pitch_comp_selfcheck(fc_pitch, box_cy, dy_aim):
+    """Проверка самой компенсации: гасит она наклон или складывается с ним.
+
+    Считаем наклон зависимости прицела от тангажа. Если компенсация верна,
+    dy_aim почти не зависит от тангажа — цель уезжает, а прицельная точка
+    стоит. Если знак не тот, dy_aim выходит примерно вдвое круче цели.
+
+    Считается по накоплению сумм, без хранения истории: ~1 мкс на кадр.
+    """
+    global _pcs_n, _pcs_sx, _pcs_sxx, _pcs_sy, _pcs_sxy, _pcs_sz, _pcs_sxz
+    _pcs_n += 1
+    _pcs_sx += fc_pitch
+    _pcs_sxx += fc_pitch * fc_pitch
+    _pcs_sy += box_cy
+    _pcs_sxy += fc_pitch * box_cy
+    _pcs_sz += dy_aim
+    _pcs_sxz += fc_pitch * dy_aim
+    if _pcs_n < PITCH_COMP_SELFCHECK_FRAMES:
+        return
+    den = _pcs_n * _pcs_sxx - _pcs_sx * _pcs_sx
+    if den > 1e-6:
+        k_tgt = (_pcs_n * _pcs_sxy - _pcs_sx * _pcs_sy) / den
+        k_aim = (_pcs_n * _pcs_sxz - _pcs_sx * _pcs_sz) / den
+        if abs(k_tgt) < 0.5:
+            verdict = "наклона почти не было, судить не по чему"
+        elif abs(k_aim) <= abs(k_tgt) * 0.5:
+            verdict = "ГАСИТ"
+        elif abs(k_aim) >= abs(k_tgt) * 1.5:
+            verdict = "СКЛАДЫВАЕТСЯ — знак не тот"
+        else:
+            verdict = "гасит частично"
+        flight_log.event(
+            "КОМПЕНСАЦИЯ ТАНГАЖА: цель %+.2f px/°, прицел %+.2f px/° -> %s"
+            % (k_tgt, k_aim, verdict))
+    _pcs_n = 0
+    _pcs_sx = _pcs_sxx = _pcs_sy = _pcs_sxy = _pcs_sz = _pcs_sxz = 0.0
+
+
 def _pitch_angle_hold_pwm(target_deg, now_mono, k):
     """Команда тангажа, удерживающая ЗАДАННЫЙ УГОЛ наклона носа.
 
@@ -2580,7 +2643,7 @@ def _compute_pitch_attitude_comp_px(now_mono, k=1.0):
 
     smoothed_pitch_deg += alpha_for_dt(PITCH_COMP_ALPHA, k) * (
         float(fc_pitch) - smoothed_pitch_deg)
-    comp_px = -smoothed_pitch_deg * PIXELS_PER_PITCH_DEG
+    comp_px = PITCH_COMP_SIGN * smoothed_pitch_deg * PIXELS_PER_PITCH_DEG
     if comp_px > MAX_PITCH_COMP_PX:
         comp_px = MAX_PITCH_COMP_PX
     elif comp_px < -MAX_PITCH_COMP_PX:
@@ -2781,6 +2844,11 @@ def update_control_from_target():
     # Прицельная точка: текущая позиция + статический оффсет + компенсация тангажа + упреждение.
     dx_aim = (box_cx + AIM_OFFSET_X + lead_x) - CENTER_X
     dy_aim = (box_cy + AIM_OFFSET_Y + pitch_comp_px + lead_y) - CENTER_Y
+
+    with state_lock:
+        _fcp = app_state.get("fc_pitch_deg")
+    if _fcp is not None:
+        _pitch_comp_selfcheck(float(_fcp), float(box_cy), float(dy_aim))
 
     # Для газа — чистая позиция коробки, БЕЗ AIM_OFFSET, БЕЗ компенсации, БЕЗ упреждения.
     # Высоту мы корректируем по реальному положению цели, а не по предсказанному.
