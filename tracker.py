@@ -181,6 +181,37 @@ TEMPLATE_MIN = 14
 TEMPLATE_MAX = 58 * TRACK_SCALE
 
 SEARCH_MARGIN = 24 * TRACK_SCALE         # было 28 — чуть тише search-окно, меньше шансов уцепиться за фоновый паттерн
+# --- ОТСЕВ ПО ДВИЖЕНИЮ ---
+# Когда цель того же цвета и яркости, что фактурный фон, сравнивать по виду
+# нечего — особенно если цель МЕЛКАЯ: маленький шаблон это просто «кусочек
+# текстуры», а кусочки текстуры похожи друг на друга. Наращивание качества
+# сравнения тут упирается в потолок: информации в шаблоне мало.
+#
+# Движение свободно от этого ограничения. Оно НЕ ЗАВИСИТ ОТ РАЗМЕРА ЦЕЛИ:
+# даже трёхпиксельная цель движется иначе фона, и этого достаточно.
+#
+# Как считается: по сетке точек в окне поиска берётся оптический поток.
+# Медиана по всем точкам — это движение ФОНА (он занимает большую часть
+# площади). Дальше каждая точка сравнивается с фоном: движется как фон —
+# штраф, движется иначе — не штрафуется.
+#
+# ТО ЖЕ ТРЕБОВАНИЕ, ЧТО И К ЦВЕТУ: не сделать хуже. Признак включается только
+# когда цель ДЕЙСТВИТЕЛЬНО движется иначе фона. Если она стоит (или дрон
+# летит на неподвижную наземную цель — тогда цель часть неподвижного мира),
+# признак информации не несёт и остаётся выключенным.
+MOTION_GUARD_ENABLED = True
+# Шаг сетки точек в окне поиска, пиксели. Мельче — точнее и дороже.
+MOTION_GRID_STEP = 8 * TRACK_SCALE
+# Насколько цель должна двигаться иначе фона, чтобы признаку верить, px/кадр.
+MOTION_MIN_SEPARATION = 1.5 * TRACK_SCALE
+# Отклонение от движения фона, считающееся полным различием, px/кадр.
+MOTION_REF_DIST = 3.0 * TRACK_SCALE
+# Разность яркости, считающаяся полным откликом движения. Мелкая цель той же
+# фактуры даёт слабый отклик, поэтому масштаб небольшой.
+MOTION_DIFF_REF = 4.0
+# Вес штрафа за движение вместе с фоном.
+MOTION_PENALTY = 0.5
+
 # --- ОТСЕВ ПО ЦВЕТУ ---
 # Трекинг идёт по яркости, а поток с камеры — YUV420: плоскости цветности УЖЕ
 # лежат в том же буфере, сразу под яркостью. Мы их выбрасывали. Брать их
@@ -698,7 +729,7 @@ _FLIGHT_LOG_COLUMNS = (
     "fc_roll,fc_pitch,fc_yaw,att_age_ms,"
     "m1,m2,m3,m4,rc_r,rc_p,rc_y,rc_t,dt_ms,cb_ms,armed,"
     "launch_target_deg,launch_reached,k,match_psr,match_second,search_margin,"
-    "match_flow_gap,size_est,size_skip,"
+    "match_flow_gap,size_est,size_skip,motion_sep,motion_on,"
     "alt_cm,vario_cms,alt_age_ms,"
     "box_size_px,box_growth,tau_s,range_m,depression_deg,dy_alt_decoupled"
 )
@@ -1319,6 +1350,11 @@ target_uv = None          # (U, V) цели, снятые при захвате
 color_active = False      # различает ли цвет цель и фон в этом захвате
 color_separation = 0.0
 chroma_fail_reason = ""   # почему цвет не сработал — для журнала
+# Движение фона и цели за последний кадр, для отсева по движению.
+motion_bg = None          # (dx, dy) фона
+motion_target = None      # (dx, dy) цели
+motion_active = False     # движется ли цель иначе фона
+motion_separation = 0.0
 template_std = 0.0
 prev_gray = None
 prev_pts = None
@@ -1943,6 +1979,105 @@ def measure_color_separation(cx, cy, box_w, box_h):
     return (tu, tv), sep
 
 
+def motion_penalty_map(prev_g, cur_g, sx1, sy1, sx2, sy2, tw, th, shape,
+                       tgt_dx, tgt_dy):
+    """Штраф кандидатам, которые движутся ВМЕСТЕ С ФОНОМ.
+
+    Метод: оценить движение фона, скомпенсировать его сдвигом предыдущего
+    кадра и взять разность с текущим. Всё, что двигалось иначе фона, даёт
+    остаточный отклик; фон гасится.
+
+    Почему не оптический поток по точкам. Он измеряет смещение по градиентам в
+    окне 15x15 и принципиально не справляется с МЕЛКОЙ целью: при смещении
+    цели на её собственный размер она уходит из окна целиком, и измерять
+    нечего. Проверено: цель 6 px, сместившаяся на 6 px, давала 1.0 вместо 6.0
+    при любом размере окна. А мелкая цель — ровно тот случай, ради которого
+    признак и нужен. Разность кадров этим не ограничена: для цели 10-16 px
+    отклик выше фонового в 40-50 раз.
+
+    Признак НЕ ЗАВИСИТ ОТ РАЗМЕРА ЦЕЛИ, и этим ценен: когда цель мельче
+    деталей фона, сравнивать по виду уже нечего, а движение различает.
+
+    Возвращает (карта_штрафа, движение_фона, различимость) либо
+    (None, None, 0.0), если посчитать нельзя.
+    """
+    if prev_g is None or cur_g is None:
+        return None, None, 0.0
+    try:
+        # --- 1. движение фона ---
+        # Считается потоком по редкой сетке: фон крупный и фактурный, для него
+        # поток надёжен. Медиана описывает именно фон — он занимает большую
+        # часть площади окна.
+        step = max(6, int(MOTION_GRID_STEP))
+        xs = np.arange(sx1 + step // 2, sx2 - 1, step, dtype=np.float32)
+        ys = np.arange(sy1 + step // 2, sy2 - 1, step, dtype=np.float32)
+        if len(xs) < 3 or len(ys) < 3:
+            return None, None, 0.0
+        gx, gy = np.meshgrid(xs, ys)
+        pts = np.stack([gx.ravel(), gy.ravel()], axis=1).reshape(-1, 1, 2)
+        nxt, st, _ = cv2.calcOpticalFlowPyrLK(
+            prev_g, cur_g, pts, None, winSize=(15, 15), maxLevel=2,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+        if nxt is None or st is None:
+            return None, None, 0.0
+        ok = st.reshape(-1).astype(bool)
+        if ok.sum() < 6:
+            return None, None, 0.0
+        d = (nxt - pts).reshape(-1, 2)
+        bg = np.array([float(np.median(d[ok, 0])), float(np.median(d[ok, 1]))])
+
+        # Если цель движется почти как фон, признак ничего не различает.
+        # Так бывает, когда цель стоит — и так будет в реальном применении,
+        # где дрон летит на НЕПОДВИЖНУЮ наземную цель. Тогда молчим.
+        sep = float(math.hypot(tgt_dx - bg[0], tgt_dy - bg[1]))
+        if sep < MOTION_MIN_SEPARATION:
+            return None, bg, sep
+
+        # --- 2. компенсация движения фона и разность ---
+        pad = 24
+        wx1 = max(0, int(sx1) - pad)
+        wy1 = max(0, int(sy1) - pad)
+        wx2 = min(cur_g.shape[1], int(sx2) + pad)
+        wy2 = min(cur_g.shape[0], int(sy2) + pad)
+        if wx2 - wx1 < 8 or wy2 - wy1 < 8:
+            return None, bg, sep
+        M = np.float32([[1, 0, float(bg[0])], [0, 1, float(bg[1])]])
+        warped = cv2.warpAffine(prev_g[wy1:wy2, wx1:wx2], M,
+                                (wx2 - wx1, wy2 - wy1),
+                                flags=cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_REPLICATE)
+        diff = cv2.absdiff(cur_g[wy1:wy2, wx1:wx2], warped).astype(np.float32)
+        # Усредняем по площади цели: одиночный пиксель разности слишком шумен.
+        k = max(3, int(tw / max(TEMPLATE_SCALE, 1.0)) | 1)
+        diff = cv2.blur(diff, (k, k))
+
+        # --- 3. штраф там, где отклика НЕТ (значит движется как фон) ---
+        # Нормировка УСТОЙЧИВАЯ, а не по максимуму. Максимум задаётся редким
+        # выбросом (край, блик), и деление на него топит слабый сигнал: у цели
+        # 6 px той же текстуры отклик около 0.6 при выбросах в десятки —
+        # различие есть, но после деления исчезает.
+        # Опорой берём медиану (это уровень фона), а масштабом — фиксированную
+        # величину в единицах яркости.
+        base = float(np.median(diff))
+        resp = np.clip((diff - base) / MOTION_DIFF_REF, 0.0, 1.0)
+        if float(resp.max()) < 0.05:
+            return None, bg, sep          # ничего не движется, различать нечем
+        pen = 1.0 - resp
+        # Вырезаем часть, соответствующую ЦЕНТРАМ кандидатов.
+        # Кандидат (i, j) ставит шаблон углом в (sx1+j, sy1+i), значит центр
+        # цели у него в (sx1+j+tw/2, sy1+i+th/2). Раньше вырез брался от угла
+        # и растягивался — из-за этого он уезжал мимо цели тем сильнее, чем
+        # крупнее шаблон, и штраф ложился не туда.
+        rh, rw = shape
+        ox = int(sx1) - wx1 + int(tw) // 2
+        oy = int(sy1) - wy1 + int(th) // 2
+        if ox < 0 or oy < 0 or ox + rw > pen.shape[1] or oy + rh > pen.shape[0]:
+            return None, bg, sep
+        return pen[oy:oy + rh, ox:ox + rw], bg, sep
+    except Exception:
+        return None, None, 0.0
+
+
 def color_penalty_map(sx1, sy1, tw, th, shape):
     """Штраф за несовпадение цвета для каждой позиции кандидата.
 
@@ -1988,7 +2123,8 @@ def build_template(gray, cx, cy, box_w, box_h):
     return tmpl
 
 
-def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0):
+def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0,
+                          tgt_dx=0.0, tgt_dy=0.0):
     """Темплейт-матч с distance-penalty + субпиксельная интерполяция пика.
 
     flow_motion: модуль смещения flow-предсказания за кадр (px). Используется
@@ -1996,6 +2132,7 @@ def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0):
     (быстрее матч, меньше шансов уцепиться за фон), на быстрой — больше.
     """
     global template_gray, tmpl_w, tmpl_h
+    global motion_bg, motion_active, motion_separation
     if template_gray is None or tmpl_w is None or tmpl_h is None:
         return False, pred_cx, pred_cy, 0.0
 
@@ -2040,6 +2177,20 @@ def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0):
     cmap = color_penalty_map(sx1, sy1, tmpl_w, tmpl_h, score_map.shape)
     if cmap is not None:
         penalized = penalized - COLOR_PENALTY * cmap
+
+    # Отсев по движению. Не зависит от размера цели, поэтому работает там, где
+    # сравнение по виду упирается в потолок: мелкая цель на фактурном фоне.
+    if MOTION_GUARD_ENABLED:
+        mmap, bg, sep = motion_penalty_map(
+            prev_gray, gray, sx1, sy1, sx2, sy2, tmpl_w, tmpl_h,
+            score_map.shape, tgt_dx, tgt_dy)
+        motion_bg = bg
+        motion_separation = sep
+        motion_active = mmap is not None
+        if mmap is not None:
+            penalized = penalized - MOTION_PENALTY * mmap
+        _match_dbg["motion_sep"] = sep
+        _match_dbg["motion_on"] = 1 if motion_active else 0
 
     _, max_val, _, max_loc = cv2.minMaxLoc(penalized.astype(np.float32))
     mx, my = max_loc
@@ -3001,7 +3152,11 @@ def process_locked_tracker(gray):
     # Модуль flow-предсказанного смещения цели за кадр — используется
     # template_match_locked для адаптивного выбора search-окна.
     flow_motion = math.hypot(pred_cx - lock_cx, pred_cy - lock_cy) if flow_ok else 0.0
-    match_ok, match_cx, match_cy, score = template_match_locked(gray, pred_cx, pred_cy, flow_motion)
+    # Движение цели за кадр — разница между предсказанием потока и прежним
+    # положением. Именно с ним сравнивается движение фона.
+    match_ok, match_cx, match_cy, score = template_match_locked(
+        gray, pred_cx, pred_cy, flow_motion,
+        tgt_dx=pred_cx - lock_cx, tgt_dy=pred_cy - lock_cy)
     last_match_score = score
     last_flow_ok = flow_ok
 
@@ -3355,6 +3510,7 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("psr"), _match_dbg.get("second"),
             _match_dbg.get("margin"), _match_dbg.get("flow_gap"),
             _match_dbg.get("size_est"), _match_dbg.get("size_skip"),
+            _match_dbg.get("motion_sep"), _match_dbg.get("motion_on"),
             alt_cm, vario_cms, alt_age,
             g("size_px"), g("growth"), g("tau_s"), g("range_m"),
             g("depression_deg"), g("dy_alt_decoupled"),
