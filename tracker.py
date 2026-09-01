@@ -254,6 +254,29 @@ COLOR_REF_DIST = 20.0
 # мелкой цели цветных пикселей единицы — оценка становится ненадёжной.
 COLOR_MIN_TARGET_CHROMA_PX = 2
 
+# --- ЦВЕТОВОЙ МАЯК ---
+# Измерено на прогоне 111042: когда цель нужного цвета ЕСТЬ в окне поиска,
+# цвет выигрывает в 85% кадров. Но в 66% кадров с включённым цветом цели
+# нужного цвета в окне НЕТ ВОВСЕ — рамка уже ушла, и выбирать цвету не из
+# чего. Штраф работает как отбор среди кандидатов и не умеет вернуть рамку
+# к тому, чего не видит.
+#
+# Уход не мгновенный: color_best растёт на 0.09 за кадр, отрезки «цели в окне
+# нет» длятся в среднем 11.8 кадра (0.5 с). То есть время на возврат есть.
+#
+# Расширять окно яркостного матча нельзя. Замерено при реальных размерах
+# (кадр 320x240, шаблон 40x40) с пересчётом Mac->малина x55:
+#     margin 24 (сейчас) -> 4.1 мс     margin 54 -> 12.8 мс
+#     margin 36 (максимум) -> 6.7 мс   margin 72 -> 18.4 мс
+# При бюджете кадра 38 мс расширение съедает его целиком. А поиск по
+# цветности идёт вдвое грубее и без свёртки шаблоном: ВЕСЬ кадр за 1.8 мс.
+# Поэтому возврат делается по цвету, а не расширением матча.
+COLOR_RECOVER_ENABLED = True
+COLOR_RECOVER_AFTER = 5        # кадров подряд «рамка на чужом цвете» до возврата
+COLOR_RECOVER_WRONG = 0.55     # выше этого штрафа считаем, что рамка не на цели
+COLOR_RECOVER_GOOD = 0.25      # маяк принимается, только если цвет совпал строго
+COLOR_RECOVER_MAX_JUMP = 110 * TRACK_SCALE   # дальше не прыгаем: это уже не наш объект
+
 MATCH_MIN_SCORE = 0.22
 # Доверие к матчу падает, если на карте откликов есть конкурент НЕ ХУЖЕ
 # выбранного. Замерено на борту в момент срыва:
@@ -733,7 +756,7 @@ _FLIGHT_LOG_COLUMNS = (
     "m1,m2,m3,m4,rc_r,rc_p,rc_y,rc_t,dt_ms,cb_ms,armed,"
     "launch_target_deg,launch_reached,k,match_psr,match_second,search_margin,"
     "match_flow_gap,size_est,size_skip,motion_sep,motion_on,"
-    "color_on,color_pen,color_best,"
+    "color_on,color_pen,color_best,color_recover,"
     "alt_cm,vario_cms,alt_age_ms,"
     "box_size_px,box_growth,tau_s,range_m,depression_deg,dy_alt_decoupled"
 )
@@ -1358,6 +1381,8 @@ chroma_u = None
 chroma_v = None
 target_uv = None          # (U, V) цели, снятые при захвате
 color_active = False      # различает ли цвет цель и фон в этом захвате
+color_wrong_frames = 0    # сколько кадров подряд рамка стоит на чужом цвете
+color_recover_count = 0   # сколько раз цвет возвращал рамку за полёт
 color_separation = 0.0
 chroma_fail_reason = ""   # почему цвет не сработал — для журнала
 chroma_debug = ""         # измеренные цвета цели и фона, для журнала
@@ -2187,6 +2212,47 @@ def color_penalty_map(sx1, sy1, tw, th, shape):
         return None
 
 
+def find_color_beacon(cur_cx, cur_cy, box_w, box_h):
+    """Где во всём кадре лежит пятно цвета цели.
+
+    Штраф по цвету умеет выбирать среди кандидатов внутри окна поиска. Когда
+    рамка с окном уже сползли с цели, выбирать не из чего — этот поиск
+    возвращает рамку обратно. Считается по цветности (вдвое грубее яркости) и
+    без свёртки шаблоном, поэтому весь кадр обходится за ~1.8 мс на малине.
+
+    Возвращает (cx, cy, d) в координатах ЯРКОСТИ или None.
+    """
+    if target_uv is None or chroma_u is None or chroma_v is None:
+        return None
+    try:
+        tu, tv = target_uv
+        u = chroma_u.astype(np.int16)
+        v = chroma_v.astype(np.int16)
+        d = np.abs(u - int(tu)) + np.abs(v - int(tv))
+        # Усреднение по площади цели: одиночный пиксель цветности слишком
+        # шумен, а нам нужно ПЯТНО размером с цель, а не случайный пиксель.
+        k = int(max(3, min(box_w, box_h) / 2))
+        if k % 2 == 0:
+            k += 1
+        d = cv2.blur(d.astype(np.float32), (k, k))
+        # За пределами разумного прыжка не смотрим: там может быть другой
+        # предмет того же цвета, и возврат превратился бы в телепорт.
+        H, W = d.shape
+        r = int(COLOR_RECOVER_MAX_JUMP / 2)          # в координатах цветности
+        ccx, ccy = int(cur_cx / 2), int(cur_cy / 2)
+        x0, x1 = max(0, ccx - r), min(W, ccx + r + 1)
+        y0, y1 = max(0, ccy - r), min(H, ccy + r + 1)
+        if x1 - x0 < 3 or y1 - y0 < 3:
+            return None
+        sub = d[y0:y1, x0:x1]
+        _, _, min_loc, _ = cv2.minMaxLoc(sub)
+        bx, by = min_loc
+        val = float(sub[by, bx]) / COLOR_REF_DIST
+        return (float((x0 + bx) * 2), float((y0 + by) * 2), val)
+    except Exception:
+        return None
+
+
 def build_template(gray, cx, cy, box_w, box_h):
     global tmpl_w, tmpl_h, template_std
     tw = clamp(max(box_w * TEMPLATE_SCALE, TEMPLATE_MIN), TEMPLATE_MIN, TEMPLATE_MAX)
@@ -2251,6 +2317,7 @@ def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0,
     # яркостной — сравнимой с прежними логами.
     cmap = color_penalty_map(sx1, sy1, tmpl_w, tmpl_h, score_map.shape)
     _match_dbg["color_on"] = 1 if cmap is not None else 0
+    _match_dbg["color_recover"] = 0
     if cmap is not None:
         penalized = penalized - COLOR_PENALTY * cmap
 
@@ -2343,6 +2410,7 @@ def reset_tracking(to_acq=False):
     global track_state, target_visible, target_controllable, overlay_text, overlay_color, target_box_main
     global lock_cx, lock_cy, lock_w, lock_h, tmpl_w, tmpl_h, template_gray, template_std
     global template_base, target_uv, color_active, color_separation
+    global color_wrong_frames, color_recover_count
     global prev_gray, prev_pts, lost_frames, last_match_score, last_flow_ok
     global acq_wait_left
     global filtered_dx_yaw, prev_adx, prev_ady_ctrl
@@ -3082,6 +3150,7 @@ def process_locked_tracker(gray):
     global fps_t0, fps_frames, fps_current
     global prev_aux_on, acq_wait_left, lock_sequence
     global auto_reacq_attempts
+    global color_wrong_frames, color_recover_count
 
     frame_index += 1
 
@@ -3196,6 +3265,7 @@ def process_locked_tracker(gray):
             if COLOR_GUARD_ENABLED:
                 target_uv, color_separation = measure_color_separation(
                     lock_cx, lock_cy, lock_w, lock_h)
+                color_wrong_frames = 0
                 color_active = (target_uv is not None
                                 and color_separation >= COLOR_MIN_SEPARATION)
                 if color_active:
@@ -3212,6 +3282,7 @@ def process_locked_tracker(gray):
                            (" | причина: " + chroma_fail_reason)
                            if chroma_fail_reason else ""))
             else:
+                color_wrong_frames = 0
                 color_active = False
             prev_gray = gray.copy()
             prev_pts = refresh_flow_points(gray, lock_cx, lock_cy, lock_w, lock_h)
@@ -3298,6 +3369,38 @@ def process_locked_tracker(gray):
         new_cx = match_cx
         new_cy = match_cy
         tracked_ok = True
+
+    # Возврат по цвету. Штраф по цвету выбирает лучшего среди кандидатов в
+    # окне; когда рамка ушла и цели в окне нет, выбирать не из чего — тогда
+    # цель ищется по цветности во всём кадре. Условия намеренно жёсткие:
+    # цвет должен различать цель и фон в этом захвате, рамка должна стоять на
+    # чужом цвете НЕСКОЛЬКО кадров подряд (одиночный кадр — шум), а найденное
+    # пятно должно совпасть по цвету строго, иначе возврата не будет.
+    if COLOR_RECOVER_ENABLED and color_active and tracked_ok:
+        pen = _match_dbg.get("color_pen")
+        if pen is not None and pen > COLOR_RECOVER_WRONG:
+            color_wrong_frames += 1
+        else:
+            color_wrong_frames = 0
+        if color_wrong_frames >= COLOR_RECOVER_AFTER:
+            beacon = find_color_beacon(new_cx, new_cy, lock_w, lock_h)
+            if beacon is not None:
+                bx, by, bval = beacon
+                jump = math.hypot(bx - new_cx, by - new_cy)
+                if bval <= COLOR_RECOVER_GOOD and jump > max(lock_w, lock_h):
+                    flight_log.event(
+                        "ЦВЕТ вернул рамку: сдвиг %.0f px, совпадение %.2f, "
+                        "рамка стояла на чужом цвете %d кадров"
+                        % (jump, bval, color_wrong_frames))
+                    new_cx, new_cy = bx, by
+                    color_wrong_frames = 0
+                    color_recover_count += 1
+                    _match_dbg["color_recover"] = 1
+                    # Поток вёл не ту точку — его опорные точки надо набрать
+                    # заново, иначе он утянет рамку обратно на фон.
+                    prev_pts = refresh_flow_points(gray, bx, by, lock_w, lock_h)
+    else:
+        color_wrong_frames = 0
 
     if tracked_ok:
         step = math.hypot(new_cx - lock_cx, new_cy - lock_cy)
@@ -3606,7 +3709,7 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("size_est"), _match_dbg.get("size_skip"),
             _match_dbg.get("motion_sep"), _match_dbg.get("motion_on"),
             _match_dbg.get("color_on"), _match_dbg.get("color_pen"),
-            _match_dbg.get("color_best"),
+            _match_dbg.get("color_best"), _match_dbg.get("color_recover"),
             alt_cm, vario_cms, alt_age,
             g("size_px"), g("growth"), g("tau_s"), g("range_m"),
             g("depression_deg"), g("dy_alt_decoupled"),
