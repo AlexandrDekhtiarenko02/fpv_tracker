@@ -21,7 +21,7 @@ src = io.open(os.path.join(_ROOT, "tracker.py"),
 
 
 def load(radius_max, adaptive):
-    ns = {"np": np, "cv2": cv2,
+    ns = {"np": np, "cv2": cv2, "_size_fail": {"why": 0, "R": 0, "w": 0},
           "ACQ_SIZE_SEARCH_RADIUS": 12, "SIZE_SEARCH_RADIUS_MAX": radius_max,
           "ACQ_DEFAULT_LOCK_W": 8, "ACQ_DEFAULT_LOCK_H": 8,
           "LOCK_PAD": 2.05, "LOCK_MIN_W": 5, "LOCK_MIN_H": 5,

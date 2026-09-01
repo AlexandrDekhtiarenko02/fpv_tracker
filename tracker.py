@@ -490,9 +490,31 @@ SEARCH_MARGIN_VEL_REF = 12.0 * TRACK_SCALE         # flow-motion (px/кадр) �
 # Это решает «дрейф зацепом за край» при сближении — коробка растёт вместе
 # с целью, и шаблон-матч продолжает якориться по центру, а не по краю.
 SIZE_ADAPT_ENABLED = True
-SIZE_ADAPT_EVERY_FRAMES = 10         # период проверки
+# ПОСЧИТАНО по заходу 152533 (383 с слежения, оператор водил цель на метр
+# туда-обратно, жалоба: «когда цель маленькая, sz вообще не меняется»):
+#
+#   проверок размера       ~410 (раз в 10 кадров при 26 fps)
+#   применено                 7%
+#   'измерить не удалось'    63%
+#   'score ниже порога'      28%
+#
+# То есть удачная поправка случалась примерно раз в 14 секунд, а каждая
+# двигала коробку лишь на 20% пути. Постоянная времени выходит около 70
+# СЕКУНД. Цель за это время успевает приблизиться и удалиться десяток раз —
+# коробка физически не может за ней следовать. Жалоба объясняется этим
+# полностью, безо всяких догадок про алгоритм.
+#
+# Правка бьёт по обоим множителям сразу и только по ним:
+#   период  10 -> 4 кадра   (цена замерена: 5.5 мс на малине за проверку,
+#                            то есть 1.4 мс на кадр при бюджете 38 мс)
+#   шаг   0.20 -> 0.45      (при удачной поправке раз в ~2 с это ~4 с
+#                            постоянной времени вместо 70)
+#
+# Порог score НЕ трогаю: это отдельный множитель, и мешать две правки в один
+# замер нельзя. Сначала посмотрим, что скажет новая диагностика size_why.
+SIZE_ADAPT_EVERY_FRAMES = 4          # период проверки
 SIZE_ADAPT_MIN_SCORE = 0.55          # минимальный score для доверия размеру
-SIZE_ADAPT_ALPHA = 0.20              # доля нового размера в старом (per update)
+SIZE_ADAPT_ALPHA = 0.45              # доля нового размера в старом (per update)
 SIZE_ADAPT_MIN_W = 5                 # нижний предел осмысленного размера
 SIZE_ADAPT_MAX_W = 55 * TRACK_SCALE  # верхний — больше LOCK_MAX, потому что на сближении ОК
 # Нижний предел НЕ масштабируется, как и остальные пороги размера: в них
@@ -802,7 +824,7 @@ _FLIGHT_LOG_COLUMNS = (
     "fc_roll,fc_pitch,fc_yaw,att_age_ms,"
     "m1,m2,m3,m4,rc_r,rc_p,rc_y,rc_t,dt_ms,cb_ms,armed,"
     "launch_target_deg,launch_reached,k,match_psr,match_second,search_margin,"
-    "match_flow_gap,size_est,size_skip,motion_sep,motion_on,"
+    "match_flow_gap,size_est,size_skip,size_why,size_R,motion_sep,motion_on,"
     "color_on,color_pen,color_best,"
     "alt_cm,vario_cms,alt_age_ms,"
     "box_size_px,box_growth,tau_s,range_m,depression_deg,dy_alt_decoupled,"
@@ -1908,6 +1930,14 @@ def flow_predict(prev_g, cur_g, pts, cx, cy):
         return False, cx, cy
 
 
+# Почему оценка размера не удалась. Кодов два, и они требуют РАЗНОГО лечения:
+# 1 — в центре нет пятна (слабый контраст или рамка не на цели),
+# 2 — пятно залило область поиска (цель крупнее области).
+# Без этого различия 'измерить не удалось' занимало 63% проверок и не
+# говорило ничего.
+_size_fail = {"why": 0, "R": 0, "w": 0}
+
+
 def estimate_size_at_position(gray, cx, cy, cur_w=None):
     """Оценка размера цели вокруг точки (cx, cy) по связной компоненте.
 
@@ -1941,8 +1971,11 @@ def estimate_size_at_position(gray, cx, cy, cur_w=None):
     y1 = max(0, cyi - R)
     x2 = min(gray.shape[1], cxi + R + 1)
     y2 = min(gray.shape[0], cyi + R + 1)
+    _size_fail["why"] = 0
+    _size_fail["R"] = R
     roi = gray[y1:y2, x1:x2]
     if roi.size == 0:
+        _size_fail["why"] = 3
         return None, None
 
     roi_f = roi.astype(np.float32)
@@ -1978,6 +2011,10 @@ def estimate_size_at_position(gray, cx, cy, cur_w=None):
             break
 
     if label == 0 or label >= num_labels:
+        # В центре коробки нет ни одного пятна: яркость там не отличается от
+        # медианы области больше порога. То есть либо цель слаба по контрасту,
+        # либо рамка стоит не на ней.
+        _size_fail["why"] = 1
         return None, None
 
     x, y, w, h, area = stats[label]
@@ -1987,6 +2024,11 @@ def estimate_size_at_position(gray, cx, cy, cur_w=None):
     # но измерить её здесь нельзя. Отвечаем «не знаю», а НЕ минимальным
     # размером: подмена этих смыслов и ужимала коробку на крупных целях.
     if w > R * 1.6 or h > R * 1.6:
+        # Пятно залило почти всю область поиска — цель как минимум такая, но
+        # измерить её здесь нечем. Это НЕ то же самое, что первый случай, и
+        # лечится совсем иначе: расширением области, а не порогом.
+        _size_fail["why"] = 2
+        _size_fail["w"] = int(w)
         return None, None
 
     lw = clamp(max(float(w) * LOCK_PAD, LOCK_MIN_W), LOCK_MIN_W, LOCK_MAX_W)
@@ -3685,6 +3727,8 @@ def process_locked_tracker(gray):
             est_w, est_h = estimate_size_at_position(
                 gray, lock_cx, lock_cy, cur_w=max(lock_w, lock_h))
             _match_dbg["size_est"] = est_w if est_w is not None else -1.0
+            _match_dbg["size_why"] = _size_fail["why"]
+            _match_dbg["size_R"] = _size_fail["R"]
             if not match_ok:
                 _match_dbg["size_skip"] = 1        # матча нет
             elif score < SIZE_ADAPT_MIN_SCORE:
@@ -3909,6 +3953,7 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("psr"), _match_dbg.get("second"),
             _match_dbg.get("margin"), _match_dbg.get("flow_gap"),
             _match_dbg.get("size_est"), _match_dbg.get("size_skip"),
+            _match_dbg.get("size_why"), _match_dbg.get("size_R"),
             _match_dbg.get("motion_sep"), _match_dbg.get("motion_on"),
             _match_dbg.get("color_on"), _match_dbg.get("color_pen"),
             _match_dbg.get("color_best"),
