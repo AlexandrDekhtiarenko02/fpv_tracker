@@ -37,6 +37,21 @@ for t, _ in lines:
 assert lines[0][0] == "R 34m", lines[0][0]
 assert lines[1][0] == "T 2.4s", lines[1][0]
 
+print("\n=== 1б. Угол визирования виден всегда, и знак читается ===")
+setup({"range_m": None, "tau_s": None, "size_px": 21.0, "growth": 0.0,
+       "depression_deg": 14.0, "alt_min_m": 0.5}, FRESH)
+got = [t for t, _ in ns["_range_readout_lines"]()]
+print("   ", " | ".join(got))
+assert any(t.startswith("dep +14") for t in got), got
+# Причина не имеет права врать: угол 14 при пороге 4 не мал.
+assert not any("ang 14" in t for t in got), "строка причины назвала неверную причину: %s" % got
+setup({"range_m": None, "tau_s": None, "size_px": 21.0, "growth": 0.0,
+       "depression_deg": -14.0, "alt_min_m": 0.5}, FRESH)
+got = [t for t, _ in ns["_range_readout_lines"]()]
+print("   ", " | ".join(got))
+assert any(t.startswith("dep -14") and t.endswith("UP") for t in got), got
+print("    нос вниз -> dep положительный; нос вверх -> отрицательный и пометка UP")
+
 print("\n=== 2. Причина, а не прочерк ===")
 cases = [
     ("нет высоты",        {"alt_cm": None, "alt_ts": 0.0, "fc_pitch_deg": -10.0}, {}, "no alt"),
