@@ -15,7 +15,7 @@ import cv2
 src = io.open("/Users/aleksandrdehtarenko/Desktop/fpv_tracker/tracker.py",
               encoding="utf-8").read()
 ns = {"np": np, "cv2": cv2, "math": math,
-      "MOTION_GRID_STEP": 8, "TEMPLATE_SCALE": 2.0, "MOTION_MIN_SEPARATION": 1.5,
+      "MOTION_GRID_STEP": 12, "TEMPLATE_SCALE": 2.0, "MOTION_MIN_SEPARATION": 1.5,
       "MOTION_REF_DIST": 3.0, "MOTION_DIFF_REF": 4.0, "MOTION_PENALTY": 0.5}
 body = src.split("def motion_penalty_map(")[1].split("\ndef color_penalty_map")[0]
 exec("def motion_penalty_map(" + body, ns)

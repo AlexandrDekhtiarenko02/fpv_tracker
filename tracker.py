@@ -201,7 +201,10 @@ SEARCH_MARGIN = 24 * TRACK_SCALE         # было 28 — чуть тише sea
 # признак информации не несёт и остаётся выключенным.
 MOTION_GUARD_ENABLED = True
 # Шаг сетки точек в окне поиска, пиксели. Мельче — точнее и дороже.
-MOTION_GRID_STEP = 8 * TRACK_SCALE
+# Шаг сетки для оценки движения ФОНА. Фон крупный, частая сетка ему не нужна,
+# а стоимость растёт как квадрат: шаг 8 обходился в 12 мс на борту, шаг 12 —
+# в 5 мс. Измерено, а не прикинуто.
+MOTION_GRID_STEP = 12 * TRACK_SCALE
 # Насколько цель должна двигаться иначе фона, чтобы признаку верить, px/кадр.
 MOTION_MIN_SEPARATION = 1.5 * TRACK_SCALE
 # Отклонение от движения фона, считающееся полным различием, px/кадр.
@@ -2015,9 +2018,33 @@ def motion_penalty_map(prev_g, cur_g, sx1, sy1, sx2, sy2, tw, th, shape,
             return None, None, 0.0
         gx, gy = np.meshgrid(xs, ys)
         pts = np.stack([gx.ravel(), gy.ravel()], axis=1).reshape(-1, 1, 2)
+        # Поток считаем по ОКНУ, а не по всему кадру: пирамида строится по
+        # всей переданной картинке, и полный кадр обходится вчетверо дороже
+        # без всякой пользы — точки всё равно лежат в окне поиска.
+        # Запас вокруг окна для пирамиды потока. 72 давало окно почти во весь
+        # кадр — дорого и без пользы: движение фона оценивается и по меньшей
+        # области.
+        gpad = 40
+        gx1 = max(0, int(sx1) - gpad); gy1 = max(0, int(sy1) - gpad)
+        gx2 = min(cur_g.shape[1], int(sx2) + gpad)
+        gy2 = min(cur_g.shape[0], int(sy2) + gpad)
+        pw = pts.copy()
+        pw[:, 0, 0] -= gx1
+        pw[:, 0, 1] -= gy1
         nxt, st, _ = cv2.calcOpticalFlowPyrLK(
-            prev_g, cur_g, pts, None, winSize=(15, 15), maxLevel=2,
+            prev_g[gy1:gy2, gx1:gx2], cur_g[gy1:gy2, gx1:gx2], pw, None,
+            # Одного уровня пирамиды достаточно: оценивается движение ФОНА,
+            # а оно между соседними кадрами невелико. Второй уровень удваивал
+            # цену ради запаса, который здесь не нужен.
+            winSize=(15, 15), maxLevel=1,
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+        if nxt is not None:
+            nxt = nxt.copy()
+            nxt[:, 0, 0] += gx1
+            nxt[:, 0, 1] += gy1
+            pts = pw.copy()
+            pts[:, 0, 0] += gx1
+            pts[:, 0, 1] += gy1
         if nxt is None or st is None:
             return None, None, 0.0
         ok = st.reshape(-1).astype(bool)
@@ -2041,14 +2068,22 @@ def motion_penalty_map(prev_g, cur_g, sx1, sy1, sx2, sy2, tw, th, shape,
         wy2 = min(cur_g.shape[0], int(sy2) + pad)
         if wx2 - wx1 < 8 or wy2 - wy1 < 8:
             return None, bg, sep
-        M = np.float32([[1, 0, float(bg[0])], [0, 1, float(bg[1])]])
-        warped = cv2.warpAffine(prev_g[wy1:wy2, wx1:wx2], M,
-                                (wx2 - wx1, wy2 - wy1),
-                                flags=cv2.INTER_LINEAR,
+        # Считаем разность в ПОЛОВИННОМ разрешении. Мы всё равно усредняем её
+        # по площади цели, поэтому полное разрешение здесь пропадает впустую, а
+        # стоит вчетверо дороже.
+        pa = prev_g[wy1:wy2, wx1:wx2]
+        ca = cur_g[wy1:wy2, wx1:wx2]
+        hw, hh = (wx2 - wx1) // 2, (wy2 - wy1) // 2
+        if hw < 8 or hh < 8:
+            return None, bg, sep
+        pa = cv2.resize(pa, (hw, hh), interpolation=cv2.INTER_AREA)
+        ca = cv2.resize(ca, (hw, hh), interpolation=cv2.INTER_AREA)
+        M = np.float32([[1, 0, float(bg[0]) / 2.0], [0, 1, float(bg[1]) / 2.0]])
+        warped = cv2.warpAffine(pa, M, (hw, hh), flags=cv2.INTER_LINEAR,
                                 borderMode=cv2.BORDER_REPLICATE)
-        diff = cv2.absdiff(cur_g[wy1:wy2, wx1:wx2], warped).astype(np.float32)
+        diff = cv2.absdiff(ca, warped).astype(np.float32)
         # Усредняем по площади цели: одиночный пиксель разности слишком шумен.
-        k = max(3, int(tw / max(TEMPLATE_SCALE, 1.0)) | 1)
+        k = max(3, int(tw / max(TEMPLATE_SCALE, 1.0) / 2.0) | 1)
         diff = cv2.blur(diff, (k, k))
 
         # --- 3. штраф там, где отклика НЕТ (значит движется как фон) ---
@@ -2068,12 +2103,15 @@ def motion_penalty_map(prev_g, cur_g, sx1, sy1, sx2, sy2, tw, th, shape,
         # цели у него в (sx1+j+tw/2, sy1+i+th/2). Раньше вырез брался от угла
         # и растягивался — из-за этого он уезжал мимо цели тем сильнее, чем
         # крупнее шаблон, и штраф ложился не туда.
+        # Карта в половинном разрешении, поэтому смещения тоже вдвое меньше.
         rh, rw = shape
-        ox = int(sx1) - wx1 + int(tw) // 2
-        oy = int(sy1) - wy1 + int(th) // 2
-        if ox < 0 or oy < 0 or ox + rw > pen.shape[1] or oy + rh > pen.shape[0]:
+        ox = (int(sx1) - wx1 + int(tw) // 2) // 2
+        oy = (int(sy1) - wy1 + int(th) // 2) // 2
+        sw, sh = (rw + 1) // 2, (rh + 1) // 2
+        if ox < 0 or oy < 0 or ox + sw > pen.shape[1] or oy + sh > pen.shape[0]:
             return None, bg, sep
-        return pen[oy:oy + rh, ox:ox + rw], bg, sep
+        sub = pen[oy:oy + sh, ox:ox + sw]
+        return cv2.resize(sub, (rw, rh), interpolation=cv2.INTER_LINEAR), bg, sep
     except Exception:
         return None, None, 0.0
 
