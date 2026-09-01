@@ -26,7 +26,8 @@ def setup(ctl, app):
     ns["_ctl_dbg"] = ctl
     ns["app_state"] = app
 
-FRESH = {"alt_cm": 5000, "alt_ts": time.monotonic(), "fc_pitch_deg": -10.0}
+FRESH = {"alt_cm": 5000, "alt_ts": time.monotonic(), "fc_pitch_deg": -10.0,
+         "alt_sigma_cm": 10.1}
 
 print("=== 1. Дальность есть — показываем метры ===")
 setup({"range_m": 34.2, "tau_s": 2.4, "size_px": 21.0, "growth": 0.013}, FRESH)
@@ -42,6 +43,8 @@ cases = [
     ("нет тангажа",       {"alt_cm": 5000, "alt_ts": time.monotonic(), "fc_pitch_deg": None}, {}, "no att"),
     ("высота протухла",   {"alt_cm": 5000, "alt_ts": time.monotonic() - 5, "fc_pitch_deg": -10.0}, {}, "alt old"),
     ("угол мал",          FRESH, {"depression_deg": 1.4}, "ang 1.4"),
+    ("высота в шуме",     {"alt_cm": 15, "alt_ts": time.monotonic(), "fc_pitch_deg": -10.0,
+                           "alt_sigma_cm": 10.1}, {"alt_min_m": 0.505}, "alt 15<50cm"),
 ]
 for name, app, extra, expect in cases:
     ctl = {"range_m": None, "tau_s": None, "size_px": 21.0, "growth": 0.0}
@@ -76,5 +79,20 @@ print("\n=== 6. Только латиница: кириллица стала б�
 for text, _ in ns["_range_readout_lines"]():
     assert all(ord(ch) < 128 for ch in text), "нелатинские знаки в %r" % text
 print("    все подписи латиницей")
+
+print("\n=== 7. Планка годности высоты растёт вместе с шумом барометра ===")
+# ЗАМЕРЕНО на столе: сигма барометра 10.1 см, показания от -2 до 40 см.
+# Прежний порог 30 см — три сигмы, шум его переходил, и на экране появлялись
+# уверенные «3.6 м», собранные целиком из дрожания датчика.
+sigmas = eval(re.search(r"^RANGE_ALT_SIGMAS = (.+?)(?:\s+#.*)?$", src, re.M).group(1))
+floor = eval(re.search(r"^RANGE_MIN_ALT_FLOOR_M = (.+?)(?:\s+#.*)?$", src, re.M).group(1))
+for sigma_cm, alt_cm, must_show in ((10.1, 15, False), (10.1, 40, False),
+                                    (10.1, 300, True), (2.0, 80, True)):
+    need = max(floor, sigmas * sigma_cm / 100.0)
+    ok = (alt_cm / 100.0) > need
+    print("    шум %.1f см, высота %3d см -> планка %.0f см, дальность %s"
+          % (sigma_cm, alt_cm, need * 100, "считается" if ok else "не считается"))
+    assert ok == must_show, "высота %d см при шуме %.1f" % (alt_cm, sigma_cm)
+print("    на столе (15-40 см при шуме 10 см) дальность не считается — верно")
 
 print("\nOK: дальность выводится, причина называется, за кадр не вылезает")

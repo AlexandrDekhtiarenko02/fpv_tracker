@@ -62,6 +62,7 @@ import struct
 import time
 import threading
 import os
+import collections
 import math
 import signal
 import subprocess
@@ -597,6 +598,15 @@ CAMERA_TILT_DEG = 0.0
 # Ниже этого угла снижения дальность не считаем: tg около нуля, и оценка
 # улетает в бесконечность от любого шума.
 RANGE_MIN_DEPRESSION_DEG = 4.0
+# Годность высоты для дальности. ЗАМЕРЕНО на неподвижном столе: сигма
+# барометра 10.1 см, показания гуляли от -2 до 40 см, а тангаж при этом стоял
+# как вкопанный (сигма 0.04°). То есть слабое звено — высота, а не угол.
+# Прежний порог 30 см был всего тремя сигмами: шум его переходил, и на экране
+# появлялись уверенные «3.6 м», собранные из дрожания датчика.
+RANGE_ALT_SIGMAS = 5.0          # ~20% по дальности, т.к. dR/R = dH/H
+RANGE_MIN_ALT_FLOOR_M = 0.5     # ниже этого дальность не считаем никогда
+ALT_NOISE_WINDOW = 40           # отсчётов высотомера для оценки шума
+ALT_NOISE_MIN_SAMPLES = 12
 # Сглаживание скорости роста коробки: размер шумит, а мы его дифференцируем.
 TAU_GROWTH_ALPHA = 0.10
 # Ниже этой относительной скорости роста считаем, что сближения нет.
@@ -739,7 +749,8 @@ _FLIGHT_LOG_COLUMNS = (
     "match_flow_gap,size_est,size_skip,motion_sep,motion_on,"
     "color_on,color_pen,color_best,"
     "alt_cm,vario_cms,alt_age_ms,"
-    "box_size_px,box_growth,tau_s,range_m,depression_deg,dy_alt_decoupled"
+    "box_size_px,box_growth,tau_s,range_m,depression_deg,dy_alt_decoupled,"
+    "alt_sigma_cm,range_min_alt_m"
 )
 
 # Снимок внутренностей управления за текущий кадр. Заполняется в
@@ -1609,10 +1620,17 @@ def fc_io_loop():
                 if alt_data is not None and len(alt_data) >= 6:
                     # u32 высота в см + i16 вертикальная скорость в см/с.
                     alt_cm, vario_cms = struct.unpack('<ih', alt_data[:6])
+                    # Шум барометра меряем на живых данных. Порог годности
+                    # высоты нельзя задать числом раз и навсегда: он зависит
+                    # от самого датчика и от погоды, а ошибка дальности прямо
+                    # пропорциональна ошибке высоты (R = H/tg, значит
+                    # dR/R = dH/H).
+                    _alt_hist.append(int(alt_cm))
                     with state_lock:
                         app_state["alt_cm"] = int(alt_cm)
                         app_state["vario_cms"] = int(vario_cms)
                         app_state["alt_ts"] = now
+                        app_state["alt_sigma_cm"] = _alt_sigma_cm()
                         if not app_state.get("alt_seen"):
                             app_state["alt_seen"] = True
                             flight_log.event(
@@ -2465,6 +2483,24 @@ def _pid_axis_step(error, prev_error, integral, ff_value,
     return out, err_f, integral
 
 
+_alt_hist = collections.deque(maxlen=ALT_NOISE_WINDOW)
+
+
+def _alt_sigma_cm():
+    """Разброс показаний высотомера за последние секунды, см.
+
+    ЗАМЕРЕНО на неподвижном столе: сигма 10.1 см, показания гуляли от -2 до
+    40 см. Прежний порог годности 30 см — это всего три сигмы, и шум его
+    регулярно переходил: трекер показывал уверенные «3.6 м» дальности,
+    целиком собранные из дрожания барометра. Отсюда и берётся живая оценка.
+    """
+    n = len(_alt_hist)
+    if n < ALT_NOISE_MIN_SAMPLES:
+        return None
+    m = sum(_alt_hist) / float(n)
+    return math.sqrt(sum((v - m) ** 2 for v in _alt_hist) / float(n))
+
+
 def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
     """Оценка сближения с целью. Возвращает словарь измерений.
 
@@ -2479,7 +2515,7 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
     """
     global prev_box_size_px, box_growth_smoothed
     out = {"size_px": None, "growth": None, "tau_s": None,
-           "range_m": None, "depression_deg": None}
+           "range_m": None, "depression_deg": None, "alt_min_m": None}
 
     # --- время до контакта ---
     # Берём геометрическое среднее сторон: устойчивее к тому, что коробка
@@ -2516,7 +2552,16 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
     out["depression_deg"] = depression
 
     alt_m = alt_cm / 100.0
-    if depression >= RANGE_MIN_DEPRESSION_DEG and alt_m > 0.3:
+    # Годность высоты — от ИЗМЕРЕННОГО шума барометра, а не от круглого числа.
+    # Ошибка дальности повторяет ошибку высоты один в один (dR/R = dH/H),
+    # поэтому пять сигм дают около 20% по дальности. На столе это условие не
+    # выполняется никогда — и правильно: там дальности нет.
+    sigma = app_state.get("alt_sigma_cm")
+    min_alt_m = RANGE_MIN_ALT_FLOOR_M
+    if sigma is not None:
+        min_alt_m = max(min_alt_m, RANGE_ALT_SIGMAS * sigma / 100.0)
+    out["alt_min_m"] = min_alt_m
+    if depression >= RANGE_MIN_DEPRESSION_DEG and alt_m > min_alt_m:
         out["range_m"] = alt_m / math.tan(math.radians(depression))
     return out
 
@@ -2987,6 +3032,7 @@ def update_control_from_target():
         # газ. Пишем очищенный вариант рядом, чтобы на живых заходах увидеть,
         # насколько это расходится, прежде чем менять закон управления.
         "dy_alt_decoupled": dy_alt + pitch_comp_px,
+        "alt_min_m": closure["alt_min_m"],
     }
 
 # =========================================================
@@ -3095,8 +3141,10 @@ def _range_readout_lines():
             why = "R no att"
         elif alt_ts and (time.monotonic() - alt_ts) > 1.0:
             why = "R alt old"
-        elif alt_cm / 100.0 <= 0.3:
-            why = "R low %dcm" % int(alt_cm)
+        elif c.get("alt_min_m") is not None and alt_cm / 100.0 <= c["alt_min_m"]:
+            # Показываем и высоту, и планку, до которой ей не хватило: без
+            # планки «R low 15cm» выглядит поломкой, а это правильный ответ.
+            why = "R alt %d<%dcm" % (int(alt_cm), int(c["alt_min_m"] * 100))
         elif dep is None:
             why = "R no ang"
         else:
@@ -3111,6 +3159,13 @@ def _range_readout_lines():
     else:
         # Ноль здесь означал бы «мы в цели», поэтому пишем словом.
         lines.append(("T no close", COLOR_YELLOW))
+
+    # Разброс барометра рядом: он объясняет планку годности высоты, и по нему
+    # сразу видно, датчик ли шумит или высоты просто нет.
+    with state_lock:
+        sig = app_state.get("alt_sigma_cm")
+    if rng is None and sig is not None:
+        lines.append(("baro +-%.0fcm" % sig, COLOR_WHITE))
 
     size = c.get("size_px")
     growth = c.get("growth")
@@ -3647,6 +3702,7 @@ def _capture_flight_row(cb_t0):
             alt_cm = app_state.get("alt_cm")
             vario_cms = app_state.get("vario_cms")
             alt_ts = app_state.get("alt_ts", 0.0)
+            alt_sigma = app_state.get("alt_sigma_cm")
 
         att_age = (now - att_ts) * 1000.0 if att_ts else None
         alt_age = (now - alt_ts) * 1000.0 if alt_ts else None
@@ -3699,6 +3755,7 @@ def _capture_flight_row(cb_t0):
             alt_cm, vario_cms, alt_age,
             g("size_px"), g("growth"), g("tau_s"), g("range_m"),
             g("depression_deg"), g("dy_alt_decoupled"),
+            alt_sigma, g("alt_min_m"),
         ))
     except Exception:
         # Лог не имеет права мешать полёту.
