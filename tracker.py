@@ -1047,7 +1047,7 @@ _FLIGHT_LOG_COLUMNS = (
     "m1,m2,m3,m4,rc_r,rc_p,rc_y,rc_t,dt_ms,cb_ms,armed,"
     "launch_target_deg,launch_reached,k,match_psr,match_second,search_margin,"
     "match_flow_gap,size_est,size_skip,size_why,size_R,size_scale,motion_sep,motion_on,"
-    "color_on,color_pen,color_best,"
+    "color_on,color_pen,color_best,chroma_sat,"
     "alt_cm,vario_cms,alt_age_ms,"
     "box_size_px,box_growth,tau_s,range_m,depression_deg,dy_alt_decoupled,"
     "alt_sigma_cm,range_min_alt_m"
@@ -4344,6 +4344,23 @@ def process_locked_tracker(gray):
                 update_control_from_target()
 
 
+def _chroma_saturation():
+    """Насколько кадр вообще цветной. Ноль — серый.
+
+    Нужна, чтобы отличить «предмет не цветной» от «камера отдаёт серое».
+    Второе случалось: вечером цель приходила с U=125 V=126 при нейтрали 128,
+    а утром тот же предмет давал U=85 V=203.
+    """
+    if chroma_u is None or chroma_v is None:
+        return None
+    try:
+        u = chroma_u.astype(np.float32) - 128.0
+        v = chroma_v.astype(np.float32) - 128.0
+        return float(np.mean(np.abs(u) + np.abs(v)))
+    except Exception:
+        return None
+
+
 def print_debug_once_per_second():
     """Раз в DEBUG_PERIOD секунд:
        FPS, state, override, RC со стика (RPYT), наш CMD, что РЕАЛЬНО ушло в FC,
@@ -4509,7 +4526,7 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("size_scale"),
             _match_dbg.get("motion_sep"), _match_dbg.get("motion_on"),
             _match_dbg.get("color_on"), _match_dbg.get("color_pen"),
-            _match_dbg.get("color_best"),
+            _match_dbg.get("color_best"), _chroma_saturation(),
             alt_cm, vario_cms, alt_age,
             g("size_px"), g("growth"), g("tau_s"), g("range_m"),
             g("depression_deg"), g("dy_alt_decoupled"),
@@ -4756,6 +4773,18 @@ def main():
         if colour is not None:
             ctrl["ColourGains"] = tuple(colour)
         picam2.set_controls(ctrl)
+        # ЧТО ИМЕННО ЗАМОРОЖЕНО — в журнал. Баланс белого фиксируется через
+        # полсекунды после запуска, тем, к чему камера успела прийти. Если она
+        # не успела или свет другой, цвета уезжают, а цветовой отсев остаётся
+        # без работы: в вечерних прогонах цель приходила почти серой
+        # (U=125 V=126 при нейтрали 128), тогда как утром тот же предмет давал
+        # U=85 V=203. Без этой записи причину не отличить от «предмет просто
+        # не цветной».
+        flight_log.event(
+            "КАМЕРА зафиксирована: выдержка %d мкс, усиление %.2f, "
+            "баланс белого %s" % (exp, float(md.get("AnalogueGain", 1.0)),
+                                  ("%.2f/%.2f" % tuple(colour)) if colour
+                                  else "не задан"))
     except Exception:
         pass
 
