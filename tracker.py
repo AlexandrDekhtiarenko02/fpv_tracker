@@ -123,6 +123,7 @@ COLOR_BLACK = (0, 0, 0, 0)
 COLOR_SENSOR_OK = (90, 230, 90, 0)     # датчик отозвался
 COLOR_SENSOR_WAIT = (60, 200, 240, 0)  # ещё поднимается
 COLOR_SENSOR_FAIL = (60, 60, 255, 0)   # не отозвался в срок
+COLOR_SENSOR_NONE = (150, 150, 150, 0)  # такого датчика нет и не ждали
 COLOR_CYAN = (255, 255, 0, 0)
 CROSS_COLOR = COLOR_WHITE
 
@@ -4666,51 +4667,83 @@ def _sensor_report():
         gps_otvet = app_state.get("gps_fix") is not None
 
     est = mask is not None
-    # Пока полётник не прислал перечень, спрашиваем про обязательный минимум.
-    def na_plate(bit):
-        return (mask & (1 << bit)) if est else True
-
-    punkty = []
-    punkty.append(("rc", rc_ts is not None and now - rc_ts < 2.0, None))
-    punkty.append(("attitude", att, None))
-    if na_plate(5):
-        punkty.append(("gyro", gyro is not None, None))
-    if na_plate(0):
-        # Нули по всем осям — датчик не откалиброван либо не читается.
-        punkty.append(("acc", bool(acc) and any(acc), None))
-    if na_plate(1):
-        punkty.append(("baro", alt, None))
-    if est and na_plate(2):
-        punkty.append(("mag", bool(mag) and any(mag), None))
-
-    gps_zhdyom = GPS_EXPECTED or gps_bylo > 0 or (est and bool(mask & (1 << 3)))
-    if gps_zhdyom:
-        if gps_est and sats >= GPS_SATS_ENOUGH:
-            punkty.append(("gps", True, "%d sats" % sats))
-        elif gps_est:
-            punkty.append(("gps", False, "%d sats, weak" % sats))
-        elif sats > 0:
-            punkty.append(("gps", False, "%d sats" % sats))
-        elif gps_otvet:
-            punkty.append(("gps", False, "no sats"))
-        else:
-            punkty.append(("gps", False, None))
-
     srok = _startup_t0 is not None and now - _startup_t0 > STARTUP_CHECK_AFTER_S
+
+    def na_plate(bit):
+        """Стоит ли датчик на плате по словам самого полётника."""
+        return bool(mask & (1 << bit)) if est else None
+
+    # СТРОКА ЕСТЬ ВСЕГДА, для каждого датчика. Прятать строку нельзя: список
+    # из четырёх пунктов вместо семи читается как «всё хорошо», и пропажа
+    # барометра выглядит точно так же, как его исправность. Отсутствие обязано
+    # называться вслух.
+    #
+    # обязательные: без них замер бессмыслен, и отсутствие на плате — отказ.
+    # необязательные: магнитометра и GPS на боевом борту не будет по замыслу.
+    punkty = [
+        ("rc", rc_ts is not None and now - rc_ts < 2.0, None, None, True),
+        ("attitude", att, None, None, True),
+        ("gyro", gyro is not None, None, na_plate(5), True),
+        # Нули по всем осям — датчик не откалиброван либо не читается.
+        ("acc", bool(acc) and any(acc), None, na_plate(0), True),
+        ("baro", alt, None, na_plate(1), True),
+        ("mag", bool(mag) and any(mag), None, na_plate(2), False),
+    ]
+
+    # GPS ждём, если его обещали настройкой, если полётник видит его на плате
+    # или если спутники хоть раз появлялись — последнее само по себе
+    # доказывает наличие модуля.
+    gps_zhdyom = GPS_EXPECTED or gps_bylo > 0
+    if gps_est and sats >= GPS_SATS_ENOUGH:
+        punkty.append(("gps", True, "%d sats" % sats, na_plate(3), gps_zhdyom))
+    elif gps_est:
+        punkty.append(("gps", False, "%d sats, weak" % sats, na_plate(3),
+                       gps_zhdyom))
+    elif sats > 0:
+        punkty.append(("gps", False, "%d sats" % sats, na_plate(3), gps_zhdyom))
+    elif gps_otvet:
+        punkty.append(("gps", False, "no sats", na_plate(3), gps_zhdyom))
+    else:
+        punkty.append(("gps", False, None, na_plate(3), gps_zhdyom))
+
     stroki = []
     vse_ok = True
-    for imya, ok, primech in punkty:
+    if not est:
+        # Полётник не прислал перечень датчиков — мы не знаем, что на плате.
+        # Молчать об этом нельзя: тогда «нет данных» не отличить от «нет
+        # датчика», и весь отчёт ниже становится догадкой.
+        stroki.append(("fc list", "NO RESPONSE" if srok else "...",
+                       COLOR_SENSOR_FAIL if srok else COLOR_SENSOR_WAIT))
+        vse_ok = False
+    for imya, ok, primech, na_bortu, nuzhen in punkty:
         if ok:
             hvost = "ok" if not primech else "ok  %s" % primech
             stroki.append((imya, hvost, COLOR_SENSOR_OK))
-        else:
-            vse_ok = False
-            if primech:                 # отвечает, но ещё не готов
-                stroki.append((imya, primech, COLOR_SENSOR_WAIT))
-            elif srok:
-                stroki.append((imya, "NO RESPONSE", COLOR_SENSOR_FAIL))
+        elif na_bortu is False:
+            # Полётник прямо говорит: такого датчика на плате нет.
+            if nuzhen:
+                stroki.append((imya, "NOT ON BOARD", COLOR_SENSOR_FAIL))
+                vse_ok = False
             else:
-                stroki.append((imya, "...", COLOR_SENSOR_WAIT))
+                stroki.append((imya, "none", COLOR_SENSOR_NONE))
+        elif primech:                   # отвечает, но ещё не готов
+            stroki.append((imya, primech, COLOR_SENSOR_WAIT))
+            vse_ok = False
+        elif na_bortu and srok:
+            # Полётник видит датчик на плате, а данных нет. Это отказ, и
+            # неважно, обязателен он для замера или нет: молчащая железка,
+            # которая физически стоит, — поломка.
+            stroki.append((imya, "NO RESPONSE", COLOR_SENSOR_FAIL))
+            vse_ok = False
+        elif not nuzhen and srok:
+            # Не обещан, на плате не значится, ответа нет — его и не ждали.
+            stroki.append((imya, "none", COLOR_SENSOR_NONE))
+        elif srok:
+            stroki.append((imya, "NO RESPONSE", COLOR_SENSOR_FAIL))
+            vse_ok = False
+        else:
+            stroki.append((imya, "...", COLOR_SENSOR_WAIT))
+            vse_ok = False
 
     global _sensors_ok_since
     if vse_ok:
