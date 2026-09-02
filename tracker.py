@@ -97,6 +97,10 @@ MAIN_W, MAIN_H = 640, 480
 HIRES_TRACKING = False
 TRACK_SCALE = 2 if HIRES_TRACKING else 1
 LORES_W, LORES_H = 320 * TRACK_SCALE, 240 * TRACK_SCALE
+# Разрешение, которое запрашивается у камеры. Обычно совпадает с рабочим; при
+# съёмке образцов в двойном разрешении оно вдвое больше, а кадр уменьшается
+# перед обработкой.
+CAM_W, CAM_H = LORES_W, LORES_H   # уточняется ниже, после RECORD_HIRES
 
 # DRM preview — окно картинки на физическом дисплее/VTX.
 # PREVIEW_W / PREVIEW_H — размер окна. На FPV-выходах часто полезно слегка
@@ -164,6 +168,23 @@ SIZE_ACQ_AGREE_TOL = 0.25
 # Цена: 115 КБ на кадр вместо 75, около 2.9 МБ в секунду. Полтора раза дороже,
 # зато на записи можно проверять ВСЁ, что делает трекер, а не половину.
 RECORD_FRAMES = False          # включается вручную, когда нужен образец
+# Снимать образцы В ДВОЙНОМ РАЗРЕШЕНИИ, продолжая ВЕСТИ по обычному.
+#
+# Зачем. Захват дальше 100 м на 320x240 бессмыслен: машина в 4 м даёт там 13
+# пикселей. Двойное разрешение отодвинуло бы захват до 200 м. Цена посчитана
+# (совпадение 4.2 -> 16.9 мс, поток 4.5 -> 6.3, проекция 0.5 -> 1.7 — всего
+# 9.2 -> 24.8 при бюджете 38), проходит впритык. Но СТАВИТЬ ВСЛЕПУЮ НЕЛЬЗЯ:
+# все наши записи 320x240, и проверить не на чем.
+#
+# Поэтому здесь: камера отдаёт 640x480, трекер УМЕНЬШАЕТ кадр до привычных
+# 320x240 и ведёт как прежде — поведение не меняется, — а запись сохраняет
+# ПОЛНЫЙ кадр. Тогда на земле по одной и той же записи можно прогнать оба
+# разрешения и сравнить честно.
+#
+# Включать только на время съёмки образцов: уменьшение стоит около 1 мс.
+RECORD_HIRES = False
+if RECORD_HIRES:
+    CAM_W, CAM_H = LORES_W * 2, LORES_H * 2
 RECORD_DIR = "recordings"      # внутри каталога полётных логов
 RECORD_MAX_SECONDS = 25.0      # предел одной записи
 RECORD_MAX_MB = 120.0          # и предел по месту на карте
@@ -2523,7 +2544,7 @@ def estimate_initial_target(gray):
             float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H), True)
 
 
-def extract_chroma(yuv):
+def extract_chroma(yuv, w=None, h=None):
     """Достать плоскости U и V из буфера YUV420.
 
     Раскладка: сначала LORES_H строк яркости, затем по LORES_H/4 строк на U и
@@ -2532,7 +2553,8 @@ def extract_chroma(yuv):
     """
     global chroma_fail_reason
     try:
-        h, w = LORES_H, LORES_W
+        h = LORES_H if h is None else h
+        w = LORES_W if w is None else w
         q = h // 4
         # ВАЖНО: строки буфера могут быть ШИРЕ кадра (выравнивание, stride).
         # На это прямо намекает то, что яркость берётся как [:H, :W], а не
@@ -4879,7 +4901,7 @@ class FrameRecorder:
                 # цветность. Разборщику надо знать и то, и другое.
                 f.write("width=%d\nheight=%d\nbuffer_height=%d\n"
                         "format=YUV420\ndtype=uint8\n"
-                        % (LORES_W, LORES_H, shape[0]))
+                        % (CAM_W, CAM_H, shape[0]))
             self._n = 0
             self._bytes = 0
             self._t0 = time.monotonic()
@@ -4963,11 +4985,27 @@ def camera_callback(request):
 
         with MappedArray(request, "lores") as lm:
             yuv = lm.array
-            gray = yuv[:LORES_H, :LORES_W].copy()
+            if RECORD_HIRES:
+                # Камера отдаёт двойное разрешение, но ВЕДЁМ мы по обычному:
+                # поведение обязано остаться прежним, иначе запись перестанет
+                # соответствовать тому, что мы проверяем. В запись при этом
+                # уходит полный кадр — ради него всё и затевалось.
+                gray = cv2.resize(yuv[:CAM_H, :CAM_W], (LORES_W, LORES_H),
+                                  interpolation=cv2.INTER_AREA)
+            else:
+                gray = yuv[:LORES_H, :LORES_W].copy()
             if COLOR_GUARD_ENABLED or TRACK_ON_COLOR:
                 # Цветность уже в этом же буфере — копируем вместе с яркостью.
-                cu, cv_ = extract_chroma(yuv)
+                cu, cv_ = extract_chroma(yuv, CAM_W, CAM_H)
                 if cu is not None:
+                    if RECORD_HIRES:
+                        # Цветность приводим к рабочему разрешению: вся
+                        # обработка идёт по уменьшенному кадру, и цветность
+                        # обязана быть с ним согласована.
+                        cu = cv2.resize(cu, (LORES_W // 2, LORES_H // 2),
+                                        interpolation=cv2.INTER_AREA)
+                        cv_ = cv2.resize(cv_, (LORES_W // 2, LORES_H // 2),
+                                         interpolation=cv2.INTER_AREA)
                     chroma_u = cu.copy()
                     chroma_v = cv_.copy()
 
@@ -4977,14 +5015,14 @@ def camera_callback(request):
         if RECORD_FRAMES:
             if track_state == TRACK_STATE_TRACKED:
                 if not frame_recorder.active:
-                    frame_recorder.start(yuv.shape)
+                    frame_recorder.start((CAM_H * 3 // 2, CAM_W))
                 with state_lock:
                     _b = target_box_main
                 _bx = ("%.1f,%.1f,%.1f,%.1f" % (
                     (_b[0] + _b[2]) / 2.0, (_b[1] + _b[3]) / 2.0,
                     _b[2] - _b[0], _b[3] - _b[1])) if _b else ",,,"
                 # Пишем ВЕСЬ буфер: яркость плюс цветность.
-                frame_recorder.add(yuv[:LORES_H * 3 // 2, :LORES_W],
+                frame_recorder.add(yuv[:CAM_H * 3 // 2, :CAM_W],
                                    "%.3f,%s,%s,%.4f" % (
                     time.monotonic() - _cb_t0 + _cb_t0, track_state, _bx,
                     last_match_score))
@@ -5028,7 +5066,7 @@ def main():
 
     kwargs = {
         "main": {"size": (MAIN_W, MAIN_H), "format": "XRGB8888"},
-        "lores": {"size": (LORES_W, LORES_H), "format": "YUV420"},
+        "lores": {"size": (CAM_W, CAM_H), "format": "YUV420"},
         "buffer_count": 4,
         "queue": False,
         "transform": Transform(hflip=CAMERA_ROTATE_180, vflip=CAMERA_ROTATE_180),

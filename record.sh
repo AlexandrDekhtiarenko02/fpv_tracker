@@ -9,13 +9,22 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
+hires=False
 case "${1:-}" in
-  on)  want=True ;;
-  off) want=False ;;
-  *)   echo "как пользоваться: ./record.sh on | off"; exit 1 ;;
+  on)   want=True ;;
+  hi)   want=True; hires=True ;;
+  off)  want=False ;;
+  *)    echo "как пользоваться: ./record.sh on | hi | off"
+        echo "   on  — обычная запись, 320x240"
+        echo "   hi  — запись в ДВОЙНОМ разрешении (ведём по-прежнему по 320x240,"
+        echo "         но в файл идёт 640x480 — чтобы сравнить оба на земле)"
+        echo "   off — выключить"
+        exit 1 ;;
 esac
 
 sed -i "s/^RECORD_FRAMES = .*/RECORD_FRAMES = ${want}          # включается вручную, когда нужен образец/" tracker.py
+sed -i "s/^RECORD_HIRES = .*/RECORD_HIRES = ${hires}/" tracker.py
+echo "==> RECORD_HIRES = ${hires}"
 echo "==> RECORD_FRAMES = ${want}"
 grep -n '^RECORD_FRAMES' tracker.py
 
