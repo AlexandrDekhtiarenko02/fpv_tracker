@@ -12,8 +12,10 @@ D=flight_logs
 [ -d "$D" ] || { echo "нет каталога $D"; exit 0; }
 
 echo "==> Будет удалено:"
+# -maxdepth обязан идти ПЕРЕД условиями: это глобальная опция, и GNU find
+# на малине ругается, если поставить её после -name.
 n_csv=$(find "$D" -maxdepth 1 -name 'flight_*.csv' | wc -l | tr -d ' ')
-n_ev=$(find "$D" -maxdepth 1 -name 'flight_*.log' -o -maxdepth 1 -name 'flight_*.txt' | wc -l | tr -d ' ')
+n_ev=$(find "$D" -maxdepth 1 \( -name 'flight_*.log' -o -name 'flight_*.txt' \) | wc -l | tr -d ' ')
 sz=$(du -sh "$D" 2>/dev/null | cut -f1)
 echo "    полётных логов: ${n_csv} csv, ${n_ev} прочих"
 if [ -d "$D/acq_debug" ]; then
