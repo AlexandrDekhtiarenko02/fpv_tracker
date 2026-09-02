@@ -96,16 +96,34 @@ kadr = np.full((80, 640, 4), 40, np.uint8)
 t.draw_startup_check(kadr)
 assert int((kadr[:, :, :3] != 40).any(axis=2).sum()) > 0, "отказ не показан"
 
-print("\n=== 7. Надписи влезают в кадр и без кириллицы ===")
+print("\n=== 7. Надпись остаётся в видимой части кадра и без кириллицы ===")
+# Замерено на борту: в углу кадра надпись уходит за пределы видимого —
+# передатчик и очки съедают края. Проверяем, что ВСЕ закрашенные пиксели
+# лежат внутри безопасной доли ширины, каким бы длинным ни был перечень.
 import cv2  # noqa: E402
 for sluchay in ({}, _zhivoy_polyotnik(), _zhivoy_polyotnik(gps_lat=50.4)):
     t = _proverit(sluchay)
     for ln in t._startup_lines:
         assert all(ord(c) < 128 for c in ln), (
             "кириллица в оверлее рисуется как «?»: %r" % ln)
-        (w, _), _ = cv2.getTextSize(ln, cv2.FONT_HERSHEY_PLAIN, 1.6, 2)
-        assert w + 14 <= 640, "строка %r не влезает в кадр (%d px)" % (ln, w)
-        print("    %4d px  %s" % (w, ln))
+    kadr = np.full((480, 640, 4), 40, np.uint8)
+    t.draw_startup_check(kadr)
+    est = (kadr[:, :, :3] != 40).any(axis=2)
+    stolbcy = np.flatnonzero(est.any(axis=0))
+    stroki = np.flatnonzero(est.any(axis=1))
+    assert stolbcy.size and stroki.size, "надпись не нарисовалась вовсе"
+    kray = 640 * (1.0 - t.STARTUP_SAFE_FRAC) / 2.0
+    print("    x %d..%d (видимо %d..%d), y %d..%d  | %s"
+          % (stolbcy[0], stolbcy[-1], int(kray), int(640 - kray),
+             stroki[0], stroki[-1], t._startup_lines[0]))
+    assert stolbcy[0] >= kray - 1 and stolbcy[-1] <= 640 - kray + 1, (
+        "надпись вылезает за видимую часть кадра — на борту её обрежет")
+    # Допуск: у крайних глифов свои боковые зазоры, пара пикселей разницы
+    # между полями — это форма букв, а не смещение блока.
+    perekos = abs((640 - stolbcy[-1] - 1) - stolbcy[0])
+    assert perekos <= 6, "блок не по центру, перекос %d px" % perekos
+    assert stroki[0] > 480 * 0.2 and stroki[-1] < 480 * 0.8, (
+        "надпись прижата к краю по высоте — там её тоже обрежет")
 
 print("\n=== 8. Отсутствие GPS не считается отказом ===")
 t = _proverit(_zhivoy_polyotnik())

@@ -200,6 +200,8 @@ CAM_SETTLE_STABLE = 3       # столько одинаковых ответов
 # вопроса (проверено).
 STARTUP_CHECK_AFTER_S = 8.0    # столько ждём отклика датчиков
 STARTUP_OK_SHOW_S = 5.0        # столько показываем «всё в порядке»
+STARTUP_SAFE_FRAC = 0.62       # какую долю ширины кадра считаем видимой
+STARTUP_FONT = 1.6             # желаемый размер; ужимается, если не влезает
 LOCK_LOG_ENABLED = True
 LOCK_LOG_DIR = "zahvaty"
 RECORD_HIRES = False
@@ -4615,20 +4617,43 @@ def _startup_sensor_check():
 
 
 def draw_startup_check(frame):
-    """Надпись о проверке датчиков поверх картинки."""
+    """Надпись о проверке датчиков поверх картинки.
+
+    Строго по центру и с запасом от краёв. Замерено на борту: в углу кадра
+    надпись уходит за пределы видимого — передатчик и очки съедают края
+    (overscan), и края эти у каждого комплекта свои. Центр виден всегда.
+
+    Размер подбирается под ширину кадра, а не задан числом: перечень молчащих
+    датчиков бывает вчетверо длиннее короткого «всё в порядке», и обрезать
+    надо не его, а шрифт. Обрезанное «NO RESPONSE: RC, ATTI...» — худший
+    исход из возможных.
+    """
     if not _startup_lines:
         return
     if _startup_until is not None and time.monotonic() > _startup_until:
         return
     try:
+        h, w = frame.shape[0], frame.shape[1]
+        safe = max(40.0, w * STARTUP_SAFE_FRAC)
+        shirina = max(
+            cv2.getTextSize(t, cv2.FONT_HERSHEY_PLAIN, STARTUP_FONT, 2)[0][0]
+            for t in _startup_lines)
+        mash = STARTUP_FONT
+        if shirina > safe:
+            mash = max(0.8, STARTUP_FONT * safe / float(shirina))
+        tol = 2 if mash < 1.3 else 3
+        shag = int(round(18 * mash))
         col = (90, 230, 90) if _startup_ok else (60, 60, 255)
-        y = 30
+        y = int(h * 0.5) - (shag * (len(_startup_lines) - 1)) // 2
         for text in _startup_lines:
-            cv2.putText(frame, text, (14, y), cv2.FONT_HERSHEY_PLAIN,
-                        1.6, COLOR_BLACK, 4)
-            cv2.putText(frame, text, (14, y), cv2.FONT_HERSHEY_PLAIN,
-                        1.6, col, 2)
-            y += 24
+            (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_PLAIN, mash, tol)
+            x = max(2, (w - tw) // 2)
+            # Обводка чёрным: без неё текст пропадает на светлом фоне.
+            cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_PLAIN,
+                        mash, COLOR_BLACK, tol + 2)
+            cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_PLAIN,
+                        mash, col, tol)
+            y += shag
     except Exception:
         pass
 
