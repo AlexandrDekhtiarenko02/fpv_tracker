@@ -188,6 +188,11 @@ RECORD_FRAMES = False          # включается вручную, когда
 CAM_SETTLE_MAX_S = 4.0      # дольше не ждём, чтобы не задерживать запуск
 CAM_SETTLE_STEP_S = 0.15    # как часто спрашивать камеру
 CAM_SETTLE_STABLE = 3       # столько одинаковых ответов подряд = сошлась
+# --- ПАПКА НА КАЖДЫЙ ЗАХВАТ ---
+# Кампания по сбору данных — это сотня заходов, и разбирать их надо поштучно.
+# Каждый захват пишется в свою папку flight_logs/zahvaty/<метка>_zahvatNN/.
+LOCK_LOG_ENABLED = True
+LOCK_LOG_DIR = "zahvaty"
 RECORD_HIRES = False
 if RECORD_HIRES:
     CAM_W, CAM_H = LORES_W * 2, LORES_H * 2
@@ -611,6 +616,21 @@ TEMPLATE_RESCALE_ON_SIZE_CHANGE = False
 #   2) потом включаешь по ОДНОЙ оси и смотришь, какая именно вызывает
 #      «спул моторов на локе» — обычно это PID-windup FC по неправильной
 #      команде угла, лечится не у нас, а в Betaflight (см. README ниже).
+# --- РЕЖИМ НАБЛЮДЕНИЯ ---
+# Трекер захватывает цель, ведёт её и всё пишет, но В УПРАВЛЕНИЕ НЕ ЛЕЗЕТ.
+# Нужен для сбора данных: заходы выполняет пилот руками, а мы смотрим и
+# записываем, чтобы потом вывести из его действий закон наведения.
+#
+# ЭТО НЕ ПРОСТО ФЛАГИ OVERRIDE_*. Их недостаточно: override_active
+# выставлялся при слежении БЕЗУСЛОВНО, и на полётнике включался MSP OVERRIDE.
+# А пока он включён, MSP_RC возвращает НАШИ ЖЕ значения вместо стиков пилота —
+# в логе оказалось бы эхо трекера вместо действий человека, и выглядело бы это
+# совершенно правдоподобно. Вся кампания налётов ушла бы впустую.
+#
+# Здесь оверрайд не включается вовсе. Заодно это гарантия безопасности: машина
+# физически не может вмешаться в управление, пока пилот заходит на цель.
+OBSERVE_ONLY = False
+
 OVERRIDE_ROLL = True
 OVERRIDE_PITCH = True
 OVERRIDE_YAW = True
@@ -978,6 +998,16 @@ RANGE_ESTIMATE_ENABLED = True
 # Показывать дальность и время до контакта текстом у рамки цели. Только
 # показ: в управление эти величины по-прежнему не подаются.
 RANGE_READOUT_ENABLED = True
+# --- ПУТЕВАЯ СКОРОСТЬ ПО БЕГУ ЗЕМЛИ (работает без GPS) ---
+# Точка на земле уходит назад тем быстрее, чем быстрее летим и чем ниже. Зная
+# высоту и угол, под которым точка видна, получаем дальность до неё, а из неё
+# и скорость. Нужно затем, что закон точки прицеливания зависит от скорости.
+GROUND_SPEED_ENABLED = True
+GROUND_BAND_TOP = 0.72        # с какой доли кадра начинается полоса земли
+GROUND_MIN_POINTS = 6
+GROUND_MAX_POINTS = 40
+GROUND_MIN_DEPRESSION_DEG = 8.0   # ближе к горизонту дальность до земли врёт
+GROUND_SPEED_ALPHA = 0.20
 # Вертикальный угол обзора IMX219 в этом режиме, градусы.
 CAMERA_VFOV_DEG = 41.4
 # Наклон камеры на раме, градусы (вверх положительный). 0 = смотрит вперёд.
@@ -1170,7 +1200,10 @@ _FLIGHT_LOG_COLUMNS = (
     "color_on,color_pen,color_best,chroma_sat,"
     "alt_cm,vario_cms,alt_age_ms,"
     "box_size_px,box_growth,tau_s,range_m,depression_deg,dy_alt_decoupled,"
-    "alt_sigma_cm,range_min_alt_m"
+    "alt_sigma_cm,range_min_alt_m,"
+    "gyro_x,gyro_y,gyro_z,acc_z,"
+    "gps_fix,gps_sats,gps_lat,gps_lon,gps_speed_ms,gps_course,"
+    "gps_range_m,ground_speed_ms"
 )
 
 # Снимок внутренностей управления за текущий кадр. Заполняется в
@@ -1639,6 +1672,109 @@ _C_RANGE = _COLS.index("range_m")
 
 flight_log = FlightLogger(FLIGHT_LOG_DIR)
 
+class LockLogger:
+    """Отдельная папка на КАЖДЫЙ захват.
+
+    Зачем отдельно от общего журнала. Кампания по сбору данных — это сотня
+    заходов, и разбирать их надо ПОШТУЧНО: один заход — одна выборка, со своей
+    высотой, дистанцией и манерой. В общем файле они слиплись бы, а резать его
+    потом по времени — лишний повод ошибиться.
+
+    В папке захвата лежит:
+        строки.csv   те же величины, что в общем журнале, но только этот заход
+        события.log  что происходило именно здесь
+        итог.txt     сводка: сколько длился, чем кончился, что было доступно
+
+    Пишется тем же способом, что и общий журнал: в камерном потоке только
+    укладка в очередь, диск — в отдельном потоке.
+    """
+
+    def __init__(self, directory):
+        self.dir = directory
+        self.active = False
+        self.n = 0
+        self._csv = None
+        self._evt = None
+        self._path = None
+        self._t0 = 0.0
+        self._rows = 0
+
+    def begin(self, seq):
+        if not LOCK_LOG_ENABLED or self.active:
+            return
+        try:
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            self.n += 1
+            self._path = os.path.join(self.dir, LOCK_LOG_DIR,
+                                      "%s_zahvat%02d" % (stamp, self.n))
+            os.makedirs(self._path, exist_ok=True)
+            self._csv = open(os.path.join(self._path, "строки.csv"), "w",
+                             buffering=1 << 16)
+            self._csv.write(_FLIGHT_LOG_COLUMNS + "\n")
+            self._evt = open(os.path.join(self._path, "события.log"), "w",
+                             buffering=1 << 12)
+            self._t0 = time.monotonic()
+            self._rows = 0
+            self.active = True
+        except Exception as exc:
+            self.active = False
+            flight_log.event("ПАПКА ЗАХВАТА не создалась: %s" % exc)
+
+    def row(self, line):
+        if not self.active:
+            return
+        try:
+            self._csv.write(line + "\n")
+            self._rows += 1
+        except Exception:
+            pass
+
+    def event(self, text):
+        if not self.active:
+            return
+        try:
+            self._evt.write("%8.3f  %s\n" % (time.monotonic() - self._t0, text))
+        except Exception:
+            pass
+
+    def end(self, why=""):
+        if not self.active:
+            return
+        self.active = False
+        dur = time.monotonic() - self._t0
+        try:
+            with state_lock:
+                gps_fix = app_state.get("gps_fix")
+                gps_sats = app_state.get("gps_sats")
+                imu = app_state.get("imu_seen")
+                alt = app_state.get("alt_seen")
+            with open(os.path.join(self._path, "итог.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("длительность: %.1f с, строк %d\n" % (dur, self._rows))
+                f.write("окончен: %s\n" % (why or "не указано"))
+                f.write("режим наблюдения: %s\n"
+                        % ("ДА, управление не трогали" if OBSERVE_ONLY
+                           else "нет — трекер вмешивался в управление"))
+                f.write("\nчто было доступно:\n")
+                f.write("  высотомер: %s\n" % ("да" if alt else "НЕТ"))
+                f.write("  гироскоп:  %s\n" % ("да" if imu else "НЕТ"))
+                f.write("  GPS:       %s\n"
+                        % ("да, спутников %s" % gps_sats if gps_fix
+                           else "НЕТ — разбор пойдёт по высоте и бегу земли"))
+                f.write("  код: %s\n" % _code_version())
+        except Exception:
+            pass
+        for h in (self._csv, self._evt):
+            try:
+                h.close()
+            except Exception:
+                pass
+        self._csv = self._evt = None
+
+
+lock_log = LockLogger(FLIGHT_LOG_DIR)
+
+
 
 # =========================================================
 # 4. SERIAL / MSP
@@ -1658,6 +1794,25 @@ MSP_STATUS_PERIOD = 0.25
 # сплавленное с акселерометром), а не сырое давление — она заметно чище.
 # 10 Гц достаточно: вертикальная динамика квада куда медленнее кадра.
 MSP_ALTITUDE_PERIOD = 0.10
+# --- ДАННЫЕ ДЛЯ СБОРА ПО НАЛЁТАМ ---
+# Гироскоп. САМОЕ ВАЖНОЕ из недостающего. В ACRO стик задаёт угловую СКОРОСТЬ,
+# значит связь «стик -> поведение аппарата» меряется именно по гироскопу. Углы
+# из MSP_ATTITUDE для этого не годятся: отфильтрованы и запаздывают. Без
+# гироскопа известно, ЧТО делал пилот, но не известно, ЧТО ИЗ ЭТОГО ВЫШЛО.
+MSP_IMU_PERIOD = 0.05
+# GPS. Даёт истинную дальность и путевую скорость — правильный ответ, с
+# которым сверяется то, что видит камера. Если приёмника нет, всё остальное
+# работает по-прежнему (см. docs/pilot-demo.md, раздел про сбор без GPS).
+MSP_GPS_PERIOD = 0.20
+# Опрашивать ли GPS вовсе. Если приёмника нет, лишние запросы только тратят
+# время обмена с полётником.
+MSP_GPS_ENABLED = True
+# Координаты цели на этот вылет. Задаются в local_settings.py, по одному разу
+# на вылет. Нужны, чтобы получить ИСТИННУЮ дальность — правильный ответ, с
+# которым сверяется всё, что видит камера. Без них сбор идёт без сверки, но
+# идёт: см. docs/pilot-demo.md, раздел про вариант без GPS.
+TARGET_LAT = None
+TARGET_LON = None
 # Номера битов режимов в flightModeFlags НЕ фиксированы: Betaflight укладывает
 # туда только НАСТРОЕННЫЕ режимы, в порядке, который отдаёт MSP_BOXIDS. Позиция
 # зависит от конкретного конфига, поэтому её надо спросить, а не угадать —
@@ -1807,6 +1962,10 @@ motion_active = False     # движется ли цель иначе фона
 motion_separation = 0.0
 template_std = 0.0
 _acq_debug_n = 0
+ground_speed_mps = None   # путевая скорость по бегу земли, м/с
+_gs_prev_gray = None
+_gs_prev_pts = None
+_gs_prev_t = 0.0
 prev_gray = None
 prev_pts = None
 lost_frames = 0
@@ -1929,6 +2088,8 @@ def fc_io_loop():
     next_status_t = 0.0
     next_boxids_t = 0.0
     next_alt_t = 0.0
+    next_imu_t = 0.0
+    next_gps_t = 0.0
     alt_warned = False
     loop_started = time.monotonic()
 
@@ -2051,6 +2212,43 @@ def fc_io_loop():
                 flight_log.event(
                     "ВЫСОТОМЕР не отвечает: барометра на плате нет либо он "
                     "не включён. Оценка дальности работать не будет.")
+
+            # ГИРОСКОП И АКСЕЛЕРОМЕТР. Нужны, чтобы связать команду пилота с
+            # откликом аппарата: стик задаёт угловую скорость, а не угол.
+            if now >= next_imu_t:
+                next_imu_t = now + MSP_IMU_PERIOD
+                imu = msp_request(102)  # MSP_RAW_IMU
+                if imu is not None and len(imu) >= 18:
+                    ax, ay, az, gx, gy, gz = struct.unpack('<6h', imu[:12])
+                    with state_lock:
+                        app_state["gyro"] = (gx, gy, gz)
+                        app_state["acc"] = (ax, ay, az)
+                        app_state["imu_ts"] = now
+                        if not app_state.get("imu_seen"):
+                            app_state["imu_seen"] = True
+                            flight_log.event("ГИРОСКОП отвечает")
+
+            # GPS. Может не быть вовсе — тогда просто молчит, а сбор данных
+            # идёт по высоте, углу и скорости роста цели.
+            if MSP_GPS_ENABLED and now >= next_gps_t:
+                next_gps_t = now + MSP_GPS_PERIOD
+                g = msp_request(106)  # MSP_RAW_GPS
+                if g is not None and len(g) >= 16:
+                    fix, numsat, lat, lon, alt_m, speed, course = \
+                        struct.unpack('<BBiihhh', g[:16])
+                    with state_lock:
+                        app_state["gps_fix"] = int(fix)
+                        app_state["gps_sats"] = int(numsat)
+                        app_state["gps_lat"] = lat / 1e7
+                        app_state["gps_lon"] = lon / 1e7
+                        app_state["gps_alt_m"] = int(alt_m)
+                        app_state["gps_speed_cms"] = int(speed)
+                        app_state["gps_course"] = course / 10.0
+                        app_state["gps_ts"] = now
+                        if fix and not app_state.get("gps_seen"):
+                            app_state["gps_seen"] = True
+                            flight_log.event(
+                                "GPS отвечает: спутников %d" % numsat)
 
             if now >= next_alt_t:
                 next_alt_t = now + MSP_ALTITUDE_PERIOD
@@ -3074,6 +3272,89 @@ def color_projection(shape):
         return None
 
 
+def estimate_ground_speed(gray, now_mono):
+    """Путевая скорость по бегу земли в кадре. Работает БЕЗ GPS.
+
+    Смысл простой. Точка на земле в нижней части кадра уходит назад тем
+    быстрее, чем быстрее летит аппарат и чем он ниже. Угловая скорость этой
+    точки равна v / R, где R — наклонная дальность до неё. Дальность берём из
+    высоты и угла, под которым эта точка видна, — то есть тем же способом, что
+    и дальность до цели.
+
+    Отсюда  v = (угловая скорость) * R.
+
+    Зачем это нужно. Закон точки прицеливания зависит от скорости, и без неё
+    он вышел бы усреднённым. GPS даёт скорость напрямую, но GPS может не быть,
+    а высота и камера есть всегда.
+
+    Считается по нижней полосе кадра: там земля, а не небо и не цель. Берём
+    СЕРЕДИННОЕ смещение, а не среднее: одиночный движущийся предмет в кадре
+    середину не сдвинет.
+    """
+    global _gs_prev_gray, _gs_prev_pts, _gs_prev_t, ground_speed_mps
+    try:
+        h, w = gray.shape[:2]
+        y0 = int(h * GROUND_BAND_TOP)
+        band = gray[y0:h, :]
+        if _gs_prev_gray is None or _gs_prev_gray.shape != band.shape:
+            _gs_prev_gray = band.copy()
+            _gs_prev_pts = None
+            _gs_prev_t = now_mono
+            return None
+        dt = now_mono - _gs_prev_t
+        if dt <= 1e-3:
+            return None
+        if _gs_prev_pts is None or len(_gs_prev_pts) < GROUND_MIN_POINTS:
+            _gs_prev_pts = cv2.goodFeaturesToTrack(
+                _gs_prev_gray, maxCorners=GROUND_MAX_POINTS,
+                qualityLevel=0.01, minDistance=8, blockSize=5)
+        if _gs_prev_pts is None or len(_gs_prev_pts) < GROUND_MIN_POINTS:
+            _gs_prev_gray = band.copy()
+            _gs_prev_t = now_mono
+            return None
+        nxt, st, _err = cv2.calcOpticalFlowPyrLK(
+            _gs_prev_gray, band, _gs_prev_pts.astype(np.float32), None,
+            winSize=(FLOW_WIN, FLOW_WIN), maxLevel=FLOW_LEVELS,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                      FLOW_ITERS, 0.03))
+        speed = None
+        if nxt is not None and st is not None:
+            ok = st.reshape(-1).astype(bool)
+            if ok.sum() >= GROUND_MIN_POINTS:
+                p0 = _gs_prev_pts.reshape(-1, 2)[ok]
+                p1 = nxt.reshape(-1, 2)[ok]
+                dy_px = np.median(p1[:, 1] - p0[:, 1])      # земля уходит ВНИЗ
+                dx_px = np.median(p1[:, 0] - p0[:, 0])
+                shift = float(math.hypot(dx_px, dy_px))
+                with state_lock:
+                    alt_cm = app_state.get("alt_cm")
+                    fc_pitch = app_state.get("fc_pitch_deg")
+                    armed = app_state.get("armed")
+                if armed and alt_cm is not None and fc_pitch is not None:
+                    alt_m = alt_cm / 100.0
+                    # Угол, под которым видна середина полосы, ниже горизонта.
+                    deg_per_px = CAMERA_VFOV_DEG / float(MAIN_H)
+                    band_mid = (y0 + h) / 2.0
+                    off_deg = (band_mid * 2.0 - CENTER_Y) * deg_per_px
+                    dep = float(fc_pitch) - CAMERA_TILT_DEG + off_deg
+                    if dep >= GROUND_MIN_DEPRESSION_DEG and alt_m > 0.5:
+                        slant = alt_m / math.sin(math.radians(dep))
+                        ang_rate = math.radians(shift * 2.0 * deg_per_px) / dt
+                        speed = ang_rate * slant
+        _gs_prev_gray = band.copy()
+        _gs_prev_pts = None if nxt is None else nxt
+        _gs_prev_t = now_mono
+        if speed is not None and 0.0 <= speed < 120.0:
+            a = alpha_for_dt(GROUND_SPEED_ALPHA, 1.0)
+            if ground_speed_mps is None:
+                ground_speed_mps = speed
+            else:
+                ground_speed_mps += a * (speed - ground_speed_mps)
+        return ground_speed_mps
+    except Exception:
+        return None
+
+
 def build_template(gray, cx, cy, box_w, box_h):
     global tmpl_w, tmpl_h, template_std
     tw = clamp(max(box_w * TEMPLATE_SCALE, TEMPLATE_MIN), TEMPLATE_MIN, TEMPLATE_MAX)
@@ -3943,7 +4224,9 @@ def update_control_from_target():
 
     with state_lock:
         app_state["dyn_throttle"] = target_throttle
-        override_active = True
+        # В режиме наблюдения оверрайд не включается НИКОГДА — см. пояснение
+        # у OBSERVE_ONLY. Иначе MSP_RC вернёт наши же значения вместо стиков.
+        override_active = not OBSERVE_ONLY
         global_roll_cmd = target_roll
         global_pitch_cmd = target_pitch
         global_yaw_cmd = target_yaw
@@ -4806,6 +5089,32 @@ def _capture_flight_row(cb_t0):
             vario_cms = app_state.get("vario_cms")
             alt_ts = app_state.get("alt_ts", 0.0)
             alt_sigma = app_state.get("alt_sigma_cm")
+            _gyro = app_state.get("gyro") or (None, None, None)
+            _acc = app_state.get("acc") or (None, None, None)
+            gyro_x, gyro_y, gyro_z = _gyro
+            acc_z = _acc[2]
+            gps_fix = app_state.get("gps_fix")
+            gps_sats = app_state.get("gps_sats")
+            gps_lat = app_state.get("gps_lat")
+            gps_lon = app_state.get("gps_lon")
+            _sp = app_state.get("gps_speed_cms")
+            gps_speed_ms = None if _sp is None else _sp / 100.0
+            gps_course = app_state.get("gps_course")
+            # ИСТИННАЯ дальность до цели — если известны и наши координаты, и
+            # координаты цели. Это тот самый «правильный ответ», с которым
+            # сверяется всё, что видит камера. Без GPS остаётся None, и разбор
+            # идёт по высоте, углу и скорости роста цели.
+            gps_range_m = None
+            if (gps_fix and gps_lat is not None and TARGET_LAT is not None
+                    and TARGET_LON is not None):
+                try:
+                    dlat = math.radians(TARGET_LAT - gps_lat)
+                    dlon = math.radians(TARGET_LON - gps_lon)
+                    la = math.radians(gps_lat)
+                    gps_range_m = 6371000.0 * math.hypot(
+                        dlat, dlon * math.cos(la))
+                except Exception:
+                    gps_range_m = None
 
         att_age = (now - att_ts) * 1000.0 if att_ts else None
         alt_age = (now - alt_ts) * 1000.0 if alt_ts else None
@@ -4814,6 +5123,13 @@ def _capture_flight_row(cb_t0):
         # а именно они отвечают на «когда всё сломалось».
         if st != _flight_prev_state:
             flight_log.event("STATE %s -> %s" % (_flight_prev_state, st))
+            # Папка захвата открывается и закрывается ВМЕСТЕ со слежением:
+            # один заход — одна выборка.
+            if st == TRACK_STATE_TRACKED:
+                lock_log.begin(lock_sequence)
+                lock_log.event("захват начат")
+            elif lock_log.active:
+                lock_log.end("состояние %s" % st)
             _flight_prev_state = st
         lp = c.get("launch_phase")
         if lp != _flight_prev_launch:
@@ -4826,7 +5142,7 @@ def _capture_flight_row(cb_t0):
         def g(k, d=None):
             return c.get(k, d) if active else None
 
-        flight_log.row((
+        _row_values = (
             now - flight_log._t0, frame_index, fps_current, st, ctrl, aux, ov,
             c.get("launch_phase") if active else "", g("launch_int"),
             last_match_score, last_flow_ok, lost_frames, auto_reacq_attempts,
@@ -4861,7 +5177,15 @@ def _capture_flight_row(cb_t0):
             g("size_px"), g("growth"), g("tau_s"), g("range_m"),
             g("depression_deg"), g("dy_alt_decoupled"),
             alt_sigma, g("alt_min_m"),
-        ))
+            gyro_x, gyro_y, gyro_z, acc_z,
+            gps_fix, gps_sats, gps_lat, gps_lon, gps_speed_ms, gps_course,
+            gps_range_m, ground_speed_mps,
+        )
+        flight_log.row(_row_values)
+        # Та же строка — в папку этого захвата. Форматируем один раз здесь, а
+        # не в фоне: в папке лежит ровно то, что было в этот кадр.
+        if lock_log.active:
+            lock_log.row(",".join(_fmt(v) for v in _row_values))
     except Exception:
         # Лог не имеет права мешать полёту.
         pass
@@ -5023,6 +5347,11 @@ def camera_callback(request):
                                          interpolation=cv2.INTER_AREA)
                     chroma_u = cu.copy()
                     chroma_v = cv_.copy()
+
+        # Путевая скорость по бегу земли. Считается всегда, когда включена:
+        # она нужна и для разбора налётов, и как замена GPS.
+        if GROUND_SPEED_ENABLED:
+            estimate_ground_speed(gray, _cb_t0)
 
         process_locked_tracker(gray)
         # Запись кадров: начинается вместе со слежением, кончается вместе с

@@ -20,13 +20,14 @@ for node in ast.walk(tree):
             getattr(t, "id", None) == "_FLIGHT_LOG_COLUMNS" for t in node.targets):
         header = ast.literal_eval(node.value)
     if isinstance(node, ast.FunctionDef) and node.name == "_capture_flight_row":
-        for call in ast.walk(node):
-            if (isinstance(call, ast.Call)
-                    and isinstance(call.func, ast.Attribute)
-                    and call.func.attr == "row"
-                    and call.args
-                    and isinstance(call.args[0], ast.Tuple)):
-                row_len = len(call.args[0].elts)
+        # Строка собирается в кортеж _row_values, а потом уходит и в общий
+        # журнал, и в папку захвата. Считаем сам кортеж.
+        for a in ast.walk(node):
+            if (isinstance(a, ast.Assign)
+                    and any(getattr(t, "id", None) == "_row_values"
+                            for t in a.targets)
+                    and isinstance(a.value, ast.Tuple)):
+                row_len = len(a.value.elts)
 
 assert header is not None, "не нашёл _COLS"
 assert row_len is not None, "не нашёл кортеж строки в _capture_flight_row"
