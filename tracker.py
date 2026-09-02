@@ -120,6 +120,9 @@ COLOR_RED = (0, 0, 255, 0)
 COLOR_WHITE = (255, 255, 255, 0)
 COLOR_YELLOW = (0, 255, 255, 0)
 COLOR_BLACK = (0, 0, 0, 0)
+COLOR_SENSOR_OK = (90, 230, 90, 0)     # датчик отозвался
+COLOR_SENSOR_WAIT = (60, 200, 240, 0)  # ещё поднимается
+COLOR_SENSOR_FAIL = (60, 60, 255, 0)   # не отозвался в срок
 COLOR_CYAN = (255, 255, 0, 0)
 CROSS_COLOR = COLOR_WHITE
 
@@ -200,10 +203,11 @@ CAM_SETTLE_STABLE = 3       # столько одинаковых ответов
 # вопроса (проверено).
 STARTUP_CHECK_AFTER_S = 8.0    # столько ждём отклика датчиков
 STARTUP_OK_SHOW_S = 5.0        # столько показываем «всё в порядке»
-STARTUP_SAFE_FRAC = 0.62       # какую долю ширины кадра считаем видимой
-STARTUP_FONT = 1.6             # желаемый размер; ужимается, если не влезает
 GPS_EXPECTED = False           # ставить True на замерном борту, где GPS есть
 GPS_SATS_ENOUGH = 6            # со скольких спутников считаем захват годным
+SENSOR_FONT_FACE = cv2.FONT_HERSHEY_SIMPLEX
+SENSOR_FONT = 0.42             # мелко и ровно, как в OSD полётника
+SENSOR_LINE_H = 15             # шаг строк отчёта
 LOCK_LOG_ENABLED = True
 LOCK_LOG_DIR = "zahvaty"
 RECORD_HIRES = False
@@ -2083,9 +2087,8 @@ motion_separation = 0.0
 template_std = 0.0
 _acq_debug_n = 0
 _gotovnost_done = False
-_startup_lines = []
-_startup_ok = False
-_startup_until = None
+_startup_t0 = None             # когда пошёл опрос полётника
+_sensors_ok_since = None       # когда всё поднялось (для срока показа)
 ground_speed_mps = None   # путевая скорость по бегу земли, м/с
 _gs_prev_gray = None
 _gs_prev_pts = None
@@ -2216,6 +2219,8 @@ def fc_io_loop():
     next_gps_t = 0.0
     alt_warned = False
     loop_started = time.monotonic()
+    global _startup_t0
+    _startup_t0 = loop_started
 
     while not io_thread_stop.is_set():
         _gps_arm_note = None
@@ -2297,6 +2302,9 @@ def fc_io_loop():
                         have = [n for b, n in SENSOR_BITS if sensor_mask & (1 << b)]
                         with state_lock:
                             app_state["has_baro"] = bool(sensor_mask & (1 << 1))
+                            # Перечень нужен отчёту на экране: спрашиваем
+                            # только про то, что на плате реально стоит.
+                            app_state["sensor_mask"] = int(sensor_mask)
                         flight_log.event("ДАТЧИКИ НА ПЛАТЕ: %s"
                                          % (", ".join(have) or "нет данных"))
                         if not (sensor_mask & (1 << 1)):
@@ -2353,7 +2361,11 @@ def fc_io_loop():
                 flight_log.event(_gps_arm_note)
 
             if not _gotovnost_done and now - loop_started > STARTUP_CHECK_AFTER_S:
-                _startup_sensor_check()
+                _otchet = _sensor_report() or []
+                flight_log.event(
+                    "ОПРОС ДАТЧИКОВ: %s"
+                    % ("; ".join("%s %s" % (n, v) for n, v, _ in _otchet)
+                       or "все ответили"))
                 _gotovnost_k_sboru()
 
             if (not alt_warned and now - loop_started > 8.0
@@ -2369,10 +2381,12 @@ def fc_io_loop():
                 next_imu_t = now + MSP_IMU_PERIOD
                 imu = msp_request(102)  # MSP_RAW_IMU
                 if imu is not None and len(imu) >= 18:
-                    ax, ay, az, gx, gy, gz = struct.unpack('<6h', imu[:12])
+                    (ax, ay, az, gx, gy, gz,
+                     mx, my, mz) = struct.unpack('<9h', imu[:18])
                     with state_lock:
                         app_state["gyro"] = (gx, gy, gz)
                         app_state["acc"] = (ax, ay, az)
+                        app_state["mag"] = (mx, my, mz)
                         app_state["imu_ts"] = now
                         if not app_state.get("imu_seen"):
                             app_state["imu_seen"] = True
@@ -4620,156 +4634,138 @@ def draw_range_readout(frame, box):
         pass
 
 
-def _startup_sensor_check():
-    """Опросить датчики и подготовить надпись на экран.
+def _sensor_report():
+    """Отчёт по датчикам — построчно, как загрузочный лог.
 
-    Смысл — увидеть молчащий датчик ДО взлёта, а не на разборе. Отсутствие
-    отклика от гироскопа или высотомера обесценивает весь полётный день, и
-    выяснять это постфактум слишком дорого.
+    Строка появляется по мере того, как датчик отзывается: gyro - ok, потом
+    acc - ok и так далее. Смысл в том, чтобы видеть ПРОЦЕСС: часть датчиков
+    оживает сразу, спутники подтягиваются десятками секунд, и «всё сразу или
+    ничего» тут не годится.
+
+    Что именно спрашивать, говорит сам полётник: в MSP_STATUS он перечисляет
+    установленные на плате датчики. Спрашиваем только про них — иначе борт
+    без магнитометра вечно висел бы с ошибкой по отсутствующей железке.
+
+    Возвращает None, когда показывать нечего (борт армлен либо всё в порядке
+    и срок показа вышел).
     """
-    global _startup_lines, _startup_ok, _startup_until
-    with state_lock:
-        imu = bool(app_state.get("imu_seen"))
-        alt = bool(app_state.get("alt_seen"))
-        # ВАЖНО: по самому наличию rc_channels судить нельзя — там лежит
-        # значение по умолчанию, и RC выглядел бы отвечающим всегда. Смотрим
-        # на признак ЖИВОЙ связи, который ставится только при реальном ответе.
-        # Проверяем НАЛИЧИЕ отметки, а не только её возраст: на машине, где
-        # монотонные часы начинаются с нуля, отсутствие ключа выглядело бы как
-        # свежий ответ.
-        _rc_ts = app_state.get("rc_link_ts")
-        rc = _rc_ts is not None and (time.monotonic() - _rc_ts) < 2.0
-        att = app_state.get("fc_pitch_deg") is not None
-        gps = _gps_zhivoy(app_state)
-    missing = []
-    if not rc:
-        missing.append("RC")
-    if not att:
-        missing.append("ATTITUDE")
-    if not imu:
-        missing.append("GYRO")
-    if not alt:
-        missing.append("BARO")
-
-    if missing:
-        _startup_ok = False
-        _startup_lines = ["NO RESPONSE: " + ", ".join(missing)]
-        # Высотомер до арма молчит по устройству прошивки — подскажем, чтобы
-        # оператор не искал неисправность там, где её нет.
-        if "BARO" in missing:
-            _startup_lines.append("BARO needs ARM to report")
-        _startup_until = None          # висит, пока не исправлено
-    else:
-        _startup_ok = True
-        _startup_lines = ["SENSORS OK" + ("" if gps else "  (no GPS)")]
-        _startup_until = time.monotonic() + STARTUP_OK_SHOW_S
-
-    flight_log.event("ПРОВЕРКА ДАТЧИКОВ: %s" % (
-        "все ответили" if not missing else "НЕ ОТВЕТИЛИ: " + ", ".join(missing)))
-
-
-def draw_startup_check(frame):
-    """Надпись о проверке датчиков поверх картинки.
-
-    Строго по центру и с запасом от краёв. Замерено на борту: в углу кадра
-    надпись уходит за пределы видимого — передатчик и очки съедают края
-    (overscan), и края эти у каждого комплекта свои. Центр виден всегда.
-
-    Размер подбирается под ширину кадра, а не задан числом: перечень молчащих
-    датчиков бывает вчетверо длиннее короткого «всё в порядке», и обрезать
-    надо не его, а шрифт. Обрезанное «NO RESPONSE: RC, ATTI...» — худший
-    исход из возможных.
-    """
-    if not _startup_lines:
-        return
-    if _startup_until is not None and time.monotonic() > _startup_until:
-        return
-    try:
-        h, w = frame.shape[0], frame.shape[1]
-        safe = max(40.0, w * STARTUP_SAFE_FRAC)
-        shirina = max(
-            cv2.getTextSize(t, cv2.FONT_HERSHEY_PLAIN, STARTUP_FONT, 2)[0][0]
-            for t in _startup_lines)
-        mash = STARTUP_FONT
-        if shirina > safe:
-            mash = max(0.8, STARTUP_FONT * safe / float(shirina))
-        tol = 2 if mash < 1.3 else 3
-        shag = int(round(18 * mash))
-        col = (90, 230, 90) if _startup_ok else (60, 60, 255)
-        y = int(h * 0.5) - (shag * (len(_startup_lines) - 1)) // 2
-        for text in _startup_lines:
-            (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_PLAIN, mash, tol)
-            x = max(2, (w - tw) // 2)
-            # Обводка чёрным: без неё текст пропадает на светлом фоне.
-            cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_PLAIN,
-                        mash, COLOR_BLACK, tol + 2)
-            cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_PLAIN,
-                        mash, col, tol)
-            y += shag
-    except Exception:
-        pass
-
-
-def _gps_prearm_stroka():
-    """Живое состояние GPS до арма — или None, если показывать нечего.
-
-    Одной проверки на старте мало: спутники подтягиваются десятками секунд,
-    и на восьмой секунде захвата не бывает никогда. Пилоту нужно видеть, что
-    происходит СЕЙЧАС, и решать, ждать ли ещё.
-
-    После арма строка убирается: на заходе картинку загораживать нечем.
-    """
+    now = time.monotonic()
     with state_lock:
         if app_state.get("armed"):
+            return None                 # на заходе картинку загораживать нечем
+        mask = app_state.get("sensor_mask")
+        rc_ts = app_state.get("rc_link_ts")
+        att = app_state.get("fc_pitch_deg") is not None
+        gyro = app_state.get("gyro")
+        acc = app_state.get("acc")
+        mag = app_state.get("mag")
+        alt = bool(app_state.get("alt_seen"))
+        sats = int(app_state.get("gps_sats") or 0)
+        gps_est = _gps_zhivoy(app_state)
+        gps_bylo = app_state.get("gps_sats_max") or 0
+        gps_otvet = app_state.get("gps_fix") is not None
+
+    est = mask is not None
+    # Пока полётник не прислал перечень, спрашиваем про обязательный минимум.
+    def na_plate(bit):
+        return (mask & (1 << bit)) if est else True
+
+    punkty = []
+    punkty.append(("rc", rc_ts is not None and now - rc_ts < 2.0, None))
+    punkty.append(("attitude", att, None))
+    if na_plate(5):
+        punkty.append(("gyro", gyro is not None, None))
+    if na_plate(0):
+        # Нули по всем осям — датчик не откалиброван либо не читается.
+        punkty.append(("acc", bool(acc) and any(acc), None))
+    if na_plate(1):
+        punkty.append(("baro", alt, None))
+    if est and na_plate(2):
+        punkty.append(("mag", bool(mag) and any(mag), None))
+
+    gps_zhdyom = GPS_EXPECTED or gps_bylo > 0 or (est and bool(mask & (1 << 3)))
+    if gps_zhdyom:
+        if gps_est and sats >= GPS_SATS_ENOUGH:
+            punkty.append(("gps", True, "%d sats" % sats))
+        elif gps_est:
+            punkty.append(("gps", False, "%d sats, weak" % sats))
+        elif sats > 0:
+            punkty.append(("gps", False, "%d sats" % sats))
+        elif gps_otvet:
+            punkty.append(("gps", False, "no sats"))
+        else:
+            punkty.append(("gps", False, None))
+
+    srok = _startup_t0 is not None and now - _startup_t0 > STARTUP_CHECK_AFTER_S
+    stroki = []
+    vse_ok = True
+    for imya, ok, primech in punkty:
+        if ok:
+            hvost = "ok" if not primech else "ok  %s" % primech
+            stroki.append((imya, hvost, COLOR_SENSOR_OK))
+        else:
+            vse_ok = False
+            if primech:                 # отвечает, но ещё не готов
+                stroki.append((imya, primech, COLOR_SENSOR_WAIT))
+            elif srok:
+                stroki.append((imya, "NO RESPONSE", COLOR_SENSOR_FAIL))
+            else:
+                stroki.append((imya, "...", COLOR_SENSOR_WAIT))
+
+    global _sensors_ok_since
+    if vse_ok:
+        if _sensors_ok_since is None:
+            _sensors_ok_since = now
+        # Всё поднялось — подержать на экране и убрать, чтобы не мешало.
+        if now - _sensors_ok_since > STARTUP_OK_SHOW_S:
             return None
-        fix = app_state.get("gps_fix")
-        sats = app_state.get("gps_sats")
-        zhivoy = _gps_zhivoy(app_state)
-        videli = app_state.get("gps_sats_max") or 0
-    # На боевом борту GPS не будет вовсе, и вечная надпись про его отсутствие
-    # там только мешает. Показываем, если GPS ждут, — или если спутники уже
-    # появлялись: это само по себе доказывает наличие модуля.
-    if not (GPS_EXPECTED or videli > 0):
-        return None
-    n = int(sats or 0)
-    if zhivoy and n >= GPS_SATS_ENOUGH:
-        return ("GPS FIX  %d sats" % n, (90, 230, 90))
-    if zhivoy:
-        return ("GPS FIX  %d sats  (weak)" % n, (60, 200, 240))
-    if n > 0:
-        return ("GPS SEARCHING  %d sats" % n, (60, 200, 240))
-    if fix is None:
-        return ("GPS NO RESPONSE", (60, 60, 255))
-    return ("GPS SEARCHING  no sats", (60, 60, 255))
+    else:
+        _sensors_ok_since = None
+    return stroki
 
 
-def draw_gps_prearm(frame):
-    """Строка состояния GPS до арма — по центру, ниже опроса датчиков."""
+def draw_sensor_report(frame):
+    """Отчёт по датчикам под лупой.
+
+    Под лупой, а не в углу: замерено на борту, что угол кадра за пределами
+    видимого — передатчик и очки съедают края. Лупа видна заведомо, значит
+    видна и полоса под ней.
+    """
     try:
-        got = _gps_prearm_stroka()
-        if got is None:
+        stroki = _sensor_report()
+        if not stroki:
             return
-        text, col = got
         h, w = frame.shape[0], frame.shape[1]
-        mash = 1.3
-        (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_PLAIN, mash, 2)
-        safe = max(40.0, w * STARTUP_SAFE_FRAC)
-        if tw > safe:
-            mash = max(0.8, mash * safe / float(tw))
-            (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_PLAIN, mash, 2)
-        x, y = max(2, (w - tw) // 2), int(h * 0.68)
-        # Обводка чёрным: без неё текст пропадает на светлом фоне.
-        cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_PLAIN,
-                    mash, COLOR_BLACK, 4)
-        cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_PLAIN, mash, col, 2)
+        # Под левым краем лупы — но не ценой обрезанной строки: «NO RESPONSE»
+        # вчетверо длиннее «ok», и именно её обрезать нельзя, иначе датчик
+        # останется неназванным. Не влезает — весь блок сдвигается левее.
+        def shir(t):
+            return cv2.getTextSize(t, SENSOR_FONT_FACE, SENSOR_FONT, 1)[0][0]
+
+        # Колонка под имена: пробелами её не набрать, шрифт пропорциональный,
+        # и тире гуляли бы по строке.
+        kol = max(shir(imya) for imya, _, _ in stroki) + shir("  -  ")
+        shirina = kol + max(shir(sost) for _, sost, _ in stroki)
+        x = min(w - MAG_MARGIN - MAG_SIZE, w - MAG_MARGIN - shirina)
+        y = MAG_MARGIN + (MAG_SIZE if MAG_ENABLED else 0) + SENSOR_LINE_H + 6
+        if x < 2 or y + SENSOR_LINE_H * len(stroki) > h:
+            x, y = max(2, (w - shirina) // 2), max(SENSOR_LINE_H, h // 3)
+        for imya, sost, col in stroki:
+            for tekst, tx in ((imya, x), ("-", x + kol - shir("- ")),
+                              (sost, x + kol)):
+                # Обводка чёрным: без неё текст пропадает на светлом фоне.
+                # Толщина 2, не 3: на мелком шрифте жирная забивает буквы.
+                cv2.putText(frame, tekst, (tx, y), SENSOR_FONT_FACE,
+                            SENSOR_FONT, COLOR_BLACK, 2)
+                cv2.putText(frame, tekst, (tx, y), SENSOR_FONT_FACE,
+                            SENSOR_FONT, col, 1)
+            y += SENSOR_LINE_H
     except Exception:
         pass
 
 
 def draw_overlay_on_frame(frame):
     draw_crosshair(frame)
-    draw_startup_check(frame)
-    draw_gps_prearm(frame)
     with state_lock:
         box = target_box_main
         vis = target_visible
@@ -4779,6 +4775,9 @@ def draw_overlay_on_frame(frame):
         draw_range_readout(frame, box)
     if MAG_ENABLED and ((not MAG_ONLY_WHEN_AUX) or aux_for_mag):
         draw_magnifier(frame, box if vis else None)
+    # Строго после лупы: она пишет прямоугольник поверх кадра и затёрла бы
+    # отчёт, окажись он раньше.
+    draw_sensor_report(frame)
 
 # =========================================================
 # 10. TRACKING CORE (без изменений)
