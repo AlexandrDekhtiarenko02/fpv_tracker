@@ -202,6 +202,8 @@ STARTUP_CHECK_AFTER_S = 8.0    # столько ждём отклика датч
 STARTUP_OK_SHOW_S = 5.0        # столько показываем «всё в порядке»
 STARTUP_SAFE_FRAC = 0.62       # какую долю ширины кадра считаем видимой
 STARTUP_FONT = 1.6             # желаемый размер; ужимается, если не влезает
+GPS_EXPECTED = False           # ставить True на замерном борту, где GPS есть
+GPS_SATS_ENOUGH = 6            # со скольких спутников считаем захват годным
 LOCK_LOG_ENABLED = True
 LOCK_LOG_DIR = "zahvaty"
 RECORD_HIRES = False
@@ -2216,6 +2218,7 @@ def fc_io_loop():
     loop_started = time.monotonic()
 
     while not io_thread_stop.is_set():
+        _gps_arm_note = None
         if fc is None:
             time.sleep(0.1)
             continue
@@ -2318,6 +2321,24 @@ def fc_io_loop():
                             if _armed_now != app_state.get("armed"):
                                 _alt_hist.clear()
                                 app_state["alt_sigma_cm"] = None
+                                # Состояние GPS именно НА МОМЕНТ АРМА.
+                                # Проверка готовности идёт на восьмой секунде,
+                                # когда захвата не бывает никогда: спутники
+                                # подтягиваются десятками секунд. Без этой
+                                # записи в разборе не отличить «GPS не было»
+                                # от «не дождались».
+                                if _armed_now and (GPS_EXPECTED or
+                                                   app_state.get("gps_sats_max")):
+                                    _gps_arm_note = (
+                                        "GPS НА АРМЕ: %s, спутников %s"
+                                        % ("захват есть"
+                                           if _gps_zhivoy(app_state)
+                                           else "ЗАХВАТА НЕТ",
+                                           app_state.get("gps_sats")))
+                                else:
+                                    _gps_arm_note = None
+                            else:
+                                _gps_arm_note = None
                             app_state["armed"] = _armed_now
                             app_state["armed_ts"] = now
                         # Активен ли MSP OVERRIDE на самом FC. Знать это
@@ -2327,6 +2348,9 @@ def fc_io_loop():
                             app_state["fc_override_on"] = bool(
                                 mode_flags & (1 << ovr_bit))
                             app_state["fc_override_ts"] = now
+
+            if _gps_arm_note:
+                flight_log.event(_gps_arm_note)
 
             if not _gotovnost_done and now - loop_started > STARTUP_CHECK_AFTER_S:
                 _startup_sensor_check()
@@ -2365,6 +2389,11 @@ def fc_io_loop():
                     with state_lock:
                         app_state["gps_fix"] = int(fix)
                         app_state["gps_sats"] = int(numsat)
+                        # Максимум за полёт: если спутники хоть раз были,
+                        # модуль на борту есть — и индикатор нужен, даже
+                        # когда захват сейчас потерян.
+                        if int(numsat) > (app_state.get("gps_sats_max") or 0):
+                            app_state["gps_sats_max"] = int(numsat)
                         app_state["gps_lat"] = lat / 1e7
                         app_state["gps_lon"] = lon / 1e7
                         app_state["gps_alt_m"] = int(alt_m)
@@ -4681,9 +4710,66 @@ def draw_startup_check(frame):
         pass
 
 
+def _gps_prearm_stroka():
+    """Живое состояние GPS до арма — или None, если показывать нечего.
+
+    Одной проверки на старте мало: спутники подтягиваются десятками секунд,
+    и на восьмой секунде захвата не бывает никогда. Пилоту нужно видеть, что
+    происходит СЕЙЧАС, и решать, ждать ли ещё.
+
+    После арма строка убирается: на заходе картинку загораживать нечем.
+    """
+    with state_lock:
+        if app_state.get("armed"):
+            return None
+        fix = app_state.get("gps_fix")
+        sats = app_state.get("gps_sats")
+        zhivoy = _gps_zhivoy(app_state)
+        videli = app_state.get("gps_sats_max") or 0
+    # На боевом борту GPS не будет вовсе, и вечная надпись про его отсутствие
+    # там только мешает. Показываем, если GPS ждут, — или если спутники уже
+    # появлялись: это само по себе доказывает наличие модуля.
+    if not (GPS_EXPECTED or videli > 0):
+        return None
+    n = int(sats or 0)
+    if zhivoy and n >= GPS_SATS_ENOUGH:
+        return ("GPS FIX  %d sats" % n, (90, 230, 90))
+    if zhivoy:
+        return ("GPS FIX  %d sats  (weak)" % n, (60, 200, 240))
+    if n > 0:
+        return ("GPS SEARCHING  %d sats" % n, (60, 200, 240))
+    if fix is None:
+        return ("GPS NO RESPONSE", (60, 60, 255))
+    return ("GPS SEARCHING  no sats", (60, 60, 255))
+
+
+def draw_gps_prearm(frame):
+    """Строка состояния GPS до арма — по центру, ниже опроса датчиков."""
+    try:
+        got = _gps_prearm_stroka()
+        if got is None:
+            return
+        text, col = got
+        h, w = frame.shape[0], frame.shape[1]
+        mash = 1.3
+        (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_PLAIN, mash, 2)
+        safe = max(40.0, w * STARTUP_SAFE_FRAC)
+        if tw > safe:
+            mash = max(0.8, mash * safe / float(tw))
+            (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_PLAIN, mash, 2)
+        x, y = max(2, (w - tw) // 2), int(h * 0.68)
+        # Обводка чёрным: без неё текст пропадает на светлом фоне.
+        cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_PLAIN,
+                    mash, COLOR_BLACK, 4)
+        cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_PLAIN, mash, col, 2)
+    except Exception:
+        pass
+
+
 def draw_overlay_on_frame(frame):
     draw_crosshair(frame)
     draw_startup_check(frame)
+    draw_gps_prearm(frame)
     with state_lock:
         box = target_box_main
         vis = target_visible
