@@ -4,7 +4,9 @@ import io, os, numpy as np, cv2, math
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 src = io.open(os.path.join(_ROOT, "tracker.py"), encoding="utf-8").read()
 ns = {"cv2": cv2, "np": np, "math": math, "FLOW_MIN_POINTS": 3,
-      "FLOW_ERR_MAX": 20.0, "FLOW_MAX_STEP": 30.0, "FLOW_WINDOW_PAD": 72, "FLOW_WINDOW_ENABLED": True}
+      "FLOW_ERR_MAX": 20.0, "FLOW_MAX_STEP": 30.0, "FLOW_WINDOW_PAD": 72, "FLOW_WINDOW_ENABLED": True,
+      "FLOW_WINDOW_PAD_MIN": 24, "FLOW_WIN": 15,
+      "FLOW_LEVELS": 1, "FLOW_ITERS": 8}
 exec("def flow_predict(" + src.split("def flow_predict(")[1].split("\ndef estimate_size_at_position")[0], ns)
 win_fn = ns["flow_predict"]
 
