@@ -1795,9 +1795,9 @@ class LockLogger:
         dur = time.monotonic() - self._t0
         try:
             with state_lock:
-                # Признак тот же, что и в снимке условий: есть координаты —
-                # значит GPS пригоден. Иначе итог и снимок противоречили бы.
-                gps_fix = app_state.get("gps_lat") is not None
+                # Признак тот же, что и в снимке условий, иначе итог и
+                # снимок противоречили бы.
+                gps_fix = _gps_zhivoy(app_state)
                 gps_sats = app_state.get("gps_sats")
                 imu = app_state.get("imu_seen")
                 alt = app_state.get("alt_seen")
@@ -1929,6 +1929,29 @@ except Exception:
 
 state_lock = threading.Lock()
 io_thread_stop = threading.Event()
+
+
+def _gps_zhivoy(st):
+    """Есть ли на борту РАБОТАЮЩИЙ GPS, а не просто ответ на запрос.
+
+    Замерено на борту: Betaflight отвечает на MSP_RAW_GPS и когда модуля нет
+    вовсе — нулями. По одному наличию ответа GPS числился исправным на борту,
+    где его физически не было. Ошибка того же рода, что и с RC: значение по
+    умолчанию принято за живой датчик.
+
+    Требуем захват, спутники и ненулевые координаты. Ноль широты и долготы —
+    это точка в Гвинейском заливе, законной её не бывает.
+
+    Вызывать, ДЕРЖА state_lock: замок не реентрантный, внутри не берём.
+    """
+    if not st.get("gps_fix"):
+        return False
+    if not (st.get("gps_sats") or 0) > 0:
+        return False
+    la, lo = st.get("gps_lat"), st.get("gps_lon")
+    if la is None or lo is None:
+        return False
+    return abs(la) > 1e-6 or abs(lo) > 1e-6
 
 app_state = {
     # Безопасные старты: throttle минимум, остальные центр.
@@ -4588,7 +4611,7 @@ def _startup_sensor_check():
         _rc_ts = app_state.get("rc_link_ts")
         rc = _rc_ts is not None and (time.monotonic() - _rc_ts) < 2.0
         att = app_state.get("fc_pitch_deg") is not None
-        gps = app_state.get("gps_lat") is not None
+        gps = _gps_zhivoy(app_state)
     missing = []
     if not rc:
         missing.append("RC")
@@ -5519,7 +5542,7 @@ def _gotovnost_k_sboru():
         with state_lock:
             imu = app_state.get("imu_seen")
             alt = app_state.get("alt_seen")
-            gps = app_state.get("gps_lat") is not None
+            gps = _gps_zhivoy(app_state)
             fc_ovr = app_state.get("fc_override_on")
             armed = app_state.get("armed")
         lines = []

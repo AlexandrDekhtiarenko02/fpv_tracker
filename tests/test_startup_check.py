@@ -130,4 +130,28 @@ t = _proverit(_zhivoy_polyotnik())
 assert t._startup_ok, "борт без GPS объявлен неисправным, а на боевом его и не будет"
 assert "no GPS" in " ".join(t._startup_lines), "молчание GPS никак не отмечено"
 
+print("\n=== 9. Ответ нулями — это ОТСУТСТВИЕ GPS, а не исправный GPS ===")
+# Замерено на борту: Betaflight отвечает на запрос GPS и когда модуля нет —
+# нулями. По одному наличию ответа GPS числился исправным там, где его
+# физически не было, и разбор пошёл бы со сверкой по несуществующим данным.
+nuli = _zhivoy_polyotnik(gps_fix=0, gps_sats=0, gps_lat=0.0, gps_lon=0.0)
+t = _proverit(nuli)
+print("   ", t._startup_lines)
+assert "no GPS" in " ".join(t._startup_lines), (
+    "нулевой ответ принят за работающий GPS")
+
+for opisanie, st in (
+        ("захвата нет", dict(gps_fix=0, gps_sats=9, gps_lat=50.4, gps_lon=30.5)),
+        ("спутников нет", dict(gps_fix=1, gps_sats=0, gps_lat=50.4, gps_lon=30.5)),
+        ("координаты нулевые", dict(gps_fix=1, gps_sats=9, gps_lat=0.0, gps_lon=0.0))):
+    t = _proverit(_zhivoy_polyotnik(**st))
+    assert "no GPS" in " ".join(t._startup_lines), (
+        "«%s» принято за работающий GPS" % opisanie)
+    print("    %-20s -> не считается GPS" % opisanie)
+
+t = _proverit(_zhivoy_polyotnik(gps_fix=1, gps_sats=9, gps_lat=50.45, gps_lon=30.52))
+print("   ", t._startup_lines)
+assert "no GPS" not in " ".join(t._startup_lines), (
+    "исправный GPS с захватом и спутниками не признан")
+
 print("\nOK: молчащий датчик не может притвориться исправным")
