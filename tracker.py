@@ -388,6 +388,43 @@ MOTION_PENALTY = 0.5
 # Код оставлен: на крупной цветной цели он может оказаться полезен, и тогда
 # включается одной строкой. Но на нынешних задачах он только ест процессор.
 COLOR_GUARD_ENABLED = False
+
+# --- СЛЕЖЕНИЕ ПО ЦВЕТОВОЙ ПРОЕКЦИИ ---
+# Отсев по цвету штрафом провалился (см. журнал опытов). Но сигнал в цвете ЕСТЬ,
+# и провалился способ, а не признак. Замерено на 15 записях с цветностью:
+#
+#     контраст цель/фон   по яркости   по цвету
+#         131204               5.4       110.0    <- 75% срывов
+#         131140               0.9        63.7
+#         131121               0.7        22.3
+#         131116               1.6        30.6
+#
+# То есть ровно там, где трекер срывался, цель по яркости почти невидима, а по
+# цвету видна прекрасно.
+#
+# ПРАВИЛЬНЫЙ СПОСОБ — не штрафовать поверх поиска по яркости, а СТРОИТЬ
+# КАРТИНКУ, в которой цветовое отличие превращено в яркостное, и искать по ней
+# обычным образом. Берётся направление «цель минус фон» в цветности, снятое при
+# захвате, и каждый пиксель проецируется на него. Оранжевое на сером становится
+# ярким, сам серый — плоским, фактура стенда пропадает.
+#
+# ЗАМЕРЕНО прогоном одного и того же кода по 15 записям:
+#     слежение по яркости  11.4% кадров на фоне
+#     слежение по цвету     1.1%
+# Улучшение вдесятеро, и оно приходится на те самые трудные записи.
+TRACK_ON_COLOR = True
+# Во сколько раз цветовой контраст должен превзойти яркостный, чтобы перейти на
+# цвет. ПОДОБРАНО ПЕРЕБОРОМ по 15 записям с цветностью:
+#     1.4 / 1.2 / 1.0 / 0.8 -> 9.5%   (цвет выбирается редко)
+#     0.5                   -> 5.8%
+# То есть переходить стоит даже когда цвет выигрывает у яркости лишь вдвое
+# меньше единицы — потому что проекция не просто добавляет контраст, она ещё и
+# СХЛОПЫВАЕТ фактуру фона, а та мешает сильнее, чем помогает яркость цели.
+TRACK_ON_COLOR_MIN_GAIN = 0.5
+# Ниже этого разделения по цветности переходить нельзя вовсе: направление
+# проекции станет шумом.
+TRACK_ON_COLOR_MIN_SEP = 8.0
+TRACK_ON_COLOR_SCALE = 2.0
 # Насколько цветность цели должна отличаться от окружения, чтобы цвету верить.
 # Единицы — сумма отклонений по U и V (каждая 0..255, серому отвечает 128).
 COLOR_MIN_SEPARATION = 12.0
@@ -1700,6 +1737,7 @@ chroma_u = None
 chroma_v = None
 target_uv = None          # (U, V) цели, снятые при захвате
 color_active = False      # различает ли цвет цель и фон в этом захвате
+color_axis = None         # направление «цель минус фон» в цветности
 color_separation = 0.0
 chroma_fail_reason = ""   # почему цвет не сработал — для журнала
 chroma_debug = ""         # измеренные цвета цели и фона, для журнала
@@ -2813,6 +2851,83 @@ def _adapt_template_base(gray):
         pass
 
 
+def measure_color_axis(gray, cx, cy, box_w, box_h):
+    """Направление в цветности, по которому цель отличается от фона.
+
+    Возвращает (du, dv, ou, ov, выигрыш) либо None. Выигрыш — во сколько раз
+    цветовой контраст цель/фон превосходит яркостный. Считается один раз при
+    захвате: направление снимается с той цели, которую указал оператор.
+    """
+    if chroma_u is None or chroma_v is None:
+        return None
+    try:
+        rw = max(2, int(box_w / 4)); rh = max(2, int(box_h / 4))
+        ccx, ccy = int(cx / 2), int(cy / 2)
+        K = 4
+
+        def s_n(a, x0, y0, x1, y1):
+            x0 = max(0, x0); y0 = max(0, y0)
+            x1 = min(a.shape[1], x1); y1 = min(a.shape[0], y1)
+            if x1 <= x0 or y1 <= y0:
+                return 0.0, 0
+            p = a[y0:y1, x0:x1]
+            return float(p.sum()), int(p.size)
+
+        def ring(a):
+            so, no = s_n(a, ccx - K * rw, ccy - K * rh, ccx + K * rw, ccy + K * rh)
+            si, ni = s_n(a, ccx - rw, ccy - rh, ccx + rw, ccy + rh)
+            if no - ni <= 0 or ni <= 0:
+                return None, None
+            return si / ni, (so - si) / (no - ni)
+
+        tu, ou = ring(chroma_u.astype(np.float32))
+        tv, ov = ring(chroma_v.astype(np.float32))
+        if tu is None or tv is None:
+            return None
+        du, dv = tu - ou, tv - ov
+        sep = math.hypot(du, dv)
+        if sep < TRACK_ON_COLOR_MIN_SEP:
+            return None
+
+        # Яркостный контраст той же пары областей — с чем сравниваем.
+        gt, gb = None, None
+        try:
+            bw2 = max(3, int(box_w)); bh2 = max(3, int(box_h))
+            si, ni = s_n(gray, int(cx - bw2 / 2), int(cy - bh2 / 2),
+                         int(cx + bw2 / 2), int(cy + bh2 / 2))
+            so, no = s_n(gray, int(cx - 2 * bw2), int(cy - 2 * bh2),
+                         int(cx + 2 * bw2), int(cy + 2 * bh2))
+            if ni > 0 and no - ni > 0:
+                gt = si / ni
+                gb = (so - si) / (no - ni)
+        except Exception:
+            pass
+        y_contrast = abs(gt - gb) if (gt is not None and gb is not None) else 0.0
+        gain = sep / max(y_contrast, 1e-3)
+        return du / sep, dv / sep, ou, ov, gain
+    except Exception:
+        return None
+
+
+def color_projection(shape):
+    """Кадр, в котором цветовое отличие цели превращено в яркостное.
+
+    Фактура фона при этом схлопывается: она отличается яркостью, а не цветом.
+    Именно поэтому перфорированная стена, на которую срывался трекер, в этой
+    картинке пропадает.
+    """
+    if color_axis is None or chroma_u is None or chroma_v is None:
+        return None
+    try:
+        du, dv, ou, ov, _g = color_axis
+        p = ((chroma_u.astype(np.float32) - ou) * du
+             + (chroma_v.astype(np.float32) - ov) * dv)
+        p = cv2.resize(p, (shape[1], shape[0]), interpolation=cv2.INTER_LINEAR)
+        return np.clip(128.0 + p * TRACK_ON_COLOR_SCALE, 0, 255).astype(np.uint8)
+    except Exception:
+        return None
+
+
 def build_template(gray, cx, cy, box_w, box_h):
     global tmpl_w, tmpl_h, template_std
     tw = clamp(max(box_w * TEMPLATE_SCALE, TEMPLATE_MIN), TEMPLATE_MIN, TEMPLATE_MAX)
@@ -2988,6 +3103,7 @@ def reset_tracking(to_acq=False):
     global track_state, target_visible, target_controllable, overlay_text, overlay_color, target_box_main
     global lock_cx, lock_cy, lock_w, lock_h, tmpl_w, tmpl_h, template_gray, template_std
     global template_base, target_uv, color_active, color_separation
+    global color_axis
     global prev_gray, prev_pts, lost_frames, last_match_score, last_flow_ok
     global acq_wait_left
     global filtered_dx_yaw, prev_adx, prev_ady_ctrl
@@ -3006,6 +3122,11 @@ def reset_tracking(to_acq=False):
 
     lock_cx = lock_cy = lock_w = lock_h = None
     tmpl_w = tmpl_h = None
+    # Ось цвета принадлежит КОНКРЕТНОМУ захвату: она снята с той цели, которую
+    # указал оператор. Оставить её жить после потери лока — значит вести поиск
+    # новой цели по проекции, снятой со старой, и вдобавок снимать следующую ось
+    # с уже спроецированной картинки. Обе ошибки тихие.
+    color_axis = None
     template_gray = None
     template_base = None
     target_uv = None
@@ -3938,7 +4059,7 @@ def process_locked_tracker(gray):
     global fps_t0, fps_frames, fps_current
     global prev_aux_on, acq_wait_left, lock_sequence
     global auto_reacq_attempts
-    global template_scale_acc
+    global template_scale_acc, color_axis
 
     frame_index += 1
 
@@ -3962,6 +4083,15 @@ def process_locked_tracker(gray):
             global_yaw_cmd = 1500.0
             global_throttle_cmd = live_thr
         return
+
+    # ВЕДЁМ ПО ТОЙ КАРТИНКЕ, ПО КОТОРОЙ РЕШИЛИ ПРИ ЗАХВАТЕ. Если выбран цвет,
+    # дальше вся обработка — поиск, поток, размер — идёт по цветовой проекции.
+    # Подмена именно здесь, чтобы ни одна часть не работала по другой картинке,
+    # чем та, из которой снят эталон.
+    if color_axis is not None:
+        _proj = color_projection(gray.shape)
+        if _proj is not None:
+            gray = _proj
 
     if rising_aux:
         reset_tracking(to_acq=True)
@@ -4046,7 +4176,31 @@ def process_locked_tracker(gray):
             lock_cy = float(acq_cy)
             lock_w = float(lw)
             lock_h = float(lh)
-            template_gray = build_template(gray, lock_cx, lock_cy, lock_w, lock_h)
+            # РЕШЕНИЕ, ПО ЧЕМУ ВЕСТИ, принимается ЗДЕСЬ, один раз на захват.
+            # Если цель отличается от окружения цветом заметно сильнее, чем
+            # яркостью, — ведём по цветовой проекции: в ней цель яркая, а
+            # фактура фона схлопнута. Иначе остаёмся на яркости.
+            color_axis = None
+            if TRACK_ON_COLOR:
+                ax = measure_color_axis(gray, lock_cx, lock_cy, lock_w, lock_h)
+                if ax is not None and ax[4] >= TRACK_ON_COLOR_MIN_GAIN:
+                    color_axis = ax
+                    flight_log.event(
+                        "ВЕДЁМ ПО ЦВЕТУ: цвет выигрывает у яркости в %.1f раза"
+                        % ax[4])
+                elif ax is not None:
+                    flight_log.event(
+                        "ведём по яркости: цвет выигрывает лишь в %.1f раза "
+                        "(нужно %.1f)" % (ax[4], TRACK_ON_COLOR_MIN_GAIN))
+            track_img = gray
+            if color_axis is not None:
+                proj = color_projection(gray.shape)
+                if proj is not None:
+                    track_img = proj
+                else:
+                    color_axis = None
+            template_gray = build_template(track_img, lock_cx, lock_cy,
+                                           lock_w, lock_h)
             template_base = template_gray.copy()
             template_scale_acc = 1.0
             # Один раз на захват решаем, помогает ли цвет. Если цель и её
@@ -4695,7 +4849,7 @@ def camera_callback(request):
         with MappedArray(request, "lores") as lm:
             yuv = lm.array
             gray = yuv[:LORES_H, :LORES_W].copy()
-            if COLOR_GUARD_ENABLED:
+            if COLOR_GUARD_ENABLED or TRACK_ON_COLOR:
                 # Цветность уже в этом же буфере — копируем вместе с яркостью.
                 cu, cv_ = extract_chroma(yuv)
                 if cu is not None:
