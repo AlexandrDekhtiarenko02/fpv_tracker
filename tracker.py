@@ -2046,6 +2046,7 @@ motion_active = False     # движется ли цель иначе фона
 motion_separation = 0.0
 template_std = 0.0
 _acq_debug_n = 0
+_gotovnost_done = False
 ground_speed_mps = None   # путевая скорость по бегу земли, м/с
 _gs_prev_gray = None
 _gs_prev_pts = None
@@ -2289,6 +2290,9 @@ def fc_io_loop():
                             app_state["fc_override_on"] = bool(
                                 mode_flags & (1 << ovr_bit))
                             app_state["fc_override_ts"] = now
+
+            if not _gotovnost_done and now - loop_started > 8.0:
+                _gotovnost_k_sboru()
 
             if (not alt_warned and now - loop_started > 8.0
                     and not app_state.get("alt_seen")):
@@ -5389,6 +5393,69 @@ class FrameRecorder:
 
 
 frame_recorder = FrameRecorder(FLIGHT_LOG_DIR)
+
+
+def _gotovnost_k_sboru():
+    """Проверка готовности к сбору данных. Пишется в журнал один раз.
+
+    Смысл: не полагаться на то, что «всё вроде сделано». Сбор данных — это
+    полётный день, и обнаружить на разборе, что гироскоп не отвечал или что в
+    стиках лежит эхо трекера, значит потерять этот день целиком.
+
+    Проверяется то, что нельзя увидеть на земле по коду, — отвечает ли
+    железо и не включён ли оверрайд.
+    """
+    global _gotovnost_done
+    if _gotovnost_done:
+        return
+    _gotovnost_done = True
+    try:
+        with state_lock:
+            imu = app_state.get("imu_seen")
+            alt = app_state.get("alt_seen")
+            gps = app_state.get("gps_lat") is not None
+            fc_ovr = app_state.get("fc_override_on")
+            armed = app_state.get("armed")
+        lines = []
+        beda = []
+
+        def check(name, ok, need, why):
+            mark = "ДА " if ok else "НЕТ"
+            lines.append("  %-28s %s" % (name, mark))
+            if need and not ok:
+                beda.append(why)
+
+        check("режим наблюдения включён", OBSERVE_ONLY, True,
+              "БЕЗ OBSERVE_ONLY в стиках окажется эхо трекера, а не действия "
+              "пилота — вся выборка будет негодной")
+        check("оверрайд на полётнике выключен", not fc_ovr, True,
+              "оверрайд активен: MSP_RC возвращает наши же значения")
+        check("папка на каждый захват", LOCK_LOG_ENABLED, True,
+              "захваты сольются в один файл, разбирать поштучно не выйдет")
+        check("гироскоп отвечает", bool(imu), True,
+              "без гироскопа неизвестно, ЧТО ВЫШЛО из действий пилота: в ACRO "
+              "стик задаёт угловую скорость, а не угол")
+        check("высотомер отвечает", bool(alt), True,
+              "без высоты нет ни дальности, ни путевой скорости по земле")
+        check("скорость по бегу земли считается", GROUND_SPEED_ENABLED, True,
+              "без неё закон упреждения выйдет усреднённым по скорости")
+        check("GPS отвечает", gps, False, "")
+        check("координаты цели заданы", TARGET_LAT is not None, False, "")
+
+        flight_log.event("ГОТОВНОСТЬ К СБОРУ ДАННЫХ:\n" + "\n".join(lines))
+        if beda:
+            for b in beda:
+                flight_log.event("  НЕ ГОТОВО: %s" % b)
+            flight_log.event("  => СБОР ДАННЫХ НЕ ИМЕЕТ СМЫСЛА, пока это не "
+                             "исправлено")
+        elif not gps:
+            flight_log.event(
+                "  готово. GPS нет — сбор идёт по высоте, углу и бегу земли, "
+                "но без сверки: систематическая ошибка не обнаружится")
+        else:
+            flight_log.event("  готово полностью, со сверкой по GPS")
+    except Exception as exc:
+        flight_log.event("проверка готовности не отработала: %s" % exc)
 
 
 def camera_callback(request):
