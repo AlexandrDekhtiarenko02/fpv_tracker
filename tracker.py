@@ -1807,7 +1807,7 @@ class LockLogger:
                 gps_fix = _gps_zhivoy(app_state)
                 gps_sats = app_state.get("gps_sats")
                 imu = app_state.get("imu_seen")
-                alt = app_state.get("alt_seen")
+                alt = _baro_zhivoy(app_state)
             with open(os.path.join(self._path, "итог.txt"), "w",
                       encoding="utf-8") as f:
                 f.write("УСЛОВИЯ ЗАХОДА (в момент захвата, не на взлёте)\n")
@@ -1936,6 +1936,24 @@ except Exception:
 
 state_lock = threading.Lock()
 io_thread_stop = threading.Event()
+
+
+def _baro_zhivoy(st):
+    """Есть ли РАБОТАЮЩИЙ барометр, а не просто ответ на запрос высоты.
+
+    Замерено на стенде: с выключенным в Betaflight барометром полётник всё
+    равно отвечает на MSP_ALTITUDE — нулями. Признак «высотомер отвечает»
+    поднимался, и отчёт показывал baro - ok на борту, где барометра нет.
+    Та же ошибка, что с GPS и с RC: ответ по умолчанию принят за живой датчик.
+
+    Единственный надёжный источник — перечень датчиков от самого полётника.
+    Пока он не пришёл, судим по ответу: раньше времени пугать нечем.
+
+    Вызывать, ДЕРЖА state_lock: замок не реентрантный, внутри не берём.
+    """
+    if st.get("has_baro") is False:
+        return False
+    return bool(st.get("alt_seen"))
 
 
 def _gps_zhivoy(st):
@@ -4660,7 +4678,7 @@ def _sensor_report():
         gyro = app_state.get("gyro")
         acc = app_state.get("acc")
         mag = app_state.get("mag")
-        alt = bool(app_state.get("alt_seen"))
+        alt = _baro_zhivoy(app_state)
         sats = int(app_state.get("gps_sats") or 0)
         gps_est = _gps_zhivoy(app_state)
         gps_bylo = app_state.get("gps_sats_max") or 0
@@ -4716,16 +4734,19 @@ def _sensor_report():
                        COLOR_SENSOR_FAIL if srok else COLOR_SENSOR_WAIT))
         vse_ok = False
     for imya, ok, primech, na_bortu, nuzhen in punkty:
-        if ok:
-            hvost = "ok" if not primech else "ok  %s" % primech
-            stroki.append((imya, hvost, COLOR_SENSOR_OK))
-        elif na_bortu is False:
-            # Полётник прямо говорит: такого датчика на плате нет.
+        # ПОРЯДОК ВАЖЕН: слово платы сильнее наличия данных. Полётник отвечает
+        # на запрос высоты и с выключенным барометром — нулями, и проверка
+        # «данные есть» первой давала baro - ok на борту без барометра.
+        # Если железки нет, никакие ответы не делают её исправной.
+        if na_bortu is False:
             if nuzhen:
                 stroki.append((imya, "NOT ON BOARD", COLOR_SENSOR_FAIL))
                 vse_ok = False
             else:
                 stroki.append((imya, "none", COLOR_SENSOR_NONE))
+        elif ok:
+            hvost = "ok" if not primech else "ok  %s" % primech
+            stroki.append((imya, hvost, COLOR_SENSOR_OK))
         elif primech:                   # отвечает, но ещё не готов
             stroki.append((imya, primech, COLOR_SENSOR_WAIT))
             vse_ok = False
@@ -5659,7 +5680,7 @@ def _gotovnost_k_sboru():
     try:
         with state_lock:
             imu = app_state.get("imu_seen")
-            alt = app_state.get("alt_seen")
+            alt = _baro_zhivoy(app_state)
             gps = _gps_zhivoy(app_state)
             fc_ovr = app_state.get("fc_override_on")
             armed = app_state.get("armed")
