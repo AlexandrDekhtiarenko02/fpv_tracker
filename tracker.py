@@ -191,6 +191,15 @@ CAM_SETTLE_STABLE = 3       # столько одинаковых ответов
 # --- ПАПКА НА КАЖДЫЙ ЗАХВАТ ---
 # Кампания по сбору данных — это сотня заходов, и разбирать их надо поштучно.
 # Каждый захват пишется в свою папку flight_logs/zahvaty/<метка>_zahvatNN/.
+# --- ПРОВЕРКА ДАТЧИКОВ ПРИ ЗАПУСКЕ, НА ЭКРАН ---
+# Оператор видит сообщение сразу после старта и до взлёта. Если всё ответило —
+# надпись сама пропадает через несколько секунд и не мешает. Если нет — висит,
+# называя молчащий датчик поимённо.
+#
+# Надписи ЛАТИНИЦЕЙ: шрифты OpenCV кириллицы не знают и рисуют её знаками
+# вопроса (проверено).
+STARTUP_CHECK_AFTER_S = 8.0    # столько ждём отклика датчиков
+STARTUP_OK_SHOW_S = 5.0        # столько показываем «всё в порядке»
 LOCK_LOG_ENABLED = True
 LOCK_LOG_DIR = "zahvaty"
 RECORD_HIRES = False
@@ -2047,6 +2056,9 @@ motion_separation = 0.0
 template_std = 0.0
 _acq_debug_n = 0
 _gotovnost_done = False
+_startup_lines = []
+_startup_ok = False
+_startup_until = None
 ground_speed_mps = None   # путевая скорость по бегу земли, м/с
 _gs_prev_gray = None
 _gs_prev_pts = None
@@ -2291,7 +2303,8 @@ def fc_io_loop():
                                 mode_flags & (1 << ovr_bit))
                             app_state["fc_override_ts"] = now
 
-            if not _gotovnost_done and now - loop_started > 8.0:
+            if not _gotovnost_done and now - loop_started > STARTUP_CHECK_AFTER_S:
+                _startup_sensor_check()
                 _gotovnost_k_sboru()
 
             if (not alt_warned and now - loop_started > 8.0
@@ -4553,8 +4566,76 @@ def draw_range_readout(frame, box):
         pass
 
 
+def _startup_sensor_check():
+    """Опросить датчики и подготовить надпись на экран.
+
+    Смысл — увидеть молчащий датчик ДО взлёта, а не на разборе. Отсутствие
+    отклика от гироскопа или высотомера обесценивает весь полётный день, и
+    выяснять это постфактум слишком дорого.
+    """
+    global _startup_lines, _startup_ok, _startup_until
+    with state_lock:
+        imu = bool(app_state.get("imu_seen"))
+        alt = bool(app_state.get("alt_seen"))
+        # ВАЖНО: по самому наличию rc_channels судить нельзя — там лежит
+        # значение по умолчанию, и RC выглядел бы отвечающим всегда. Смотрим
+        # на признак ЖИВОЙ связи, который ставится только при реальном ответе.
+        # Проверяем НАЛИЧИЕ отметки, а не только её возраст: на машине, где
+        # монотонные часы начинаются с нуля, отсутствие ключа выглядело бы как
+        # свежий ответ.
+        _rc_ts = app_state.get("rc_link_ts")
+        rc = _rc_ts is not None and (time.monotonic() - _rc_ts) < 2.0
+        att = app_state.get("fc_pitch_deg") is not None
+        gps = app_state.get("gps_lat") is not None
+    missing = []
+    if not rc:
+        missing.append("RC")
+    if not att:
+        missing.append("ATTITUDE")
+    if not imu:
+        missing.append("GYRO")
+    if not alt:
+        missing.append("BARO")
+
+    if missing:
+        _startup_ok = False
+        _startup_lines = ["NO RESPONSE: " + ", ".join(missing)]
+        # Высотомер до арма молчит по устройству прошивки — подскажем, чтобы
+        # оператор не искал неисправность там, где её нет.
+        if "BARO" in missing:
+            _startup_lines.append("BARO needs ARM to report")
+        _startup_until = None          # висит, пока не исправлено
+    else:
+        _startup_ok = True
+        _startup_lines = ["SENSORS OK" + ("" if gps else "  (no GPS)")]
+        _startup_until = time.monotonic() + STARTUP_OK_SHOW_S
+
+    flight_log.event("ПРОВЕРКА ДАТЧИКОВ: %s" % (
+        "все ответили" if not missing else "НЕ ОТВЕТИЛИ: " + ", ".join(missing)))
+
+
+def draw_startup_check(frame):
+    """Надпись о проверке датчиков поверх картинки."""
+    if not _startup_lines:
+        return
+    if _startup_until is not None and time.monotonic() > _startup_until:
+        return
+    try:
+        col = (90, 230, 90) if _startup_ok else (60, 60, 255)
+        y = 30
+        for text in _startup_lines:
+            cv2.putText(frame, text, (14, y), cv2.FONT_HERSHEY_PLAIN,
+                        1.6, COLOR_BLACK, 4)
+            cv2.putText(frame, text, (14, y), cv2.FONT_HERSHEY_PLAIN,
+                        1.6, col, 2)
+            y += 24
+    except Exception:
+        pass
+
+
 def draw_overlay_on_frame(frame):
     draw_crosshair(frame)
+    draw_startup_check(frame)
     with state_lock:
         box = target_box_main
         vis = target_visible
