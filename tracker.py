@@ -1693,16 +1693,56 @@ class LockLogger:
         self.dir = directory
         self.active = False
         self.n = 0
+        self.at_lock = {}
         self._csv = None
         self._evt = None
         self._path = None
         self._t0 = 0.0
         self._rows = 0
 
+    def _snapshot(self):
+        """Условия в момент захвата: чем определяется эта выборка."""
+        try:
+            with state_lock:
+                d = {
+                    "высота_см": app_state.get("alt_cm"),
+                    "тангаж": app_state.get("fc_pitch_deg"),
+                    "крен": app_state.get("fc_roll_deg"),
+                    "широта": app_state.get("gps_lat"),
+                    "долгота": app_state.get("gps_lon"),
+                    "скорость_GPS_мс": (
+                        None if app_state.get("gps_speed_cms") is None
+                        else app_state["gps_speed_cms"] / 100.0),
+                    "спутников": app_state.get("gps_sats"),
+                }
+            d["скорость_по_земле_мс"] = ground_speed_mps
+            d["дальность_по_высоте_м"] = _ctl_dbg.get("range_m")
+            d["угол_снижения"] = _ctl_dbg.get("depression_deg")
+            d["время_до_цели_с"] = _ctl_dbg.get("tau_s")
+            # Истинная дальность — если известны и наши координаты, и цели.
+            d["дальность_GPS_м"] = None
+            if (d["широта"] is not None and TARGET_LAT is not None
+                    and TARGET_LON is not None):
+                try:
+                    dlat = math.radians(TARGET_LAT - d["широта"])
+                    dlon = math.radians(TARGET_LON - d["долгота"])
+                    d["дальность_GPS_м"] = 6371000.0 * math.hypot(
+                        dlat, dlon * math.cos(math.radians(d["широта"])))
+                except Exception:
+                    pass
+            return d
+        except Exception:
+            return {}
+
     def begin(self, seq):
         if not LOCK_LOG_ENABLED or self.active:
             return
         try:
+            # УСЛОВИЯ ЗАХОДА снимаются В МОМЕНТ ЛОКА, а не на взлёте. Каждый
+            # лок — отдельная выборка, и «точка старта» для неё это та точка,
+            # где оператор указал цель. Она в воздухе, и именно её высота,
+            # дальность и угол определяют, к какой связке относится заход.
+            self.at_lock = self._snapshot()
             stamp = time.strftime("%Y%m%d_%H%M%S")
             self.n += 1
             self._path = os.path.join(self.dir, LOCK_LOG_DIR,
@@ -1744,12 +1784,23 @@ class LockLogger:
         dur = time.monotonic() - self._t0
         try:
             with state_lock:
-                gps_fix = app_state.get("gps_fix")
+                # Признак тот же, что и в снимке условий: есть координаты —
+                # значит GPS пригоден. Иначе итог и снимок противоречили бы.
+                gps_fix = app_state.get("gps_lat") is not None
                 gps_sats = app_state.get("gps_sats")
                 imu = app_state.get("imu_seen")
                 alt = app_state.get("alt_seen")
             with open(os.path.join(self._path, "итог.txt"), "w",
                       encoding="utf-8") as f:
+                f.write("УСЛОВИЯ ЗАХОДА (в момент захвата, не на взлёте)\n")
+                for k, v in self.at_lock.items():
+                    if v is None:
+                        f.write("  %-24s нет\n" % k)
+                    elif isinstance(v, float):
+                        f.write("  %-24s %.4f\n" % (k, v))
+                    else:
+                        f.write("  %-24s %s\n" % (k, v))
+                f.write("\n")
                 f.write("длительность: %.1f с, строк %d\n" % (dur, self._rows))
                 f.write("окончен: %s\n" % (why or "не указано"))
                 f.write("режим наблюдения: %s\n"
