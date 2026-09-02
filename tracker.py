@@ -5046,6 +5046,40 @@ def camera_callback(request):
         pass
 
 # =========================================================
+# МЕСТНЫЕ НАСТРОЙКИ БОРТА
+# =========================================================
+# Файл local_settings.py, если он есть рядом, переопределяет любые настройки
+# выше. Он НЕ в репозитории (см. .gitignore), поэтому:
+#   * git pull больше не конфликтует с местными правками;
+#   * настройки конкретного борта не уезжают в общий код;
+#   * ./record.sh пишет туда, а не правит tracker.py.
+#
+# До этого record.sh менял tracker.py на месте, и обновление на малине падало
+# с «local changes would be overwritten». Правка настроек и правка программы —
+# разные вещи, и хранить их надо порознь.
+try:
+    import local_settings as _ls
+    _applied = []
+    for _name in dir(_ls):
+        if _name.startswith("_"):
+            continue
+        if _name in globals():
+            globals()[_name] = getattr(_ls, _name)
+            _applied.append(_name)
+        else:
+            print("[настройки борта] неизвестное имя %s — пропущено" % _name)
+    if _applied:
+        print("[настройки борта] применено: %s" % ", ".join(sorted(_applied)))
+except ImportError:
+    pass
+except Exception as _exc:
+    print("[настройки борта] НЕ ПРИМЕНЕНЫ: %s" % _exc)
+
+# Разрешение камеры зависит от RECORD_HIRES, а он мог быть переопределён выше.
+if RECORD_HIRES:
+    CAM_W, CAM_H = LORES_W * 2, LORES_H * 2
+
+# =========================================================
 # 12. START
 # =========================================================
 def main():

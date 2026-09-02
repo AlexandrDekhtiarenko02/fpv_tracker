@@ -19,6 +19,12 @@ FILE_MD5=$(md5sum tracker.py 2>/dev/null | cut -c1-12)
 echo "  md5 tracker.py  : $FILE_MD5"
 
 echo
+if [ -f local_settings.py ]; then
+    echo "=== Настройки этого борта ==="
+    grep -v '^#' local_settings.py | grep -v '^$' | sed 's/^/  /'
+    echo
+fi
+
 echo "=== Служба ==="
 ACTIVE=$(systemctl is-active tracker 2>/dev/null || echo "нет")
 MAINPID=$(systemctl show tracker -p MainPID --value 2>/dev/null || echo 0)

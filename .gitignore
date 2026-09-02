@@ -21,3 +21,6 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+# Настройки конкретного борта — не код, в репозитории им не место.
+local_settings.py
