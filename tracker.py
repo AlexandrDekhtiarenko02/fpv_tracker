@@ -425,6 +425,14 @@ TRACK_ON_COLOR_MIN_GAIN = 0.5
 # проекции станет шумом.
 TRACK_ON_COLOR_MIN_SEP = 8.0
 TRACK_ON_COLOR_SCALE = 2.0
+# Как часто пересчитывать ФОН в оси цвета. Цвет самой цели — её опознавательный
+# признак, он остаётся с захвата. А фон меняется по ходу захода: цель уходит с
+# серого асфальта на жёлтое поле, и ось, в которой зашит старый фон, становится
+# неверной. Поэтому фон обновляется, а цель — нет.
+TRACK_ON_COLOR_BG_EVERY = 8
+# Если цель и фон сравнялись по цвету, вести по цветовой проекции больше
+# нельзя: направление оси превращается в шум. Возвращаемся на яркость.
+TRACK_ON_COLOR_DROP_SEP = 5.0
 # Насколько цветность цели должна отличаться от окружения, чтобы цвету верить.
 # Единицы — сумма отклонений по U и V (каждая 0..255, серому отвечает 128).
 COLOR_MIN_SEPARATION = 12.0
@@ -2904,9 +2912,66 @@ def measure_color_axis(gray, cx, cy, box_w, box_h):
             pass
         y_contrast = abs(gt - gb) if (gt is not None and gb is not None) else 0.0
         gain = sep / max(y_contrast, 1e-3)
-        return du / sep, dv / sep, ou, ov, gain
+        # В оси хранится и САМ ЦВЕТ ЦЕЛИ: он нужен, чтобы потом
+        # пересчитывать фон, не трогая цель.
+        return du / sep, dv / sep, ou, ov, gain, tu, tv
     except Exception:
         return None
+
+
+def refresh_color_axis(cx, cy, box_w, box_h):
+    """Пересчитать ФОН в оси цвета, оставив цвет цели прежним.
+
+    Ось строится как «цвет цели минус цвет фона». Цвет цели — её признак, он
+    снят при захвате и не меняется: иначе, стоит рамке чуть сползти, мы начнём
+    считать целью фон. А вот ФОН по ходу захода меняется по-настоящему —
+    оранжевая машина уходит с серого асфальта на жёлтое поле, — и ось со старым
+    фоном становится неверной.
+
+    Если цель и фон сравнялись по цвету, возвращаем False: вести по проекции
+    больше нельзя, направление оси стало шумом.
+    """
+    global color_axis
+    if color_axis is None or chroma_u is None or chroma_v is None:
+        return False
+    try:
+        _du0, _dv0, _ou0, _ov0, gain, tu, tv = color_axis
+
+        rw = max(2, int(box_w / 4)); rh = max(2, int(box_h / 4))
+        ccx, ccy = int(cx / 2), int(cy / 2)
+        K = 4
+
+        def s_n(a, x0, y0, x1, y1):
+            x0 = max(0, x0); y0 = max(0, y0)
+            x1 = min(a.shape[1], x1); y1 = min(a.shape[0], y1)
+            if x1 <= x0 or y1 <= y0:
+                return 0.0, 0
+            p = a[y0:y1, x0:x1]
+            return float(p.sum()), int(p.size)
+
+        def ring_bg(a):
+            so, no = s_n(a, ccx - K * rw, ccy - K * rh, ccx + K * rw, ccy + K * rh)
+            si, ni = s_n(a, ccx - rw, ccy - rh, ccx + rw, ccy + rh)
+            if no - ni <= 0:
+                return None
+            return (so - si) / (no - ni)
+
+        ou = ring_bg(chroma_u.astype(np.float32))
+        ov = ring_bg(chroma_v.astype(np.float32))
+        if ou is None or ov is None:
+            return True                      # не смогли — оставляем как было
+        du, dv = tu - ou, tv - ov
+        sep = math.hypot(du, dv)
+        if sep < TRACK_ON_COLOR_DROP_SEP:
+            flight_log.event(
+                "ЦВЕТ БОЛЬШЕ НЕ РАЗЛИЧАЕТ: цель и фон сошлись (%.1f), "
+                "возвращаемся на яркость" % sep)
+            color_axis = None
+            return False
+        color_axis = (du / sep, dv / sep, ou, ov, gain, tu, tv)
+        return True
+    except Exception:
+        return True
 
 
 def color_projection(shape):
@@ -2919,7 +2984,7 @@ def color_projection(shape):
     if color_axis is None or chroma_u is None or chroma_v is None:
         return None
     try:
-        du, dv, ou, ov, _g = color_axis
+        du, dv, ou, ov, _g, _tu, _tv = color_axis
         p = ((chroma_u.astype(np.float32) - ou) * du
              + (chroma_v.astype(np.float32) - ov) * dv)
         p = cv2.resize(p, (shape[1], shape[0]), interpolation=cv2.INTER_LINEAR)
@@ -4387,6 +4452,12 @@ def process_locked_tracker(gray):
         # в 76%% кадров и почти не растёт, хотя объект бывает крупным. Гейта
         # два — порог score и допустимый диапазон оценки, — и без записи
         # непонятно, какой именно закрыт.
+        # Фон в оси цвета обновляем на ходу: он меняется по-настоящему, когда
+        # цель уходит с одного покрытия на другое.
+        if (color_axis is not None
+                and frame_index % TRACK_ON_COLOR_BG_EVERY == 0):
+            refresh_color_axis(lock_cx, lock_cy, lock_w, lock_h)
+
         if (SIZE_BY_SCALE_ENABLED and SIZE_ADAPT_ENABLED
                 and frame_index % SIZE_ADAPT_EVERY_FRAMES == 0):
             # Размер по масштабу совпадения. Сегментация не участвует.
