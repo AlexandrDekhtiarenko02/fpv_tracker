@@ -27,7 +27,7 @@ import offline  # noqa: E402
 # уехал дальше и завалил проверку, которая про него ничего не знает.
 _POLYA = ("armed", "gps_fix", "gps_sats", "gps_lat", "gps_lon", "gps_sats_max",
           "sensor_mask", "rc_link_ts", "fc_pitch_deg", "gyro", "acc", "mag",
-          "alt_seen", "has_baro")
+          "alt_seen", "has_baro", "feature_mask")
 # Что плата сообщает о себе: акселерометр, барометр, магнитометр, GPS, гироскоп.
 MASK = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5)
 
@@ -194,7 +194,49 @@ t = _tr(armed=True, **_vse_podnyalos())
 assert t._sensor_report() is None, "на заходе картинку загораживать нечем"
 assert _narisovano(t).sum() == 0
 
-print("\n=== 13. Отчёт целиком в кадре, ниже лупы и без кириллицы ===")
+print("\n=== 13. Модуль GPS на борту виден ДО фикса ===")
+# Найдено на борту: GPS поставили, а отчёт писал none. Полётник показывает
+# GPS в перечне датчиков только при фиксе, а фикса в помещении не будет
+# никогда — судить по перечню нельзя. Источник истины: включена ли функция.
+FGPS = 1 << 7
+bez_gps_v_perechne = (1 << 0) | (1 << 1) | (1 << 5)
+baza = dict(_vse_podnyalos(), sensor_mask=bez_gps_v_perechne, mag=None)
+for opisanie, st, zhdyom in (
+        ("функция выключена, модуля нет", dict(feature_mask=0, gps_fix=0,
+                                               gps_sats=0), "none"),
+        ("МОДУЛЬ ЕСТЬ, фикса нет", dict(feature_mask=FGPS, gps_fix=0,
+                                        gps_sats=0), "no fix"),
+        ("модуль ловит 4 спутника", dict(feature_mask=FGPS, gps_fix=0,
+                                         gps_sats=4), "4 sats"),
+        ("фикс на 9 спутниках", dict(feature_mask=FGPS, gps_fix=1, gps_sats=9,
+                                     gps_lat=50.4, gps_lon=30.5), "ok  9 sats")):
+    d = _kak_slovar(_tr(srok=True, gps=False, **dict(baza, **st)))
+    print("    %-30s -> %s" % (opisanie, d["gps"]))
+    assert d["gps"] == zhdyom, (
+        "«%s»: показано «%s» вместо «%s»" % (opisanie, d["gps"], zhdyom))
+
+print("\n=== 14. Ожидание фикса не держит на экране весь отчёт ===")
+# Фикса можно ждать минутами, а в помещении не дождаться вовсе. Держать
+# из-за этого семь строк поверх картинки нельзя — но и убирать GPS нельзя,
+# пилот должен видеть, дождался он или нет.
+t = _tr(srok=True, gps=False, **dict(baza, feature_mask=FGPS, gps_fix=0,
+                                     gps_sats=2))
+polnyi = t._sensor_report()
+assert len(polnyi) > 1, "отчёт должен быть полным, пока идёт срок показа"
+t._sensors_ok_since = time.monotonic() - t.STARTUP_OK_SHOW_S - 1.0
+ostatok = t._sensor_report()
+print("    было строк %d, осталось %s"
+      % (len(polnyi), [(n, v) for n, v, _ in ostatok]))
+assert [n for n, _v, _c in ostatok] == ["gps"], (
+    "на экране должна остаться ТОЛЬКО строка GPS")
+
+t = _tr(srok=True, gps=False, **dict(baza, feature_mask=FGPS, gps_fix=1,
+                                     gps_sats=9, gps_lat=50.4, gps_lon=30.5))
+t._sensors_ok_since = time.monotonic() - t.STARTUP_OK_SHOW_S - 1.0
+assert t._sensor_report() is None, (
+    "фикс есть — отчёту незачем оставаться на экране")
+
+print("\n=== 15. Отчёт целиком в кадре, ниже лупы и без кириллицы ===")
 niz_lupy = 6 + 170          # MAG_MARGIN + MAG_SIZE
 # Состояния строим ЛЕНИВО: load_tracker отдаёт один и тот же модуль, и
 # заготовленные заранее трекеры оказались бы одним объектом — проверка
