@@ -49,9 +49,29 @@ def _prognat(t, frames, chroma, kadrov):
     return zahvatov
 
 
+def _sintet(n=320, w=320, h=240):
+    """Синтетический заход: яркое пятно ползёт по шумному фону.
+
+    Записи лежат в flight_logs, а он не в репозитории — на чистой копии
+    проверка не запустилась бы вовсе. Логика папок от картинки не зависит,
+    поэтому кадры делаем сами: так проверка работает всегда и везде.
+    """
+    rng = np.random.RandomState(7)
+    fon = (rng.rand(h, w) * 40 + 60).astype(np.uint8)
+    kadry = []
+    for i in range(n):
+        f = np.clip(fon.astype(np.int16) + rng.randint(-3, 4, (h, w)), 0,
+                    255).astype(np.uint8)
+        cx = w // 2 + int(28 * np.sin(i * 0.045))
+        cy = h // 2 + int(16 * np.cos(i * 0.037))
+        f[cy - 7:cy + 7, cx - 7:cx + 7] = 235
+        f[cy - 3:cy + 3, cx - 3:cx + 3] = 90     # фактура внутри цели
+        kadry.append(f)
+    return kadry
+
+
 zapisi = sorted(glob.glob(os.path.join(_ROOT, "flight_logs", "recordings",
                                        "*.yuv")))
-assert zapisi, "нет ни одной записи — проверять нечего"
 
 vremennaya = tempfile.mkdtemp(prefix="zahvat_")
 try:
@@ -65,10 +85,15 @@ try:
     t.flight_log.dir = vremennaya
     t.flight_log.enabled = True
     t.flight_log.event = lambda *a, **k: None
-    frames, _rows, w, h, chroma = offline.load_recording(zapisi[0][:-4])
+    if zapisi:
+        frames, _rows, w, h, chroma = offline.load_recording(zapisi[0][:-4])
+        otkuda = os.path.basename(zapisi[0])
+    else:
+        frames, chroma = _sintet(), None
+        h, w = frames[0].shape
+        otkuda = "синтетический заход (записей нет)"
     print("=== 1. Захват открывает папку ===")
-    print("    запись: %s, %d кадров %dx%d"
-          % (os.path.basename(zapisi[0]), len(frames), w, h))
+    print("    источник: %s, %d кадров %dx%d" % (otkuda, len(frames), w, h))
     slezhenie = _prognat(t, frames, chroma, min(200, len(frames)))
     print("    кадров в слежении:", slezhenie)
     assert slezhenie > 0, "трекер вообще не захватил цель — проверять нечего"
@@ -159,6 +184,55 @@ try:
     assert t.lock_log._rows - na_diske <= t.LOCK_LOG_FLUSH_ROWS + 1, (
         "на диске отстало больше секунды — последние секунды перед целью "
         "потеряются при обрыве")
+
+    print("\n=== 9. Заминка НЕ рвёт папку на куски ===")
+    # HOLD и LOST — штатные заминки на несколько кадров внутри того же
+    # захода: цель на миг не совпала. Закрывай мы папку на них, один заход
+    # развалился бы на десяток кусков, и «одна выборка» перестала бы
+    # существовать. На стенде HOLD не случается — камера неподвижна, цель
+    # медленная, — поэтому имитируем его руками.
+    t.lock_log.end("подготовка")
+    t.track_state = t.TRACK_STATE_ACQ
+    t._capture_flight_row(time.monotonic())
+    bylo = len(glob.glob(os.path.join(vremennaya, t.LOCK_LOG_DIR, "*")))
+    zaminok = 0
+    for i, f in enumerate(frames[:150]):
+        if chroma is not None:
+            cu, cv_ = t.extract_chroma(np.ascontiguousarray(chroma[i]))
+            if cu is not None:
+                t.chroma_u, t.chroma_v = cu, cv_
+        t.process_locked_tracker(np.ascontiguousarray(f))
+        if i and i % 30 == 0:
+            for zamin in (t.TRACK_STATE_HOLD, t.TRACK_STATE_LOST):
+                with t.state_lock:
+                    t.track_state = zamin
+                t._capture_flight_row(time.monotonic())
+                zaminok += 1
+        t._capture_flight_row(time.monotonic())
+    stalo = len(glob.glob(os.path.join(vremennaya, t.LOCK_LOG_DIR, "*")))
+    print("    заминок: %d, новых папок: %d" % (zaminok, stalo - bylo))
+    assert stalo - bylo == 1, (
+        "%d заминок породили %d папок — один заход развалился на куски"
+        % (zaminok, stalo - bylo))
+
+    novaya = sorted(glob.glob(os.path.join(vremennaya, t.LOCK_LOG_DIR, "*")),
+                    key=os.path.getmtime)[-1]
+    sob = io.open(os.path.join(novaya, "события.log"), encoding="utf-8").read()
+    assert "заминка" in sob, (
+        "заминки нигде не отмечены — на разборе провал в данных будет "
+        "неотличим от исправного слежения")
+    print("    заминок записано событиями:", sob.count("заминка"))
+
+    print("\n=== 10. А снятие лока папку закрывает ===")
+    t.track_state = t.TRACK_STATE_IDLE
+    t._capture_flight_row(time.monotonic())
+    assert not t.lock_log.active, (
+        "оператор снял лок, а папка осталась открытой — следующий заход "
+        "допишется в неё")
+    itog = io.open(os.path.join(novaya, "итог.txt"), encoding="utf-8").read()
+    assert "НЕ ЗАВЕРШЁН" not in itog, "закрытый заход помечен как оборванный"
+    assert "длительность" in itog, "у закрытого захода нет длительности"
+    print("    папка закрыта, итог дописан")
 
     print("\nOK: каждый захват получает свою папку, и обрыв её не обнуляет")
 finally:

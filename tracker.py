@@ -5511,13 +5511,29 @@ def _capture_flight_row(cb_t0):
         # а именно они отвечают на «когда всё сломалось».
         if st != _flight_prev_state:
             flight_log.event("STATE %s -> %s" % (_flight_prev_state, st))
-            # Папка захвата открывается и закрывается ВМЕСТЕ со слежением:
-            # один заход — одна выборка.
+            # Папка захвата живёт РОВНО ОДИН ЗАХОД: открывается на захвате и
+            # закрывается, когда слежение окончено — то есть на IDLE или ACQ
+            # (оператор снял лок, либо цель потеряна окончательно и нужен
+            # повторный захват).
+            #
+            # HOLD и LOST папку НЕ закрывают. Это штатные заминки на несколько
+            # кадров внутри того же захода: цель на миг не совпала. Закрывай
+            # мы папку на них, один заход развалился бы на десяток кусков, и
+            # «одна выборка» перестала бы существовать. На стенде HOLD не
+            # случился ни разу на 3079 кадрах, но стенд лёгкий: камера
+            # неподвижна, цель медленная. В полёте будет.
             if st == TRACK_STATE_TRACKED:
-                lock_log.begin(lock_sequence)
-                lock_log.event("захват начат")
+                if not lock_log.active:
+                    lock_log.begin(lock_sequence)
+                    lock_log.event("захват начат")
+                else:
+                    lock_log.event("слежение восстановлено")
+            elif st in (TRACK_STATE_IDLE, TRACK_STATE_ACQ):
+                if lock_log.active:
+                    lock_log.end("состояние %s" % st)
             elif lock_log.active:
-                lock_log.end("состояние %s" % st)
+                # Заминка внутри захода: записываем, но папку не рвём.
+                lock_log.event("заминка: %s" % st)
             _flight_prev_state = st
         lp = c.get("launch_phase")
         if lp != _flight_prev_launch:
