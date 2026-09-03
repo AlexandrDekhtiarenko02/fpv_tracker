@@ -212,6 +212,7 @@ SENSOR_LINE_H = 15             # шаг строк отчёта
 SENSOR_X_FRAC = 0.08           # левый край отчёта, доля ширины кадра
 LOCK_LOG_ENABLED = True
 LOCK_LOG_DIR = "zahvaty"
+LOCK_LOG_FLUSH_ROWS = 30       # через сколько строк сбрасывать на диск (~1 с)
 RECORD_HIRES = False
 if RECORD_HIRES:
     CAM_W, CAM_H = LORES_W * 2, LORES_H * 2
@@ -1770,11 +1771,19 @@ class LockLogger:
             self._csv = open(os.path.join(self._path, "строки.csv"), "w",
                              buffering=1 << 16)
             self._csv.write(_FLIGHT_LOG_COLUMNS + "\n")
+            # Построчная буферизация: событий мало, а теряются они первыми.
+            # Замерено на борту: у прерванного захода события.log остался
+            # пустым при 517 КБ строк — весь ход захода пропал.
             self._evt = open(os.path.join(self._path, "события.log"), "w",
-                             buffering=1 << 12)
+                             buffering=1)
             self._t0 = time.monotonic()
             self._rows = 0
             self.active = True
+            # Условия захода известны ПРЯМО СЕЙЧАС — записываем их немедленно,
+            # не дожидаясь конца. Прерывается всегда последний заход (сняли
+            # питание, перезапустили службу), и именно его условия ценнее
+            # прочих. Раньше они терялись целиком.
+            self._zapisat_itog("заход не завершён (питание снято?)")
         except Exception as exc:
             self.active = False
             flight_log.event("ПАПКА ЗАХВАТА не создалась: %s" % exc)
@@ -1785,6 +1794,12 @@ class LockLogger:
         try:
             self._csv.write(line + "\n")
             self._rows += 1
+            # Сброс на диск примерно раз в секунду. Буфер в 64 КБ — это около
+            # четырёх секунд захода, и при обрыве терялись именно последние
+            # секунды перед целью, ради которых всё и пишется. Раз в секунду
+            # SD-карту не нагружает: система и так пишет не чаще.
+            if self._rows % LOCK_LOG_FLUSH_ROWS == 0:
+                self._csv.flush()
         except Exception:
             pass
 
@@ -1796,11 +1811,9 @@ class LockLogger:
         except Exception:
             pass
 
-    def end(self, why=""):
-        if not self.active:
-            return
-        self.active = False
-        dur = time.monotonic() - self._t0
+    def _zapisat_itog(self, why="", dur=None):
+        """Записать итог захода. Вызывается дважды: сразу при захвате (чтобы
+        условия не пропали, если заход оборвётся) и при нормальном конце."""
         try:
             with state_lock:
                 # Признак тот же, что и в снимке условий, иначе итог и
@@ -1811,6 +1824,9 @@ class LockLogger:
                 alt = _baro_zhivoy(app_state)
             with open(os.path.join(self._path, "итог.txt"), "w",
                       encoding="utf-8") as f:
+                if dur is None:
+                    f.write("!!! ЗАХОД НЕ ЗАВЕРШЁН. Условия записаны в момент\n"
+                            "    захвата; строки.csv может быть обрезан.\n\n")
                 f.write("УСЛОВИЯ ЗАХОДА (в момент захвата, не на взлёте)\n")
                 for k, v in self.at_lock.items():
                     if v is None:
@@ -1820,7 +1836,9 @@ class LockLogger:
                     else:
                         f.write("  %-24s %s\n" % (k, v))
                 f.write("\n")
-                f.write("длительность: %.1f с, строк %d\n" % (dur, self._rows))
+                if dur is not None:
+                    f.write("длительность: %.1f с, строк %d\n"
+                            % (dur, self._rows))
                 f.write("окончен: %s\n" % (why or "не указано"))
                 f.write("режим наблюдения: %s\n"
                         % ("ДА, управление не трогали" if OBSERVE_ONLY
@@ -1834,6 +1852,14 @@ class LockLogger:
                 f.write("  код: %s\n" % _code_version())
         except Exception:
             pass
+
+    def end(self, why=""):
+        if not self.active:
+            return
+        self.active = False
+        # Итог переписывается поверх предварительного, записанного при
+        # захвате: теперь известны и длительность, и чем всё кончилось.
+        self._zapisat_itog(why, time.monotonic() - self._t0)
         for h in (self._csv, self._evt):
             try:
                 h.close()

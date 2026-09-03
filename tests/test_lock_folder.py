@@ -127,6 +127,39 @@ try:
     for slovo in ("УСЛОВИЯ ЗАХОДА", "режим наблюдения", "длительность"):
         assert slovo in tekst, "в итоге нет строки про «%s»" % slovo
 
-    print("\nOK: каждый захват получает свою папку, и в ней есть что разбирать")
+    print("\n=== 7. ОБОРВАННЫЙ заход не теряет условия ===")
+    # Замерено на борту: у захода, прерванного перезапуском, строки.csv был
+    # на 517 КБ, а итог.txt и события.log — пустые. Условия захода пропали
+    # целиком. Прерывается всегда последний заход, и он же обычно ценнее
+    # прочих.
+    _prognat(t, frames, chroma, min(120, len(frames)))
+    aktivnye = sorted(glob.glob(os.path.join(vremennaya, t.LOCK_LOG_DIR, "*")),
+                      key=os.path.getmtime)
+    tekushchaya = aktivnye[-1]
+    assert t.lock_log.active, "заход должен быть ещё открыт"
+    itog = os.path.join(tekushchaya, "итог.txt")
+    sob = os.path.join(tekushchaya, "события.log")
+    razmery = (os.path.getsize(itog), os.path.getsize(sob))
+    print("    ещё в полёте: итог.txt %d байт, события.log %d байт" % razmery)
+    assert razmery[0] > 0, (
+        "условия захода не записаны до конца захода — при обрыве пропадут")
+    assert razmery[1] > 0, "события не дошли до диска — при обрыве пропадут"
+    tekst = io.open(itog, encoding="utf-8").read()
+    assert "НЕ ЗАВЕРШЁН" in tekst, (
+        "недописанный итог не помечен — на разборе его примут за полный")
+    assert "УСЛОВИЯ ЗАХОДА" in tekst, "условий нет в предварительном итоге"
+
+    print("\n=== 8. Строки доходят до диска по ходу захода ===")
+    put = os.path.join(tekushchaya, "строки.csv")
+    na_diske = len([l for l in io.open(put, encoding="utf-8") if l.strip()])
+    print("    строк на диске: %d при %d записанных"
+          % (na_diske, t.lock_log._rows))
+    assert na_diske > 1, (
+        "на диске только шапка — при обрыве пропадут все строки захода")
+    assert t.lock_log._rows - na_diske <= t.LOCK_LOG_FLUSH_ROWS + 1, (
+        "на диске отстало больше секунды — последние секунды перед целью "
+        "потеряются при обрыве")
+
+    print("\nOK: каждый захват получает свою папку, и обрыв её не обнуляет")
 finally:
     shutil.rmtree(vremennaya, ignore_errors=True)
