@@ -2302,7 +2302,10 @@ def fc_io_loop():
                         # считаем данные чистыми: до подъёма AUX4 оверрайд
                         # физически не может быть включён.
                         stale_ovr = (now_rc - fc_ovr_ts) > 1.0
-                        if not fc_ovr or stale_ovr:
+                        # В OBSERVE_ONLY исходящих MSP RC-кадров нет, поэтому
+                        # даже при поднятом mode box MSP_RC после истечения
+                        # старого MSP-значения снова показывает приёмник.
+                        if OBSERVE_ONLY or not fc_ovr or stale_ovr:
                             app_state["receiver_channels"] = list(ch[:8])
                             app_state["receiver_ts"] = now_rc
                             app_state["rc_throttle"] = ch[3]
@@ -2537,16 +2540,20 @@ def fc_io_loop():
                 y_cmd = global_yaw_cmd
                 t_cmd = global_throttle_cmd
 
-            # ВСЕГДА шлём поток MSP override, как только пришёл хотя бы один
-            # успешный MSP_RC. Это лечит «после AUX OFF тротл не возвращается»:
-            # Betaflight с включённым msp_override_channels_mask ожидает
-            # непрерывный поток MSP-кадров. Если мы вдруг перестаём слать,
-            # он держит последние значения / уходит в failsafe.
+            # В рабочем режиме непрерывно шлём поток MSP override, как только
+            # пришёл хотя бы один успешный MSP_RC. Это лечит «после AUX OFF
+            # тротл не возвращается»: Betaflight с включённым
+            # msp_override_channels_mask ожидает непрерывный поток кадров.
             #
             # Passthrough идёт из кэша приёмника. Оси подменяются только
             # когда AUX4 поднят И трекер в TRACKED (override_active=True).
+            #
+            # В OBSERVE_ONLY не шлём MSP_SET_RAW_RC вообще. Даже кадр с
+            # «passthrough» остаётся для Betaflight свежим MSP override и при
+            # активном mode box замораживает маскируемые каналы на значениях
+            # из кэша вместо живых стиков пилота.
             have_fresh_rc = (time.monotonic() - rc_ts) <= RC_FRESH_WINDOW
-            if have_fresh_rc:
+            if have_fresh_rc and not OBSERVE_ONLY:
                 apply_ov = ov and aux_now
                 channels = build_output_channels(
                     live, r_cmd, p_cmd, y_cmd, t_cmd, apply_ov)

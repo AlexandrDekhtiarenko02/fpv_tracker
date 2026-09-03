@@ -28,12 +28,43 @@ case "${1:-}" in
        exit 1 ;;
 esac
 
-cat > "$CFG" <<CFGEOF
-# Настройки ЭТОГО борта. Файл не в репозитории и обновлением не затирается.
-# Создан ./record.sh $(date '+%Y-%m-%d %H:%M').
-RECORD_FRAMES = ${frames}
-RECORD_HIRES = ${hires}
-CFGEOF
+# Меняем только нужный параметр. Полная перезапись здесь удаляла
+# OBSERVE_ONLY, координаты цели и остальные настройки конкретного борта.
+update_setting() {
+  key=$1
+  value=$2
+  tmp="${CFG}.tmp.$$"
+
+  if [ -f "$CFG" ]; then
+    awk -v key="$key" -v value="$value" '
+      BEGIN { found = 0 }
+      $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+        if (!found) print key " = " value
+        found = 1
+        next
+      }
+      { print }
+      END { if (!found) print key " = " value }
+    ' "$CFG" > "$tmp" || return 1
+  else
+    {
+      echo "# Настройки ЭТОГО борта. Файл не в репозитории."
+      echo "# Создан ./record.sh $(date '+%Y-%m-%d %H:%M')."
+      echo "$key = $value"
+    } > "$tmp" || return 1
+  fi
+  mv "$tmp" "$CFG"
+}
+
+update_setting RECORD_FRAMES "$frames"
+update_setting RECORD_HIRES "$hires"
+
+# Запись образцов всегда означает ручной заход пилота. Включаем наблюдение
+# сами, чтобы старая или неполная local_settings.py не отдала управление
+# трекеру при захвате цели. Команда off этот флаг намеренно не снимает.
+if [ "$frames" = "True" ]; then
+  update_setting OBSERVE_ONLY True
+fi
 
 echo "==> $CFG:"
 sed 's/^/    /' "$CFG"
@@ -54,4 +85,5 @@ if [ "$frames" = "True" ]; then
 else
     echo
     echo "Запись выключена."
+    echo "Режим OBSERVE_ONLY не изменён."
 fi
