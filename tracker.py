@@ -1226,7 +1226,7 @@ _FLIGHT_LOG_COLUMNS = (
     "alt_cm,vario_cms,alt_age_ms,"
     "box_size_px,box_growth,tau_s,range_m,depression_deg,dy_alt_decoupled,"
     "alt_sigma_cm,range_min_alt_m,"
-    "gyro_x,gyro_y,gyro_z,acc_z,"
+    "gyro_x,gyro_y,gyro_z,acc_z,gyro_age_ms,rc_age_ms,"
     "gps_fix,gps_sats,gps_lat,gps_lon,gps_speed_ms,gps_course,gps_age_ms,"
     "gps_range_m,ground_speed_ms,"
     "ground_flow_dx_px,ground_flow_dy_px,ground_flow_px_s,"
@@ -5588,6 +5588,13 @@ def _capture_flight_row(cb_t0):
             vario_cms = app_state.get("vario_cms")
             alt_ts = app_state.get("alt_ts", 0.0)
             alt_sigma = app_state.get("alt_sigma_cm")
+            # Возраст пакетов гироскопа и RC. Без них не измерить задержку
+            # «стик -> вращение аппарата»: в ACRO стик задаёт скорость
+            # вращения, и сверять его надо с гироскопом, а не с отфильтрованным
+            # углом. Строки пишутся по кадрам, пакеты приходят своим темпом —
+            # без возраста эти два ряда не совместить по времени.
+            imu_ts = app_state.get("imu_ts", 0.0)
+            rc_ts_row = app_state.get("rc_link_ts", 0.0)
             _gyro = app_state.get("gyro") or (None, None, None)
             _acc = app_state.get("acc") or (None, None, None)
             gyro_x, gyro_y, gyro_z = _gyro
@@ -5688,6 +5695,8 @@ def _capture_flight_row(cb_t0):
             g("depression_deg"), g("dy_alt_decoupled"),
             alt_sigma, g("alt_min_m"),
             gyro_x, gyro_y, gyro_z, acc_z,
+            (now - imu_ts) * 1000.0 if imu_ts else None,
+            (now - rc_ts_row) * 1000.0 if rc_ts_row else None,
             gps_fix, gps_sats, gps_lat, gps_lon, gps_speed_ms, gps_course,
             gps_age, gps_range_m, ground_speed_mps,
             _ground_flow_dbg.get("dx_px"), _ground_flow_dbg.get("dy_px"),
