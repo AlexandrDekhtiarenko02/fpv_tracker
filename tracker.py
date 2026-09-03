@@ -1222,8 +1222,10 @@ _FLIGHT_LOG_COLUMNS = (
     "box_size_px,box_growth,tau_s,range_m,depression_deg,dy_alt_decoupled,"
     "alt_sigma_cm,range_min_alt_m,"
     "gyro_x,gyro_y,gyro_z,acc_z,"
-    "gps_fix,gps_sats,gps_lat,gps_lon,gps_speed_ms,gps_course,"
-    "gps_range_m,ground_speed_ms"
+    "gps_fix,gps_sats,gps_lat,gps_lon,gps_speed_ms,gps_course,gps_age_ms,"
+    "gps_range_m,ground_speed_ms,"
+    "ground_flow_dx_px,ground_flow_dy_px,ground_flow_px_s,"
+    "ground_flow_points,ground_flow_dt_ms"
 )
 
 # Снимок внутренностей управления за текущий кадр. Заполняется в
@@ -1937,10 +1939,12 @@ PRODUCTION_COLUMNS = (
     "rc_r", "rc_p", "rc_y", "rc_t",
     # считается из них
     "depression_deg", "range_m", "ground_speed_ms",
+    "ground_flow_dx_px", "ground_flow_dy_px", "ground_flow_px_s",
+    "ground_flow_points", "ground_flow_dt_ms",
 )
 CAMPAIGN_ONLY_COLUMNS = (
     "gps_fix", "gps_sats", "gps_lat", "gps_lon",
-    "gps_speed_ms", "gps_course", "gps_range_m",
+    "gps_speed_ms", "gps_course", "gps_age_ms", "gps_range_m",
 )
 # Номера битов режимов в flightModeFlags НЕ фиксированы: Betaflight укладывает
 # туда только НАСТРОЕННЫЕ режимы, в порядке, который отдаёт MSP_BOXIDS. Позиция
@@ -2029,6 +2033,13 @@ app_state = {
     "fc_pitch_ts": 0.0,
     "motors": [],
     "motors_ts": 0.0,
+    "gps_fix": None,
+    "gps_sats": None,
+    "gps_lat": None,
+    "gps_lon": None,
+    "gps_speed_cms": None,
+    "gps_course": None,
+    "gps_ts": 0.0,
     "last_sent_channels": [1500] * 8,
 }
 
@@ -2140,6 +2151,13 @@ ground_speed_mps = None   # путевая скорость по бегу зем
 _gs_prev_gray = None
 _gs_prev_pts = None
 _gs_prev_t = 0.0
+# Сырой результат последнего измерения бега земли. В отличие от уже
+# пересчитанной ground_speed_mps эти числа позволяют после полёта заново
+# подобрать геометрию камеры и фильтрацию, не прогоняя тяжёлый YUV.
+_ground_flow_dbg = {
+    "dx_px": None, "dy_px": None, "px_s": None,
+    "points": 0, "dt_ms": None,
+}
 prev_gray = None
 prev_pts = None
 lost_frames = 0
@@ -3535,6 +3553,13 @@ def estimate_ground_speed(gray, now_mono):
     середину не сдвинет.
     """
     global _gs_prev_gray, _gs_prev_pts, _gs_prev_t, ground_speed_mps
+    global _ground_flow_dbg
+    # Значения относятся только к текущей паре кадров. Оставлять прошлое
+    # измерение нельзя: на разборе оно выглядело бы как новый оптический поток.
+    _ground_flow_dbg = {
+        "dx_px": None, "dy_px": None, "px_s": None,
+        "points": 0, "dt_ms": None,
+    }
     try:
         h, w = gray.shape[:2]
         y0 = int(h * GROUND_BAND_TOP)
@@ -3547,11 +3572,14 @@ def estimate_ground_speed(gray, now_mono):
         dt = now_mono - _gs_prev_t
         if dt <= 1e-3:
             return None
+        _ground_flow_dbg["dt_ms"] = dt * 1000.0
         if _gs_prev_pts is None or len(_gs_prev_pts) < GROUND_MIN_POINTS:
             _gs_prev_pts = cv2.goodFeaturesToTrack(
                 _gs_prev_gray, maxCorners=GROUND_MAX_POINTS,
                 qualityLevel=0.01, minDistance=8, blockSize=5)
         if _gs_prev_pts is None or len(_gs_prev_pts) < GROUND_MIN_POINTS:
+            _ground_flow_dbg["points"] = (0 if _gs_prev_pts is None
+                                           else len(_gs_prev_pts))
             _gs_prev_gray = band.copy()
             _gs_prev_t = now_mono
             return None
@@ -3563,12 +3591,20 @@ def estimate_ground_speed(gray, now_mono):
         speed = None
         if nxt is not None and st is not None:
             ok = st.reshape(-1).astype(bool)
+            _ground_flow_dbg["points"] = int(ok.sum())
             if ok.sum() >= GROUND_MIN_POINTS:
                 p0 = _gs_prev_pts.reshape(-1, 2)[ok]
                 p1 = nxt.reshape(-1, 2)[ok]
                 dy_px = np.median(p1[:, 1] - p0[:, 1])      # земля уходит ВНИЗ
                 dx_px = np.median(p1[:, 0] - p0[:, 0])
                 shift = float(math.hypot(dx_px, dy_px))
+                _ground_flow_dbg.update({
+                    "dx_px": float(dx_px),
+                    "dy_px": float(dy_px),
+                    # Координаты рабочего кадра 320x240. Для угловой скорости
+                    # ниже сохраняется прежний пересчёт в разрешение 640x480.
+                    "px_s": shift / dt,
+                })
                 with state_lock:
                     alt_cm = app_state.get("alt_cm")
                     fc_pitch = app_state.get("fc_pitch_deg")
@@ -5558,6 +5594,7 @@ def _capture_flight_row(cb_t0):
             _sp = app_state.get("gps_speed_cms")
             gps_speed_ms = None if _sp is None else _sp / 100.0
             gps_course = app_state.get("gps_course")
+            gps_ts = app_state.get("gps_ts", 0.0)
             # ИСТИННАЯ дальность до цели — если известны и наши координаты, и
             # координаты цели. Это тот самый «правильный ответ», с которым
             # сверяется всё, что видит камера. Без GPS остаётся None, и разбор
@@ -5576,6 +5613,7 @@ def _capture_flight_row(cb_t0):
 
         att_age = (now - att_ts) * 1000.0 if att_ts else None
         alt_age = (now - alt_ts) * 1000.0 if alt_ts else None
+        gps_age = (now - gps_ts) * 1000.0 if gps_ts else None
 
         # Переходы пишем событиями: по CSV их искать глазами неудобно,
         # а именно они отвечают на «когда всё сломалось».
@@ -5653,7 +5691,10 @@ def _capture_flight_row(cb_t0):
             alt_sigma, g("alt_min_m"),
             gyro_x, gyro_y, gyro_z, acc_z,
             gps_fix, gps_sats, gps_lat, gps_lon, gps_speed_ms, gps_course,
-            gps_range_m, ground_speed_mps,
+            gps_age, gps_range_m, ground_speed_mps,
+            _ground_flow_dbg.get("dx_px"), _ground_flow_dbg.get("dy_px"),
+            _ground_flow_dbg.get("px_s"), _ground_flow_dbg.get("points"),
+            _ground_flow_dbg.get("dt_ms"),
         )
         flight_log.row(_row_values)
         # Та же строка — в папку этого захвата. Форматируем один раз здесь, а
@@ -5692,22 +5733,33 @@ class FrameRecorder:
         self._stop = threading.Event()
         self._thread = None
         self._path = None
-        self._index = None
+        self._index_path = None
         self._n = 0
         self._bytes = 0
+        self._written_bytes = 0
+        self._dropped = 0
+        self._error = None
         self._t0 = 0.0
         self.shape = None
 
     def start(self, shape):
-        if self.active or not RECORD_FRAMES:
+        if (self.active or not RECORD_FRAMES
+                or (self._thread is not None and self._thread.is_alive())):
             return
         try:
             d = os.path.join(self.dir, RECORD_DIR)
             os.makedirs(d, exist_ok=True)
             stamp = time.strftime("%Y%m%d_%H%M%S")
+            # Два коротких захвата могут начаться в одну секунду. Не затираем
+            # первый вторым: суффикс делает имя свободным без изменения формата.
+            original = stamp
+            suffix = 1
+            while any(os.path.exists(os.path.join(d, stamp + ext))
+                      for ext in (".yuv", ".index.csv", ".meta.txt")):
+                stamp = "%s_%02d" % (original, suffix)
+                suffix += 1
             self._path = os.path.join(d, stamp + ".yuv")
-            self._index = open(os.path.join(d, stamp + ".index.csv"), "w")
-            self._index.write("frame,t,state,box_cx,box_cy,box_w,box_h,score\n")
+            self._index_path = os.path.join(d, stamp + ".index.csv")
             self.shape = shape
             with open(os.path.join(d, stamp + ".meta.txt"), "w") as f:
                 # Высота буфера в полтора раза больше кадра: под яркостью лежит
@@ -5717,13 +5769,18 @@ class FrameRecorder:
                         % (CAM_W, CAM_H, shape[0]))
             self._n = 0
             self._bytes = 0
+            self._written_bytes = 0
+            self._dropped = 0
+            self._error = None
             self._t0 = time.monotonic()
+            with self._lock:
+                self._q.clear()
             self._stop.clear()
             self.active = True
             self._thread = threading.Thread(target=self._run, daemon=True)
             self._thread.start()
             flight_log.event("ЗАПИСЬ КАДРОВ начата: %s (%dx%d, с цветом)"
-                             % (os.path.basename(self._path), LORES_W, LORES_H))
+                             % (os.path.basename(self._path), CAM_W, CAM_H))
         except Exception as exc:
             self.active = False
             flight_log.event("ЗАПИСЬ КАДРОВ не началась: %s" % exc)
@@ -5739,43 +5796,72 @@ class FrameRecorder:
             return
         # Только копия и укладка в очередь: диск в камерном потоке недопустим.
         with self._lock:
-            if len(self._q) > 90:      # карта не успевает — лучше пропустить кадр
+            if len(self._q) >= 90:     # карта не успевает — лучше пропустить кадр
+                self._dropped += 1
                 return
             self._q.append((gray.copy(), row))
         self._bytes += gray.nbytes
 
     def _run(self):
         try:
-            with open(self._path, "wb") as f:
-                while not self._stop.is_set() or self._q:
+            # Оба файла открывает и закрывает один поток. Раньше stop() мог
+            # закрыть индекс через 3 секунды, пока этот поток ещё дописывал YUV;
+            # результатом были файлы разной длины.
+            with open(self._path, "wb", buffering=1 << 20) as f, \
+                    open(self._index_path, "w", buffering=1 << 16) as index:
+                index.write("frame,t,state,box_cx,box_cy,box_w,box_h,score\n")
+                while True:
                     item = None
                     with self._lock:
                         if self._q:
                             item = self._q.popleft()
                     if item is None:
+                        if self._stop.is_set():
+                            break
                         time.sleep(0.005)
                         continue
                     gray, row = item
-                    f.write(gray.tobytes())
-                    self._index.write("%d,%s\n" % (self._n, row))
+                    raw = gray.tobytes()
+                    f.write(raw)
+                    index.write("%d,%s\n" % (self._n, row))
                     self._n += 1
-        except Exception:
-            pass
+                    self._written_bytes += len(raw)
+                f.flush()
+                index.flush()
+                if FLIGHT_LOG_FSYNC:
+                    os.fsync(f.fileno())
+                    os.fsync(index.fileno())
+        except Exception as exc:
+            self._error = str(exc)
+            self.active = False
+            with self._lock:
+                self._q.clear()
+            flight_log.event("ЗАПИСЬ КАДРОВ ОШИБКА: %s" % exc)
+            try:
+                print("[recorder] запись неполная: %s" % exc, flush=True)
+            except Exception:
+                pass
 
     def stop(self, why=""):
-        if not self.active:
+        alive = self._thread is not None and self._thread.is_alive()
+        if not self.active and not alive:
             return
         self.active = False
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=3.0)
-        try:
-            self._index.close()
-        except Exception:
-            pass
-        flight_log.event("ЗАПИСЬ КАДРОВ окончена: %d кадров, %.1f МБ%s"
-                         % (self._n, self._bytes / 1048576.0,
-                            (" (" + why + ")") if why else ""))
+            # Полный индекс важнее короткой паузы после окончания захвата.
+            # Управление RC живёт в отдельном потоке и этой дописью не блокируется.
+            self._thread.join()
+        note = (" (" + why + ")") if why else ""
+        if self._error:
+            flight_log.event(
+                "ЗАПИСЬ КАДРОВ НЕПОЛНАЯ: %d кадров, ошибка %s%s"
+                % (self._n, self._error, note))
+        else:
+            flight_log.event(
+                "ЗАПИСЬ КАДРОВ окончена: %d кадров, %.1f МБ, пропущено %d%s"
+                % (self._n, self._written_bytes / 1048576.0,
+                   self._dropped, note))
 
 
 frame_recorder = FrameRecorder(FLIGHT_LOG_DIR)
@@ -5853,6 +5939,12 @@ def camera_callback(request):
 
         if not aux_snapshot:
             fast_idle_update()
+            # Этот ранний выход раньше обходил обычную остановку записи ниже.
+            # После снятия AUX4 YUV и index.csv оставались открытыми: большой
+            # буфер YUV уже был виден на диске, а часть строк индекса ещё жила
+            # только в памяти. Именно так запись выглядела как 299/166 кадров.
+            if frame_recorder.active:
+                frame_recorder.stop("AUX4 выключен")
             print_debug_once_per_second()
             with MappedArray(request, "main") as mm:
                 draw_overlay_on_frame(mm.array)
@@ -6099,7 +6191,14 @@ def main():
         # чтобы выйти штатно с кодом 0: для systemd это нормальная остановка.
         pass
     finally:
-        # Первым делом дописываем лог: если ниже что-то зависнет на закрытии
+        # Кадры закрываем раньше общего журнала: его событие об окончании записи
+        # должно попасть в events.log. Это также спасает активный захват при
+        # штатном перезапуске службы, когда перехода TRACKED -> IDLE не было.
+        try:
+            frame_recorder.stop("программа остановлена")
+        except Exception:
+            pass
+        # Затем дописываем общий лог: если ниже что-то зависнет на закрытии
         # железа, разбор полёта всё равно останется на диске.
         try:
             flight_log.stop()
