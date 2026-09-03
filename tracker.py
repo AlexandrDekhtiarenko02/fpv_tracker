@@ -217,8 +217,13 @@ RECORD_HIRES = False
 if RECORD_HIRES:
     CAM_W, CAM_H = LORES_W * 2, LORES_H * 2
 RECORD_DIR = "recordings"      # внутри каталога полётных логов
-RECORD_MAX_SECONDS = 25.0      # предел одной записи
-RECORD_MAX_MB = 120.0          # и предел по месту на карте
+# Одна запись = одно включение лока: от первого TRACKED до выключения AUX4.
+# Ограничивать её временем или размером нельзя — длительность захода задаёт
+# пилот, а временная потеря цели не должна обрывать выборку.
+# Большой YUV нельзя синхронно проталкивать на SD-карту из камерного потока:
+# на 65 МБ это останавливало изображение на 2.1 с. Обычное закрытие всё равно
+# отдаёт данные ОС; полётный CSV отдельно защищён FLIGHT_LOG_FSYNC.
+RECORD_FSYNC = False
 ACQ_DEBUG_DUMP = True
 ACQ_DEBUG_DIR = "acq_debug"   # внутри каталога полётных логов
 ACQ_DEBUG_MAX = 8
@@ -5619,30 +5624,23 @@ def _capture_flight_row(cb_t0):
         # а именно они отвечают на «когда всё сломалось».
         if st != _flight_prev_state:
             flight_log.event("STATE %s -> %s" % (_flight_prev_state, st))
-            # Папка захвата живёт РОВНО ОДИН ЗАХОД: открывается на захвате и
-            # закрывается, когда слежение окончено — то есть на IDLE или ACQ
-            # (оператор снял лок, либо цель потеряна окончательно и нужен
-            # повторный захват).
-            #
-            # HOLD и LOST папку НЕ закрывают. Это штатные заминки на несколько
-            # кадров внутри того же захода: цель на миг не совпала. Закрывай
-            # мы папку на них, один заход развалился бы на десяток кусков, и
-            # «одна выборка» перестала бы существовать. На стенде HOLD не
-            # случился ни разу на 3079 кадрах, но стенд лёгкий: камера
-            # неподвижна, цель медленная. В полёте будет.
+            # Папка захвата открывается на первом TRACKED и живёт до снятия
+            # AUX4. HOLD, LOST и повторный ACQ остаются внутри того же захода:
+            # именно они показывают, где и как слежение сорвалось.
             if st == TRACK_STATE_TRACKED:
                 if not lock_log.active:
                     lock_log.begin(lock_sequence)
                     lock_log.event("захват начат")
                 else:
                     lock_log.event("слежение восстановлено")
-            elif st in (TRACK_STATE_IDLE, TRACK_STATE_ACQ):
-                if lock_log.active:
-                    lock_log.end("состояние %s" % st)
             elif lock_log.active:
-                # Заминка внутри захода: записываем, но папку не рвём.
                 lock_log.event("заминка: %s" % st)
             _flight_prev_state = st
+        # AUX может выключиться уже после перехода в IDLE, поэтому закрытие
+        # проверяется независимо от смены состояния. Это единственная штатная
+        # граница выборки, которую явно задаёт пилот.
+        if lock_log.active and not aux:
+            lock_log.end("AUX4 выключен")
         lp = c.get("launch_phase")
         if lp != _flight_prev_launch:
             flight_log.event("LAUNCH %s -> %s" % (_flight_prev_launch, lp))
@@ -5739,6 +5737,7 @@ class FrameRecorder:
         self._written_bytes = 0
         self._dropped = 0
         self._error = None
+        self._stop_why = ""
         self._t0 = 0.0
         self.shape = None
 
@@ -5772,6 +5771,7 @@ class FrameRecorder:
             self._written_bytes = 0
             self._dropped = 0
             self._error = None
+            self._stop_why = ""
             self._t0 = time.monotonic()
             with self._lock:
                 self._q.clear()
@@ -5787,12 +5787,6 @@ class FrameRecorder:
 
     def add(self, gray, row):
         if not self.active:
-            return
-        if (time.monotonic() - self._t0) > RECORD_MAX_SECONDS:
-            self.stop("вышло время")
-            return
-        if self._bytes > RECORD_MAX_MB * 1024 * 1024:
-            self.stop("вышло место")
             return
         # Только копия и укладка в очередь: диск в камерном потоке недопустим.
         with self._lock:
@@ -5828,7 +5822,7 @@ class FrameRecorder:
                     self._written_bytes += len(raw)
                 f.flush()
                 index.flush()
-                if FLIGHT_LOG_FSYNC:
+                if RECORD_FSYNC:
                     os.fsync(f.fileno())
                     os.fsync(index.fileno())
         except Exception as exc:
@@ -5841,27 +5835,40 @@ class FrameRecorder:
                 print("[recorder] запись неполная: %s" % exc, flush=True)
             except Exception:
                 pass
+        finally:
+            self.active = False
+            note = (" (" + self._stop_why + ")") if self._stop_why else ""
+            if self._error:
+                flight_log.event(
+                    "ЗАПИСЬ КАДРОВ НЕПОЛНАЯ: %d кадров, ошибка %s%s"
+                    % (self._n, self._error, note))
+            else:
+                flight_log.event(
+                    "ЗАПИСЬ КАДРОВ окончена: %d кадров, %.1f МБ, "
+                    "пропущено %d%s"
+                    % (self._n, self._written_bytes / 1048576.0,
+                       self._dropped, note))
 
-    def stop(self, why=""):
+    def stop(self, why="", wait=False):
         alive = self._thread is not None and self._thread.is_alive()
         if not self.active and not alive:
             return
-        self.active = False
-        self._stop.set()
-        if self._thread is not None:
-            # Полный индекс важнее короткой паузы после окончания захвата.
-            # Управление RC живёт в отдельном потоке и этой дописью не блокируется.
+        if self.active:
+            self.active = False
+            self._stop_why = why
+            self._stop.set()
+        # Обычная остановка вызывается из camera_callback и обязана вернуть
+        # управление сразу. Поток сам допишет очередь, закроет YUV с индексом и
+        # только затем запишет событие об окончании. Ждём его лишь при завершении
+        # всей программы, когда следующего кадра уже не будет.
+        if wait and self._thread is not None:
             self._thread.join()
-        note = (" (" + why + ")") if why else ""
-        if self._error:
-            flight_log.event(
-                "ЗАПИСЬ КАДРОВ НЕПОЛНАЯ: %d кадров, ошибка %s%s"
-                % (self._n, self._error, note))
-        else:
-            flight_log.event(
-                "ЗАПИСЬ КАДРОВ окончена: %d кадров, %.1f МБ, пропущено %d%s"
-                % (self._n, self._written_bytes / 1048576.0,
-                   self._dropped, note))
+
+    def wait(self, timeout=None):
+        """Дождаться фонового закрытия. Нужна штатному выходу и тестам."""
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+        return self._thread is None or not self._thread.is_alive()
 
 
 frame_recorder = FrameRecorder(FLIGHT_LOG_DIR)
@@ -5983,12 +5990,14 @@ def camera_callback(request):
             estimate_ground_speed(gray, _cb_t0)
 
         process_locked_tracker(gray)
-        # Запись кадров: начинается вместе со слежением, кончается вместе с
-        # ним. Пишем ровно то, что видел трекер, — ту же яркость, тот же кадр.
+        # Запись начинается при первом TRACKED и после этого пишет КАЖДЫЙ кадр
+        # до выключения AUX4. HOLD, LOST, ACQ и любая их длительность относятся
+        # к тому же локу: по ним как раз и разбирается потеря цели.
         if RECORD_FRAMES:
-            if track_state == TRACK_STATE_TRACKED:
-                if not frame_recorder.active:
-                    frame_recorder.start((CAM_H * 3 // 2, CAM_W))
+            if (track_state == TRACK_STATE_TRACKED
+                    and not frame_recorder.active):
+                frame_recorder.start((CAM_H * 3 // 2, CAM_W))
+            if frame_recorder.active:
                 with state_lock:
                     _b = target_box_main
                 _bx = ("%.1f,%.1f,%.1f,%.1f" % (
@@ -5999,8 +6008,6 @@ def camera_callback(request):
                                    "%.3f,%s,%s,%.4f" % (
                     time.monotonic() - _cb_t0 + _cb_t0, track_state, _bx,
                     last_match_score))
-            elif frame_recorder.active:
-                frame_recorder.stop("слежение окончено")
         print_debug_once_per_second()
 
         with MappedArray(request, "main") as mm:
@@ -6195,7 +6202,7 @@ def main():
         # должно попасть в events.log. Это также спасает активный захват при
         # штатном перезапуске службы, когда перехода TRACKED -> IDLE не было.
         try:
-            frame_recorder.stop("программа остановлена")
+            frame_recorder.stop("программа остановлена", wait=True)
         except Exception:
             pass
         # Затем дописываем общий лог: если ниже что-то зависнет на закрытии

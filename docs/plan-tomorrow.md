@@ -162,7 +162,7 @@ U≈69, V≈189.
 ```bash
 # на малине
 cd ~/fpv_tracker && git pull && ./record.sh on
-#   поснимать; предел 25 с на образец
+#   поснимать; запись идёт до выключения AUX4
 ./record.sh off
 
 # на Mac

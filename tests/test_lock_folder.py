@@ -49,6 +49,15 @@ def _prognat(t, frames, chroma, kadrov):
     return zahvatov
 
 
+def _snat_lok(t):
+    """Закрыть выборку так же, как оператор: только выключением AUX4."""
+    with t.state_lock:
+        t.aux4_state = False
+    t.fast_idle_update()
+    t._capture_flight_row(time.monotonic())
+    assert not t.lock_log.active, "AUX4 выключен, а папка лока не закрылась"
+
+
 def _sintet(n=320, w=320, h=240):
     """Синтетический заход: яркое пятно ползёт по шумному фону.
 
@@ -132,6 +141,7 @@ try:
 
     print("\n=== 5. Второй захват — ВТОРАЯ папка, а не дописка в первую ===")
     bylo = len(papki)
+    _snat_lok(t)
     _prognat(t, frames, chroma, min(200, len(frames)))
     papki2 = sorted(glob.glob(os.path.join(vremennaya, t.LOCK_LOG_DIR, "*")))
     print("    папок было %d, стало %d" % (bylo, len(papki2)))
@@ -185,12 +195,9 @@ try:
         "на диске отстало больше секунды — последние секунды перед целью "
         "потеряются при обрыве")
 
-    print("\n=== 9. Заминка НЕ рвёт папку на куски ===")
-    # HOLD и LOST — штатные заминки на несколько кадров внутри того же
-    # захода: цель на миг не совпала. Закрывай мы папку на них, один заход
-    # развалился бы на десяток кусков, и «одна выборка» перестала бы
-    # существовать. На стенде HOLD не случается — камера неподвижна, цель
-    # медленная, — поэтому имитируем его руками.
+    print("\n=== 9. Любая потеря цели НЕ рвёт папку до выключения AUX4 ===")
+    # HOLD, LOST и повторный ACQ относятся к тому же включению лока независимо
+    # от длительности. На стенде такие потери не случаются, поэтому имитируем.
     t.lock_log.end("подготовка")
     t.track_state = t.TRACK_STATE_ACQ
     t._capture_flight_row(time.monotonic())
@@ -203,7 +210,8 @@ try:
                 t.chroma_u, t.chroma_v = cu, cv_
         t.process_locked_tracker(np.ascontiguousarray(f))
         if i and i % 30 == 0:
-            for zamin in (t.TRACK_STATE_HOLD, t.TRACK_STATE_LOST):
+            for zamin in (t.TRACK_STATE_HOLD, t.TRACK_STATE_LOST,
+                          t.TRACK_STATE_ACQ):
                 with t.state_lock:
                     t.track_state = zamin
                 t._capture_flight_row(time.monotonic())
@@ -224,11 +232,7 @@ try:
     print("    заминок записано событиями:", sob.count("заминка"))
 
     print("\n=== 10. А снятие лока папку закрывает ===")
-    t.track_state = t.TRACK_STATE_IDLE
-    t._capture_flight_row(time.monotonic())
-    assert not t.lock_log.active, (
-        "оператор снял лок, а папка осталась открытой — следующий заход "
-        "допишется в неё")
+    _snat_lok(t)
     itog = io.open(os.path.join(novaya, "итог.txt"), encoding="utf-8").read()
     assert "НЕ ЗАВЕРШЁН" not in itog, "закрытый заход помечен как оборванный"
     assert "длительность" in itog, "у закрытого захода нет длительности"

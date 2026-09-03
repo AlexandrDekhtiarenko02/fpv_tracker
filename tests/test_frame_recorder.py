@@ -42,9 +42,7 @@ class _SlowFile:
 
 t = offline.load_tracker()
 t.RECORD_FRAMES = True
-t.RECORD_MAX_SECONDS = 30.0
-t.RECORD_MAX_MB = 100.0
-t.FLIGHT_LOG_FSYNC = False
+t.RECORD_FSYNC = False
 t.CAM_W, t.CAM_H = 4, 4
 events = []
 t.flight_log.event = events.append
@@ -67,9 +65,14 @@ try:
     for i in range(90):
         rec.add(frame + i, "%.3f,TRACKED,1,2,3,4,0.9" % (i / 30.0))
 
-    print("=== 1. stop ждёт полного опустошения очереди ===")
+    print("=== 1. stop не замораживает камерный поток ===")
+    before = time.monotonic()
     rec.stop("проверка")
-    assert not rec._thread.is_alive(), "stop вернулся, пока писатель ещё работает"
+    elapsed = time.monotonic() - before
+    print("    stop вернулся за %.3f с" % elapsed)
+    assert elapsed < 0.25, "завершение записи заморозило изображение"
+    assert rec._thread.is_alive(), "медленная допись неожиданно не была фоновой"
+    assert rec.wait(timeout=10.0), "фоновая допись не завершилась"
     assert rec._error is None, "поток записи завершился с ошибкой: %s" % rec._error
 
     builtins.open = real_open
@@ -87,6 +90,7 @@ try:
     rec.start((6, 4))
     rec.add(frame, "0.000,TRACKED,1,2,3,4,0.9")
     rec.stop("вторая проверка")
+    assert rec.wait(timeout=2.0), "вторая запись не закрылась"
     print("    %s -> %s" % (os.path.basename(first_path),
                           os.path.basename(rec._path)))
     assert rec._path != first_path, "второй захват затёр первый"
@@ -103,4 +107,12 @@ idle_branch = source.split("if not aux_snapshot:", 1)[1].split(
 assert 'frame_recorder.stop("AUX4 выключен")' in idle_branch, (
     "ранний выход AUX4 оставит YUV и индекс открытыми")
 
-print("\nOK: каждый записанный кадр имеет строку индекса")
+print("\n=== 4. Внутри лока нет лимита времени и остановки по состоянию ===")
+assert "RECORD_MAX_SECONDS" not in source and "RECORD_MAX_MB" not in source, (
+    "длина записи всё ещё ограничена программой, а не AUX4")
+record_branch = source.split("# Запись начинается при первом TRACKED", 1)[1].split(
+    "print_debug_once_per_second()", 1)[0]
+assert "frame_recorder.stop" not in record_branch, (
+    "HOLD/LOST/ACQ всё ещё могут оборвать запись до выключения AUX4")
+
+print("\nOK: запись закрывается в фоне, каждый кадр имеет строку индекса")
