@@ -140,13 +140,13 @@ print("    баро выключен, ответы идут:", d["baro"])
 assert d["baro"] != "ok", (
     "выключенный барометр показан исправным — ровно тот случай, что нашёлся "
     "на стенде")
-assert d["baro"] == "NOT ON BOARD"
+assert d["baro"] == "missing"
 
 print("\n=== 7. Нет на плате, но нужен — это ОТКАЗ, а не тишина ===")
 d = _kak_slovar(_tr(srok=True, **dict(
     _vse_podnyalos(), sensor_mask=MASK & ~(1 << 1), alt_seen=False)))
 print("    барометра нет на плате:", d["baro"])
-assert d["baro"] == "NOT ON BOARD", (
+assert d["baro"] == "missing", (
     "отсутствие барометра не названо — а без него нет оценки дальности")
 
 print("\n=== 8. Нет на плате и не нужен — это не отказ ===")
@@ -165,7 +165,7 @@ print("\n=== 9. Полётник не прислал перечень — об �
 d = _kak_slovar(_tr(srok=True, **{k: v for k, v in _vse_podnyalos().items()
                                   if k != "sensor_mask"}))
 print("    fc list:", d.get("fc list"))
-assert d.get("fc list") == "NO RESPONSE", (
+assert d.get("fc list") == "no data", (
     "без перечня «нет данных» не отличить от «нет датчика», и весь отчёт "
     "становится догадкой — молчать об этом нельзя")
 
@@ -174,7 +174,7 @@ t = _tr(srok=True, sensor_mask=MASK, gyro=(1, 2, 3),
         rc_link_ts=time.monotonic(), fc_pitch_deg=0.0)
 d = _kak_slovar(t)
 print("   ", d)
-assert d["acc"] == "NO RESPONSE" and d["baro"] == "NO RESPONSE"
+assert d["acc"] == "no data" and d["baro"] == "no data"
 assert d["gyro"] == "ok", "исправный датчик записан в отказавшие"
 assert _narisovano(t).sum() > 0, "отказ не показан"
 
@@ -211,14 +211,18 @@ for opisanie, srok, st in sluchai:
             "кириллица в оверлее рисуется как «?»: %r" % (imya + sost))
         # Самый широкий случай — «NO RESPONSE» по всем строкам; именно его и
         # нельзя обрезать, иначе датчик останется неназванным.
-        shirochayshiy = shirochayshiy or sost == "NO RESPONSE"
+        shirochayshiy = shirochayshiy or sost == "no data"
     est = _narisovano(t)
     stolbcy = np.flatnonzero(est.any(axis=0))
     stroki = np.flatnonzero(est.any(axis=1))
     print("    %-14s x %d..%d, y %d..%d"
           % (opisanie, stolbcy[0], stolbcy[-1], stroki[0], stroki[-1]))
-    assert stolbcy[0] >= 2 and stolbcy[-1] <= 637, (
-        "отчёт обрезан по краю кадра — датчик останется неназванным")
+    # Замерено на борту: правый край кадра до пилота не доходит — длинные
+    # красные строки там обрезало. Держим отчёт в левой половине, с запасом.
+    assert stolbcy[0] >= 2, "отчёт обрезан по левому краю"
+    assert stolbcy[-1] <= 640 * 0.6, (
+        "отчёт уходит вправо (%d px) — на борту его там обрежет, и датчик "
+        "останется неназванным" % stolbcy[-1])
     assert stroki[0] > niz_lupy, "отчёт налезает на лупу"
     assert stroki[-1] < 480, "отчёт не влезает по высоте"
 

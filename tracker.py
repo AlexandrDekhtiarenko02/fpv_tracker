@@ -209,6 +209,7 @@ GPS_SATS_ENOUGH = 6            # со скольких спутников счи
 SENSOR_FONT_FACE = cv2.FONT_HERSHEY_SIMPLEX
 SENSOR_FONT = 0.42             # мелко и ровно, как в OSD полётника
 SENSOR_LINE_H = 15             # шаг строк отчёта
+SENSOR_X_FRAC = 0.08           # левый край отчёта, доля ширины кадра
 LOCK_LOG_ENABLED = True
 LOCK_LOG_DIR = "zahvaty"
 RECORD_HIRES = False
@@ -4730,7 +4731,7 @@ def _sensor_report():
         # Полётник не прислал перечень датчиков — мы не знаем, что на плате.
         # Молчать об этом нельзя: тогда «нет данных» не отличить от «нет
         # датчика», и весь отчёт ниже становится догадкой.
-        stroki.append(("fc list", "NO RESPONSE" if srok else "...",
+        stroki.append(("fc list", "no data" if srok else "...",
                        COLOR_SENSOR_FAIL if srok else COLOR_SENSOR_WAIT))
         vse_ok = False
     for imya, ok, primech, na_bortu, nuzhen in punkty:
@@ -4740,7 +4741,7 @@ def _sensor_report():
         # Если железки нет, никакие ответы не делают её исправной.
         if na_bortu is False:
             if nuzhen:
-                stroki.append((imya, "NOT ON BOARD", COLOR_SENSOR_FAIL))
+                stroki.append((imya, "missing", COLOR_SENSOR_FAIL))
                 vse_ok = False
             else:
                 stroki.append((imya, "none", COLOR_SENSOR_NONE))
@@ -4754,13 +4755,13 @@ def _sensor_report():
             # Полётник видит датчик на плате, а данных нет. Это отказ, и
             # неважно, обязателен он для замера или нет: молчащая железка,
             # которая физически стоит, — поломка.
-            stroki.append((imya, "NO RESPONSE", COLOR_SENSOR_FAIL))
+            stroki.append((imya, "no data", COLOR_SENSOR_FAIL))
             vse_ok = False
         elif not nuzhen and srok:
             # Не обещан, на плате не значится, ответа нет — его и не ждали.
             stroki.append((imya, "none", COLOR_SENSOR_NONE))
         elif srok:
-            stroki.append((imya, "NO RESPONSE", COLOR_SENSOR_FAIL))
+            stroki.append((imya, "no data", COLOR_SENSOR_FAIL))
             vse_ok = False
         else:
             stroki.append((imya, "...", COLOR_SENSOR_WAIT))
@@ -4800,9 +4801,14 @@ def draw_sensor_report(frame):
         # и тире гуляли бы по строке.
         kol = max(shir(imya) for imya, _, _ in stroki) + shir("  -  ")
         shirina = kol + max(shir(sost) for _, sost, _ in stroki)
-        x = min(w - MAG_MARGIN - MAG_SIZE, w - MAG_MARGIN - shirina)
+        # Левая сторона, подальше от правого края: замерено на борту, что
+        # длинные красные строки там не помещались. Лупа стоит справа, так
+        # что заодно расходятся.
+        x = int(w * SENSOR_X_FRAC)
+        # По высоте — на уровне ниже лупы. Верхние углы режет сильнее всего,
+        # середина кадра по вертикали видна заведомо.
         y = MAG_MARGIN + (MAG_SIZE if MAG_ENABLED else 0) + SENSOR_LINE_H + 6
-        if x < 2 or y + SENSOR_LINE_H * len(stroki) > h:
+        if x + shirina > w - 2 or y + SENSOR_LINE_H * len(stroki) > h:
             x, y = max(2, (w - shirina) // 2), max(SENSOR_LINE_H, h // 3)
         for imya, sost, col in stroki:
             for tekst, tx in ((imya, x), ("-", x + kol - shir("- ")),
