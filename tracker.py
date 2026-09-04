@@ -1259,10 +1259,12 @@ _FLIGHT_LOG_COLUMNS = (
     "match_flow_gap,size_est,size_skip,size_why,size_R,size_scale,motion_sep,motion_on,"
     "color_on,color_pen,color_best,chroma_sat,"
     "alt_cm,vario_cms,alt_age_ms,"
-    "box_size_px,box_growth,tau_s,range_m,depression_deg,dy_alt_decoupled,"
+    "box_size_px,box_growth,growth_raw,growth_sigma,tau_s,tau_sigma_s,"
+    "range_m,depression_deg,dy_alt_decoupled,"
     "alt_sigma_cm,range_min_alt_m,range_gain,range_sigma_m,"
     "gyro_x,gyro_y,gyro_z,acc_z,gyro_age_ms,rc_age_ms,"
-    "gps_fix,gps_sats,gps_lat,gps_lon,gps_speed_ms,gps_course,gps_age_ms,"
+    "gps_fix,gps_sats,gps_lat,gps_lon,gps_alt_m,gps_speed_ms,gps_course,"
+    "gps_age_ms,"
     "gps_range_m,ground_speed_ms,"
     "ground_flow_dx_px,ground_flow_dy_px,ground_flow_px_s,"
     "ground_flow_points,ground_flow_dt_ms"
@@ -2133,6 +2135,9 @@ prev_launch_pitch_deg = None
 
 # Оценка сближения: прошлый размер коробки и сглаженная скорость роста.
 prev_box_size_px = None
+# Хвост несглаженных приростов рамки: по нему считается разброс, а по
+# разбросу — надёжность времени до контакта.
+_growth_raw = collections.deque(maxlen=24)
 box_growth_smoothed = 0.0
 
 # Интегратор внутреннего контура каскадного газа.
@@ -4025,6 +4030,7 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
     out = {"size_px": None, "growth": None, "tau_s": None,
            "range_m": None, "depression_deg": None, "alt_min_m": None,
            "range_gain": None, "range_sigma_m": None,
+           "growth_raw": None, "growth_sigma": None, "tau_sigma_s": None,
            "alt_reason": None}
 
     # --- время до контакта ---
@@ -4037,11 +4043,33 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
         rel = ((size - prev_box_size_px) / prev_box_size_px) / k
         a = alpha_for_dt(TAU_GROWTH_ALPHA, k)
         box_growth_smoothed += a * (rel - box_growth_smoothed)
+        # НЕСГЛАЖЕННЫЙ прирост держим отдельно. Сверка с GPS 4 сентября
+        # показала: tau завышает время на 25%, а сглаживание отстаёт на
+        # разгоне и занижает знаменатель — это первый подозреваемый.
+        # Проверить его можно только имея оба ряда рядом.
+        _growth_raw.append(rel)
     prev_box_size_px = size
     out["growth"] = box_growth_smoothed
+    out["growth_raw"] = _growth_raw[-1] if _growth_raw else None
+    # НАСКОЛЬКО tau НАДЁЖЕН СЕЙЧАС. tau = постоянная / прирост, поэтому
+    # относительная погрешность времени равна относительной погрешности
+    # прироста. Когда сближение вялое, прирост тонет в шуме — и tau врёт в
+    # разы. Замерено: два захода из одиннадцати с самым медленным сближением
+    # дали отношение к истине 0.12 и 0.65, остальные девять 1.0-1.6.
+    sig_g = None
+    if len(_growth_raw) >= 8:
+        sr = sorted(_growth_raw)
+        n = len(sr)
+        # Межквартильный размах вместо стандартного отклонения: одиночный
+        # скачок рамки не должен объявлять весь заход ненадёжным.
+        sig_g = (sr[(3 * n) // 4] - sr[n // 4]) * 0.7413
+    out["growth_sigma"] = sig_g
     if box_growth_smoothed > TAU_MIN_GROWTH:
         # Кадров до контакта -> секунд.
-        out["tau_s"] = (1.0 / box_growth_smoothed) * NOMINAL_DT
+        tau = (1.0 / box_growth_smoothed) * NOMINAL_DT
+        out["tau_s"] = tau
+        if sig_g is not None:
+            out["tau_sigma_s"] = tau * (sig_g / max(1e-9, box_growth_smoothed))
 
     # --- дальность по наземной цели ---
     if not RANGE_ESTIMATE_ENABLED:
@@ -4784,7 +4812,18 @@ def _range_readout_lines():
 
     tau = c.get("tau_s")
     if tau is not None:
-        lines.append(("T %.1fs" % tau, COLOR_GREEN))
+        # Погрешность рядом, как у дальности. Сверка с GPS показала: на
+        # медленном сближении прирост рамки тонет в шуме, и tau врёт в разы
+        # (0.12 и 0.65 от истины в двух заходах из одиннадцати). Голое число
+        # об этом не говорит ничего.
+        tsig = c.get("tau_sigma_s")
+        if tsig is None:
+            lines.append(("T %.1fs" % tau, COLOR_GREEN))
+        else:
+            otn = tsig / max(0.1, tau)
+            cvet = (COLOR_GREEN if otn < 0.25
+                    else COLOR_YELLOW if otn < 0.6 else COLOR_RED)
+            lines.append(("T %.1f+-%.1fs" % (tau, tsig), cvet))
     else:
         # Ноль здесь означал бы «мы в цели», поэтому пишем словом.
         lines.append(("T no close", COLOR_YELLOW))
@@ -5696,6 +5735,11 @@ def _capture_flight_row(cb_t0):
             gps_sats = app_state.get("gps_sats")
             gps_lat = app_state.get("gps_lat")
             gps_lon = app_state.get("gps_lon")
+            # Высота с GPS. Дальность стоит на двух величинах — угле и
+            # высоте, — а сверена по GPS была только первая. Вторая до сих
+            # пор ничем не проверена, хотя ошибка высоты входит в дальность
+            # один в один: dR/R = dH/H.
+            gps_alt_m = app_state.get("gps_alt_m")
             _sp = app_state.get("gps_speed_cms")
             gps_speed_ms = None if _sp is None else _sp / 100.0
             gps_course = app_state.get("gps_course")
@@ -5788,13 +5832,15 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("color_on"), _match_dbg.get("color_pen"),
             _match_dbg.get("color_best"), _chroma_saturation(),
             alt_cm, vario_cms, alt_age,
-            g("size_px"), g("growth"), g("tau_s"), g("range_m"),
+            g("size_px"), g("growth"), g("growth_raw"), g("growth_sigma"),
+            g("tau_s"), g("tau_sigma_s"), g("range_m"),
             g("depression_deg"), g("dy_alt_decoupled"),
             alt_sigma, g("alt_min_m"), g("range_gain"), g("range_sigma_m"),
             gyro_x, gyro_y, gyro_z, acc_z,
             (now - imu_ts) * 1000.0 if imu_ts else None,
             (now - rc_ts_row) * 1000.0 if rc_ts_row else None,
-            gps_fix, gps_sats, gps_lat, gps_lon, gps_speed_ms, gps_course,
+            gps_fix, gps_sats, gps_lat, gps_lon, gps_alt_m, gps_speed_ms,
+            gps_course,
             gps_age, gps_range_m, ground_speed_mps,
             _ground_flow_dbg.get("dx_px"), _ground_flow_dbg.get("dy_px"),
             _ground_flow_dbg.get("px_s"), _ground_flow_dbg.get("points"),
