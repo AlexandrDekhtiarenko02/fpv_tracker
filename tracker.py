@@ -1108,6 +1108,13 @@ RANGE_MIN_DEPRESSION_DEG = 4.0
 # появлялись уверенные «3.6 м», собранные из дрожания датчика.
 RANGE_ALT_SIGMAS = 5.0          # ~20% по дальности, т.к. dR/R = dH/H
 RANGE_MIN_ALT_FLOOR_M = 0.5     # ниже этого дальность не считаем никогда
+# СКОЛЬКО ВРЁТ УГОЛ СНИЖЕНИЯ. Замерено 4 сентября 2026 по сверке с GPS:
+# 11 заходов, 2584 точки. Полный разброс ошибки угла вышел 4.7°, но он
+# складывается из нашего шума и шума самого GPS, разделить их этими данными
+# нельзя. По обратному счёту из достигнутой точности дальности получается
+# 1.6-4.6° в зависимости от угла. Берём середину и честно считаем оценкой.
+# Уточнять — новой выборкой с GPS, а не подгонкой под старую.
+RANGE_ANGLE_SIGMA_DEG = 2.5
 ALT_NOISE_WINDOW = 40           # отсчётов высотомера для оценки шума
 ALT_NOISE_MIN_SAMPLES = 12
 # Сглаживание скорости роста коробки: размер шумит, а мы его дифференцируем.
@@ -1253,7 +1260,7 @@ _FLIGHT_LOG_COLUMNS = (
     "color_on,color_pen,color_best,chroma_sat,"
     "alt_cm,vario_cms,alt_age_ms,"
     "box_size_px,box_growth,tau_s,range_m,depression_deg,dy_alt_decoupled,"
-    "alt_sigma_cm,range_min_alt_m,"
+    "alt_sigma_cm,range_min_alt_m,range_gain,range_sigma_m,"
     "gyro_x,gyro_y,gyro_z,acc_z,gyro_age_ms,rc_age_ms,"
     "gps_fix,gps_sats,gps_lat,gps_lon,gps_speed_ms,gps_course,gps_age_ms,"
     "gps_range_m,ground_speed_ms,"
@@ -4017,6 +4024,7 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
     global prev_box_size_px, box_growth_smoothed
     out = {"size_px": None, "growth": None, "tau_s": None,
            "range_m": None, "depression_deg": None, "alt_min_m": None,
+           "range_gain": None, "range_sigma_m": None,
            "alt_reason": None}
 
     # --- время до контакта ---
@@ -4088,7 +4096,20 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
         min_alt_m = max(min_alt_m, RANGE_ALT_SIGMAS * sigma / 100.0)
     out["alt_min_m"] = min_alt_m
     if depression >= RANGE_MIN_DEPRESSION_DEG and alt_m > min_alt_m:
-        out["range_m"] = alt_m / math.tan(math.radians(depression))
+        R = alt_m / math.tan(math.radians(depression))
+        out["range_m"] = R
+        # ПОГРЕШНОСТЬ ДАЛЬНОСТИ. Голое число одинаково выглядит и при 11%, и
+        # при 27% ошибки, а разница между ними решающая: на пологом заходе
+        # дальность годна на порядок хуже, чем на крутом.
+        #
+        # Из R = h/tg(θ) следует dR/R = 2·dθ/sin(2θ). Множитель 1/sin(2θ) —
+        # чистая геометрия, он и есть усиление ошибки угла: на 45° единица,
+        # на 5° почти шесть, на 2° четырнадцать. Высота входит один в один.
+        usilenie = 1.0 / max(0.02, math.sin(math.radians(2.0 * depression)))
+        out["range_gain"] = usilenie
+        otn_ugol = 2.0 * math.radians(RANGE_ANGLE_SIGMA_DEG) * usilenie
+        otn_vys = (sigma / 100.0 / alt_m) if sigma is not None else 0.0
+        out["range_sigma_m"] = R * math.hypot(otn_ugol, otn_vys)
     return out
 
 
@@ -4699,7 +4720,18 @@ def _range_readout_lines():
 
     rng = c.get("range_m")
     if rng is not None:
-        lines.append(("R %.0fm" % rng, COLOR_GREEN))
+        # Погрешность рядом с числом, а не только в логе: на пологом заходе
+        # она втрое больше, чем на крутом, а само число выглядит одинаково.
+        sig = c.get("range_sigma_m")
+        if sig is None:
+            lines.append(("R %.0fm" % rng, COLOR_GREEN))
+        else:
+            # Цвет по надёжности: пока погрешность мала — зелёный, дальше
+            # жёлтый, а при разбросе больше половины числа верить нечему.
+            otn = sig / max(1.0, rng)
+            cvet = (COLOR_GREEN if otn < 0.2
+                    else COLOR_YELLOW if otn < 0.5 else COLOR_RED)
+            lines.append(("R %.0f+-%.0fm" % (rng, sig), cvet))
     else:
         # Разбираем, чего именно не хватило: высоты, свежести высоты или угла.
         with state_lock:
@@ -4734,6 +4766,21 @@ def _range_readout_lines():
             # неизвестна, чем назовёт неверную.
             why = "R ?"
         lines.append((why, COLOR_YELLOW))
+
+    # Дистанция по GPS — независимая от нашей геометрии. Показывается рядом,
+    # чтобы сверять на глаз прямо в полёте, а не только на разборе. Есть она
+    # только на замерном борту: нужен фикс и вписанные координаты цели, на
+    # боевом её не будет.
+    grng = c.get("gps_range_m")
+    if grng is not None:
+        if rng is not None:
+            # Расхождение важнее самих чисел: по нему сразу видно, врёт
+            # геометрия или нет, без пересчёта в уме.
+            d = rng - grng
+            lines.append(("G %.0f d%+.0f" % (grng, d),
+                          COLOR_GREEN if abs(d) < 0.2 * grng else COLOR_YELLOW))
+        else:
+            lines.append(("G %.0fm" % grng, COLOR_WHITE))
 
     tau = c.get("tau_s")
     if tau is not None:
@@ -5668,6 +5715,10 @@ def _capture_flight_row(cb_t0):
                         dlat, dlon * math.cos(la))
                 except Exception:
                     gps_range_m = None
+            # Кладём туда же, откуда читает показ у рамки: пилот должен видеть
+            # расхождение геометрии с GPS вживую, а не узнавать о нём на
+            # разборе, когда переигрывать вылет уже поздно.
+            _ctl_dbg["gps_range_m"] = gps_range_m
 
         att_age = (now - att_ts) * 1000.0 if att_ts else None
         alt_age = (now - alt_ts) * 1000.0 if alt_ts else None
@@ -5739,7 +5790,7 @@ def _capture_flight_row(cb_t0):
             alt_cm, vario_cms, alt_age,
             g("size_px"), g("growth"), g("tau_s"), g("range_m"),
             g("depression_deg"), g("dy_alt_decoupled"),
-            alt_sigma, g("alt_min_m"),
+            alt_sigma, g("alt_min_m"), g("range_gain"), g("range_sigma_m"),
             gyro_x, gyro_y, gyro_z, acc_z,
             (now - imu_ts) * 1000.0 if imu_ts else None,
             (now - rc_ts_row) * 1000.0 if rc_ts_row else None,
