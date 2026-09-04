@@ -1465,7 +1465,7 @@ class FlightLogger:
             rows, self._rows = self._rows, []
         out = []
         for r in rows:
-            out.append(",".join(_fmt(v) for v in r))
+            out.append(_fmt_row(r))
             # Может добавить события (ARMED/DISARMED), поэтому события
             # забираем ПОСЛЕ разбора строк — иначе на последнем сбросе перед
             # выходом отметка о дизарме потерялась бы.
@@ -1711,6 +1711,24 @@ def _fmt(v):
     return str(v)
 
 
+def _fmt_row(vals):
+    """Строка CSV. Координаты — с полной точностью, остальное с тремя знаками.
+
+    Найдено при разборе 4 сентября 2026: три знака у широты это шаг в 111
+    метров, у долготы 70. Траекторию по такому логу не восстановить, цель
+    задним числом не поправить, и любой разбор, опирающийся на координаты,
+    молча считает мусор. Сама gps_range_m при этом верна — она считается на
+    борту из полных значений, — но проверить её по логу было нечем.
+    """
+    out = []
+    for i, v in enumerate(vals):
+        if i in _COLS_TOCHNYE and isinstance(v, float):
+            out.append("%.7f" % v)      # 1 см по широте, с запасом
+        else:
+            out.append(_fmt(v))
+    return ",".join(out)
+
+
 # Индексы колонок для аналитики вычисляются ИЗ ЗАГОЛОВКА по именам.
 #
 # Раньше они были записаны числами, и вставка колонки в середину списка
@@ -1731,6 +1749,10 @@ _C_YAW_SAT = _COLS.index("yaw_sat")
 _C_ATT_AGE = _COLS.index("att_age_ms")
 _C_ARMED = _COLS.index("armed")
 _C_VARIO = _COLS.index("vario_cms")
+# Колонки, которым трёх знаков мало. Пока это только координаты, но список
+# именно списком: следующая такая величина не должна потребовать правки
+# формата в двух местах.
+_COLS_TOCHNYE = frozenset(_COLS.index(k) for k in ("gps_lat", "gps_lon"))
 _C_TAU = _COLS.index("tau_s")
 _C_RANGE = _COLS.index("range_m")
 
@@ -5850,7 +5872,7 @@ def _capture_flight_row(cb_t0):
         # Та же строка — в папку этого захвата. Форматируем один раз здесь, а
         # не в фоне: в папке лежит ровно то, что было в этот кадр.
         if lock_log.active:
-            lock_log.row(",".join(_fmt(v) for v in _row_values))
+            lock_log.row(_fmt_row(_row_values))
     except Exception:
         # Лог не имеет права мешать полёту.
         pass
