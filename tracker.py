@@ -1033,6 +1033,12 @@ GROUND_MIN_POINTS = 6
 GROUND_MAX_POINTS = 40
 GROUND_MIN_DEPRESSION_DEG = 8.0   # ближе к горизонту дальность до земли врёт
 GROUND_SPEED_ALPHA = 0.20
+# Через сколько кадров считать бег земли. Замерено в полёте: расчёт стоит
+# 11.4 мс на кадр при бюджете 48 мс, то есть треть времени кадра. На стенде он
+# не запускался НИ РАЗУ (нужен арм и высота), поэтому в цену никто не смотрел.
+# Скорость аппарата меняется медленно, 10 Гц с запасом хватает, а смещение
+# потока 0.7 px за кадр — вдвое больший шаг оптический поток держит свободно.
+GROUND_EVERY_N = 2
 # Вертикальный угол обзора IMX219 в этом режиме, градусы.
 CAMERA_VFOV_DEG = 41.4
 # Наклон камеры на раме, градусы (вверх положительный). 0 = смотрит вперёд.
@@ -3538,6 +3544,9 @@ def color_projection(shape):
         return None
 
 
+_gs_n = 0                      # счётчик кадров для прореживания бега земли
+
+
 def estimate_ground_speed(gray, now_mono):
     """Путевая скорость по бегу земли в кадре. Работает БЕЗ GPS.
 
@@ -5947,7 +5956,7 @@ def _gotovnost_k_sboru():
 
 
 def camera_callback(request):
-    global chroma_u, chroma_v
+    global chroma_u, chroma_v, _gs_n
     _cb_t0 = time.monotonic()
     try:
         with state_lock:
@@ -5993,9 +6002,12 @@ def camera_callback(request):
                     chroma_u = cu.copy()
                     chroma_v = cv_.copy()
 
-        # Путевая скорость по бегу земли. Считается всегда, когда включена:
-        # она нужна и для разбора налётов, и как замена GPS.
-        if GROUND_SPEED_ENABLED:
+        # Путевая скорость по бегу земли. Нужна и для разбора налётов, и как
+        # замена GPS, но считать её каждый кадр незачем: см. GROUND_EVERY_N.
+        # Интервал измеряется по факту, поэтому прореживание не искажает
+        # результат — только реже обновляет.
+        _gs_n += 1
+        if GROUND_SPEED_ENABLED and _gs_n % GROUND_EVERY_N == 0:
             estimate_ground_speed(gray, _cb_t0)
 
         process_locked_tracker(gray)
