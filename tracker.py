@@ -1113,6 +1113,36 @@ CAMERA_VFOV_DEG = 41.4
 # точностью, и траекторию можно будет восстановить — раньше три знака после
 # запятой давали шаг в 111 метров, и проверять было нечем.
 CAMERA_TILT_DEG = 10.0
+
+# ЗАНИЖЕНИЕ ТАНГАЖА В ПОЛЁТЕ. Отдельная величина, а не часть наклона камеры.
+#
+# Замерено 4 сентября 2026 по сверке с GPS, 27 заходов. В полёте цель стоит
+# РОВНО В ЦЕНТРЕ кадра (box_cy = 239 при центре 240), то есть ось камеры
+# смотрит точно на неё, и её угол ниже горизонта равен истинному — 18.7° по
+# GPS. А полётник в этот момент даёт тангаж 19.0°. При камере, задранной на
+# 10°, ось была бы на 9° ниже горизонта, и цель обязана была бы стоять на
+# 9.7° ниже центра, то есть box_cy около 352. Её там нет.
+#
+# Значит полётник занижает тангаж, и занижение РАСТЁТ СО СКОРОСТЬЮ:
+#     0-5 м/с   -> +4.6°
+#     5-10 м/с  -> +9.5°
+#     10-15 м/с -> +11.5°
+#     15-20 м/с -> +17.4°
+# Связь со скоростью r = +0.52. Причина обычная: горизонт строится по
+# акселерометру, а в разгоне тот меряет не только тяжесть. На земле, где
+# дрон неподвижен, занижения нет — потому наземные замеры и давали честные
+# 8.5-10°, а полётные требовали нуля.
+#
+# Проверено на отложенной половине заходов:
+#     наклон 10, без поправки           132.2% ошибки дальности
+#     наклон 0.5 (прежняя заплатка)      20.6%
+#     наклон 10 + эта поправка           13.5%
+#
+# Прежняя константа 0.5° прятала обе величины разом и потому ломалась на
+# земле. Здесь они разведены, и каждая означает то, что означает.
+PITCH_BIAS_PER_MS = 0.90       # градусов занижения на каждый м/с
+PITCH_BIAS_BASE = 2.0          # и постоянная часть
+PITCH_BIAS_MAX = 25.0          # выше этого не поправляем: данных там нет
 # Ниже этого угла снижения дальность не считаем: tg около нуля, и оценка
 # улетает в бесконечность от любого шума.
 RANGE_MIN_DEPRESSION_DEG = 4.0
@@ -1276,7 +1306,7 @@ _FLIGHT_LOG_COLUMNS = (
     "alt_cm,vario_cms,alt_age_ms,"
     "box_size_px,box_growth,growth_raw,growth_sigma,tau_s,tau_sigma_s,"
     "range_m,depression_deg,dy_alt_decoupled,"
-    "alt_sigma_cm,range_min_alt_m,range_gain,range_sigma_m,"
+    "alt_sigma_cm,range_min_alt_m,range_gain,range_sigma_m,pitch_bias_deg,"
     "gyro_x,gyro_y,gyro_z,acc_z,gyro_age_ms,rc_age_ms,"
     "gps_fix,gps_sats,gps_lat,gps_lon,gps_alt_m,gps_speed_ms,gps_course,"
     "gps_age_ms,"
@@ -4072,6 +4102,7 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
            "range_m": None, "depression_deg": None, "alt_min_m": None,
            "range_gain": None, "range_sigma_m": None,
            "growth_raw": None, "growth_sigma": None, "tau_sigma_s": None,
+           "pitch_bias_deg": None,
            "alt_reason": None}
 
     # --- время до контакта ---
@@ -4151,7 +4182,25 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
     #
     # Сходится и с самим заходом: оператор нёс дрон, наклонив к цели, тангаж
     # был +14°, а код объявлял это взглядом на 14° ВЫШЕ горизонта.
-    depression = float(fc_pitch) - CAMERA_TILT_DEG + off_deg
+    # Поправка на занижение тангажа в полёте (см. PITCH_BIAS_PER_MS).
+    # Скорость берём лучшую доступную: GPS на замерном борту, бег земли на
+    # боевом. Нет ни той, ни другой — не поправляем вовсе: это случай
+    # неподвижного аппарата, где занижения и нет.
+    with state_lock:
+        _sp_cms = app_state.get("gps_speed_cms")
+        _gps_zh = _gps_zhivoy(app_state)
+    skorost = None
+    if _gps_zh and _sp_cms is not None:
+        skorost = _sp_cms / 100.0
+    elif ground_speed_mps is not None:
+        skorost = ground_speed_mps
+    if skorost is None:
+        popravka = 0.0
+    else:
+        popravka = min(PITCH_BIAS_MAX,
+                       max(0.0, PITCH_BIAS_PER_MS * skorost + PITCH_BIAS_BASE))
+    out["pitch_bias_deg"] = popravka
+    depression = float(fc_pitch) - CAMERA_TILT_DEG + off_deg + popravka
     out["depression_deg"] = depression
 
     alt_m = alt_cm / 100.0
@@ -5888,6 +5937,7 @@ def _capture_flight_row(cb_t0):
             g("tau_s"), g("tau_sigma_s"), g("range_m"),
             g("depression_deg"), g("dy_alt_decoupled"),
             alt_sigma, g("alt_min_m"), g("range_gain"), g("range_sigma_m"),
+            g("pitch_bias_deg"),
             gyro_x, gyro_y, gyro_z, acc_z,
             (now - imu_ts) * 1000.0 if imu_ts else None,
             (now - rc_ts_row) * 1000.0 if rc_ts_row else None,

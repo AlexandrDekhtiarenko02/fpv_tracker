@@ -27,9 +27,13 @@ CAMERA_VFOV_DEG = eval(re.search(r"^CAMERA_VFOV_DEG = (.+?)(?:\s+#.*)?$", src, r
 CAMERA_TILT_DEG = eval(re.search(r"^CAMERA_TILT_DEG = (.+?)(?:\s+#.*)?$", src, re.M).group(1))
 deg_per_px = CAMERA_VFOV_DEG / float(MAIN_H)
 
-def depression(fc_pitch, off_deg):
+def depression(fc_pitch, off_deg, popravka=0.0):
+    """Угол снижения по формуле ИЗ КОДА. popravka — поправка на занижение
+    тангажа в полёте; в проверках знака она нулевая, чтобы не смешивать два
+    разных вопроса."""
     return eval(expr, {"float": float, "fc_pitch": fc_pitch, "off_deg": off_deg,
-                       "CAMERA_TILT_DEG": CAMERA_TILT_DEG})
+                       "CAMERA_TILT_DEG": CAMERA_TILT_DEG,
+                       "popravka": popravka})
 
 print("\n=== 1. Нос вниз -> угол снижения положительный ===")
 d = depression(20.0, 0.0)
