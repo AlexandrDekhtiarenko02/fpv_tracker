@@ -71,9 +71,9 @@ print("    коробка прошла путь туда и обратно, %d �
 
 print("\n=== 2. Предел коробки допускает режим сближения ===")
 frac = ns["LOCK_MAX_W"] ** 2 / float(W * H)
-need = eval(re.search(r"^TERMINAL_BOX_FRAC_THRESHOLD = (.+?)(?:\s+#.*)?$",
+need = eval(re.search(r"^CLOSING_BOX_FRAC_THRESHOLD = (.+?)(?:\s+#.*)?$",
                       src, re.M).group(1))
-print("    предел коробки %d px -> максимум %.1f%% площади кадра, порог терминала %.0f%%"
+print("    предел коробки %d px -> максимум %.1f%% площади кадра, порог сближения %.0f%%"
       % (ns["LOCK_MAX_W"], 100 * frac, 100 * need))
 assert frac >= need, (
     "режим сближения НЕДОСТИЖИМ: коробка не может занять больше %.1f%% "

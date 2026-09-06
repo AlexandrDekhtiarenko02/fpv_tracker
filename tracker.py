@@ -795,11 +795,11 @@ FF_GAIN_YAW = 1.0       # PWM на (px/кадр) скорости цели по 
 # Когда коробка занимает заметную часть кадра — мы в финальной фазе.
 # Времени на интеграл нет, нужны рефлексы: повышаем P, поджимаем I.
 # Триггер: площадь коробки относительно всего кадра.
-TERMINAL_MODE_ENABLED = True
-TERMINAL_BOX_FRAC_THRESHOLD = 0.18   # 18% площади кадра = «уже близко»
-TERMINAL_P_MULTIPLIER = 1.6          # P-гэйны умножаем на это в терминале
-TERMINAL_I_MULTIPLIER = 0.3          # I-гэйны срезаем (нет времени интегрировать)
-TERMINAL_FF_MULTIPLIER = 1.3         # FF тоже приподнимаем — реакция должна быть резче
+CLOSING_MODE_ENABLED = True
+CLOSING_BOX_FRAC_THRESHOLD = 0.18   # 18% площади кадра = «уже близко»
+CLOSING_P_MULTIPLIER = 1.6          # P-гэйны умножаем на это в сближении
+CLOSING_I_MULTIPLIER = 0.3          # I-гэйны срезаем (нет времени интегрировать)
+CLOSING_FF_MULTIPLIER = 1.3         # FF тоже приподнимаем — реакция должна быть резче
 
 # --- АДАПТИВНЫЙ SEARCH_MARGIN ---
 # При неподвижной цели бессмысленно искать в большом окне — больше шансов
@@ -990,9 +990,9 @@ LAUNCH_HOLD_FRAMES = 60
 LAUNCH_RAMP_DOWN_FRAMES = 30
 # Дополнительный газ во время launch (в % от текущего стика). Применяется
 # ТОЛЬКО если OVERRIDE_THROTTLE=True; иначе газ остаётся под управлением пилота.
-# При наклоне носа квад на низком газе трейдит высоту на скорость
-# (дайвит и разгоняется), что для камикадзе нормально. Если хочешь сохранять
-# высоту во время launch — включай boost.
+# При наклоне носа квад на низком газе трейдит высоту на скорость: снижается
+# и разгоняется. Для сближения с наземной целью это штатно — снижение и есть
+# часть захода. Если нужно держать высоту во время launch — включай boost.
 LAUNCH_THR_BOOST_PCT = 10.0
 
 # --- CRUISE PITCH (постоянная тяга вперёд) ---
@@ -1303,7 +1303,7 @@ _FLIGHT_LOG_COLUMNS = (
     "match_score,flow_ok,lost_frames,reacq,"
     "box_cx,box_cy,box_w,box_h,box_frac,"
     "dx_raw,dy_raw,pitch_comp_px,lead_x,lead_y,dx_aim,dy_aim,adx,ady,dy_alt,"
-    "tgt_vx,tgt_vy,stable_frames,in_terminal,"
+    "tgt_vx,tgt_vy,stable_frames,in_closing,"
     "roll_p,roll_d,roll_i,roll_ff,roll_off,roll_sat,"
     "pitch_p,pitch_d,pitch_i,pitch_ff,pitch_off,pitch_sat,"
     "launch_pwm,cruise_pwm,pitch_comb,"
@@ -4617,20 +4617,20 @@ def update_control_from_target():
     box_w_main = box[2] - box[0]
     box_h_main = box[3] - box[1]
     box_frac = (box_w_main * box_h_main) / float(MAIN_W * MAIN_H)
-    in_terminal = TERMINAL_MODE_ENABLED and box_frac >= TERMINAL_BOX_FRAC_THRESHOLD
+    in_closing = CLOSING_MODE_ENABLED and box_frac >= CLOSING_BOX_FRAC_THRESHOLD
 
     # Оценка сближения. Пока ТОЛЬКО измеряется и пишется в лог — в закон
     # управления не входит (см. блок про оценку сближения выше).
     closure = _estimate_closure(box_w_main, box_h_main, box_cy, now_mono, k)
 
-    if in_terminal:
-        p_roll_eff = P_GAIN_ROLL * TERMINAL_P_MULTIPLIER
-        p_pitch_eff = P_GAIN_PITCH * TERMINAL_P_MULTIPLIER
-        i_roll_eff = I_GAIN_ROLL * TERMINAL_I_MULTIPLIER
-        i_pitch_eff = I_GAIN_PITCH * TERMINAL_I_MULTIPLIER
-        ff_roll_eff = FF_GAIN_ROLL * TERMINAL_FF_MULTIPLIER
-        ff_pitch_eff = FF_GAIN_PITCH * TERMINAL_FF_MULTIPLIER
-        ff_yaw_eff = FF_GAIN_YAW * TERMINAL_FF_MULTIPLIER
+    if in_closing:
+        p_roll_eff = P_GAIN_ROLL * CLOSING_P_MULTIPLIER
+        p_pitch_eff = P_GAIN_PITCH * CLOSING_P_MULTIPLIER
+        i_roll_eff = I_GAIN_ROLL * CLOSING_I_MULTIPLIER
+        i_pitch_eff = I_GAIN_PITCH * CLOSING_I_MULTIPLIER
+        ff_roll_eff = FF_GAIN_ROLL * CLOSING_FF_MULTIPLIER
+        ff_pitch_eff = FF_GAIN_PITCH * CLOSING_FF_MULTIPLIER
+        ff_yaw_eff = FF_GAIN_YAW * CLOSING_FF_MULTIPLIER
     else:
         p_roll_eff = P_GAIN_ROLL
         p_pitch_eff = P_GAIN_PITCH
@@ -4778,7 +4778,7 @@ def update_control_from_target():
         "dx_aim": dx_aim, "dy_aim": dy_aim, "adx": adx, "ady": ady,
         "dy_alt": dy_alt,
         "tgt_vx": target_vx_smoothed, "tgt_vy": target_vy_smoothed,
-        "stable": stable_track_frames, "terminal": in_terminal,
+        "stable": stable_track_frames, "closing": in_closing,
         "roll_p": r_p, "roll_d": r_d, "roll_i": r_i, "roll_ff": r_ff,
         "roll_off": r_off, "roll_sat": r_sat,
         "pitch_p": p_p, "pitch_d": p_d, "pitch_i": p_i, "pitch_ff": p_ff,
@@ -5972,7 +5972,7 @@ def _capture_flight_row(cb_t0):
             g("box_cx"), g("box_cy"), g("box_w"), g("box_h"), g("box_frac"),
             g("dx_raw"), g("dy_raw"), g("comp"), g("lead_x"), g("lead_y"),
             g("dx_aim"), g("dy_aim"), g("adx"), g("ady"), g("dy_alt"),
-            g("tgt_vx"), g("tgt_vy"), g("stable"), g("terminal"),
+            g("tgt_vx"), g("tgt_vy"), g("stable"), g("closing"),
             g("roll_p"), g("roll_d"), g("roll_i"), g("roll_ff"),
             g("roll_off"), g("roll_sat"),
             g("pitch_p"), g("pitch_d"), g("pitch_i"), g("pitch_ff"),
