@@ -298,7 +298,7 @@ LOCK_MIN_H = 5
 # ровно то, что оператор видит как «бегает по объекту, а при отдалении
 # сползает на край или за него».
 #
-# Второе, и это хуже: ТЕРМИНАЛЬНЫЙ РЕЖИМ БЫЛ НЕДОСТИЖИМ. Он включается при
+# Второе, и это хуже: РЕЖИМ СБЛИЖЕНИЯ БЫЛ НЕДОСТИЖИМ. Он включается при
 # box_frac >= 0.18, то есть когда коробка занимает 18% площади кадра. При
 # пределе 38 на кадре 320x240 максимум составлял 1.9%. Порог нельзя было
 # перейти ни при какой цели и ни на каком расстоянии — и в логах он ни разу
@@ -625,7 +625,7 @@ TEMPLATE_RESCALE_ON_SIZE_CHANGE = False
 # выставлялся при слежении БЕЗУСЛОВНО, и на полётнике включался MSP OVERRIDE.
 # А пока он включён, MSP_RC возвращает НАШИ ЖЕ значения вместо стиков пилота —
 # в логе оказалось бы эхо трекера вместо действий человека, и выглядело бы это
-# совершенно правдоподобно. Вся кампания налётов ушла бы впустую.
+# совершенно правдоподобно. Вся кампания вылетов ушла бы впустую.
 #
 # Здесь оверрайд не включается вовсе. Заодно это гарантия безопасности: машина
 # физически не может вмешаться в управление, пока пилот заходит на цель.
@@ -648,7 +648,7 @@ YAW_SIGN = +1
 # На стенде раньше стояло 120 ради подстраховки от runaway_takeoff_prevention
 # при отсутствии аэродинамики. В реальном полёте этого мало:
 # при P_GAIN_ROLL=11 потолок 120 достигается уже на adx=11 — авторитета не хватает
-# для агрессивных манёвров на терминальной фазе.
+# для агрессивных манёвров на фазе сближения.
 # Сейчас выставлено 400 / 400 / 300 = 80% / 80% / 60% полного стика.
 # Это даёт квадрату полную скорость вращения по rate-профилю Betaflight,
 # но всё ещё оставляет запас «до края». Если хочешь полный авторитет — ставь 500.
@@ -758,15 +758,15 @@ FF_GAIN_ROLL = 2.0      # PWM на (px/кадр) скорости цели по 
 FF_GAIN_PITCH = 1.5     # PWM на (px/кадр) скорости цели по Y
 FF_GAIN_YAW = 1.0       # PWM на (px/кадр) скорости цели по X (для yaw тоже X)
 
-# --- ТЕРМИНАЛЬНЫЙ РЕЖИМ ---
+# --- РЕЖИМ СБЛИЖЕНИЯ ---
 # Когда коробка занимает заметную часть кадра — мы в финальной фазе.
 # Времени на интеграл нет, нужны рефлексы: повышаем P, поджимаем I.
 # Триггер: площадь коробки относительно всего кадра.
-TERMINAL_MODE_ENABLED = True
-TERMINAL_BOX_FRAC_THRESHOLD = 0.18   # 18% площади кадра = «уже близко»
-TERMINAL_P_MULTIPLIER = 1.6          # P-гэйны умножаем на это в терминале
-TERMINAL_I_MULTIPLIER = 0.3          # I-гэйны срезаем (нет времени интегрировать)
-TERMINAL_FF_MULTIPLIER = 1.3         # FF тоже приподнимаем — реакция должна быть резче
+CLOSING_MODE_ENABLED = True
+CLOSING_BOX_FRAC_THRESHOLD = 0.18   # 18% площади кадра = «уже близко»
+CLOSING_P_MULTIPLIER = 1.6          # P-гэйны умножаем на это в сближении
+CLOSING_I_MULTIPLIER = 0.3          # I-гэйны срезаем (нет времени интегрировать)
+CLOSING_FF_MULTIPLIER = 1.3         # FF тоже приподнимаем — реакция должна быть резче
 
 # --- АДАПТИВНЫЙ SEARCH_MARGIN ---
 # При неподвижной цели бессмысленно искать в большом окне — больше шансов
@@ -949,7 +949,7 @@ LAUNCH_RAMP_DOWN_FRAMES = 30
 # Дополнительный газ во время launch (в % от текущего стика). Применяется
 # ТОЛЬКО если OVERRIDE_THROTTLE=True; иначе газ остаётся под управлением пилота.
 # При наклоне носа квад на низком газе трейдит высоту на скорость
-# (дайвит и разгоняется), что для камикадзе нормально. Если хочешь сохранять
+# (дайвит и разгоняется), что для сближения с наземной целью нормально. Если хочешь сохранять
 # высоту во время launch — включай boost.
 LAUNCH_THR_BOOST_PCT = 10.0
 
@@ -1185,7 +1185,7 @@ _FLIGHT_LOG_COLUMNS = (
     "match_score,flow_ok,lost_frames,reacq,"
     "box_cx,box_cy,box_w,box_h,box_frac,"
     "dx_raw,dy_raw,pitch_comp_px,lead_x,lead_y,dx_aim,dy_aim,adx,ady,dy_alt,"
-    "tgt_vx,tgt_vy,stable_frames,in_terminal,"
+    "tgt_vx,tgt_vy,stable_frames,in_closing,"
     "roll_p,roll_d,roll_i,roll_ff,roll_off,roll_sat,"
     "pitch_p,pitch_d,pitch_i,pitch_ff,pitch_off,pitch_sat,"
     "launch_pwm,cruise_pwm,pitch_comb,"
@@ -1794,7 +1794,7 @@ MSP_STATUS_PERIOD = 0.25
 # сплавленное с акселерометром), а не сырое давление — она заметно чище.
 # 10 Гц достаточно: вертикальная динамика квада куда медленнее кадра.
 MSP_ALTITUDE_PERIOD = 0.10
-# --- ДАННЫЕ ДЛЯ СБОРА ПО НАЛЁТАМ ---
+# --- ДАННЫЕ ДЛЯ СБОРА ПО ВЫЛЕТАМ ---
 # Гироскоп. САМОЕ ВАЖНОЕ из недостающего. В ACRO стик задаёт угловую СКОРОСТЬ,
 # значит связь «стик -> поведение аппарата» меряется именно по гироскопу. Углы
 # из MSP_ATTITUDE для этого не годятся: отфильтрованы и запаздывают. Без
@@ -1814,18 +1814,18 @@ MSP_GPS_ENABLED = True
 TARGET_LAT = None
 TARGET_LON = None
 
-# --- ЧТО ЕСТЬ НА БОЕВОМ БОРТУ, А ЧЕГО НЕТ ---
+# --- ЧТО ЕСТЬ НА СЕРИЙНОМ БОРТУ, А ЧЕГО НЕТ ---
 # GPS будет ТОЛЬКО на время замеров. На готовом борту приёмника нет.
 #
 # Отсюда жёсткое правило: ЗАКОН НАВЕДЕНИЯ НЕ ИМЕЕТ ПРАВА ЗАВИСЕТЬ НИ ОТ ОДНОЙ
-# величины из GPS. Иначе получится красивый закон, который на боевом борту
+# величины из GPS. Иначе получится красивый закон, который на серийном борту
 # просто не заработает.
 #
 # Роль GPS в кампании — не участвовать в законе, а ПРОВЕРИТЬ те величины,
 # которыми закон будет пользоваться потом:
 #   * дальность по высоте и углу — сверить с истинной дальностью;
 #   * путевую скорость по бегу земли — сверить с истинной скоростью.
-# То есть кампания с GPS нужна прежде всего для того, чтобы на боевом борту
+# То есть кампания с GPS нужна прежде всего для того, чтобы на серийном борту
 # можно было ДОВЕРЯТЬ дальности и скорости, посчитанным без него.
 #
 # Списки ниже читает разбор на земле: он обязан строить закон только из
@@ -4110,27 +4110,27 @@ def update_control_from_target():
     adx = 0.0 if abs(dx_aim) < DEADBAND_X else (dx_aim - DEADBAND_X if dx_aim > 0 else dx_aim + DEADBAND_X)
     ady = 0.0 if abs(dy_aim) < DEADBAND_Y else (dy_aim - DEADBAND_Y if dy_aim > 0 else dy_aim + DEADBAND_Y)
 
-    # --- Терминальный режим: близко к цели — другие гэйны ---
+    # --- Режим сближения: близко к цели — другие гэйны ---
     # Когда коробка занимает заметную часть кадра, мы в финальных секундах.
     # Поднимаем P (нужны рефлексы), срезаем I (нет времени интегрировать),
     # чуть повышаем FF (резче следуем за движением цели).
     box_w_main = box[2] - box[0]
     box_h_main = box[3] - box[1]
     box_frac = (box_w_main * box_h_main) / float(MAIN_W * MAIN_H)
-    in_terminal = TERMINAL_MODE_ENABLED and box_frac >= TERMINAL_BOX_FRAC_THRESHOLD
+    in_closing = CLOSING_MODE_ENABLED and box_frac >= CLOSING_BOX_FRAC_THRESHOLD
 
     # Оценка сближения. Пока ТОЛЬКО измеряется и пишется в лог — в закон
     # управления не входит (см. блок про оценку сближения выше).
     closure = _estimate_closure(box_w_main, box_h_main, box_cy, now_mono, k)
 
-    if in_terminal:
-        p_roll_eff = P_GAIN_ROLL * TERMINAL_P_MULTIPLIER
-        p_pitch_eff = P_GAIN_PITCH * TERMINAL_P_MULTIPLIER
-        i_roll_eff = I_GAIN_ROLL * TERMINAL_I_MULTIPLIER
-        i_pitch_eff = I_GAIN_PITCH * TERMINAL_I_MULTIPLIER
-        ff_roll_eff = FF_GAIN_ROLL * TERMINAL_FF_MULTIPLIER
-        ff_pitch_eff = FF_GAIN_PITCH * TERMINAL_FF_MULTIPLIER
-        ff_yaw_eff = FF_GAIN_YAW * TERMINAL_FF_MULTIPLIER
+    if in_closing:
+        p_roll_eff = P_GAIN_ROLL * CLOSING_P_MULTIPLIER
+        p_pitch_eff = P_GAIN_PITCH * CLOSING_P_MULTIPLIER
+        i_roll_eff = I_GAIN_ROLL * CLOSING_I_MULTIPLIER
+        i_pitch_eff = I_GAIN_PITCH * CLOSING_I_MULTIPLIER
+        ff_roll_eff = FF_GAIN_ROLL * CLOSING_FF_MULTIPLIER
+        ff_pitch_eff = FF_GAIN_PITCH * CLOSING_FF_MULTIPLIER
+        ff_yaw_eff = FF_GAIN_YAW * CLOSING_FF_MULTIPLIER
     else:
         p_roll_eff = P_GAIN_ROLL
         p_pitch_eff = P_GAIN_PITCH
@@ -4278,7 +4278,7 @@ def update_control_from_target():
         "dx_aim": dx_aim, "dy_aim": dy_aim, "adx": adx, "ady": ady,
         "dy_alt": dy_alt,
         "tgt_vx": target_vx_smoothed, "tgt_vy": target_vy_smoothed,
-        "stable": stable_track_frames, "terminal": in_terminal,
+        "stable": stable_track_frames, "terminal": in_closing,
         "roll_p": r_p, "roll_d": r_d, "roll_i": r_i, "roll_ff": r_ff,
         "roll_off": r_off, "roll_sat": r_sat,
         "pitch_p": p_p, "pitch_d": p_d, "pitch_i": p_i, "pitch_ff": p_ff,
@@ -5382,7 +5382,7 @@ def camera_callback(request):
                     chroma_v = cv_.copy()
 
         # Путевая скорость по бегу земли. Считается всегда, когда включена:
-        # она нужна и для разбора налётов, и как замена GPS.
+        # она нужна и для разбора вылетов, и как замена GPS.
         if GROUND_SPEED_ENABLED:
             estimate_ground_speed(gray, _cb_t0)
 
