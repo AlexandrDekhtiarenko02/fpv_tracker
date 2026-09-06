@@ -1759,6 +1759,45 @@ def _code_version():
         branch, commit, dirty, digest, me)
 
 
+def _kod_metka():
+    """Короткая метка версии кода для имени папки захода.
+
+    Зачем в ИМЕНИ, а не только внутри итога: папок за день набирается под
+    сотню, и при разборе постоянно нужно знать, каким кодом снят конкретный
+    заход. Сегодня это выяснялось листанием итогов по одной; с меткой в имени
+    видно сразу в списке — и сразу видно, где проходит граница между версиями.
+
+    Помета «izm» означает, что tracker.py правили поверх коммита. Такой заход
+    невоспроизводим: по хешу его уже не поднять.
+
+    Считается ОДИН РАЗ при запуске. Вызывать git из камерного потока нельзя —
+    на локе это дало бы ступор на кадре, ровно как отладочные снимки.
+    """
+    try:
+        me = os.path.abspath(__file__)
+        here = os.path.dirname(me)
+    except NameError:
+        return "nogit"
+    try:
+        commit = subprocess.check_output(
+            ["git", "-C", here, "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL, timeout=5).decode().strip()
+    except Exception:
+        return "nogit"
+    if not commit:
+        return "nogit"
+    try:
+        changed = subprocess.check_output(
+            ["git", "-C", here, "status", "--porcelain", "--", me],
+            stderr=subprocess.DEVNULL, timeout=5).decode().strip()
+    except Exception:
+        changed = ""
+    return commit + ("-izm" if changed else "")
+
+
+KOD_METKA = _kod_metka()
+
+
 def _fmt(v):
     if v is None:
         return ""
@@ -1893,7 +1932,8 @@ class LockLogger:
             stamp = time.strftime("%Y%m%d_%H%M%S")
             self.n += 1
             self._path = os.path.join(self.dir, LOCK_LOG_DIR,
-                                      "%s_zahvat%02d" % (stamp, self.n))
+                                      "%s_zahvat%02d_%s"
+                                      % (stamp, self.n, KOD_METKA))
             os.makedirs(self._path, exist_ok=True)
             self._csv = open(os.path.join(self._path, "строки.csv"), "w",
                              buffering=1 << 16)
