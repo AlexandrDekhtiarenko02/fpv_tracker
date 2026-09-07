@@ -5062,15 +5062,18 @@ def draw_range_readout(frame, box):
         if x + w_est > frame.shape[1] - 4:
             x = max(4, int(x1) - 10 - w_est)
         y = int(clamp(y1 + 12, 14, frame.shape[0] - 14 * len(lines)))
-        for i, (text, color) in enumerate(lines):
+        for i, (text, _color) in enumerate(lines):
             yy = y + i * 14
-            # Обводка чёрным: без неё текст пропадает на светлом фоне.
-            # Сглаживание (LINE_AA) НЕ включаем — замерено, оно стоит 8.8 мс
-            # на малине против 0.6 мс без него, при бюджете кадра 38 мс.
+            # БЕЛЫМ и тонко: цветной текст на видео читался плохо. Надёжность
+            # величины цвет больше не несёт — она и так видна числом (R 141
+            # +-30m) и строкой d рядом с GPS, то есть цвет был дублированием.
+            # Обводка чёрным в ОДИН пиксель: двойная делала текст жирным и
+            # мутным на светлом фоне. Сглаживание (LINE_AA) НЕ включаем —
+            # замерено, оно стоит 8.8 мс на малине против 0.6 мс без него.
             cv2.putText(frame, text, (x, yy), cv2.FONT_HERSHEY_PLAIN,
-                        1.0, COLOR_BLACK, 2)
+                        1.0, COLOR_BLACK, 2, cv2.LINE_8)
             cv2.putText(frame, text, (x, yy), cv2.FONT_HERSHEY_PLAIN,
-                        1.0, color, 1)
+                        1.0, COLOR_WHITE, 1, cv2.LINE_8)
     except Exception:
         pass
 
