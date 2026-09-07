@@ -1,7 +1,3 @@
-# FPV Tracker
-
-Код донаведения для FPV-дрона: Raspberry Pi Zero 2W + камера IMX219,
-управление полётным контроллером Betaflight по MSP.
 
 ## Запуск на малине
 
