@@ -27,6 +27,10 @@ MSP_ATTITUDE, отклик на команду — в MSP_MOTOR.
 Проверка идёт в два шага. Первый — БЕЗ АРМА, аппарат просто наклоняют рукой.
 Второй требует арма и потому спрашивает подтверждение отдельно.
 
+Если первый шаг уже пройден, второй запускается отдельно:
+
+    python3 tools/os_znaki.py --shag2
+
 ВИНТЫ СНЯТЬ. Второй шаг армит аппарат и раскручивает моторы.
 """
 import os
@@ -186,6 +190,31 @@ def _srednie_motory(fc, pitch_pwm, sek=1.2):
     return [sum(s[i] for s in sbor) / float(n) for i in range(4)]
 
 
+DA = ("da", "да", "d", "д", "y", "yes", "ага", "ок", "ok")
+NET = ("net", "нет", "n", "н", "no", "-", "")
+
+
+def _soglasie():
+    """Согласие на шаг с армом. Переспрашивает, а не толкует молча.
+
+    Неузнанный ответ раньше означал «пропустить»: набранное второпях «dada»
+    отменяло шаг, хотя человек явно соглашался. Молчаливый отказ на шаге,
+    который иначе некому выполнить, хуже лишнего вопроса.
+    """
+    while True:
+        print("Продолжаем? (da / net): ", end="")
+        sys.stdout.flush()
+        try:
+            otvet = input().strip().lower()
+        except EOFError:
+            return False
+        if otvet in DA:
+            return True
+        if otvet in NET:
+            return False
+        print("  Не понял ответ %r. Нужно da или net." % otvet)
+
+
 def shag_pwm(fc):
     print()
     print("=" * 62)
@@ -198,9 +227,7 @@ def shag_pwm(fc):
     print("тяги сзади — по этому и определяется направление.")
     print()
     print("Нужно: MSP OVERRIDE поднят, аппарат заармлен, аппарат закреплён.")
-    print("Набери 'da' чтобы продолжить, что угодно другое — пропустить: ", end="")
-    sys.stdout.flush()
-    if input().strip().lower() != "da":
+    if not _soglasie():
         print("Шаг 2 пропущен.")
         return None
 
@@ -277,7 +304,15 @@ def main():
         print("Полётник не отвечает по MSP. Проверь кабель и порт.")
         return 1
 
-    z1 = shag_ugol(fc)
+    tolko2 = "--shag2" in sys.argv
+    if tolko2:
+        # Знак угла уже установлен на этой плате — второй раз наклонять
+        # аппарат руками незачем.
+        print()
+        print("Шаг 1 пропущен по --shag2 (знак угла считаем уже проверенным).")
+        z1 = 1
+    else:
+        z1 = shag_ugol(fc)
     z2 = shag_pwm(fc)
 
     print()
