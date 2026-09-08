@@ -1371,7 +1371,7 @@ FLIGHT_LOG_FSYNC = True
 # итоговой dy_aim этого не увидеть.
 
 _FLIGHT_LOG_COLUMNS = (
-    "t,frame,fps,state,controllable,aux4,override,launch_phase,launch_int,"
+    "t,frame,fps,state,controllable,aux4,override,fc_ovr,launch_phase,launch_int,"
     "match_score,flow_ok,lost_frames,reacq,"
     "box_cx,box_cy,box_w,box_h,box_frac,"
     "dx_raw,dy_raw,pitch_comp_px,lead_x,lead_y,dx_aim,dy_aim,adx,ady,dy_alt,"
@@ -2496,6 +2496,48 @@ def send_msp_set_raw_rc(channels):
         pass
 
 
+_ovr_zhaloba_ts = 0.0
+_ovr_zhaloba_s = 0.0
+
+
+def _preduprezhdenie_ob_overrayde(rulim):
+    """Трекер шлёт команды, а полётник их не берёт.
+
+    Самая дорогая осечка проверки управления: всё выглядит исправным —
+    захват держится, поправки считаются, в логе цифры, — а борт летит как
+    летел, потому что MSP OVERRIDE на полётнике не поднят. Без этой строки
+    разбираться пришлось бы уже после посадки, по логу.
+    """
+    global _ovr_zhaloba_ts, _ovr_zhaloba_s
+    now = time.monotonic()
+    if not rulim:
+        _ovr_zhaloba_s = 0.0
+        return
+    with state_lock:
+        prinyat = bool(app_state.get("fc_override_on"))
+        ts = app_state.get("fc_override_ts", 0.0)
+    # Пока полётник ни разу не сказал про режим, молчим: неизвестно ≠ выключен.
+    if ts <= 0.0:
+        return
+    if prinyat:
+        _ovr_zhaloba_s = 0.0
+        return
+    # Полсекунды выдержки: на переключении тумблера состояния расходятся на
+    # один-два цикла, и ложная тревога в этот момент только мешает.
+    if _ovr_zhaloba_s == 0.0:
+        _ovr_zhaloba_s = now
+        return
+    if now - _ovr_zhaloba_s < 0.5:
+        return
+    if now - _ovr_zhaloba_ts < 5.0:
+        return
+    _ovr_zhaloba_ts = now
+    flight_log.event(
+        "MSP OVERRIDE НЕ ПОДНЯТ на полётнике: трекер шлёт команды, борт их "
+        "игнорирует. Проверить режим MSP OVERRIDE в Betaflight и маску "
+        "msp_override_channels_mask")
+
+
 def build_output_channels(receiver, r_cmd, p_cmd, y_cmd, t_cmd, apply_ov):
     """Собрать 8 каналов для MSP_SET_RAW_RC.
 
@@ -2835,7 +2877,14 @@ def fc_io_loop():
                     live, r_cmd, p_cmd, y_cmd, t_cmd, apply_ov)
                 with state_lock:
                     app_state["last_sent_channels"] = list(channels[:8])
+                    # Рулит ли трекер прямо сейчас. Нужно отдельно от ov:
+                    # ov — «есть цель», а команды уходят только при поднятом
+                    # AUX4. Ниже по этой пометке ловится случай, когда трекер
+                    # шлёт, а борт не принимает.
+                    app_state["steering"] = apply_ov
+                    app_state["steering_ts"] = time.monotonic()
                 send_msp_set_raw_rc(channels)
+                _preduprezhdenie_ob_overrayde(apply_ov)
             # Без связи с FC вообще ничего не шлём — иначе он получит
             # стартовое «среднее» из app_state.
         except Exception:
@@ -5425,6 +5474,52 @@ def draw_sensor_report(frame):
                 cv2.putText(frame, tekst, (tx, y), SENSOR_FONT_FACE,
                             SENSOR_FONT, col, 1)
             y += SENSOR_LINE_H
+        global _sensor_niz
+        _sensor_niz = (x, y)
+    except Exception:
+        pass
+
+
+_sensor_niz = None
+
+
+def draw_control_state(frame):
+    """Одна строка: рулит ли трекер и берёт ли борт команды.
+
+    В очках не видно ни журнала, ни лога — только кадр. Проверка управления
+    без этой строки сводится к гаданию, отчего аппарат не довернул: трекер
+    не считал, или полётник не принял.
+    """
+    if OBSERVE_ONLY:
+        return
+    try:
+        now = time.monotonic()
+        with state_lock:
+            rulim = bool(app_state.get("steering"))
+            svezho = (now - app_state.get("steering_ts", 0.0)) < 0.5
+            prinyat = bool(app_state.get("fc_override_on"))
+            izvestno = app_state.get("fc_override_ts", 0.0) > 0.0
+        if not (rulim and svezho):
+            tekst, col = "ovr - standby", COLOR_WHITE
+        elif not izvestno:
+            tekst, col = "ovr - sending", COLOR_YELLOW
+        elif prinyat:
+            tekst, col = "ovr - live", COLOR_GREEN
+        else:
+            tekst, col = "ovr - NOT ACCEPTED", COLOR_RED
+        h, w = frame.shape[0], frame.shape[1]
+        if _sensor_niz:
+            x, y = _sensor_niz
+        else:
+            x = int(w * SENSOR_X_FRAC)
+            y = MAG_MARGIN + (MAG_SIZE if MAG_ENABLED else 0) + SENSOR_LINE_H + 6
+        y += 2
+        if y + SENSOR_LINE_H > h:
+            return
+        cv2.putText(frame, tekst, (x, y), SENSOR_FONT_FACE, SENSOR_FONT,
+                    COLOR_BLACK, 2)
+        cv2.putText(frame, tekst, (x, y), SENSOR_FONT_FACE, SENSOR_FONT,
+                    col, 1)
     except Exception:
         pass
 
@@ -5443,6 +5538,7 @@ def draw_overlay_on_frame(frame):
     # Строго после лупы: она пишет прямоугольник поверх кадра и затёрла бы
     # отчёт, окажись он раньше.
     draw_sensor_report(frame)
+    draw_control_state(frame)
 
 # =========================================================
 # 10. TRACKING CORE (без изменений)
@@ -6051,6 +6147,10 @@ def _capture_flight_row(cb_t0):
             ctrl = target_controllable
             aux = aux4_state
             ov = override_active
+            # Отдельно от ov: ov — «трекер считает себя управляющим», fc_ovr —
+            # «полётник принимает». Разбор после посадки без этой пары
+            # неотличим: команды в логе есть, а аппарат их не выполнял.
+            fc_ovr_row = app_state.get("fc_override_on")
             r_cmd = int(global_roll_cmd)
             p_cmd = int(global_pitch_cmd)
             y_cmd = int(global_yaw_cmd)
@@ -6149,6 +6249,7 @@ def _capture_flight_row(cb_t0):
 
         _row_values = (
             now - flight_log._t0, frame_index, fps_current, st, ctrl, aux, ov,
+            fc_ovr_row,
             c.get("launch_phase") if active else "", g("launch_int"),
             last_match_score, last_flow_ok, lost_frames, auto_reacq_attempts,
             g("box_cx"), g("box_cy"), g("box_w"), g("box_h"), g("box_frac"),
@@ -6404,11 +6505,25 @@ def _gotovnost_k_sboru():
             if need and not ok:
                 beda.append(why)
 
-        check("режим наблюдения включён", OBSERVE_ONLY, True,
-              "БЕЗ OBSERVE_ONLY в стиках окажется эхо трекера, а не действия "
-              "пилота — вся выборка будет негодной")
-        check("оверрайд на полётнике выключен", not fc_ovr, True,
-              "оверрайд активен: MSP_RC возвращает наши же значения")
+        if OBSERVE_ONLY:
+            # Сбор данных: в стиках должны быть действия пилота, а не эхо.
+            check("режим наблюдения включён", True, True, "")
+            check("оверрайд на полётнике выключен", not fc_ovr, True,
+                  "оверрайд активен: MSP_RC возвращает наши же значения")
+        else:
+            # Проверка управления: обратные требования. Трекер обязан рулить,
+            # а полётник — принимать команды, иначе вылет ничего не покажет.
+            check("управление включено", True, True, "")
+            osi = [nm for nm, on in (("roll", OVERRIDE_ROLL),
+                                     ("pitch", OVERRIDE_PITCH),
+                                     ("yaw", OVERRIDE_YAW),
+                                     ("throttle", OVERRIDE_THROTTLE)) if on]
+            check("оси под трекером: " + (",".join(osi) or "нет"),
+                  bool(osi), True,
+                  "все оси отданы пилоту: трекер считает поправки, но борт "
+                  "их не увидит — вылет ничего не покажет")
+            check("MSP OVERRIDE поднят на полётнике", bool(fc_ovr), False,
+                  "")
         check("папка на каждый захват", LOCK_LOG_ENABLED, True,
               "захваты сольются в один файл, разбирать поштучно не выйдет")
         check("гироскоп отвечает", bool(imu), True,
@@ -6421,12 +6536,15 @@ def _gotovnost_k_sboru():
         check("GPS отвечает", gps, False, "")
         check("координаты цели заданы", TARGET_LAT is not None, False, "")
 
-        flight_log.event("ГОТОВНОСТЬ К СБОРУ ДАННЫХ:\n" + "\n".join(lines))
+        zagolovok = ("ГОТОВНОСТЬ К СБОРУ ДАННЫХ" if OBSERVE_ONLY
+                     else "ГОТОВНОСТЬ К ПРОВЕРКЕ УПРАВЛЕНИЯ")
+        flight_log.event(zagolovok + ":\n" + "\n".join(lines))
         if beda:
             for b in beda:
                 flight_log.event("  НЕ ГОТОВО: %s" % b)
-            flight_log.event("  => СБОР ДАННЫХ НЕ ИМЕЕТ СМЫСЛА, пока это не "
-                             "исправлено")
+            flight_log.event(
+                "  => %s НЕ ИМЕЕТ СМЫСЛА, пока это не исправлено"
+                % ("СБОР ДАННЫХ" if OBSERVE_ONLY else "ПРОВЕРКА УПРАВЛЕНИЯ"))
         elif not gps:
             flight_log.event(
                 "  готово. GPS нет — сбор идёт по высоте, углу и бегу земли, "
