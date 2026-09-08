@@ -24,7 +24,7 @@ MSP_ATTITUDE, отклик на команду — в MSP_MOTOR.
     python3 tools/os_znaki.py
     sudo systemctl start tracker
 
-Проверка идёт в два шага. Первый — БЕЗ АРМА, аппарат просто наклоняют рукой.
+Проверка идёт в три шага. Первый — БЕЗ АРМА, аппарат просто наклоняют рукой.
 Второй требует арма и потому спрашивает подтверждение отдельно.
 
 Если первый шаг уже пройден, второй запускается отдельно:
@@ -168,18 +168,22 @@ def shag_ugol(fc):
 
 # ---------- шаг 2: куда PWM клонит нос ----------
 
-def _kanaly(pitch_pwm):
-    # Порядок MSP_SET_RAW_RC — rcmap external (AETR): R, P, T, Y, затем AUX.
-    ch = [1500, int(pitch_pwm), 1000, 1500, 1000, 1000, 1000, 1000]
+# Порядок MSP_SET_RAW_RC — rcmap external (AETR): R, P, T, Y, затем AUX.
+OS_INDEX = {"kren": 0, "tangazh": 1}
+
+
+def _kanaly(os_imya, pwm):
+    ch = [1500, 1500, 1000, 1500, 1000, 1000, 1000, 1000]
+    ch[OS_INDEX[os_imya]] = int(pwm)
     return struct.pack("<8H", *ch)
 
 
-def _srednie_motory(fc, pitch_pwm, sek=1.2):
+def _srednie_motory(fc, os_imya, pwm, sek=1.2):
     """Держим команду и копим моторы. Поток кадров нужен непрерывный."""
     sbor = []
     t0 = time.monotonic()
     while time.monotonic() - t0 < sek:
-        msp(fc, MSP_SET_RAW_RC, _kanaly(pitch_pwm))
+        msp(fc, MSP_SET_RAW_RC, _kanaly(os_imya, pwm))
         m = motory(fc)
         if m and len(m) >= 4 and max(m) > 1000:
             sbor.append(m)
@@ -238,11 +242,11 @@ def shag_pwm(fc):
 
     print()
     print("  подаю тангаж 1350 ...")
-    nizhe = _srednie_motory(fc, 1350)
+    nizhe = _srednie_motory(fc, "tangazh", 1350)
     print("  подаю тангаж 1650 ...")
-    vyshe = _srednie_motory(fc, 1650)
+    vyshe = _srednie_motory(fc, "tangazh", 1650)
     # Возврат в центр и снятие команды.
-    _srednie_motory(fc, 1500, sek=0.5)
+    _srednie_motory(fc, "tangazh", 1500, sek=0.5)
 
     if nizhe is None or vyshe is None:
         print()
@@ -289,6 +293,72 @@ def shag_pwm(fc):
     return znak
 
 
+def shag_kren(fc):
+    """Знак крена — тем же способом по моторам.
+
+    Отдельным шагом, а не заодно с тангажом: тангаж на этом борту оказался
+    обратным «стандартному», и после такого принимать крен на веру нельзя.
+    """
+    print()
+    print("=" * 62)
+    print("ШАГ 3. Куда PWM клонит аппарат по крену. ТРЕБУЕТ АРМА.")
+    print("=" * 62)
+    print("ВИНТЫ ДОЛЖНЫ БЫТЬ СНЯТЫ.")
+    print()
+    print("Подаю крен 1350 и 1650. Аппарат кренится вправо той командой,")
+    print("при которой больше тяги дают ЛЕВЫЕ моторы.")
+    if not _soglasie():
+        print("Шаг 3 пропущен.")
+        return None
+    if not armed(fc):
+        print()
+        print("  АППАРАТ НЕ ЗААРМЛЕН. Заармь и запусти заново.")
+        return None
+
+    print()
+    print("  подаю крен 1350 ...")
+    nizhe = _srednie_motory(fc, "kren", 1350)
+    print("  подаю крен 1650 ...")
+    vyshe = _srednie_motory(fc, "kren", 1650)
+    _srednie_motory(fc, "kren", 1500, sek=0.5)
+    if nizhe is None or vyshe is None:
+        print()
+        print("  МОТОРЫ НЕ ОТВЕЧАЮТ. Либо разармился, либо в маске каналов")
+        print("  оверрайда нет крена.")
+        return None
+
+    print()
+    print("  %-8s %8s %8s %8s %8s" % ("крен", "m1", "m2", "m3", "m4"))
+    print("  %-8s %8.0f %8.0f %8.0f %8.0f" % (("1350",) + tuple(nizhe)))
+    print("  %-8s %8.0f %8.0f %8.0f %8.0f" % (("1650",) + tuple(vyshe)))
+
+    # quadX по умолчанию: m1 зад-право, m2 перёд-право, m3 зад-лево,
+    # m4 перёд-лево. Крен вправо = больше тяги СЛЕВА.
+    def levye_minus_pravye(m):
+        return (m[2] + m[3]) - (m[0] + m[1])
+
+    d_n = levye_minus_pravye(nizhe)
+    d_v = levye_minus_pravye(vyshe)
+    print()
+    print("  левые минус правые:  при 1350  %+.0f" % d_n)
+    print("                       при 1650  %+.0f" % d_v)
+    if abs(d_v - d_n) < 30:
+        print()
+        print("  РАЗНИЦА СЛИШКОМ МАЛА — команда до моторов не дошла.")
+        return None
+
+    znak = +1 if d_v > d_n else -1
+    print()
+    print("  ВЫВОД: вправо кренит PWM %s 1500."
+          % ("ВЫШЕ" if znak > 0 else "НИЖЕ"))
+    if znak > 0:
+        print("  Совпадает с ROLL_SIGN = +1 в tracker.py.")
+    else:
+        print("  НЕ СОВПАДАЕТ: в tracker.py ROLL_SIGN = +1.")
+        print("  Скажи мне результат, поправлю.")
+    return znak
+
+
 def main():
     print("порт: %s" % PORT)
     try:
@@ -314,6 +384,7 @@ def main():
     else:
         z1 = shag_ugol(fc)
     z2 = shag_pwm(fc)
+    z3 = shag_kren(fc)
 
     print()
     print("=" * 62)
@@ -322,12 +393,19 @@ def main():
     print("  знак угла (нос вниз = ...):   %s"
           % ({1: "положительный fc_pitch — как в коде",
               -1: "отрицательный fc_pitch — В КОДЕ ИНАЧЕ"}.get(z1, "не определён")))
-    print("  знак команды (нос вниз = ...): %s"
-          % ({-1: "PWM ниже 1500 — как в коде",
-              1: "PWM выше 1500 — В КОДЕ ИНАЧЕ"}.get(z2, "не определён")))
-    if z1 == 1 and z2 == -1:
+    print("  знак тангажа (нос вниз = ...): %s"
+          % ({1: "PWM выше 1500 — как в коде",
+              -1: "PWM ниже 1500 — В КОДЕ ИНАЧЕ"}.get(z2, "не определён")))
+    print("  знак крена (вправо = ...):     %s"
+          % ({1: "PWM выше 1500 — как в коде",
+              -1: "PWM ниже 1500 — В КОДЕ ИНАЧЕ"}.get(z3, "не определён")))
+    print()
+    print("  Рыскание по моторам не определяется: направление зависит ещё и")
+    print("  от того, куда крутятся винты, а MSP_MOTOR этого не сообщает.")
+    print("  Его знак проверяется только в воздухе.")
+    if z1 == 1 and z2 == 1 and z3 == 1:
         print()
-        print("  Оба знака сходятся с кодом. По этой части можно лететь.")
+        print("  Тангаж и крен сходятся с кодом. Остаётся рыскание.")
     else:
         print()
         print("  Есть расхождение либо неопределённость. Пришли мне вывод.")
