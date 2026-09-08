@@ -24,7 +24,7 @@ MSP_ATTITUDE, отклик на команду — в MSP_MOTOR.
     python3 tools/os_znaki.py
     sudo systemctl start tracker
 
-Проверка идёт в три шага. Первый — БЕЗ АРМА, аппарат просто наклоняют рукой.
+Проверка идёт в четыре шага. Первый — БЕЗ АРМА, аппарат просто наклоняют рукой.
 Второй требует арма и потому спрашивает подтверждение отдельно.
 
 Если первый шаг уже пройден, второй запускается отдельно:
@@ -48,6 +48,7 @@ MSP_STATUS = 101
 MSP_MOTOR = 104
 MSP_RC = 105
 MSP_ATTITUDE = 108
+MSP_MIXER_CONFIG = 42
 MSP_SET_RAW_RC = 200
 
 
@@ -100,6 +101,20 @@ def motory(fc):
     if d is None or len(d) < 8:
         return None
     return list(struct.unpack("<" + "H" * (len(d) // 2), d))[:4]
+
+
+def mikser(fc):
+    """Тип микшера и признак развёрнутых по рысканию моторов.
+
+    Именно этого не хватало, чтобы определить рыскание по моторам: диагональ,
+    которая ускоряется, говорит лишь о ЗНАКЕ команды в микшере, а куда при
+    этом повернётся нос — зависит от направления вращения винтов. Полётник
+    знает его сам и отдаёт в MSP_MIXER_CONFIG.
+    """
+    d = msp(fc, MSP_MIXER_CONFIG)
+    if d is None or len(d) < 2:
+        return None, None
+    return d[0], bool(d[1])
 
 
 def armed(fc):
@@ -169,7 +184,7 @@ def shag_ugol(fc):
 # ---------- шаг 2: куда PWM клонит нос ----------
 
 # Порядок MSP_SET_RAW_RC — rcmap external (AETR): R, P, T, Y, затем AUX.
-OS_INDEX = {"kren": 0, "tangazh": 1}
+OS_INDEX = {"kren": 0, "tangazh": 1, "ryskanie": 3}
 
 
 def _kanaly(os_imya, pwm):
@@ -359,6 +374,95 @@ def shag_kren(fc):
     return znak
 
 
+MIXER_QUADX = 3
+
+
+def shag_ryskanie(fc):
+    """Знак рыскания. По моторам плюс направление вращения винтов.
+
+    Одних моторов мало: диагональ показывает знак команды в микшере, а не
+    сторону поворота. Недостающее — yaw_motors_reversed из MSP_MIXER_CONFIG.
+    """
+    print()
+    print("=" * 62)
+    print("ШАГ 4. Куда PWM разворачивает нос. ТРЕБУЕТ АРМА.")
+    print("=" * 62)
+    print("ВИНТЫ ДОЛЖНЫ БЫТЬ СНЯТЫ.")
+
+    rezhim, razvernuty = mikser(fc)
+    if rezhim is None:
+        print()
+        print("  Полётник не отдал MSP_MIXER_CONFIG — направление вращения")
+        print("  винтов неизвестно, а без него сторону поворота по моторам")
+        print("  не определить. Знак рыскания придётся проверять в воздухе.")
+        return None
+    print()
+    print("  микшер: %d%s" % (rezhim, " (quadX)" if rezhim == MIXER_QUADX else ""))
+    print("  моторы развёрнуты по рысканию: %s" % ("да" if razvernuty else "нет"))
+    if rezhim != MIXER_QUADX:
+        print()
+        print("  Это не quadX. Раскладка моторов другая, разбирать надо")
+        print("  вручную. Знак рыскания проверяй в воздухе.")
+        return None
+
+    print()
+    print("Подаю рыскание 1350 и 1650, смотрю, какая ДИАГОНАЛЬ ускоряется.")
+    if not _soglasie():
+        print("Шаг 4 пропущен.")
+        return None
+    if not armed(fc):
+        print()
+        print("  АППАРАТ НЕ ЗААРМЛЕН. Заармь и запусти заново.")
+        return None
+
+    print()
+    print("  подаю рыскание 1350 ...")
+    nizhe = _srednie_motory(fc, "ryskanie", 1350)
+    print("  подаю рыскание 1650 ...")
+    vyshe = _srednie_motory(fc, "ryskanie", 1650)
+    _srednie_motory(fc, "ryskanie", 1500, sek=0.5)
+    if nizhe is None or vyshe is None:
+        print()
+        print("  МОТОРЫ НЕ ОТВЕЧАЮТ. Либо разармился, либо в маске каналов")
+        print("  оверрайда нет рыскания.")
+        return None
+
+    print()
+    print("  %-10s %8s %8s %8s %8s" % ("рыскание", "m1", "m2", "m3", "m4"))
+    print("  %-10s %8.0f %8.0f %8.0f %8.0f" % (("1350",) + tuple(nizhe)))
+    print("  %-10s %8.0f %8.0f %8.0f %8.0f" % (("1650",) + tuple(vyshe)))
+
+    # quadX: m1 зад-право, m2 перёд-право, m3 зад-лево, m4 перёд-лево.
+    # Микшер Betaflight по рысканию: m2 и m3 в плюс, m1 и m4 в минус.
+    def diagonal(m):
+        return (m[1] + m[2]) - (m[0] + m[3])
+
+    d_n = diagonal(nizhe)
+    d_v = diagonal(vyshe)
+    print()
+    print("  диагональ (m2+m3) - (m1+m4):  при 1350  %+.0f" % d_n)
+    print("                                при 1650  %+.0f" % d_v)
+    if abs(d_v - d_n) < 30:
+        print()
+        print("  РАЗНИЦА СЛИШКОМ МАЛА — команда до моторов не дошла.")
+        return None
+
+    # Положительная команда микшера = нос вправо, если моторы не развёрнуты.
+    polozh_vpravo = (d_v > d_n)
+    if razvernuty:
+        polozh_vpravo = not polozh_vpravo
+    znak = +1 if polozh_vpravo else -1
+    print()
+    print("  ВЫВОД: нос вправо разворачивает PWM %s 1500."
+          % ("ВЫШЕ" if znak > 0 else "НИЖЕ"))
+    if znak > 0:
+        print("  Совпадает с YAW_SIGN = +1 в tracker.py.")
+    else:
+        print("  НЕ СОВПАДАЕТ: в tracker.py YAW_SIGN = +1.")
+        print("  Скажи мне результат, поправлю.")
+    return znak
+
+
 def main():
     print("порт: %s" % PORT)
     try:
@@ -385,6 +489,7 @@ def main():
         z1 = shag_ugol(fc)
     z2 = shag_pwm(fc)
     z3 = shag_kren(fc)
+    z4 = shag_ryskanie(fc)
 
     print()
     print("=" * 62)
@@ -399,13 +504,12 @@ def main():
     print("  знак крена (вправо = ...):     %s"
           % ({1: "PWM выше 1500 — как в коде",
               -1: "PWM ниже 1500 — В КОДЕ ИНАЧЕ"}.get(z3, "не определён")))
-    print()
-    print("  Рыскание по моторам не определяется: направление зависит ещё и")
-    print("  от того, куда крутятся винты, а MSP_MOTOR этого не сообщает.")
-    print("  Его знак проверяется только в воздухе.")
-    if z1 == 1 and z2 == 1 and z3 == 1:
+    print("  знак рыскания (вправо = ...):  %s"
+          % ({1: "PWM выше 1500 — как в коде",
+              -1: "PWM ниже 1500 — В КОДЕ ИНАЧЕ"}.get(z4, "не определён")))
+    if z1 == 1 and z2 == 1 and z3 == 1 and z4 == 1:
         print()
-        print("  Тангаж и крен сходятся с кодом. Остаётся рыскание.")
+        print("  Все три оси сходятся с кодом. По знакам можно лететь.")
     else:
         print()
         print("  Есть расхождение либо неопределённость. Пришли мне вывод.")
