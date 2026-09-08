@@ -818,7 +818,18 @@ FF_GAIN_YAW = 1.0       # PWM на (px/кадр) скорости цели по 
 # Времени на интеграл нет, нужны рефлексы: повышаем P, поджимаем I.
 # Триггер: площадь коробки относительно всего кадра.
 CLOSING_MODE_ENABLED = True
-CLOSING_BOX_FRAC_THRESHOLD = 0.18   # 18% площади кадра = «уже близко»
+CLOSING_BOX_FRAC_THRESHOLD = 0.18   # запасной признак, если времени нет
+# ПЕРЕКЛЮЧАЕМСЯ ПО ВРЕМЕНИ ДО КОНТАКТА, а не по доле кадра.
+#
+# Замерено по 46 заходам: доля кадра доходила до порога 0.18 лишь в 1.2%
+# кадров — то есть режим сближения не включался практически никогда. И не
+# мог: цель размером в десятки пикселей занимает 18% кадра, только когда до
+# неё считанные метры, а решения принимать надо раньше.
+#
+# Правильный признак — сколько СЕКУНД осталось. Он не зависит ни от размера
+# цели, ни от разрешения. При доле кадра 0.05 время до контакта было 6.8 с
+# по медиане, то есть решать надо примерно там.
+CLOSING_TAU_S = 4.0                 # ближе этого по времени — режим сближения
 CLOSING_P_MULTIPLIER = 1.6          # P-гэйны умножаем на это в сближении
 CLOSING_I_MULTIPLIER = 0.3          # I-гэйны срезаем (нет времени интегрировать)
 CLOSING_FF_MULTIPLIER = 1.3         # FF тоже приподнимаем — реакция должна быть резче
@@ -1042,6 +1053,45 @@ THROTTLE_OUT_ALPHA = 0.25
 
 DY_THROTTLE_GAIN = 1.0
 DY_THROTTLE_D_GAIN = 2.0
+
+# --- ГАЗ ПО ВРЕМЕНИ ДО КОНТАКТА ---
+#
+# Замерено по 46 заходам, как газом работал живой пилот:
+#     скорость выросла в 1.6 раза (9.3 -> 14.5 м/с)
+#     тангаж   вырос на 5° (20 -> 25°)
+#     газ      вырос меньше чем на 1% (1350 -> 1363)
+#     связь газа с вертикальной скоростью: r = 0.00
+#
+# То есть газ НЕ управлял снижением — снижение получалось от наклона. Пилот
+# трогал газ редко и грубо, выбирая темп захода, а целился тангажом.
+#
+# А в коде газ подруливает по пикселям кадр за кадром, то есть лезет в работу
+# тангажа. Отсюда новая роль: газ — распорядитель энергии, а не следящая ось.
+# Он смотрит на ВРЕМЯ до контакта и держит его между двумя границами:
+#
+#     заход затягивается (времени много) — добавить газ
+#     идём слишком быстро (времени мало) — убрать газ
+#     между границами                     — НЕ ТРОГАТЬ
+#
+# Почему по времени, а не по дальности: замерено, что на 60-90 м время до
+# контакта разбросано 4.6-12.3 с, а на 130-200 м — 1.9-12.5 с. Диапазоны
+# накладываются, то есть по дальности невозможно понять, у тебя две секунды
+# или двенадцать. Решает время, а не метры.
+THROTTLE_BY_TAU = True         # False = прежнее поведение по пикселям
+TAU_THROTTLE_LO_S = 3.0        # быстрее этого — сбрасываем газ
+TAU_THROTTLE_HI_S = 9.0        # медленнее этого — добавляем
+TAU_THROTTLE_GAIN = 12.0       # PWM на секунду выхода за границу
+TAU_THROTTLE_MAX = 120.0       # предел поправки по времени
+# УДЕРЖАНИЕ ВРЕМЕНИ, когда рост рамки временно пропал.
+#
+# Замерено: время до контакта заполнено лишь в 51% кадров — на вялом
+# сближении рамка почти не растёт, и оценка гаснет. Для газа это плохо: он
+# бездействовал бы половину кадров не по решению, а от незнания.
+#
+# Время меняется медленно и предсказуемо: каждую секунду оно убывает на
+# секунду. Поэтому пропажу переживаем экстраполяцией, а не обнулением. Но
+# недолго: через TAU_HOLD_S оценка признаётся протухшей и газ отпускается.
+TAU_HOLD_S = 1.5
 DY_INTEGRAL_RATE = 0.04
 DY_INTEGRAL_MAX = 60.0
 DY_INTEGRAL_DECAY = 0.985
@@ -2281,6 +2331,8 @@ prev_box_size_px = None
 # разбросу — надёжность времени до контакта.
 _growth_raw = collections.deque(maxlen=24)
 box_growth_smoothed = 0.0
+_tau_hold_val = None           # последнее годное время до контакта
+_tau_hold_t = 0.0              # когда оно было замерено
 # Хвост (время, размер рамки) для оценки времени до контакта по окну.
 _size_hist = collections.deque(maxlen=256)
 
@@ -4679,11 +4731,22 @@ def update_control_from_target():
     box_w_main = box[2] - box[0]
     box_h_main = box[3] - box[1]
     box_frac = (box_w_main * box_h_main) / float(MAIN_W * MAIN_H)
-    in_closing = CLOSING_MODE_ENABLED and box_frac >= CLOSING_BOX_FRAC_THRESHOLD
-
-    # Оценка сближения. Пока ТОЛЬКО измеряется и пишется в лог — в закон
-    # управления не входит (см. блок про оценку сближения выше).
+    # Оценка сближения. ТЕПЕРЬ ВХОДИТ В ЗАКОН: время до контакта решает, когда
+    # переключаться в режим сближения и как вести газ. Считать её надо ДО
+    # того, как она понадобится, — раньше она стояла ниже по коду.
     closure = _estimate_closure(box_w_main, box_h_main, box_cy, now_mono, k)
+
+    # Режим сближения: сначала по времени до контакта, и лишь если времени
+    # нет — по доле кадра. Доля кадра оставлена запасным признаком: она
+    # срабатывает слишком поздно (замерено — в 1.2% кадров), но лучше, чем
+    # ничего, когда рамка не растёт и время не считается.
+    _tau_now = closure.get("tau_s") if isinstance(closure, dict) else None
+    if not CLOSING_MODE_ENABLED:
+        in_closing = False
+    elif _tau_now is not None:
+        in_closing = _tau_now <= CLOSING_TAU_S
+    else:
+        in_closing = box_frac >= CLOSING_BOX_FRAC_THRESHOLD
 
     if in_closing:
         p_roll_eff = P_GAIN_ROLL * CLOSING_P_MULTIPLIER
@@ -4765,6 +4828,60 @@ def update_control_from_target():
         smooth_throttle_out = float(base_thr)
         throttle_integral = 0.0
         prev_ady = float(dy_alt)
+    elif THROTTLE_BY_TAU:
+        # ГАЗ ПО ВРЕМЕНИ ДО КОНТАКТА (см. блок настроек выше).
+        #
+        # Газ здесь не следящая ось, а распорядитель энергии: он держит время
+        # сближения между двумя границами и МЕЖДУ НИМИ НЕ ТРОГАЕТ РУЧКУ. Так
+        # летал живой пилот — газ у него менялся меньше чем на 1%, пока
+        # тангаж гулял на 5°.
+        tau_now = closure.get("tau_s") if isinstance(closure, dict) else None
+        tau_sig = closure.get("tau_sigma_s") if isinstance(closure, dict) else None
+        # УДЕРЖАНИЕ: если оценка пропала, продолжаем её сами — время убывает
+        # секунда за секунду. Так газ не бездействует от незнания.
+        global _tau_hold_val, _tau_hold_t
+        if tau_now is not None:
+            _tau_hold_val, _tau_hold_t = tau_now, now_mono
+        elif _tau_hold_val is not None:
+            proshlo = now_mono - _tau_hold_t
+            if proshlo <= TAU_HOLD_S:
+                tau_now = max(0.1, _tau_hold_val - proshlo)
+                # Экстраполяция менее надёжна, чем замер: растим погрешность
+                # вместе с возрастом, и доверие падает само.
+                tau_sig = (tau_sig or 0.0) + proshlo
+            else:
+                _tau_hold_val = None
+        thr_adjust = 0.0
+        if tau_now is not None:
+            if tau_now < TAU_THROTTLE_LO_S:
+                # Слишком быстро: не успеем довернуть — сбрасываем.
+                thr_adjust = -(TAU_THROTTLE_LO_S - tau_now) * TAU_THROTTLE_GAIN
+            elif tau_now > TAU_THROTTLE_HI_S:
+                # Заход затягивается — добавляем.
+                thr_adjust = (tau_now - TAU_THROTTLE_HI_S) * TAU_THROTTLE_GAIN
+            # ОСЛАБЛЯЕМ ПОПРАВКУ, КОГДА ВРЕМЕНИ ВЕРИТЬ НЕЛЬЗЯ. Замерено: на
+            # вялом сближении рамка почти не растёт, и время врёт в разы.
+            # Отрабатывать газом такую оценку вслепую — рвать заход.
+            if tau_sig is not None and tau_now > 0.1:
+                doverie = 1.0 / (1.0 + (tau_sig / tau_now) ** 2)
+                thr_adjust *= doverie
+            thr_adjust = max(-TAU_THROTTLE_MAX, min(TAU_THROTTLE_MAX, thr_adjust))
+        # Времени нет — газ не трогаем вовсе: пусть остаётся пилотский.
+        throttle_integral = 0.0
+        prev_ady = float(dy_alt)
+
+        max_adj = max(30.0, base_thr * THROTTLE_PERCENT / 100.0)
+        thr_adjust = max(-max_adj, min(max_adj, thr_adjust))
+        raw_throttle = max(THROTTLE_MIN_PWM,
+                           min(THROTTLE_MAX_PWM, base_thr + thr_adjust))
+        if smooth_throttle_out is None:
+            smooth_throttle_out = float(raw_throttle)
+        else:
+            smooth_throttle_out += alpha_for_dt(THROTTLE_OUT_ALPHA, k) * (
+                raw_throttle - smooth_throttle_out)
+        target_throttle = int(round(smooth_throttle_out))
+        target_throttle = max(THROTTLE_MIN_PWM,
+                              min(THROTTLE_MAX_PWM, target_throttle))
     else:
         # Динамика по dy_alt (БЕЗ AIM_OFFSET).
         thr_adjust = 0.0
