@@ -1016,11 +1016,19 @@ LAUNCH_ATT_TIMEOUT = 0.30
 # Смешать их — значит поймать разгон в обратную сторону при первой же смене
 # крепления камеры.
 PITCH_PWM_TO_FC_ANGLE_SIGN = +1
-# Структура манёвра: 0.5 сек плавного нарастания → 2 сек полной тяги → 1 сек спада.
-# В кадрах при 30 FPS:
-LAUNCH_RAMP_UP_FRAMES = 15
-LAUNCH_HOLD_FRAMES = 60
-LAUNCH_RAMP_DOWN_FRAMES = 30
+# Структура манёвра: 0.5 сек нарастания → 2 сек полной тяги → 1 сек спада.
+#
+# Задаётся В СЕКУНДАХ, а счётчики фаз идут в кадрах — поэтому пересчёт здесь,
+# от CAM_FPS. Раньше кадры были вписаны числами под 30 к/с; после перехода на
+# 24 к/с тот же манёвр стал длиться на четверть дольше, и заметить это по
+# поведению нельзя — просто «разгон какой-то затяжной». Через секунды смена
+# частоты кадров длительность манёвра не трогает.
+LAUNCH_RAMP_UP_S = 0.5
+LAUNCH_HOLD_S = 2.0
+LAUNCH_RAMP_DOWN_S = 1.0
+LAUNCH_RAMP_UP_FRAMES = max(1, int(round(LAUNCH_RAMP_UP_S * CAM_FPS)))
+LAUNCH_HOLD_FRAMES = max(1, int(round(LAUNCH_HOLD_S * CAM_FPS)))
+LAUNCH_RAMP_DOWN_FRAMES = max(1, int(round(LAUNCH_RAMP_DOWN_S * CAM_FPS)))
 # Дополнительный газ во время launch (в % от текущего стика). Применяется
 # ТОЛЬКО если OVERRIDE_THROTTLE=True; иначе газ остаётся под управлением пилота.
 # При наклоне носа квад на низком газе трейдит высоту на скорость: снижается
@@ -6670,6 +6678,13 @@ except Exception as _exc:
 # Разрешение камеры зависит от RECORD_HIRES, а он мог быть переопределён выше.
 if RECORD_HIRES:
     CAM_W, CAM_H = LORES_W * 2, LORES_H * 2
+
+# Фазы launch считаются в кадрах, а заданы в секундах. Пересчёт повторяется
+# здесь: борт мог переопределить и CAM_FPS, и сами длительности, а взятые до
+# этого кадры остались бы от прежней частоты — манёвр молча сменил бы длину.
+LAUNCH_RAMP_UP_FRAMES = max(1, int(round(LAUNCH_RAMP_UP_S * CAM_FPS)))
+LAUNCH_HOLD_FRAMES = max(1, int(round(LAUNCH_HOLD_S * CAM_FPS)))
+LAUNCH_RAMP_DOWN_FRAMES = max(1, int(round(LAUNCH_RAMP_DOWN_S * CAM_FPS)))
 
 # =========================================================
 # 12. START
