@@ -33,12 +33,61 @@ MSP_ATTITUDE, отклик на команду — в MSP_MOTOR.
 
 ВИНТЫ СНЯТЬ. Второй шаг армит аппарат и раскручивает моторы.
 """
+import ast
+import io
 import os
 import struct
 import sys
 import time
 
 import serial
+
+KOREN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _znaki_iz_koda():
+    """Знаки осей — из самого tracker.py, а не копией здесь.
+
+    Копия однажды уже разошлась: знак тангажа исправили в трекере, а вердикт
+    в этом скрипте продолжал печатать «НЕ СОВПАДАЕТ» на верном замере. Второй
+    источник правды о знаках хуже, чем никакого. Разбираем файл текстом —
+    импортировать нельзя, tracker.py тянет камеру и OpenCV.
+    """
+    nuzhno = ("PITCH_SIGN", "ROLL_SIGN", "YAW_SIGN")
+    out = {}
+    try:
+        derevo = ast.parse(io.open(os.path.join(KOREN, "tracker.py"),
+                                   encoding="utf-8").read())
+        for node in derevo.body:
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            imya = getattr(node.targets[0], "id", None)
+            if imya in nuzhno:
+                out[imya] = ast.literal_eval(node.value)
+    except Exception:
+        pass
+    return out
+
+
+ZNAKI = _znaki_iz_koda()
+
+
+def _sverit(imya, izmereno, chto):
+    """Печатает вердикт, сверяя замер с тем, что стоит в трекере."""
+    v_kode = ZNAKI.get(imya)
+    print()
+    print("  ВЫВОД: %s PWM %s 1500."
+          % (chto, "ВЫШЕ" if izmereno > 0 else "НИЖЕ"))
+    if v_kode is None:
+        print("  Не смог прочитать %s из tracker.py — сверь вручную." % imya)
+        return izmereno
+    if v_kode == izmereno:
+        print("  Совпадает с %s = %+d в tracker.py." % (imya, v_kode))
+    else:
+        print("  НЕ СОВПАДАЕТ: в tracker.py %s = %+d." % (imya, v_kode))
+        print("  Так летать нельзя — аппарат будет доворачивать ОТ цели.")
+        print("  Скажи мне результат, поправлю знак.")
+    return izmereno
 
 PORT_BY_ID = "/dev/serial/by-id/usb-Betaflight_Betaflight_STM32F405_0x8000000-if00"
 PORT = PORT_BY_ID if os.path.exists(PORT_BY_ID) else "/dev/ttyACM0"
@@ -293,19 +342,8 @@ def shag_pwm(fc):
         return None
 
     # Больше тяги сзади = нос вниз.
-    nos_vniz_pwm = 1650 if d_vyshe > d_nizhe else 1350
-    znak = +1 if nos_vniz_pwm > 1500 else -1
-    print()
-    print("  ВЫВОД: нос опускает PWM %s 1500."
-          % ("ВЫШЕ" if znak > 0 else "НИЖЕ"))
-    if znak < 0:
-        print("  Совпадает с тем, что заложено в tracker.py")
-        print("  (PITCH_SIGN = -1, PITCH_PWM_TO_FC_ANGLE_SIGN = -1).")
-    else:
-        print("  НЕ СОВПАДАЕТ с tracker.py: там нос опускается PWM НИЖЕ 1500.")
-        print("  Так летать нельзя — аппарат будет доворачивать ОТ цели.")
-        print("  Скажи мне результат, поправлю знаки.")
-    return znak
+    znak = +1 if d_vyshe > d_nizhe else -1
+    return _sverit("PITCH_SIGN", znak, "нос опускает")
 
 
 def shag_kren(fc):
@@ -363,15 +401,7 @@ def shag_kren(fc):
         return None
 
     znak = +1 if d_v > d_n else -1
-    print()
-    print("  ВЫВОД: вправо кренит PWM %s 1500."
-          % ("ВЫШЕ" if znak > 0 else "НИЖЕ"))
-    if znak > 0:
-        print("  Совпадает с ROLL_SIGN = +1 в tracker.py.")
-    else:
-        print("  НЕ СОВПАДАЕТ: в tracker.py ROLL_SIGN = +1.")
-        print("  Скажи мне результат, поправлю.")
-    return znak
+    return _sverit("ROLL_SIGN", znak, "вправо кренит")
 
 
 MIXER_QUADX = 3
@@ -452,15 +482,7 @@ def shag_ryskanie(fc):
     if razvernuty:
         polozh_vpravo = not polozh_vpravo
     znak = +1 if polozh_vpravo else -1
-    print()
-    print("  ВЫВОД: нос вправо разворачивает PWM %s 1500."
-          % ("ВЫШЕ" if znak > 0 else "НИЖЕ"))
-    if znak > 0:
-        print("  Совпадает с YAW_SIGN = +1 в tracker.py.")
-    else:
-        print("  НЕ СОВПАДАЕТ: в tracker.py YAW_SIGN = +1.")
-        print("  Скажи мне результат, поправлю.")
-    return znak
+    return _sverit("YAW_SIGN", znak, "нос вправо разворачивает")
 
 
 def main():
@@ -498,16 +520,26 @@ def main():
     print("  знак угла (нос вниз = ...):   %s"
           % ({1: "положительный fc_pitch — как в коде",
               -1: "отрицательный fc_pitch — В КОДЕ ИНАЧЕ"}.get(z1, "не определён")))
-    print("  знак тангажа (нос вниз = ...): %s"
-          % ({1: "PWM выше 1500 — как в коде",
-              -1: "PWM ниже 1500 — В КОДЕ ИНАЧЕ"}.get(z2, "не определён")))
-    print("  знак крена (вправо = ...):     %s"
-          % ({1: "PWM выше 1500 — как в коде",
-              -1: "PWM ниже 1500 — В КОДЕ ИНАЧЕ"}.get(z3, "не определён")))
-    print("  знак рыскания (вправо = ...):  %s"
-          % ({1: "PWM выше 1500 — как в коде",
-              -1: "PWM ниже 1500 — В КОДЕ ИНАЧЕ"}.get(z4, "не определён")))
-    if z1 == 1 and z2 == 1 and z3 == 1 and z4 == 1:
+    shodyatsya = True
+    for imya, zam, podpis in (("PITCH_SIGN", z2, "тангаж (нос вниз)"),
+                              ("ROLL_SIGN", z3, "крен (вправо)"),
+                              ("YAW_SIGN", z4, "рыскание (вправо)")):
+        v_kode = ZNAKI.get(imya)
+        if zam is None:
+            sost = "не определён"
+            shodyatsya = False
+        elif v_kode is None:
+            sost = "PWM %s 1500 — в коде не прочитан" % (
+                "выше" if zam > 0 else "ниже")
+            shodyatsya = False
+        elif v_kode == zam:
+            sost = "PWM %s 1500 — как в коде" % ("выше" if zam > 0 else "ниже")
+        else:
+            sost = "PWM %s 1500 — В КОДЕ ИНАЧЕ" % (
+                "выше" if zam > 0 else "ниже")
+            shodyatsya = False
+        print("  знак: %-22s %s" % (podpis, sost))
+    if z1 == 1 and shodyatsya:
         print()
         print("  Все три оси сходятся с кодом. По знакам можно лететь.")
     else:
