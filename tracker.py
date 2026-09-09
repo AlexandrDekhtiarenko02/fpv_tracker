@@ -714,6 +714,23 @@ YAW_SIGN = +1
 # 200/200/150 оставляет достаточный авторитет для доворота, но превращает
 # залипание на упоре из сальто в медленное вращение, которое видно и которое
 # успеваешь перехватить тумблером.
+# --- ДЕМПФИРОВАНИЕ ПО ГИРОСКОПУ ---
+# Замерено 9 сентября 2026 по полётам с управлением: gyro_y против фактической
+# скорости изменения тангажа даёт 0.078 (°/с) на единицу (r=0.52, n=261).
+GYRO_UNIT_DPS = 0.078
+# Старше этого гироскоп в демпфирование не берётся: запоздалая поправка
+# добавляет фазы вместо того, чтобы возвращать её. Замеренный возраст: медиана
+# 67 мс, 90% ниже 126 мс.
+GYRO_FRESH_S = 0.15
+PITCH_RATE_DAMP_ENABLED = True
+# PWM на градус в секунду. Аппарат даёт примерно 1.4 (°/с) на единицу PWM,
+# значит единичный внутренний контур — это 0.7. Взято 0.25: мягкое
+# демпфирование, около трети от единичного. При вращении 100 °/с даёт 25 PWM,
+# при 300 °/с — 75 из 200 доступных.
+PITCH_RATE_DAMP = 0.25
+# Потолок: демпфирование помогает прицеливанию, а не подменяет его.
+PITCH_RATE_DAMP_MAX = 90.0
+
 # --- СКОРОСТЬ ИЗМЕНЕНИЯ КОМАНДЫ ---
 # Ограничивает не величину отклонения, а СКОРОСТЬ подхода к нему: авторитет
 # остаётся полным. 1200 PWM/с — это 50 PWM за кадр при 24 к/с, то есть от
@@ -728,9 +745,9 @@ MAX_YAW_DEFLECT = 150
 
 # --- ГЭЙНЫ ---
 P_GAIN_YAW = 2.5
-P_GAIN_ROLL = 11.0
+P_GAIN_ROLL = 6.0
 D_GAIN_ROLL = 6.0
-P_GAIN_PITCH = 3.5
+P_GAIN_PITCH = 1.8
 D_GAIN_PITCH = 1.2
 
 # I-компоненты для прицеливания: добивают остаточную ошибку P+D,
@@ -1482,7 +1499,7 @@ _FLIGHT_LOG_COLUMNS = (
     "tgt_vx,tgt_vy,stable_frames,in_closing,"
     "roll_p,roll_d,roll_i,roll_ff,roll_off,roll_sat,"
     "pitch_p,pitch_d,pitch_i,pitch_ff,pitch_off,pitch_sat,"
-    "launch_pwm,cruise_pwm,pitch_comb,"
+    "launch_pwm,cruise_pwm,rate_damp,pitch_comb,"
     "yaw_filt,yaw_weight,yaw_pd,yaw_ff,yaw_i,yaw_off,yaw_sat,"
     "base_thr,thr_adjust,thr_i,rc_fresh,"
     "cmd_roll,cmd_pitch,cmd_yaw,cmd_thr,"
@@ -5050,7 +5067,43 @@ def update_control_from_target():
     )
     # Поверх PID — launch boost и cruise. Они могут вытолкнуть target_pitch
     # за MAX_PITCH_DEFLECT, но финальный clamp 1000-2000 остаётся.
-    combined_pitch = pitch_offset + launch_pitch_pwm + cruise_pitch_pwm
+    # --- ДЕМПФИРОВАНИЕ ПО ГИРОСКОПУ ---
+    #
+    # Здесь лечится структурная беда, а не подбор коэффициентов. В ACRO стик
+    # задаёт УГЛОВУЮ СКОРОСТЬ, а ошибка прицела — это УГОЛ. Значит объект
+    # управления для нас интегратор, а это сразу 90° запаздывания по фазе.
+    # Сверху ложится задержка канала: замерено по взаимной корреляции
+    # «команда -> отклик гироскопа» пик на 42-83 мс, плюс отправка отстаёт от
+    # решения ещё на два кадра. Около 125 мс. На замеренной частоте раскачки
+    # 2.2 Гц это 99°, вместе с интегратором 189° — за границей устойчивости.
+    # Отсюда и расходящиеся колебания: с 10 px до 90 px за восемь секунд.
+    #
+    # Обратная связь по скорости вращения замыкает внутренний контур вокруг
+    # интегратора и превращает его в апериодическое звено — фаза возвращается.
+    # Это работает лучше, чем D по пикселям: гироскоп меряет ровно ту величину,
+    # которой мы командуем, и не требует дифференцировать шумный ряд пикселей.
+    #
+    # Знак: gyro_y положительный = тангаж РАСТЁТ = нос идёт вниз (замерено,
+    # 0.078 °/с на единицу, r=0.52). Нос вниз командуется PWM выше 1500,
+    # поэтому вращению противодействуем вычитанием.
+    rate_damp_pwm = 0.0
+    if PITCH_RATE_DAMP_ENABLED:
+        with state_lock:
+            _g = app_state.get("gyro")
+            _g_ts = app_state.get("imu_ts", 0.0)
+        # Несвежий гироскоп демпфированием быть не может: запоздалая поправка
+        # добавляет фазы вместо того, чтобы возвращать её, и раскачивает.
+        if _g is not None and _g[1] is not None and (
+                now_mono - _g_ts) <= GYRO_FRESH_S:
+            skorost_dps = float(_g[1]) * GYRO_UNIT_DPS
+            rate_damp_pwm = -PITCH_RATE_DAMP * skorost_dps
+            if rate_damp_pwm > PITCH_RATE_DAMP_MAX:
+                rate_damp_pwm = PITCH_RATE_DAMP_MAX
+            elif rate_damp_pwm < -PITCH_RATE_DAMP_MAX:
+                rate_damp_pwm = -PITCH_RATE_DAMP_MAX
+
+    combined_pitch = (pitch_offset + launch_pitch_pwm + cruise_pitch_pwm
+                      + rate_damp_pwm)
     target_pitch = max(1000, min(2000, 1500 + combined_pitch))
 
     # --- YAW: фильтр + ослабление при больших adx + I + FF с anti-windup ---
@@ -5260,6 +5313,9 @@ def update_control_from_target():
         "pitch_p": p_p, "pitch_d": p_d, "pitch_i": p_i, "pitch_ff": p_ff,
         "pitch_off": p_off, "pitch_sat": p_sat,
         "launch_pwm": launch_pitch_pwm, "cruise_pwm": cruise_pitch_pwm,
+        # Отдельной колонкой: без неё вклад демпфирования не отличить от
+        # прицельного, а именно его размер и надо проверять по логу.
+        "rate_damp": rate_damp_pwm,
         "pitch_comb": combined_pitch,
         "yaw_filt": filtered_dx_yaw, "yaw_weight": yaw_weight,
         "yaw_pd": yaw_pd, "yaw_ff": yaw_ff, "yaw_i": yaw_integral,
@@ -6509,7 +6565,7 @@ def _capture_flight_row(cb_t0):
             g("roll_off"), g("roll_sat"),
             g("pitch_p"), g("pitch_d"), g("pitch_i"), g("pitch_ff"),
             g("pitch_off"), g("pitch_sat"),
-            g("launch_pwm"), g("cruise_pwm"), g("pitch_comb"),
+            g("launch_pwm"), g("cruise_pwm"), g("rate_damp"), g("pitch_comb"),
             g("yaw_filt"), g("yaw_weight"), g("yaw_pd"), g("yaw_ff"),
             g("yaw_i"), g("yaw_off"), g("yaw_sat"),
             c.get("base_thr"), g("thr_adjust"), g("thr_i"), g("rc_fresh"),
