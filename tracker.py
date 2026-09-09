@@ -1256,6 +1256,23 @@ DY_THROTTLE_D_GAIN = 2.0
 # контакта разбросано 4.6-12.3 с, а на 130-200 м — 1.9-12.5 с. Диапазоны
 # накладываются, то есть по дальности невозможно понять, у тебя две секунды
 # или двенадцать. Решает время, а не метры.
+# --- ГАЗ ПО УГЛУ ВИЗИРОВАНИЯ ---
+# Главный закон газа. По времени до контакта (ниже) остаётся запасным: он
+# работает, когда угол визирования посчитать не из чего.
+LOS_THROTTLE_ENABLED = True
+# Фильтр на скорость изменения угла. Угол собран из тангажа и положения цели
+# в кадре, и берётся ещё и разность — без фильтра газ пойдёт за шумом.
+# 0.08 при номинале 30 к/с — постоянная 0.40 с, срез около 0.40 Гц: ниже
+# замеренной раскачки 1.3 Гц, но выше скорости изменения геометрии захода.
+LOS_RATE_ALPHA = 0.08
+# Мёртвая зона. Замеренная скорость роста на промахе +2.13 °/с, так что 0.3
+# отсекает шум, не трогая полезный сигнал.
+LOS_RATE_DEADBAND_DPS = 0.3
+# PWM на (°/с). При замеренных 2.13 °/с даёт 46 PWM — заметная уборка газа,
+# но не сброс в ноль.
+LOS_THROTTLE_GAIN = 25.0
+LOS_THROTTLE_MAX = 120.0
+
 THROTTLE_BY_TAU = True         # False = прежнее поведение по пикселям
 TAU_THROTTLE_LO_S = 3.0        # быстрее этого — сбрасываем газ
 TAU_THROTTLE_HI_S = 9.0        # медленнее этого — добавляем
@@ -1559,7 +1576,7 @@ _FLIGHT_LOG_COLUMNS = (
     "pitch_p,pitch_d,pitch_i,pitch_ff,pitch_off,pitch_sat,"
     "launch_pwm,cruise_pwm,rate_damp,roll_damp,pitch_comb,"
     "yaw_filt,yaw_weight,yaw_pd,yaw_ff,yaw_i,yaw_off,yaw_sat,"
-    "base_thr,thr_adjust,thr_i,rc_fresh,"
+    "los_rate,base_thr,thr_adjust,thr_i,rc_fresh,"
     "cmd_roll,cmd_pitch,cmd_yaw,cmd_thr,"
     "sent_r,sent_p,sent_t,sent_y,"
     "fc_roll,fc_pitch,fc_yaw,att_age_ms,"
@@ -2481,6 +2498,10 @@ global_pitch_cmd = 1500.0
 global_roll_cmd = 1500.0
 global_throttle_cmd = 1500.0
 override_active = False
+# Угол визирования на прошлом кадре и его отфильтрованная скорость.
+_los_ugol = None
+_los_t = 0.0
+_los_skorost = 0.0
 # Счётчик подтверждения режима сближения: сколько кадров подряд время до
 # контакта держится ниже порога. Одиночный выброс режим не включает.
 _closing_schet = 0
@@ -4814,6 +4835,7 @@ def update_control_from_target():
     """
     global global_yaw_cmd, global_pitch_cmd, global_roll_cmd, global_throttle_cmd, override_active
     global _slew_roll, _slew_pitch, _slew_yaw, _pitch_pri_loke
+    global _los_ugol, _los_t, _los_skorost
     global filtered_dx_yaw, prev_adx, prev_ady_ctrl
     global smooth_throttle_out, throttle_integral, prev_ady
     global roll_integral, pitch_integral, yaw_integral
@@ -4864,6 +4886,10 @@ def update_control_from_target():
         _slew_roll = _slew_pitch = _slew_yaw = 1500.0
         # Отсчёт компенсации тоже: новый захват — новое начало.
         _pitch_pri_loke = None
+        # И угол визирования: разность через паузу между локами дала бы
+        # выброс скорости на первом же кадре нового захода.
+        _los_ugol = None
+        _los_skorost = 0.0
         filtered_dx_yaw = 0.0
         prev_adx = 0.0
         prev_ady_ctrl = 0.0
@@ -5243,6 +5269,52 @@ def update_control_from_target():
         smooth_throttle_out = float(base_thr)
         throttle_integral = 0.0
         prev_ady = float(dy_alt)
+    elif LOS_THROTTLE_ENABLED and closure.get("depression_deg") is not None:
+        # --- ГАЗ ДЕРЖИТ УГОЛ ВИЗИРОВАНИЯ ---
+        #
+        # На курсе столкновения с НЕПОДВИЖНОЙ целью угол визирования обязан
+        # СТОЯТЬ. Растёт — цель уходит под нас, пройдём выше. Убывает —
+        # недолёт. Это тот же постоянный пеленг, что и по прицельным осям,
+        # только в вертикальной плоскости, и меряется он раньше, чем промах
+        # становится виден.
+        #
+        # Замерено 9 сентября 2026: угол рос в 16 заходах из 18, медиана
+        # +2.13 °/с, типично с 15° до 41° за восемь секунд. Аппарат сближался
+        # почти горизонтально — рамка росла вдвое, а высота падала на 2-18 м.
+        # Нос при этом стоял на цели: ошибка прицела держалась в пределах
+        # пары пикселей. То есть контур наводил НОС, но не управлял
+        # ТРАЕКТОРИЕЙ, а газ бездействовал: у закона по времени до контакта
+        # мёртвая зона 3-9 с, а само время было 6-10 с.
+        #
+        # Почему газом, а не тангажом: тангаж уже занят прицеливанием, и
+        # нагружать его вторым делом — это та самая борьба двух регуляторов
+        # на одной оси. Тангаж решает, КУДА СМОТРИМ, газ — КУДА ЛЕТИМ.
+        #
+        # Ничего, кроме угла визирования, не нужно: ни дальности, ни скорости,
+        # ни GPS. Угол складывается из тангажа полётника и положения цели в
+        # кадре, и обе величины есть на серийном борту.
+        _dep = float(closure["depression_deg"])
+        thr_adjust = 0.0
+        if _los_ugol is not None and now_mono > _los_t:
+            syraya = (_dep - _los_ugol) / (now_mono - _los_t)
+            # Угол собран из тангажа и пикселей — обе величины шумят, а это
+            # ещё и разность. Без фильтра газ пойдёт за шумом.
+            _los_skorost += alpha_for_dt(LOS_RATE_ALPHA, k) * (
+                syraya - _los_skorost)
+        _los_ugol, _los_t = _dep, now_mono
+        if abs(_los_skorost) > LOS_RATE_DEADBAND_DPS:
+            _izbytok = (_los_skorost - LOS_RATE_DEADBAND_DPS
+                        if _los_skorost > 0
+                        else _los_skorost + LOS_RATE_DEADBAND_DPS)
+            # Угол растёт -> пройдём выше -> снижаемся -> газ убрать.
+            thr_adjust = -LOS_THROTTLE_GAIN * _izbytok
+            if thr_adjust > LOS_THROTTLE_MAX:
+                thr_adjust = LOS_THROTTLE_MAX
+            elif thr_adjust < -LOS_THROTTLE_MAX:
+                thr_adjust = -LOS_THROTTLE_MAX
+        throttle_integral = 0.0
+        prev_ady = float(dy_alt)
+
     elif THROTTLE_BY_TAU:
         # ГАЗ ПО ВРЕМЕНИ ДО КОНТАКТА (см. блок настроек выше).
         #
@@ -5395,6 +5467,9 @@ def update_control_from_target():
         "yaw_pd": yaw_pd, "yaw_ff": yaw_ff, "yaw_i": yaw_integral,
         "yaw_off": yaw_offset,
         "yaw_sat": abs(yaw_offset) >= MAX_YAW_DEFLECT,
+        # Скорость изменения угла визирования — главный признак промаха:
+        # на курсе столкновения она ноль, при перелёте растёт.
+        "los_rate": _los_skorost,
         "base_thr": base_thr, "thr_adjust": thr_adjust,
         "thr_i": throttle_integral, "rc_fresh": rc_fresh,
         "launch_phase": launch_phase, "launch_int": launch_intensity,
@@ -5403,9 +5478,17 @@ def update_control_from_target():
         "launch_target_deg": LAUNCH_TARGET_PITCH_DEG * launch_intensity,
         "launch_reached": launch_angle_reached,
         "k": k,
-        "size_px": closure["size_px"], "growth": closure["growth"],
-        "tau_s": closure["tau_s"], "range_m": closure["range_m"],
-        "depression_deg": closure["depression_deg"],
+        # ВСЯ оценка сближения целиком, а не выбранные ключи.
+        #
+        # Раньше здесь стоял список из семи имён, а словарь отдаёт четырнадцать.
+        # Колонки tau_sigma_s, growth_raw, growth_sigma, range_gain,
+        # range_sigma_m и pitch_bias_deg существовали в заголовке, но значения
+        # до них не доезжали — и в логах стояли пустыми. Разбирать по ним было
+        # нечего, а выглядело это как «величина не считается».
+        #
+        # Звёздочка вместо списка: словарь пополняется, а список о пополнении
+        # не узнаёт. Имена ключей закрыты тестом на совпадение с колонками.
+        **closure,
         # Вертикальная ошибка газа, ОЧИЩЕННАЯ от собственного наклона.
         # Сейчас регулятор газа работает по сырому dy_alt, и наклон носа он
         # читает как «цель ушла вверх» — то есть разгон сам себе подкручивает
@@ -6653,6 +6736,7 @@ def _capture_flight_row(cb_t0):
             g("pitch_comb"),
             g("yaw_filt"), g("yaw_weight"), g("yaw_pd"), g("yaw_ff"),
             g("yaw_i"), g("yaw_off"), g("yaw_sat"),
+            g("los_rate"),
             c.get("base_thr"), g("thr_adjust"), g("thr_i"), g("rc_fresh"),
             r_cmd, p_cmd, y_cmd, t_cmd,
             _idx(sent, 0), _idx(sent, 1), _idx(sent, 2), _idx(sent, 3),
