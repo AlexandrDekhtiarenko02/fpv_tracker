@@ -711,6 +711,16 @@ YAW_SIGN = +1
 # Сейчас выставлено 400 / 400 / 300 = 80% / 80% / 60% полного стика.
 # Это даёт квадрату полную скорость вращения по rate-профилю Betaflight,
 # но всё ещё оставляет запас «до края». Если хочешь полный авторитет — ставь 500.
+# --- СКОРОСТЬ ИЗМЕНЕНИЯ КОМАНДЫ ---
+# Насколько быстро команда может ехать к желаемой. Ограничивает не величину
+# отклонения, а СКОРОСТЬ подхода к нему: авторитет остаётся полным.
+#
+# 1200 PWM/с — это 50 PWM за кадр при 24 к/с, то есть от центра до любого
+# края за треть секунды. Замерено, что без ограничения команда тангажа
+# шагала на 540 PWM за один кадр, и аппарат отвечал рывком носом вверх.
+CMD_SLEW_ENABLED = True
+CMD_SLEW_PWM_PER_S = 1200.0
+
 MAX_ROLL_DEFLECT = 400
 MAX_PITCH_DEFLECT = 400
 MAX_YAW_DEFLECT = 300
@@ -4266,6 +4276,23 @@ def reset_tracking(to_acq=False):
 # =========================================================
 # 8. CONTROL — главные исправления здесь
 # =========================================================
+_slew_roll = 1500.0
+_slew_pitch = 1500.0
+_slew_yaw = 1500.0
+
+
+def _ogranich_skorost(bylo, hochu, shag):
+    """Подтянуть команду к желаемой не быстрее, чем на shag за кадр."""
+    if bylo is None:
+        return float(hochu)
+    raznica = float(hochu) - bylo
+    if raznica > shag:
+        return bylo + shag
+    if raznica < -shag:
+        return bylo - shag
+    return float(hochu)
+
+
 def _pid_axis_step(error, prev_error, integral, ff_value,
                    p_gain, d_gain, i_gain, ff_gain,
                    integral_max, integral_decay,
@@ -4674,6 +4701,7 @@ def update_control_from_target():
        Реальная отправка на FC решается в fc_io_loop по флагам OVERRIDE_*.
     """
     global global_yaw_cmd, global_pitch_cmd, global_roll_cmd, global_throttle_cmd, override_active
+    global _slew_roll, _slew_pitch, _slew_yaw
     global filtered_dx_yaw, prev_adx, prev_ady_ctrl
     global smooth_throttle_out, throttle_integral, prev_ady
     global roll_integral, pitch_integral, yaw_integral
@@ -4717,6 +4745,11 @@ def update_control_from_target():
     if not controllable or box is None:
         # Сбрасываем ВСЕ накопители, иначе windup из прошлой сессии вылезет
         # на следующем TRACKED-кадре как «моторы сами раскрутились».
+        #
+        # Ограничитель скорости тоже: он хранит последнюю выданную команду, и
+        # без сброса новый лок начинал бы подъезжать от насыщенного значения
+        # предыдущего — то есть с уже отклонённой ручки.
+        _slew_roll = _slew_pitch = _slew_yaw = 1500.0
         filtered_dx_yaw = 0.0
         prev_adx = 0.0
         prev_ady_ctrl = 0.0
@@ -5013,6 +5046,29 @@ def update_control_from_target():
     elif yaw_offset < -MAX_YAW_DEFLECT:
         yaw_offset = -MAX_YAW_DEFLECT
     target_yaw = max(1000, min(2000, 1500 + yaw_offset))
+
+    # --- ОГРАНИЧЕНИЕ СКОРОСТИ ИЗМЕНЕНИЯ КОМАНДЫ ---
+    #
+    # У газа сглаживание выхода было с самого начала, у прицельных осей — нет.
+    # Замерено на стенде 9 сентября: команда тангажа шагала с 1640 на 1100 за
+    # один кадр, 540 PWM за 42 мс. Аппарат отвечал рывком носом вверх — ровно
+    # то, что видно глазом.
+    #
+    # Рывок здесь не следствие большой ошибки, а следствие СКОРОСТИ, с которой
+    # команда её отрабатывает. Ограничение скорости оставляет весь авторитет
+    # (за 0.33 с команда доходит до любого края), но убирает ступеньку, на
+    # которой аппарат козлит и раскачивается вместе с задержкой канала.
+    #
+    # Ограничение применяется ПОСЛЕ насыщения по MAX_*_DEFLECT: сначала
+    # решаем, куда хотим, потом — как быстро туда идти.
+    if CMD_SLEW_ENABLED:
+        shag = CMD_SLEW_PWM_PER_S * (k / NOMINAL_FPS)
+        _slew_roll = _ogranich_skorost(_slew_roll, target_roll, shag)
+        _slew_pitch = _ogranich_skorost(_slew_pitch, target_pitch, shag)
+        _slew_yaw = _ogranich_skorost(_slew_yaw, target_yaw, shag)
+        target_roll = int(round(_slew_roll))
+        target_pitch = int(round(_slew_pitch))
+        target_yaw = int(round(_slew_yaw))
 
     # --- THROTTLE ---
     thr_adjust = 0.0
