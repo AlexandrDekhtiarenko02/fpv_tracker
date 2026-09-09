@@ -5409,18 +5409,6 @@ def update_control_from_target():
         throttle_integral = 0.0
         prev_ady = float(dy_alt)
 
-        max_adj = max(30.0, base_thr * THROTTLE_PERCENT / 100.0)
-        thr_adjust = max(-max_adj, min(max_adj, thr_adjust))
-        raw_throttle = max(THROTTLE_MIN_PWM,
-                           min(THROTTLE_MAX_PWM, base_thr + thr_adjust))
-        if smooth_throttle_out is None:
-            smooth_throttle_out = float(raw_throttle)
-        else:
-            smooth_throttle_out += alpha_for_dt(THROTTLE_OUT_ALPHA, k) * (
-                raw_throttle - smooth_throttle_out)
-        target_throttle = int(round(smooth_throttle_out))
-        target_throttle = max(THROTTLE_MIN_PWM,
-                              min(THROTTLE_MAX_PWM, target_throttle))
     else:
         # Динамика по dy_alt (БЕЗ AIM_OFFSET).
         thr_adjust = 0.0
@@ -5439,19 +5427,31 @@ def update_control_from_target():
         prev_ady = float(dy_alt)
         thr_adjust += (d_dy / k) * DY_THROTTLE_D_GAIN
 
+
+    # ОБЩИЙ ХВОСТ ГАЗА — ОДИН НА ВСЕ ЗАКОНЫ.
+    #
+    # Ветки выше решают только ОДНО: какова поправка thr_adjust. Ограничение,
+    # клампы и сглаживание — общие, и лежат здесь, а не в каждой ветке.
+    #
+    # Раньше этот хвост был скопирован в две ветки из трёх. Добавленный закон
+    # газа по углу визирования поправку считал, а до команды не доводил, и
+    # каждый кадр с локом падал с UnboundLocalError по target_throttle. На
+    # борту это выглядело так: лока нет, лупа пропадает, весь оверлей
+    # исчезает — потому что исключение случалось ДО отрисовки. Пока ветки
+    # заканчивались каждая по-своему, четвёртый закон повторил бы это снова.
+    if OVERRIDE_THROTTLE:
         max_adj = max(30.0, base_thr * THROTTLE_PERCENT / 100.0)
         thr_adjust = max(-max_adj, min(max_adj, thr_adjust))
-
-        raw_throttle = base_thr + thr_adjust
-        raw_throttle = max(THROTTLE_MIN_PWM, min(THROTTLE_MAX_PWM, raw_throttle))
-
+        raw_throttle = max(THROTTLE_MIN_PWM,
+                           min(THROTTLE_MAX_PWM, base_thr + thr_adjust))
         if smooth_throttle_out is None:
             smooth_throttle_out = float(raw_throttle)
         else:
             smooth_throttle_out += alpha_for_dt(THROTTLE_OUT_ALPHA, k) * (
                 raw_throttle - smooth_throttle_out)
         target_throttle = int(round(smooth_throttle_out))
-        target_throttle = max(THROTTLE_MIN_PWM, min(THROTTLE_MAX_PWM, target_throttle))
+        target_throttle = max(THROTTLE_MIN_PWM,
+                              min(THROTTLE_MAX_PWM, target_throttle))
 
     # Launch throttle boost — применяется ТОЛЬКО при OVERRIDE_THROTTLE=True,
     # чтобы не наступать на ручное управление пилота.
