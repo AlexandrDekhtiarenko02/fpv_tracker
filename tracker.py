@@ -856,6 +856,11 @@ CLOSING_BOX_FRAC_THRESHOLD = 0.18   # запасной признак, если 
 # цели, ни от разрешения. При доле кадра 0.05 время до контакта было 6.8 с
 # по медиане, то есть решать надо примерно там.
 CLOSING_TAU_S = 4.0                 # ближе этого по времени — режим сближения
+# Сколько кадров подряд время должно быть ниже порога, чтобы войти в режим.
+# 6 кадров при 24 к/с — четверть секунды: одиночный выброс от дёрганья рамки
+# не проходит, настоящее сближение проходит незаметно. Выход из режима
+# выдержки не имеет: задерживать возврат к обычным коэффициентам опаснее.
+CLOSING_CONFIRM_FRAMES = 6
 CLOSING_P_MULTIPLIER = 1.6          # P-гэйны умножаем на это в сближении
 CLOSING_I_MULTIPLIER = 0.3          # I-гэйны срезаем (нет времени интегрировать)
 CLOSING_FF_MULTIPLIER = 1.3         # FF тоже приподнимаем — реакция должна быть резче
@@ -1444,7 +1449,7 @@ FLIGHT_LOG_FSYNC = True
 # итоговой dy_aim этого не увидеть.
 
 _FLIGHT_LOG_COLUMNS = (
-    "t,frame,fps,state,controllable,aux4,override,fc_ovr,launch_phase,launch_int,"
+    "t,frame,fps,state,controllable,aux4,override,fc_ovr,launch_phase,launch_int,glide_ves,"
     "match_score,flow_ok,lost_frames,reacq,"
     "box_cx,box_cy,box_w,box_h,box_frac,"
     "dx_raw,dy_raw,pitch_comp_px,lead_x,lead_y,dx_aim,dy_aim,adx,ady,dy_alt,"
@@ -2375,6 +2380,9 @@ global_pitch_cmd = 1500.0
 global_roll_cmd = 1500.0
 global_throttle_cmd = 1500.0
 override_active = False
+# Счётчик подтверждения режима сближения: сколько кадров подряд время до
+# контакта держится ниже порога. Одиночный выброс режим не включает.
+_closing_schet = 0
 
 smooth_throttle_out = None
 throttle_integral = 0.0
@@ -4779,6 +4787,7 @@ def update_control_from_target():
     prev_controllable_for_launch = True
     launch_phase = "NONE"
     launch_intensity = 0.0
+    glide_ves = 0.0
     launch_pitch_pwm = 0.0
     cruise_pitch_pwm = 0.0
     launch_angle_reached = False
@@ -4858,11 +4867,32 @@ def update_control_from_target():
     # срабатывает слишком поздно (замерено — в 1.2% кадров), но лучше, чем
     # ничего, когда рамка не растёт и время не считается.
     _tau_now = closure.get("tau_s") if isinstance(closure, dict) else None
+    # РЕЖИМ СБЛИЖЕНИЯ ВКЛЮЧАЕТСЯ НЕ С ПЕРВОГО КАДРА.
+    #
+    # Замерено на стенде: время до контакта вышло 0.61 с там, где ничего не
+    # сближалось — коробка дёрнулась от движения рукой, наклон подгонки по
+    # шести точкам оказался достаточным. Контур мгновенно ушёл в режим
+    # сближения: подняты P, срезан I, и наклон отключён. В воздухе тот же
+    # дёрг рамки далеко от цели даст ровно это же.
+    #
+    # Лечится выдержкой: время должно быть ниже порога подряд несколько
+    # кадров. Одиночный выброс её не проходит, настоящее сближение проходит
+    # за долю секунды. Выход — сразу, без выдержки: задерживать возврат к
+    # обычным коэффициентам опаснее, чем задержать вход.
+    global _closing_schet
     if not CLOSING_MODE_ENABLED:
+        _closing_schet = 0
         in_closing = False
     elif _tau_now is not None:
-        in_closing = _tau_now <= CLOSING_TAU_S
+        if _tau_now <= CLOSING_TAU_S:
+            _closing_schet += 1
+        else:
+            _closing_schet = 0
+        in_closing = _closing_schet >= CLOSING_CONFIRM_FRAMES
     else:
+        # Времени нет — остаётся доля кадра. Она врёт в другую сторону
+        # (срабатывает поздно), поэтому выдержки не требует.
+        _closing_schet = 0
         in_closing = box_frac >= CLOSING_BOX_FRAC_THRESHOLD
 
     # --- НАКЛОН ПО ЗАТЯНУТОСТИ ЗАХОДА ---
@@ -4884,7 +4914,7 @@ def update_control_from_target():
         else:
             ves = ((_tau_now - GLIDE_TAU_OFF_S)
                    / max(0.1, GLIDE_TAU_FULL_S - GLIDE_TAU_OFF_S))
-        launch_intensity = ves
+        glide_ves = ves
         launch_phase = "GLIDE" if ves > 0.0 else "NONE"
         if ves > 0.0:
             # Целевой УГОЛ масштабируется весом, а не выход. Иначе на спаде
@@ -4892,10 +4922,21 @@ def update_control_from_target():
             # команда без своего угла — то же самое, от чего уходим.
             launch_pitch_pwm, launch_angle_reached = _pitch_angle_hold_pwm(
                 GLIDE_MIN_PITCH_DEG * ves, now_mono, k)
-            if launch_pitch_pwm > GLIDE_MAX_PWM:
+            # ТОЛЬКО ВНИЗ. Это ПОЛ, а не цель: «не летим положе, чем нужно».
+            #
+            # Замерено на стенде: при наклоне 32° угловой контур честно тянул
+            # обратно к 15°, выдавая -120 в насыщении весь заход. Он работал
+            # правильно и делал не то: прицельный PID опускал нос к цели, а
+            # наклон в те же кадры поднимал его к своей уставке. Ровно та
+            # борьба двух регуляторов на одной оси, из-за которой убирали
+            # таймерный разгон, — и я её же сюда и вернул.
+            #
+            # Нос вниз = PWM выше 1500 (замер os_znaki.py), поэтому отсечка
+            # снизу нулём: добавить пикирования можно, отнять — нет.
+            if launch_pitch_pwm < 0.0:
+                launch_pitch_pwm = 0.0
+            elif launch_pitch_pwm > GLIDE_MAX_PWM:
                 launch_pitch_pwm = GLIDE_MAX_PWM
-            elif launch_pitch_pwm < -GLIDE_MAX_PWM:
-                launch_pitch_pwm = -GLIDE_MAX_PWM
     elif CRUISE_ENABLED:
         cruise_pitch_pwm, _ = _pitch_angle_hold_pwm(
             CRUISE_TARGET_PITCH_DEG, now_mono, k)
@@ -5068,7 +5109,13 @@ def update_control_from_target():
 
     # Launch throttle boost — применяется ТОЛЬКО при OVERRIDE_THROTTLE=True,
     # чтобы не наступать на ручное управление пилота.
-    if OVERRIDE_THROTTLE and launch_intensity > 0.0 and LAUNCH_THR_BOOST_PCT > 0.0:
+    # LAUNCH_ENABLED в условии обязателен: буст принадлежит ТАЙМЕРНОМУ
+    # разгону. Пока наклон писал свой вес в launch_intensity, буст срабатывал
+    # вместе с ним и молча добавлял 10% газа почти весь заход. В логе это
+    # выглядело как необъяснимая прибавка: thr_adjust=0, а cmd_thr на 131
+    # выше base_thr — потому что буст в thr_adjust не входит.
+    if (OVERRIDE_THROTTLE and LAUNCH_ENABLED and launch_intensity > 0.0
+            and LAUNCH_THR_BOOST_PCT > 0.0):
         # Буст считается от опорного стика пилота. Пока base_thr брался из
         # собственного выхода, буст начислялся на уже забустованное значение —
         # это давало не прибавку в 10%, а экспоненциальный разгон до упора.
@@ -5110,6 +5157,9 @@ def update_control_from_target():
         "dy_alt": dy_alt,
         "tgt_vx": target_vx_smoothed, "tgt_vy": target_vy_smoothed,
         "stable": stable_track_frames, "closing": in_closing,
+        # Отдельно от launch_int: та колонка принадлежит таймерному разгону.
+        # Пока наклон писал вес туда же, он тянул за собой чужой буст газа.
+        "glide_ves": glide_ves,
         "roll_p": r_p, "roll_d": r_d, "roll_i": r_i, "roll_ff": r_ff,
         "roll_off": r_off, "roll_sat": r_sat,
         "pitch_p": p_p, "pitch_d": p_d, "pitch_i": p_i, "pitch_ff": p_ff,
@@ -6354,6 +6404,7 @@ def _capture_flight_row(cb_t0):
             now - flight_log._t0, frame_index, fps_current, st, ctrl, aux, ov,
             fc_ovr_row,
             c.get("launch_phase") if active else "", g("launch_int"),
+            g("glide_ves"),
             last_match_score, last_flow_ok, lost_frames, auto_reacq_attempts,
             g("box_cx"), g("box_cy"), g("box_w"), g("box_h"), g("box_frac"),
             g("dx_raw"), g("dy_raw"), g("comp"), g("lead_x"), g("lead_y"),
