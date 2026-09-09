@@ -27,7 +27,9 @@ for node in tree.body:
             except Exception:
                 pass
 
-assert zn["PITCH_RATE_DAMP_ENABLED"] is True, "демпфирование выключено"
+assert zn["PITCH_RATE_DAMP_ENABLED"] is True, "демпфирование тангажа выключено"
+assert zn["ROLL_RATE_DAMP_ENABLED"] is True, (
+    "демпфирование крена выключено: крен раскачивался сильнее тангажа")
 
 # Масштаб гироскопа — замеренный, не выдуманный.
 assert 0.05 <= zn["GYRO_UNIT_DPS"] <= 0.12, (
@@ -37,6 +39,11 @@ assert 0.05 <= zn["GYRO_UNIT_DPS"] <= 0.12, (
 # Демпфирование мягче единичного внутреннего контура. Аппарат даёт около
 # 1.4 (°/с) на единицу PWM, значит единичный контур — 0.7 PWM на (°/с).
 edinichnyy = 0.7
+assert 0.0 < zn["ROLL_RATE_DAMP"] < edinichnyy, (
+    "демпфирование крена %.2f не мягче единичного внутреннего контура"
+    % zn["ROLL_RATE_DAMP"])
+assert zn["ROLL_RATE_DAMP_MAX"] < zn["MAX_ROLL_DEFLECT"], (
+    "потолок демпфирования крена не ниже полного отклонения оси")
 assert 0.0 < zn["PITCH_RATE_DAMP"] < edinichnyy, (
     "%.2f PWM на (°/с) — не мягче единичного внутреннего контура (%.2f); "
     "такой контур сам станет источником колебаний"

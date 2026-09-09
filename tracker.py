@@ -717,7 +717,10 @@ YAW_SIGN = +1
 # --- ДЕМПФИРОВАНИЕ ПО ГИРОСКОПУ ---
 # Замерено 9 сентября 2026 по полётам с управлением: gyro_y против фактической
 # скорости изменения тангажа даёт 0.078 (°/с) на единицу (r=0.52, n=261).
-GYRO_UNIT_DPS = 0.078
+# Один сенсор — один масштаб. По тангажу регрессия дала 0.078 (r=0.52,
+# n=261), по крену 0.059 (r=0.51, n=8802); расходятся они не из-за гироскопа,
+# а из-за разного запаздывания оценщика углов по осям. Берём среднее.
+GYRO_UNIT_DPS = 0.068
 # Старше этого гироскоп в демпфирование не берётся: запоздалая поправка
 # добавляет фазы вместо того, чтобы возвращать её. Замеренный возраст: медиана
 # 67 мс, 90% ниже 126 мс.
@@ -735,6 +738,15 @@ PITCH_RATE_DAMP_ENABLED = True
 PITCH_RATE_DAMP = 0.45
 # Потолок: демпфирование помогает прицеливанию, а не подменяет его.
 PITCH_RATE_DAMP_MAX = 90.0
+# То же по крену. Замерено: gyro_x против скорости изменения крена даёт
+# 0.0594 (°/с) на единицу при r=0.51 — знак тот же, что у тангажа
+# (положительный gyro_x = крен растёт = аппарат кренится вправо, а вправо
+# командуется PWM выше 1500). Значит и противодействовать надо вычитанием.
+#
+# Крен раскачивался сильнее тангажа и при этом демпфирования не имел вовсе.
+ROLL_RATE_DAMP_ENABLED = True
+ROLL_RATE_DAMP = 0.45
+ROLL_RATE_DAMP_MAX = 90.0
 
 # --- СКОРОСТЬ ИЗМЕНЕНИЯ КОМАНДЫ ---
 # Ограничивает не величину отклонения, а СКОРОСТЬ подхода к нему: авторитет
@@ -750,7 +762,7 @@ MAX_YAW_DEFLECT = 150
 
 # --- ГЭЙНЫ ---
 P_GAIN_YAW = 2.5
-P_GAIN_ROLL = 6.0
+P_GAIN_ROLL = 4.0
 D_GAIN_ROLL = 6.0
 P_GAIN_PITCH = 1.8
 D_GAIN_PITCH = 1.2
@@ -889,9 +901,24 @@ LEAD_AIM_ENABLED = True
 # и против раскачки. Дальше поднимать нельзя вслепую: снос считается разностью
 # по кадрам и шумит, а LEAD_MAX_PX ограничивает только величину, не шум.
 LEAD_FRAMES = 8
-# Низкочастотный фильтр на скорость цели. Без него прицел прыгает от пиксельных
-# шумов трекера (особенно от субпиксельной интерполяции на покоящейся цели).
-LEAD_VEL_ALPHA = 0.25
+# Низкочастотный фильтр на скорость цели. РЕЖЕТ НЕ ТОЛЬКО ШУМ — этим числом
+# разделяются два разных дела, которые делает один и тот же член.
+#
+# Снос цели нужен для НАВЕДЕНИЯ: геометрия захода меняется за секунды. Но снос
+# — это производная, и на частоте раскачки она даёт большое усиление. Опережения
+# по фазе при этом нет: производная даёт +90°, а задержка петли 125 мс на
+# замеренных 1.9 Гц съедает 85° обратно. Остаётся почти чистое усиление там,
+# где его быть не должно.
+#
+# Замерено 9 сентября после подъёма упреждения до 8 кадров: на частоте раскачки
+# вклад сноса выходил в 4.4 раза больше позиционного, и раскачка усилилась —
+# причём пошла и по крену.
+#
+# 0.06 при номинале 30 к/с — постоянная времени 0.54 с, срез около 0.29 Гц.
+# Медленный снос проходит целиком, на 1.9 Гц остаётся 15%: вклад падает ниже
+# позиционного, а наведение по пеленгу сохраняется. Прежние 0.25 срезали лишь
+# выше 1.1 Гц, то есть раскачку пропускали.
+LEAD_VEL_ALPHA = 0.06
 # Если межкадровая скорость больше этого порога (px/кадр) — кадр считается
 # глитчем (re-lock / occlusion) и не идёт в фильтр.
 LEAD_MAX_VEL_JUMP = 25.0 * TRACK_SCALE
@@ -1530,7 +1557,7 @@ _FLIGHT_LOG_COLUMNS = (
     "tgt_vx,tgt_vy,stable_frames,in_closing,"
     "roll_p,roll_d,roll_i,roll_ff,roll_off,roll_sat,"
     "pitch_p,pitch_d,pitch_i,pitch_ff,pitch_off,pitch_sat,"
-    "launch_pwm,cruise_pwm,rate_damp,pitch_comb,"
+    "launch_pwm,cruise_pwm,rate_damp,roll_damp,pitch_comb,"
     "yaw_filt,yaw_weight,yaw_pd,yaw_ff,yaw_i,yaw_off,yaw_sat,"
     "base_thr,thr_adjust,thr_i,rc_fresh,"
     "cmd_roll,cmd_pitch,cmd_yaw,cmd_thr,"
@@ -5086,6 +5113,22 @@ def update_control_from_target():
         ROLL_INTEGRAL_MAX, ROLL_INTEGRAL_DECAY,
         ROLL_SIGN, MAX_ROLL_DEFLECT, dbg_key="roll", k=k,
     )
+    # Демпфирование по гироскопу для крена — то же, что у тангажа. Крен
+    # раскачивался сильнее и при этом не имел его вовсе.
+    roll_damp_pwm = 0.0
+    if ROLL_RATE_DAMP_ENABLED:
+        with state_lock:
+            _gr = app_state.get("gyro")
+            _gr_ts = app_state.get("imu_ts", 0.0)
+        if _gr is not None and _gr[0] is not None and (
+                now_mono - _gr_ts) <= GYRO_FRESH_S:
+            roll_damp_pwm = -ROLL_RATE_DAMP * float(_gr[0]) * GYRO_UNIT_DPS
+            if roll_damp_pwm > ROLL_RATE_DAMP_MAX:
+                roll_damp_pwm = ROLL_RATE_DAMP_MAX
+            elif roll_damp_pwm < -ROLL_RATE_DAMP_MAX:
+                roll_damp_pwm = -ROLL_RATE_DAMP_MAX
+        roll_offset += roll_damp_pwm
+
     target_roll = max(1000, min(2000, 1500 + roll_offset))
 
     # --- PITCH: P+D+I+FF через хелпер с anti-windup ---
@@ -5346,7 +5389,7 @@ def update_control_from_target():
         "launch_pwm": launch_pitch_pwm, "cruise_pwm": cruise_pitch_pwm,
         # Отдельной колонкой: без неё вклад демпфирования не отличить от
         # прицельного, а именно его размер и надо проверять по логу.
-        "rate_damp": rate_damp_pwm,
+        "rate_damp": rate_damp_pwm, "roll_damp": roll_damp_pwm,
         "pitch_comb": combined_pitch,
         "yaw_filt": filtered_dx_yaw, "yaw_weight": yaw_weight,
         "yaw_pd": yaw_pd, "yaw_ff": yaw_ff, "yaw_i": yaw_integral,
@@ -6606,7 +6649,8 @@ def _capture_flight_row(cb_t0):
             g("roll_off"), g("roll_sat"),
             g("pitch_p"), g("pitch_d"), g("pitch_i"), g("pitch_ff"),
             g("pitch_off"), g("pitch_sat"),
-            g("launch_pwm"), g("cruise_pwm"), g("rate_damp"), g("pitch_comb"),
+            g("launch_pwm"), g("cruise_pwm"), g("rate_damp"), g("roll_damp"),
+            g("pitch_comb"),
             g("yaw_filt"), g("yaw_weight"), g("yaw_pd"), g("yaw_ff"),
             g("yaw_i"), g("yaw_off"), g("yaw_sat"),
             c.get("base_thr"), g("thr_adjust"), g("thr_i"), g("rc_fresh"),
