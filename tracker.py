@@ -5860,11 +5860,21 @@ def draw_control_state(frame):
 
 
 def draw_overlay_on_frame(frame):
-    draw_crosshair(frame)
     with state_lock:
         box = target_box_main
         vis = target_visible
         aux_for_mag = aux4_state
+    # ПЕРЕКРЕСТЬЕ ПРЯЧЕТСЯ НА ВРЕМЯ ЗАХВАТА.
+    #
+    # Наведение идёт по постоянному пеленгу: цель обязана СТОЯТЬ в кадре, а не
+    # сидеть в центре. Перекрестье в это время показывает величину, к которой
+    # контур не стремится, и читается как промах там, где всё правильно.
+    # Ориентир на захвате — рамка цели.
+    #
+    # Возвращается сразу, как только захвата нет: без лока перекрестье снова
+    # единственный ориентир, по нему цель и наводят перед локом.
+    if not (vis and box is not None):
+        draw_crosshair(frame)
     if vis and box is not None:
         draw_corners(frame, box, COLOR_WHITE, 2)
         draw_range_readout(frame, box)
