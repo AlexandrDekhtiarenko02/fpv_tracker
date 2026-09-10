@@ -1238,6 +1238,28 @@ SIZE_ADAPT_ENABLED = True
 # зато цена платится каждый раз. Замерено: при крупном эталоне примерка
 # съедала 9.3 мс на кадр.
 SIZE_ADAPT_EVERY_FRAMES = 8          # период проверки
+# --- ПЕРИОД ПРОВЕРКИ РАСТЁТ ВМЕСТЕ С РАМКОЙ ---
+# Примерка масштабов стоит пропорционально ПЛОЩАДИ эталона, а рамка у цели
+# вырастает втрое. Замерено на борту:
+#     рамка  20-39 px -> 24.6 мс на кадр, 23.7 к/с
+#     рамка 100-119 px -> 35.2 мс, 19.5 к/с
+#     рамка 180-199 px -> 50.5 мс, 17.5 к/с
+# (площадь -> время: r=+0.62, 0.79 мс на 1000 px²)
+#
+# Это не косметика: кадр у цели идёт вдвое дольше, задержка петли растёт со
+# 125 до 180 мс, и запас по фазе падает с 39° до 18° — ровно там, где точность
+# нужнее всего. Отсюда «раскачка раз на раз не приходится».
+#
+# ЧТО ИМЕННО РЕЖЕТСЯ. Не само измерение — оно остаётся прежним по качеству, —
+# а его ЧАСТОТА. Прошлая попытка правила уменьшение внутри примерки и сломала
+# отслеживание роста коробки (рост 3.08 отслеживался как 1.00). Реже мерить
+# безопаснее: к этому времени размер цели уже установлен многими измерениями,
+# и уточнять его каждые восемь кадров незачем.
+#
+# Ниже порога период прежний, то есть на большей части захода поведение не
+# меняется вовсе.
+SIZE_ADAPT_BIG_PX = 100          # с какой рамки считаем эталон дорогим
+SIZE_ADAPT_BIG_EVERY = 24        # период проверки для дорогого эталона
 SIZE_ADAPT_MIN_SCORE = 0.55          # минимальный score для доверия размеру
 SIZE_ADAPT_ALPHA = 0.45              # доля нового размера в старом (per update)
 SIZE_ADAPT_MIN_W = 5                 # нижний предел осмысленного размера
@@ -1762,7 +1784,7 @@ _FLIGHT_LOG_COLUMNS = (
     "cmd_roll,cmd_pitch,cmd_yaw,cmd_thr,"
     "sent_r,sent_p,sent_t,sent_y,"
     "fc_roll,fc_pitch,fc_yaw,att_age_ms,"
-    "m1,m2,m3,m4,rc_r,rc_p,rc_y,rc_t,dt_ms,cb_ms,armed,"
+    "m1,m2,m3,m4,rc_r,rc_p,rc_y,rc_t,dt_ms,cb_ms,ms_potok,ms_sovpadenie,ms_primerka,armed,"
     "launch_target_deg,launch_reached,k,match_psr,match_second,search_margin,"
     "match_flow_gap,size_est,size_skip,size_why,size_R,size_scale,motion_sep,motion_on,"
     "color_on,color_pen,color_best,chroma_sat,"
@@ -1787,6 +1809,21 @@ _pid_dbg = {}
 # Внутренности сопоставления шаблона за текущий кадр. Нужны, чтобы понять
 # ПОЧЕМУ матч встал именно сюда, а не просто насколько он уверенный.
 _match_dbg = {}
+# Время по этапам обработки кадра, миллисекунды. Заводится каждый кадр заново.
+#
+# ЗАЧЕМ. Замерено, что кадр у крупной цели идёт вдвое дольше (50 мс против
+# 25), и стоимость растёт с ПЛОЩАДЬЮ рамки. Но какой именно этап её съедает —
+# неизвестно: примерка масштабов упирается в потолок эталона уже при рамке 55,
+# значит дело не в ней. Гадать здесь дорого: две прошлые попытки ускорить не
+# то место сломали отслеживание роста коробки.
+_etap_ms = {}
+
+
+def _etap(imya, t0):
+    """Записать длительность этапа. Возвращает момент для следующего."""
+    t1 = time.monotonic()
+    _etap_ms[imya] = (t1 - t0) * 1000.0
+    return t1
 
 
 class FlightLogger:
@@ -4284,6 +4321,22 @@ def color_penalty_map(sx1, sy1, tw, th, shape):
         return cv2.resize(d, (rw, rh), interpolation=cv2.INTER_LINEAR)
     except Exception:
         return None
+
+
+def _period_primerki():
+    """Через сколько кадров примерять масштаб. Зависит от размера эталона.
+
+    Стоимость примерки растёт с площадью, а польза — нет: у крупной цели
+    размер уже установлен. Ниже порога период прежний.
+    """
+    if template_gray is None:
+        return SIZE_ADAPT_EVERY_FRAMES
+    try:
+        if min(template_gray.shape[:2]) >= SIZE_ADAPT_BIG_PX:
+            return SIZE_ADAPT_BIG_EVERY
+    except Exception:
+        pass
+    return SIZE_ADAPT_EVERY_FRAMES
 
 
 def measure_scale_change(gray, cx, cy):
@@ -7052,15 +7105,19 @@ def process_locked_tracker(gray):
         reset_tracking(to_acq=True)
         return
 
+    _t_etap = time.monotonic()
     flow_ok, pred_cx, pred_cy = flow_predict(prev_gray, gray, prev_pts, lock_cx, lock_cy)
+    _t_etap = _etap("potok", _t_etap)
     # Модуль flow-предсказанного смещения цели за кадр — используется
     # template_match_locked для адаптивного выбора search-окна.
     flow_motion = math.hypot(pred_cx - lock_cx, pred_cy - lock_cy) if flow_ok else 0.0
     # Движение цели за кадр — разница между предсказанием потока и прежним
     # положением. Именно с ним сравнивается движение фона.
+    _t_sovp = time.monotonic()
     match_ok, match_cx, match_cy, score = template_match_locked(
         gray, pred_cx, pred_cy, flow_motion,
         tgt_dx=pred_cx - lock_cx, tgt_dy=pred_cy - lock_cy)
+    _etap("sovpadenie", _t_sovp)
     last_match_score = score
     last_flow_ok = flow_ok
 
@@ -7192,14 +7249,16 @@ def process_locked_tracker(gray):
             refresh_color_axis(lock_cx, lock_cy, lock_w, lock_h)
 
         if (SIZE_BY_SCALE_ENABLED and SIZE_ADAPT_ENABLED
-                and frame_index % SIZE_ADAPT_EVERY_FRAMES == 0):
+                and frame_index % _period_primerki() == 0):
             # Размер по масштабу совпадения. Сегментация не участвует.
             if not match_ok:
                 _match_dbg["size_skip"] = 1
             elif score < SIZE_ADAPT_MIN_SCORE:
                 _match_dbg["size_skip"] = 2
             else:
+                _t_pr = time.monotonic()
                 k_scale = measure_scale_change(gray, lock_cx, lock_cy)
+                _etap("primerka", _t_pr)
                 _match_dbg["size_scale"] = k_scale
                 if template_std < TEMPLATE_STARVED_STD:
                     # Эталон безлик — он внутри однородного предмета. Растём,
@@ -7261,7 +7320,7 @@ def process_locked_tracker(gray):
                             # и всегда по СВЕЖИМ данным — исходный эталон не
                             # пересчитывается сам из себя и не размывается.
                             _adapt_template_base(gray)
-        elif SIZE_ADAPT_ENABLED and frame_index % SIZE_ADAPT_EVERY_FRAMES == 0:
+        elif SIZE_ADAPT_ENABLED and frame_index % _period_primerki() == 0:
             # Область поиска растягиваем под ТЕКУЩИЙ размер коробки, иначе
             # крупная цель заведомо в неё не помещается и измерить её нельзя.
             est_w, est_h = estimate_size_at_position(
@@ -7574,7 +7633,12 @@ def _capture_flight_row(cb_t0):
             fc_roll, fc_pitch, fc_yaw, att_age,
             _idx(motors, 0), _idx(motors, 1), _idx(motors, 2), _idx(motors, 3),
             _idx(rc, 0), _idx(rc, 1), _idx(rc, 2), _idx(rc, 3),
-            dt_ms, (time.monotonic() - cb_t0) * 1000.0, armed,
+            dt_ms, (time.monotonic() - cb_t0) * 1000.0,
+            # Поэтапно: без разбивки видно только «кадр стал дороже», а какой
+            # именно этап съедает время — нет. Дважды чинил не то место.
+            _etap_ms.get("potok"), _etap_ms.get("sovpadenie"),
+            _etap_ms.get("primerka"),
+            armed,
             g("launch_target_deg"), g("launch_reached"), g("k"),
             _match_dbg.get("psr"), _match_dbg.get("second"),
             _match_dbg.get("margin"), _match_dbg.get("flow_gap"),
