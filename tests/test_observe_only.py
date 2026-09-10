@@ -40,7 +40,27 @@ for f in found:
     print("   ", f)
 assert found, "нигде не видно связи оверрайда с режимом наблюдения"
 
-print("\n=== 3. Флаг существует и по умолчанию ВЫКЛЮЧЕН ===")
+print("\n=== 3. В режиме наблюдения RC-команды по MSP не отправляются ===")
+lines = src.splitlines()
+send_lines = [i for i, line in enumerate(lines)
+              if line.strip().startswith("send_msp_set_raw_rc(")]
+assert send_lines, "в коде не найден вызов send_msp_set_raw_rc"
+for send_i in send_lines:
+    guards = [i for i in range(send_i)
+              if lines[i].strip() ==
+              "if have_fresh_rc and not OBSERVE_ONLY:"]
+    assert guards, (
+        "send_msp_set_raw_rc не защищён условием not OBSERVE_ONLY")
+    guard_i = guards[-1]
+    guard_indent = len(lines[guard_i]) - len(lines[guard_i].lstrip())
+    for line in lines[guard_i + 1:send_i + 1]:
+        if line.strip() and not line.lstrip().startswith("#"):
+            indent = len(line) - len(line.lstrip())
+            assert indent > guard_indent, (
+                "send_msp_set_raw_rc оказался вне защиты OBSERVE_ONLY")
+print("    все отправки MSP RC отключены")
+
+print("\n=== 4. Флаг существует и по умолчанию ВЫКЛЮЧЕН ===")
 m = re.search(r"^OBSERVE_ONLY = (.+?)(?:\s+#.*)?$", src, re.M)
 assert m, "нет флага OBSERVE_ONLY"
 val = eval(m.group(1))
@@ -49,7 +69,7 @@ assert val is False, (
     "режим наблюдения включён по умолчанию — тогда серийной заход пройдёт БЕЗ "
     "управления, и это обнаружится только в воздухе")
 
-print("\n=== 4. Программа разбирается и флаг читается однозначно ===")
+print("\n=== 5. Программа разбирается и флаг читается однозначно ===")
 tree = ast.parse(src)
 assigns = [n for n in tree.body
            if isinstance(n, ast.Assign)
@@ -57,4 +77,4 @@ assigns = [n for n in tree.body
 print("    присваиваний OBSERVE_ONLY на верхнем уровне:", len(assigns))
 assert len(assigns) == 1, "флаг задан больше одного раза — легко перепутать"
 
-print("\nOK: наблюдение не может незаметно превратиться в управление")
+print("\nOK: наблюдение не отправляет команды и не может включить управление")

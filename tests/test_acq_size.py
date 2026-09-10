@@ -41,6 +41,10 @@ exec(re.search(r"^def estimate_size_at_position.*?(?=\n\ndef )",
                src, re.S | re.M).group(0), ns)
 exec(re.search(r"^def estimate_size_at_crosshair.*?(?=\n\ndef )",
                src, re.S | re.M).group(0), ns)
+# Само измерение живёт в версии «в произвольной точке»: захват может
+# случиться не в перекрестье, а на пятне рядом (зона поиска).
+exec(re.search(r"^def estimate_size_at_position_any.*?(?=\n\ndef )",
+               src, re.S | re.M).group(0), ns)
 
 rng = np.random.default_rng(2)
 _TEX = np.clip(150.0 + cv2.GaussianBlur(

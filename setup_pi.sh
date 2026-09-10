@@ -117,3 +117,17 @@ else
     echo "    sudo systemctl start tracker    # запустить сейчас"
 fi
 echo "    ./status.sh                     # проверить, что летит нужный код"
+
+# --- ЗАЩИТА ОТ ПОРЧИ ПРИ ПРОПАЖЕ ПИТАНИЯ ---
+# Карта монтирована ext4 с отложенной записью: имя файла попадает на диск
+# сразу, содержимое — когда соберётся ядро. Пропажа питания в этом окне
+# оставляет файлы нулевого размера с целыми именами. За 9 сентября 2026 это
+# случилось трижды: tracker.py обнулялся, служба уходила в цикл перезапусков
+# (пустой файл Python выполняет молча), git падал с «object file is empty».
+#
+# Здесь git заставляют дописывать свои объекты на карту сразу. Рабочие файлы
+# это не покрывает — для них есть sync в obnovit.sh.
+echo "==> Настраиваю git на немедленную запись объектов"
+git -C "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" config core.fsync \
+    loose-object,pack,pack-metadata,commit-graph,index,derived-metadata,reference
+git -C "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" config core.fsyncMethod fsync
