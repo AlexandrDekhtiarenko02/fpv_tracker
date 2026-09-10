@@ -1034,6 +1034,20 @@ FF_GAIN_YAW = 1.0       # PWM на (px/кадр) скорости цели по 
 # Триггер: площадь коробки относительно всего кадра.
 CLOSING_MODE_ENABLED = True
 CLOSING_BOX_FRAC_THRESHOLD = 0.18   # запасной признак, если времени нет
+
+# --- ФИНАЛ: ДЕРЖИМ ПОСЛЕДНЮЮ КОМАНДУ ---
+# В последние мгновения доворачивать поздно и вредно (подробности у самой
+# заморозки). Команда замирает на значении, сложившемся ДО финала, когда
+# данные ещё были надёжными.
+FINAL_HOLD_ENABLED = True
+# Во сколько раз должна вырасти рамка от захвата. Рост втрое = дальность втрое
+# меньше той, что была при захвате: заход с 60 м замирает на 20 м, с 30 м — на
+# 10. То есть порог сам подстраивается под то, с какой дистанции целились.
+#
+# Признак безразмерный и прямой: ни высоты, ни угла, ни скорости, ни GPS.
+# Дальность через высоту врёт на малых углах, а время до контакта пока не
+# работает вовсе — на них опираться нельзя.
+FINAL_HOLD_ROST = 3.0
 # ПЕРЕКЛЮЧАЕМСЯ ПО ВРЕМЕНИ ДО КОНТАКТА, а не по доле кадра.
 #
 # Замерено по 46 заходам: доля кадра доходила до порога 0.18 лишь в 1.2%
@@ -1406,6 +1420,14 @@ GROUND_MIN_POINTS = 6
 GROUND_MAX_POINTS = 40
 GROUND_MIN_DEPRESSION_DEG = 8.0   # ближе к горизонту дальность до земли врёт
 GROUND_SPEED_ALPHA = 0.20
+# Как часто набор точек для бега земли ищется заново. Без обновления по
+# времени в наборе оседают точки, которые НЕ уехали, — то есть неудачи
+# слежения, и смещение по ним занижено. Полсекунды: земля за это время
+# сменяется полностью, а поиск углов стоит недорого.
+GROUND_PTS_REFRESH_S = 0.5
+# Через сколько молчания скорость по бегу земли считается протухшей. Раньше
+# последнее удачное значение хранилось вечно и выглядело как измерение.
+GROUND_SPEED_STALE_S = 1.0
 # Через сколько кадров считать бег земли. Замерено в полёте: расчёт стоит
 # 11.4 мс на кадр при бюджете 48 мс, то есть треть времени кадра. На стенде он
 # не запускался НИ РАЗУ (нужен арм и высота), поэтому в цену никто не смотрел.
@@ -1664,7 +1686,7 @@ _FLIGHT_LOG_COLUMNS = (
     "pitch_p,pitch_d,pitch_i,pitch_ff,pitch_off,pitch_sat,"
     "launch_pwm,cruise_pwm,rate_damp,roll_damp,pitch_comb,"
     "yaw_filt,yaw_weight,yaw_pd,yaw_ff,yaw_i,yaw_off,yaw_sat,"
-    "los_rate,base_thr,thr_adjust,thr_i,rc_fresh,"
+    "los_rate,rost_ot_zahvata,final_hold,base_thr,thr_adjust,thr_i,rc_fresh,"
     "cmd_roll,cmd_pitch,cmd_yaw,cmd_thr,"
     "sent_r,sent_p,sent_t,sent_y,"
     "fc_roll,fc_pitch,fc_yaw,att_age_ms,"
@@ -2607,6 +2629,9 @@ override_active = False
 _los_ugol = None
 _los_t = 0.0
 _los_skorost = 0.0
+# Финал: заморожена ли команда и на каких значениях.
+_final_zamorozhen = False
+_final_komandy = (1500, 1500, 1500)
 # Счётчик подтверждения режима сближения: сколько кадров подряд время до
 # контакта держится ниже порога. Одиночный выброс режим не включает.
 _closing_schet = 0
@@ -2717,6 +2742,8 @@ _gotovnost_done = False
 _startup_t0 = None             # когда пошёл опрос полётника
 _sensors_ok_since = None       # когда всё поднялось (для срока показа)
 ground_speed_mps = None   # путевая скорость по бегу земли, м/с
+_gs_speed_t = 0.0         # когда её измеряли в последний раз
+_gs_pts_t = 0.0           # когда в последний раз искали точки
 _gs_prev_gray = None
 _gs_prev_pts = None
 _gs_prev_t = 0.0
@@ -4384,10 +4411,23 @@ def estimate_ground_speed(gray, now_mono):
         if dt <= 1e-3:
             return None
         _ground_flow_dbg["dt_ms"] = dt * 1000.0
-        if _gs_prev_pts is None or len(_gs_prev_pts) < GROUND_MIN_POINTS:
+        # ТОЧКИ ОБНОВЛЯЮТСЯ ПО ВРЕМЕНИ, А НЕ ТОЛЬКО ПО СЧЁТУ.
+        #
+        # Раньше набор искался заново лишь когда точек становилось меньше
+        # минимума. Пока их хватало по счёту, те же самые тащились из кадра в
+        # кадр — а земля под ними уезжает. Остаются в наборе как раз те, что
+        # НЕ уехали, то есть неудачи слежения: угол дома на горизонте, залипший
+        # угол, точка на самом аппарате. Смещение по ним занижено и не меняется.
+        global _gs_pts_t
+        nado_obnovit = (
+            _gs_prev_pts is None
+            or len(_gs_prev_pts) < GROUND_MIN_POINTS
+            or (now_mono - _gs_pts_t) >= GROUND_PTS_REFRESH_S)
+        if nado_obnovit:
             _gs_prev_pts = cv2.goodFeaturesToTrack(
                 _gs_prev_gray, maxCorners=GROUND_MAX_POINTS,
                 qualityLevel=0.01, minDistance=8, blockSize=5)
+            _gs_pts_t = now_mono
         if _gs_prev_pts is None or len(_gs_prev_pts) < GROUND_MIN_POINTS:
             _ground_flow_dbg["points"] = (0 if _gs_prev_pts is None
                                            else len(_gs_prev_pts))
@@ -4434,12 +4474,30 @@ def estimate_ground_speed(gray, now_mono):
         _gs_prev_gray = band.copy()
         _gs_prev_pts = None if nxt is None else nxt
         _gs_prev_t = now_mono
+        # ИЗМЕРЕНИЕ ПРОТУХАЕТ. Раньше ground_speed_mps просто хранил последнее
+        # удачное значение — и если измерить переставало получаться (угол
+        # визирования полосы ушёл ниже порога, аппарат разоружён, точек не
+        # набралось), оно оставалось там НАВСЕГДА.
+        #
+        # Именно так это и выглядело в логах: 7.3 м/с во всех кадрах одного
+        # вылета и 9.469 во всех кадрах другого — до третьего знака, при любом
+        # наклоне от 5° до 40°, тогда как GPS в тех же кадрах давал от 8 до 18.
+        # Не измерение, а застрявшее число. А от него считается поправка
+        # тангажа, то есть и дальность.
+        #
+        # Молчать честнее, чем повторять старое: None наверху читается как
+        # «скорости нет», и закон на неё не обопрётся.
+        global _gs_speed_t
         if speed is not None and 0.0 <= speed < 120.0:
             a = alpha_for_dt(GROUND_SPEED_ALPHA, 1.0)
             if ground_speed_mps is None:
                 ground_speed_mps = speed
             else:
                 ground_speed_mps += a * (speed - ground_speed_mps)
+            _gs_speed_t = now_mono
+        elif (ground_speed_mps is not None
+              and now_mono - _gs_speed_t > GROUND_SPEED_STALE_S):
+            ground_speed_mps = None
         return ground_speed_mps
     except Exception:
         return None
@@ -5131,6 +5189,7 @@ def update_control_from_target():
     global global_yaw_cmd, global_pitch_cmd, global_roll_cmd, global_throttle_cmd, override_active
     global _slew_roll, _slew_pitch, _slew_yaw, _pitch_pri_loke
     global _los_ugol, _los_t, _los_skorost
+    global _final_zamorozhen, _final_komandy
     global filtered_dx_yaw, prev_adx, prev_ady_ctrl
     global smooth_throttle_out, throttle_integral, prev_ady
     global roll_integral, pitch_integral, yaw_integral
@@ -5685,6 +5744,48 @@ def update_control_from_target():
         thr_adjust += (d_dy / k) * DY_THROTTLE_D_GAIN
 
 
+    # --- ФИНАЛ: ДЕРЖИМ ПОСЛЕДНЮЮ КОМАНДУ ---
+    #
+    # В последние мгновения доворачивать поздно и вредно. Поздно — потому что
+    # аппарат физически не успевает изменить траекторию: на 20 м/с последние
+    # пять метров проходятся за четверть секунды, а отклик петли замерен в
+    # 125 мс. Вредно — потому что именно там всё сходится против нас: рамка
+    # огромная, кадр идёт вдвое дольше (замерено 50 мс против 25), слежение по
+    # раздутому эталону шатается, и любая поправка вносит больше шума, чем
+    # исправляет.
+    #
+    # Поэтому команда замораживается на том значении, которое сложилось ДО
+    # финала — когда данные ещё были надёжными. Аппарат доходит по уже
+    # выбранному направлению, а не пытается уточнять его вслепую.
+    #
+    # ПРИЗНАК БЛИЗОСТИ — РОСТ РАМКИ ОТ ЗАХВАТА, а не дальность и не время.
+    # Дальность считается через высоту и угол и врёт на малых углах; время до
+    # контакта пока не работает вовсе. А рост рамки — прямое измерение и
+    # безразмерное: рамка выросла втрое, значит дальность втрое меньше той,
+    # что была при захвате. Ни высоты, ни скорости, ни GPS для этого не надо.
+    rost_ot_zahvata = None
+    if lock_w0 and lock_h0:
+        _bok0 = math.sqrt(float(lock_w0) * float(lock_h0))
+        _bok = math.sqrt(max(1.0, box_w_main * box_h_main))
+        # lock_w0 хранится в координатах lores, коробка — в координатах кадра.
+        _bok0 *= float(MAIN_W) / float(LORES_W)
+        if _bok0 > 1.0:
+            rost_ot_zahvata = _bok / _bok0
+
+    if (FINAL_HOLD_ENABLED and rost_ot_zahvata is not None
+            and rost_ot_zahvata >= FINAL_HOLD_ROST):
+        if not _final_zamorozhen:
+            _final_zamorozhen = True
+            _final_komandy = (target_roll, target_pitch, target_yaw)
+            flight_log.event(
+                "ФИНАЛ: команда заморожена, рамка выросла в %.1f раза "
+                "(порог %.1f). Держим roll=%d pitch=%d yaw=%d"
+                % (rost_ot_zahvata, FINAL_HOLD_ROST,
+                   target_roll, target_pitch, target_yaw))
+        target_roll, target_pitch, target_yaw = _final_komandy
+    else:
+        _final_zamorozhen = False
+
     # ОБЩИЙ ХВОСТ ГАЗА — ОДИН НА ВСЕ ЗАКОНЫ.
     #
     # Ветки выше решают только ОДНО: какова поправка thr_adjust. Ограничение,
@@ -5779,6 +5880,9 @@ def update_control_from_target():
         # Скорость изменения угла визирования — главный признак промаха:
         # на курсе столкновения она ноль, при перелёте растёт.
         "los_rate": _los_skorost,
+        # Рост рамки от захвата и признак заморозки: по ним после посадки
+        # видно, когда контур перестал рулить и почему.
+        "rost_ot_zahvata": rost_ot_zahvata, "final_hold": _final_zamorozhen,
         "base_thr": base_thr, "thr_adjust": thr_adjust,
         "thr_i": throttle_integral, "rc_fresh": rc_fresh,
         "launch_phase": launch_phase, "launch_int": launch_intensity,
@@ -7098,7 +7202,7 @@ def _capture_flight_row(cb_t0):
             g("pitch_comb"),
             g("yaw_filt"), g("yaw_weight"), g("yaw_pd"), g("yaw_ff"),
             g("yaw_i"), g("yaw_off"), g("yaw_sat"),
-            g("los_rate"),
+            g("los_rate"), g("rost_ot_zahvata"), g("final_hold"),
             c.get("base_thr"), g("thr_adjust"), g("thr_i"), g("rc_fresh"),
             r_cmd, p_cmd, y_cmd, t_cmd,
             _idx(sent, 0), _idx(sent, 1), _idx(sent, 2), _idx(sent, 3),
