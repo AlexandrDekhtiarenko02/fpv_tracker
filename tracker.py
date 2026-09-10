@@ -676,6 +676,21 @@ MAX_LOCK_STEP = 32
 
 FLOW_MIN_POINTS = 3
 FLOW_ERR_MAX = 20.0 * TRACK_SCALE
+# --- РАСШИРЕНИЕ ЦЕЛИ ПО ТОЧКАМ ПОТОКА ---
+# Из него считается время до контакта. Подробности у самого расчёта; суть в
+# том, что коробка растёт ступенями масштаба и её производная — мусор, а
+# разбегание точек от своего центра непрерывно.
+# Наименьший разброс точек, при котором отношение осмысленно: на кучке в
+# пару пикселей шум перекрывает сигнал.
+FLOW_RASSH_MIN_R = 3.0
+# Пределы расширения ЗА ОДИН КАДР. Больше — точки уехали на фон или цель
+# развернулась; такому кадру верить нельзя.
+FLOW_RASSH_MIN = 0.90
+FLOW_RASSH_MAX = 1.12
+# Старше этого измерение не берётся: поток мог не сойтись несколько кадров,
+# и подставлять старое расширение как новое — то же, чем болел бег земли.
+FLOW_RASSH_SVEZH_S = 0.20
+
 FLOW_MAX_STEP = 30.0 * TRACK_SCALE
 FLOW_REFRESH_EVERY = 1
 # Параметры расчёта потока вынесены сюда, чтобы их можно было мерить перебором
@@ -2808,6 +2823,12 @@ _tau_hold_val = None           # последнее годное время до
 _tau_hold_t = 0.0              # когда оно было замерено
 # Хвост (время, размер рамки) для оценки времени до контакта по окну.
 _size_hist = collections.deque(maxlen=256)
+# Коэффициент расширения цели за кадр по точкам потока и когда он получен.
+# Накопленный логарифм — это ln(размера) с точностью до постоянной, а для
+# наклона постоянная и не нужна.
+_flow_rasshirenie = None
+_flow_rasshirenie_t = 0.0
+_rassh_nakop = 0.0
 
 # Интегратор внутреннего контура каскадного газа.
 cascade_integral = 0.0
@@ -3523,6 +3544,34 @@ def flow_predict(prev_g, cur_g, pts, cx, cy):
         dy = float(np.median(new[:, 1] - old[:, 1]))
         if math.hypot(dx, dy) > FLOW_MAX_STEP:
             return False, cx, cy
+
+        # РАСШИРЕНИЕ ЦЕЛИ В КАДРЕ — здесь и только здесь оно доступно даром.
+        #
+        # Время до контакта = размер / скорость роста размера. Прежде ростом
+        # считалось изменение КОРОБКИ, а коробка — не измерение: масштаб
+        # примеряется тремя ступенями (0.847 / 1.0 / 1.18) и потом
+        # сглаживается. Ряд выходит ступенчатым, и его производная — мусор.
+        # Отсюда и «время до контакта не считается»: метод верен, а входные
+        # данные для него негодны.
+        #
+        # Точки потока дают ту же величину НЕПРЕРЫВНО: если цель приблизилась,
+        # они разбегаются от своего центра. Отношение средних расстояний до
+        # центра и есть коэффициент расширения за кадр. Ни ступеней, ни
+        # сглаживания, и никакого знания настоящего размера цели.
+        global _flow_rasshirenie, _flow_rasshirenie_t
+        if len(new) >= FLOW_MIN_POINTS:
+            c0 = np.median(old, axis=0)
+            c1 = np.median(new, axis=0)
+            r0 = float(np.median(np.hypot(old[:, 0] - c0[0], old[:, 1] - c0[1])))
+            r1 = float(np.median(np.hypot(new[:, 0] - c1[0], new[:, 1] - c1[1])))
+            if r0 > FLOW_RASSH_MIN_R:
+                k = r1 / r0
+                # Отсекаем невозможное за один кадр: столько цель вырасти не
+                # может, значит точки уехали на фон или зацепились за поворот.
+                if FLOW_RASSH_MIN <= k <= FLOW_RASSH_MAX:
+                    _flow_rasshirenie = k
+                    _flow_rasshirenie_t = time.monotonic()
+
         return True, cx + dx, cy + dy
     except Exception:
         return False, cx, cy
@@ -5050,7 +5099,21 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
     # ВРЕМЯ ДО КОНТАКТА — по наклону ln(размера) за окно. При постоянной
     # скорости сближения размер обратно пропорционален дальности, поэтому
     # d ln(размер)/dt = V/D = 1/tau, и настоящий размер цели не нужен.
-    _size_hist.append((now_mono, size))
+    # В ряд идёт РАСШИРЕНИЕ ПО ПОТОКУ, если оно свежее, и коробка — если нет.
+    #
+    # Ряд один и тот же по смыслу: ln(размера) с точностью до постоянной.
+    # Накопленный логарифм расширения — это тот же ln(размера), только
+    # измеренный непрерывно, а не тремя ступенями масштаба.
+    global _rassh_nakop
+    ryad = None
+    if (_flow_rasshirenie is not None
+            and now_mono - _flow_rasshirenie_t <= FLOW_RASSH_SVEZH_S):
+        _rassh_nakop += math.log(_flow_rasshirenie)
+        # Экспонента от накопленного — чтобы дальше по коду ряд оставался
+        # «размером», и логарифм брался в одном месте, как раньше.
+        ryad = math.exp(_rassh_nakop) * 100.0
+        out["rassh_kadr"] = _flow_rasshirenie
+    _size_hist.append((now_mono, ryad if ryad is not None else size))
     while _size_hist and (now_mono - _size_hist[0][0]) > TAU_FIT_WINDOW_S:
         _size_hist.popleft()
     if len(_size_hist) >= TAU_FIT_MIN_POINTS:
@@ -5328,6 +5391,7 @@ def update_control_from_target():
     global _los_ugol, _los_t, _los_skorost
     global _final_zamorozhen, _final_komandy, _final_okno
     global _dover_score_ema, _dover_psr_ema
+    global _rassh_nakop, _flow_rasshirenie
     global filtered_dx_yaw, prev_adx, prev_ady_ctrl
     global smooth_throttle_out, throttle_integral, prev_ady
     global roll_integral, pitch_integral, yaw_integral
@@ -5405,6 +5469,10 @@ def update_control_from_target():
         prev_box_size_px = None
         box_growth_smoothed = 0.0
         _size_hist.clear()
+        # И накопленное расширение: оно осмысленно только внутри одного
+        # захода, у новой цели свой размер и свой отсчёт.
+        _rassh_nakop = 0.0
+        _flow_rasshirenie = None
         prev_box_cx = None
         prev_box_cy = None
         target_vx_smoothed = 0.0
