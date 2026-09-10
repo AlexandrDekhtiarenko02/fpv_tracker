@@ -89,4 +89,52 @@ r2 = ugly_i_radius(snyat(4.0))
 print("    через 1.5 и 4 длительности: %.1f и %.1f px" % (r1, r2))
 assert abs(r1 - r2) < 0.6, "метка продолжает двигаться после анимации"
 
-print("\nOK: лупа меньше, метка делает оборот, поджимается и замирает")
+print("\n=== 6. Стороны втягиваются: остаются уголки, середина открыта ===")
+
+
+def seredina_storony_pusta(kadr, r):
+    """Есть ли разрыв посередине сторон.
+
+    В покое квадрат стоит ровно, значит середины сторон — это точки строго
+    справа, слева, сверху и снизу от центра на расстоянии r/sqrt(2).
+    """
+    cx, cy = 160, 120
+    pol = r / math.sqrt(2.0)
+    pusto = 0
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        x = int(round(cx + dx * pol))
+        y = int(round(cy + dy * pol))
+        okno = kadr[max(0, y - 1):y + 2, max(0, x - 1):x + 2, 0]
+        if okno.size and okno.max() < 200:
+            pusto += 1
+    return pusto
+
+
+# Сразу после оборота стороны ещё сплошные.
+f = snyat(1.0)
+r_kon = t.METKA_R_END
+tselyh = seredina_storony_pusta(f, r_kon)
+print("    сразу после оборота: пустых середин %d из 4" % tselyh)
+assert tselyh == 0, "стороны разорвались раньше времени — два движения слились"
+
+# А после втягивания — пусты.
+t._metka_t0 = t.time.monotonic() - (t.METKA_ANIM_S + t.METKA_UGLY_S + 0.05)
+f = np.zeros((240, 320, 3), np.uint8)
+t.draw_corners(f, BOX, t.COLOR_WHITE, 2)
+pusto = seredina_storony_pusta(f, r_kon)
+print("    после втягивания:    пустых середин %d из 4" % pusto)
+assert pusto == 4, (
+    "середины сторон закрашены: квадрат остался сплошным и закрывает цель")
+
+# Но углы на месте — иначе метка просто исчезла.
+ys, xs = np.nonzero(f[:, :, 0] > 200)
+assert len(xs) > 0, "метка исчезла целиком"
+r_ugly = float(np.hypot(xs - 160.0, ys - 120.0).max())
+print("    углы на радиусе %.1f px (метка %g)" % (r_ugly, r_kon))
+assert abs(r_ugly - r_kon) <= 2.0, "углы уехали с радиуса метки"
+
+assert 0.0 < t.METKA_UGOL_DOLYA < 0.5, (
+    "доля стороны %g: при 0.5 квадрат сплошной, при 0 углов не останется"
+    % t.METKA_UGOL_DOLYA)
+
+print("\nOK: лупа меньше, метка делает оборот, поджимается и раскрывается в уголки")

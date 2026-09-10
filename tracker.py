@@ -156,6 +156,13 @@ METKA_R_START = 14.0
 METKA_R_END = 8.0
 # Тонкая линия: метка указывает на цель, а не заменяет её.
 METKA_TOLSHCHINA = 1
+# Вторая фаза: сколько длится втягивание сторон к углам. Идёт ПОСЛЕ оборота,
+# а не вместе с ним: два движения разом сливаются в мельтешение.
+METKA_UGLY_S = 0.35
+# Какая доля стороны остаётся у каждого угла. 0.5 — стороны смыкаются
+# посередине, то есть сплошной квадрат; 0.3 оставляет заметные уголки и
+# открытую середину, через которую видно цель.
+METKA_UGOL_DOLYA = 0.3
 MAG_ONLY_WHEN_AUX = False
 
 # =========================================================
@@ -5842,15 +5849,41 @@ def draw_corners(frame, box, color, thickness=2):
     r = METKA_R_START + (METKA_R_END - METKA_R_START) * plavno
     ugol = 2.0 * math.pi * plavno
 
+    # ВТОРАЯ ФАЗА: стороны втягиваются к углам.
+    #
+    # Сплошной квадрат вокруг цели её же и закрывает — а разглядывать надо
+    # именно цель. Уголки очерчивают ровно то же место, но оставляют середину
+    # открытой. Втягивание идёт ПОСЛЕ оборота, а не вместе с ним: два
+    # движения разом сливаются в мельтешение, и ни одно не читается.
+    dolya_storony = 0.5
+    if METKA_UGLY_S > 0.0 and _metka_t0 is not None:
+        posle = (time.monotonic() - _metka_t0) - METKA_ANIM_S
+        d2 = posle / METKA_UGLY_S
+        if d2 < 0.0:
+            d2 = 0.0
+        elif d2 > 1.0:
+            d2 = 1.0
+        pl2 = 1.0 - (1.0 - d2) ** 2
+        dolya_storony = 0.5 + (METKA_UGOL_DOLYA - 0.5) * pl2
+
     # Квадрат: четыре угла через 90°, начиная с 45°, чтобы в покое он стоял
     # ровно, а не на ребре.
-    pts = []
+    ugly = []
     for i in range(4):
         a = ugol + math.pi / 4.0 + i * math.pi / 2.0
-        pts.append([int(round(bcx + r * math.cos(a))),
-                    int(round(bcy + r * math.sin(a)))])
-    cv2.polylines(frame, [np.array(pts, dtype=np.int32).reshape((-1, 1, 2))],
-                  True, COLOR_WHITE, METKA_TOLSHCHINA, cv2.LINE_8)
+        ugly.append((bcx + r * math.cos(a), bcy + r * math.sin(a)))
+
+    # От каждого угла — два отрезка к соседним. При доле 0.5 они смыкаются
+    # посередине стороны, и квадрат выглядит сплошным; меньше — в середине
+    # сторон появляется разрыв, и остаются уголки.
+    for i in range(4):
+        ax, ay = ugly[i]
+        for sosed in (ugly[(i + 1) % 4], ugly[(i - 1) % 4]):
+            bx = ax + (sosed[0] - ax) * dolya_storony
+            by = ay + (sosed[1] - ay) * dolya_storony
+            cv2.line(frame, (int(round(ax)), int(round(ay))),
+                     (int(round(bx)), int(round(by))),
+                     COLOR_WHITE, METKA_TOLSHCHINA, cv2.LINE_8)
 
 
 def draw_magnifier(frame, box=None):
