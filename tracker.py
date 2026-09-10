@@ -121,6 +121,9 @@ CENTER_X, CENTER_Y = MAIN_W // 2, MAIN_H // 2
 CENTER_X_LORES, CENTER_Y_LORES = LORES_W // 2, LORES_H // 2
 
 COLOR_GREEN = (0, 255, 0, 0)
+# Зона поиска при захвате. Приглушённый серый: она подсказка, а не прицел, и
+# перетягивать внимание на себя не должна.
+COLOR_SNAP_ZONE = (150, 150, 150, 0)
 COLOR_RED = (0, 0, 255, 0)
 COLOR_WHITE = (255, 255, 255, 0)
 COLOR_YELLOW = (0, 255, 255, 0)
@@ -142,6 +145,35 @@ MAG_ONLY_WHEN_AUX = False
 # =========================================================
 # 2. LOCK-ON ПАРАМЕТРЫ (трекинг не трогаем)
 # =========================================================
+# --- ЗОНА ПОИСКА ПРИ ЗАХВАТЕ ---
+# Наводить перекрестье ТОЧНО на цель неудобно: аппарат трясёт, цель мелкая, и
+# промах на десяток пикселей означает захват фона рядом с ней. Пилот целится
+# «в район» — значит в этом районе и надо искать то, что выделяется.
+#
+# Если в зоне ничего выраженного нет, захват идёт ровно туда, куда навёл
+# пилот, то есть прежним поведением. Это важно: над однородной поверхностью
+# зона поиска не должна мешать целиться вручную.
+ACQ_SNAP_ENABLED = True
+# Радиус зоны в пикселях КАДРА (не lores). 60 px при 640 в ширину — примерно
+# десятая часть кадра: заметно шире промаха от тряски, но не настолько, чтобы
+# захватить соседний предмет.
+ACQ_SNAP_RADIUS_MAIN = 60
+ACQ_SNAP_RADIUS_LORES = max(6, int(round(ACQ_SNAP_RADIUS_MAIN * LORES_W / MAIN_W)))
+# Размытия для оценки выраженности: мелкое убирает шум, крупное даёт фон.
+ACQ_SNAP_SIGMA_MELKO = 1.2
+ACQ_SNAP_SIGMA_KRUPNO = 6.0
+# Вес выраженности у КРАЯ зоны. У центра он 1.0. Меньше — сильнее притяжение
+# к тому, куда целился пилот; 0.45 означает, что край должен быть вдвое
+# выразительнее центра, чтобы перевесить.
+ACQ_SNAP_EDGE_WEIGHT = 0.45
+# Порог: во сколько раз пятно должно превосходить типичную выраженность в
+# самой зоне. Относительный, а не абсолютный: абсолютный зависел бы от
+# освещённости и от фона.
+ACQ_SNAP_MIN_OTN = 2.5
+# И нижняя абсолютная граница в уровнях яркости — против пустого неба, где
+# медиана почти ноль и любой шум превышает её в разы.
+ACQ_SNAP_MIN_ABS = 4.0
+
 ACQ_RADIUS_MAIN = 18
 ACQ_RADIUS_LORES = max(8, int(round(ACQ_RADIUS_MAIN * LORES_W / MAIN_W)))
 
@@ -3484,6 +3516,71 @@ def _acq_debug_dump(gray, results):
         flight_log.event("СНИМОК ЗАХВАТА не удался: %s" % exc)
 
 
+def _nayti_pyatno(gray):
+    """Самое выраженное пятно в зоне поиска у прицела.
+
+    ЗАЧЕМ. Наводить перекрестье ТОЧНО на цель неудобно: аппарат трясёт, цель
+    мелкая, а промах на десяток пикселей означает захват фона рядом с целью.
+    Пилот целится «в район», и разумнее дать ему это делать: искать в зоне
+    вокруг прицела то, что на фоне выделяется, и захватываться за него.
+
+    ЧТО СЧИТАЕТСЯ ПЯТНОМ. Разность двух размытий (мелкого и крупного) — это
+    и есть «насколько точка отличается от своего окружения». Ни цвет, ни
+    яркость сами по себе не годятся: тёмная цель на светлом фоне так же
+    выражена, как светлая на тёмном, а важна именно РАЗНИЦА. Поэтому берётся
+    модуль.
+
+    ПОЧЕМУ С ПРИТЯЖЕНИЕМ К ЦЕНТРУ. Без него на краю зоны почти всегда
+    найдётся контраст сильнее цели — граница поля, столб, край дороги, — и
+    захват уезжал бы от того, куда целился пилот. Вес плавно спадает от
+    центра к краю: у центра решает пилот, у края — только явно выраженное
+    пятно может перевесить.
+
+    Возвращает (x, y) в координатах lores либо None, если ничего выраженного
+    в зоне нет — тогда захват идёт ровно туда, куда навёл пилот.
+    """
+    if not ACQ_SNAP_ENABLED:
+        return None
+    try:
+        R = int(ACQ_SNAP_RADIUS_LORES)
+        if R < 4:
+            return None
+        h, w = gray.shape[:2]
+        x0 = max(0, int(CENTER_X_LORES) - R)
+        y0 = max(0, int(CENTER_Y_LORES) - R)
+        x1 = min(w, int(CENTER_X_LORES) + R + 1)
+        y1 = min(h, int(CENTER_Y_LORES) + R + 1)
+        roi = gray[y0:y1, x0:x1]
+        if roi.shape[0] < 8 or roi.shape[1] < 8:
+            return None
+        f = roi.astype(np.float32)
+        # Мелкое размытие убирает пиксельный шум, крупное даёт фон. Их
+        # разность и есть выраженность.
+        melko = cv2.GaussianBlur(f, (0, 0), ACQ_SNAP_SIGMA_MELKO)
+        krupno = cv2.GaussianBlur(f, (0, 0), ACQ_SNAP_SIGMA_KRUPNO)
+        sal = cv2.absdiff(melko, krupno)
+        # Ещё одно лёгкое размытие: иначе побеждает одиночный битый пиксель,
+        # а нам нужно пятно, у которого есть размер.
+        sal = cv2.GaussianBlur(sal, (0, 0), ACQ_SNAP_SIGMA_MELKO)
+
+        # Притяжение к центру: вес 1.0 у прицела, ACQ_SNAP_EDGE_WEIGHT у края.
+        gy, gx = np.mgrid[y0:y1, x0:x1]
+        dist = np.sqrt((gx - CENTER_X_LORES) ** 2 + (gy - CENTER_Y_LORES) ** 2)
+        otn = np.clip(dist / float(R), 0.0, 1.0)
+        ves = 1.0 - (1.0 - ACQ_SNAP_EDGE_WEIGHT) * otn
+        vzves = sal * ves.astype(np.float32)
+
+        _, maxv, _, maxloc = cv2.minMaxLoc(vzves)
+        # Сравниваем с типичной выраженностью в самой зоне, а не с абсолютным
+        # порогом: он зависел бы от освещённости и от того, что за фон.
+        fon = float(np.median(sal))
+        if maxv < max(ACQ_SNAP_MIN_ABS, fon * ACQ_SNAP_MIN_OTN):
+            return None
+        return (x0 + maxloc[0], y0 + maxloc[1])
+    except Exception:
+        return None
+
+
 def estimate_size_at_crosshair(gray):
     """Размер цели под прицелом в момент захвата.
 
@@ -3503,11 +3600,22 @@ def estimate_size_at_crosshair(gray):
     Захват случается редко, поэтому здесь можно позволить себе несколько
     попыток с разной областью и взять первую, где предмет уместился целиком.
     """
+    return estimate_size_at_position_any(gray, CENTER_X_LORES, CENTER_Y_LORES)
+
+
+def estimate_size_at_position_any(gray, px, py):
+    """То же самое, но в произвольной точке кадра.
+
+    Вынесено из estimate_size_at_crosshair, когда появилась зона поиска:
+    захват теперь может случиться не в перекрестье, а на пятне рядом, и
+    мерить размер надо ТАМ ЖЕ, где захватываемся. Мерить в перекрестье, а
+    захватываться рядом — значит взять размер фона вместо размера цели.
+    """
     got = []
     shots = []
     for radius in SIZE_ACQ_RADII:
         lw, lh = estimate_size_at_position(
-            gray, CENTER_X_LORES, CENTER_Y_LORES, cur_w=radius / 1.6)
+            gray, px, py, cur_w=radius / 1.6)
         if ACQ_DEBUG_DUMP and _size_fail["roi"] is not None:
             shots.append((_size_fail["R"], _size_fail["roi"],
                           _size_fail["mask"], _size_fail["box"], lw))
@@ -3538,8 +3646,24 @@ def estimate_size_at_crosshair(gray):
 def estimate_initial_target(gray):
     if ACQ_LOCK_AT_CROSSHAIR_EXACTLY:
         lw = lh = None
+        # ЗОНА ПОИСКА. Пилот целится в район цели, а захватываемся мы за то,
+        # что в этом районе выделяется. Не нашли ничего выраженного — берём
+        # ровно ту точку, куда он навёл: прежнее поведение сохраняется, и над
+        # однородной поверхностью зона целиться не мешает.
+        tx, ty = float(CENTER_X_LORES), float(CENTER_Y_LORES)
+        pyatno = _nayti_pyatno(gray)
+        if pyatno is not None:
+            tx, ty = float(pyatno[0]), float(pyatno[1])
+            sdvig = math.hypot(tx - CENTER_X_LORES, ty - CENTER_Y_LORES)
+            flight_log.event(
+                "ЗАХВАТ ПО ПЯТНУ: сдвиг от прицела %.0f px (зона %d)"
+                % (sdvig, ACQ_SNAP_RADIUS_LORES))
+        else:
+            flight_log.event(
+                "захват по прицелу: в зоне %d ничего выраженного"
+                % ACQ_SNAP_RADIUS_LORES)
         if ACQ_SIZE_BY_SEGMENTATION:
-            lw, lh = estimate_size_at_crosshair(gray)
+            lw, lh = estimate_size_at_position_any(gray, tx, ty)
         elif ACQ_DEBUG_DUMP:
             # Мерить не мерим, но снимок захвата всё равно снимаем: по нему
             # видно, что вообще было под прицелом.
@@ -3548,7 +3672,7 @@ def estimate_initial_target(gray):
         # цель ещё неизвестна, и начать с чего-то надо.
         if lw is None or lh is None:
             lw, lh = float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H)
-        return float(CENTER_X_LORES), float(CENTER_Y_LORES), float(lw), float(lh), True
+        return tx, ty, float(lw), float(lh), True
     return (float(CENTER_X_LORES), float(CENTER_Y_LORES),
             float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H), True)
 
@@ -6080,6 +6204,21 @@ def draw_overlay_on_frame(frame):
     # единственный ориентир, по нему цель и наводят перед локом.
     if not (vis and box is not None):
         draw_crosshair(frame)
+        # ЗОНА ПОИСКА рисуется только до захвата — она и нужна только тогда.
+        # Без неё пилот не знает, насколько грубо можно целиться, и по
+        # привычке продолжает наводить перекрестье точно на цель.
+        if ACQ_SNAP_ENABLED and ACQ_SNAP_RADIUS_MAIN > 4:
+            r = int(ACQ_SNAP_RADIUS_MAIN)
+            # Уголками, а не сплошным кругом: круг вокруг прицела сам
+            # притягивает взгляд и мешает разглядывать цель.
+            d = max(6, r // 3)
+            for zx in (-1, 1):
+                for zy in (-1, 1):
+                    ux, uy = CENTER_X + zx * r, CENTER_Y + zy * r
+                    cv2.line(frame, (ux, uy), (ux - zx * d, uy),
+                             COLOR_SNAP_ZONE, 1)
+                    cv2.line(frame, (ux, uy), (ux, uy - zy * d),
+                             COLOR_SNAP_ZONE, 1)
     if vis and box is not None:
         draw_corners(frame, box, COLOR_WHITE, 2)
         draw_range_readout(frame, box)
