@@ -121,9 +121,6 @@ CENTER_X, CENTER_Y = MAIN_W // 2, MAIN_H // 2
 CENTER_X_LORES, CENTER_Y_LORES = LORES_W // 2, LORES_H // 2
 
 COLOR_GREEN = (0, 255, 0, 0)
-# Зона поиска при захвате. Приглушённый серый: она подсказка, а не прицел, и
-# перетягивать внимание на себя не должна.
-COLOR_SNAP_ZONE = (150, 150, 150, 0)
 COLOR_RED = (0, 0, 255, 0)
 COLOR_WHITE = (255, 255, 255, 0)
 COLOR_YELLOW = (0, 255, 255, 0)
@@ -6366,21 +6363,6 @@ def draw_overlay_on_frame(frame):
     # единственный ориентир, по нему цель и наводят перед локом.
     if not (vis and box is not None):
         draw_crosshair(frame)
-        # ЗОНА ПОИСКА рисуется только до захвата — она и нужна только тогда.
-        # Без неё пилот не знает, насколько грубо можно целиться, и по
-        # привычке продолжает наводить перекрестье точно на цель.
-        if ACQ_SNAP_ENABLED and ACQ_SNAP_RADIUS_MAIN > 4:
-            r = int(ACQ_SNAP_RADIUS_MAIN)
-            # Уголками, а не сплошным кругом: круг вокруг прицела сам
-            # притягивает взгляд и мешает разглядывать цель.
-            d = max(6, r // 3)
-            for zx in (-1, 1):
-                for zy in (-1, 1):
-                    ux, uy = CENTER_X + zx * r, CENTER_Y + zy * r
-                    cv2.line(frame, (ux, uy), (ux - zx * d, uy),
-                             COLOR_SNAP_ZONE, 1)
-                    cv2.line(frame, (ux, uy), (ux, uy - zy * d),
-                             COLOR_SNAP_ZONE, 1)
     if vis and box is not None:
         draw_corners(frame, box, COLOR_WHITE, 2)
         draw_range_readout(frame, box)
