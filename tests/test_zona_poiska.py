@@ -31,7 +31,9 @@ src = io.open(os.path.join(_ROOT, "tracker.py"), encoding="utf-8").read()
 
 ns = {"np": np, "cv2": cv2, "math": math}
 for name in ("ACQ_SNAP_ENABLED", "ACQ_SNAP_SIGMA_MELKO", "ACQ_SNAP_SIGMA_KRUPNO",
-             "ACQ_SNAP_PEAK_OKNO", "ACQ_SNAP_YADRO_LORES", "ACQ_SNAP_MIN_OTN", "ACQ_SNAP_MIN_ABS"):
+             "ACQ_SNAP_PEAK_OKNO", "ACQ_SNAP_YADRO_LORES",
+             "ACQ_SNAP_SIGMA_YADRO", "ACQ_SNAP_YADRO_MIN_OTN",
+             "ACQ_SNAP_YADRO_MIN_ABS", "ACQ_SNAP_MIN_OTN", "ACQ_SNAP_MIN_ABS"):
     ns[name] = eval(re.search(r"^%s = (.+?)(?:\s+#.*)?$" % name, src, re.M).group(1))
 W, H = 320, 240
 ns["CENTER_X_LORES"], ns["CENTER_Y_LORES"] = W // 2, H // 2
@@ -64,9 +66,9 @@ for podpis, jarche in (("равный", 40), ("много ярче", 15)):
     assert sdvig < 0.5, "сдвиг %.1f px при захвате по прицелу" % sdvig
 
 print("\n=== 2. Под прицелом пусто — уезжаем на ближайшее ===")
-for sdvig_celi, storona in ((14, "вправо"), (-16, "влево")):
+for sdvig_celi, storona in ((22, "вправо"), (-24, "влево")):
     g = fon()
-    cx, cy = W // 2 + sdvig_celi, H // 2 - 6
+    cx, cy = W // 2 + sdvig_celi, H // 2 - 4
     cv2.circle(g, (cx, cy), 6, 35, -1)
     p = nayti(g)
     assert p is not None, "цель %s не найдена вовсе" % storona
@@ -95,5 +97,46 @@ print("    выбрано (%.0f,%.0f): до ближнего %.1f px, до да�
       % (p[0], p[1], d_bl, d_dl))
 assert d_bl < d_dl, (
     "выбрано дальнее яркое: значит решает выраженность, а не близость")
+
+print("\n=== 4б. Граница: сосед вплотную — держим прицел, далёкий — уезжаем ===")
+for d, ozhid in ((12, "прицел"), (22, "пятно")):
+    g = fon()
+    cv2.circle(g, (W // 2 + d, H // 2), 6, 35, -1)
+    p = nayti(g)
+    assert p is not None, "сосед в %d px: не нашла ничего" % d
+    print("    сосед в %2d px -> %s" % (d, p[2]))
+    assert p[2] == ozhid, (
+        "сосед в %d px дал «%s», ожидалось «%s»: граница между «прицел на "
+        "предмете» и «прицел на пустом месте» уехала" % (d, p[2], ozhid))
+
+print("\n=== 5. Фактурный предмет: захват НЕ ездит по нему ===")
+# Здесь ломались два прежних подхода. У фактуры вершин много, и требование
+# «своя вершина под прицелом» гнало захват с выбранного места на соседнюю
+# вершину ТОГО ЖЕ предмета.
+def faktura(cx, cy, r, seed):
+    g = fon()
+    rr = np.random.default_rng(seed)
+    y, x = np.mgrid[0:H, 0:W]
+    vnutri = (x - cx) ** 2 + (y - cy) ** 2 <= r * r
+    shum = rr.normal(0, 26, (H, W))
+    shum = cv2.GaussianBlur(shum.astype(np.float32), (0, 0), 1.3)
+    pole = g.astype(np.float32)
+    pole[vnutri] = np.clip(70 + shum, 0, 255)[vnutri]
+    return np.clip(pole, 0, 255).astype(np.uint8)
+
+uehalo = 0
+for smesh in (-8, -4, 0, 4, 8):
+    # Прицел стоит В РАЗНЫХ местах одного фактурного предмета.
+    g = faktura(W // 2 - smesh, H // 2, 16, 100 + smesh)
+    p = nayti(g)
+    assert p is not None, "на фактуре не нашла ничего (смещение %+d)" % smesh
+    if p[2] != "прицел":
+        uehalo += 1
+        print("    смещение %+d: УЕХАЛО на (%.0f,%.0f)" % (smesh, p[0], p[1]))
+    else:
+        print("    смещение %+d: захват по прицелу" % smesh)
+assert uehalo == 0, (
+    "%d из 5 точек фактурного предмета захват уехал: пилот выбирает часть "
+    "предмета, а его перекидывает на другую" % uehalo)
 
 print("\nOK: прицел имеет приоритет, зона — только запасной ход")
