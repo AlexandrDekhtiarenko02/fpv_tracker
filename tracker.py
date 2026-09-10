@@ -136,10 +136,26 @@ COLOR_CYAN = (255, 255, 0, 0)
 CROSS_COLOR = COLOR_WHITE
 
 MAG_ENABLED = True
-MAG_SIZE = 170
+# Уменьшено на 20% с прежних 170: лупа занимала слишком много кадра и
+# закрывала обзор ровно там, где он нужен для наведения.
+MAG_SIZE = 136
 MAG_ZOOM = 3.0
 MAG_MARGIN = 6
 MAG_SRC_MIN_SIZE = 8
+
+# --- МЕТКА ЗАХВАЧЕННОЙ ЦЕЛИ ---
+# Квадрат, который на захвате делает один оборот и поджимается. Движение —
+# подтверждение захвата: в очках, на трясущейся картинке, статичная метка от
+# статичной рамки почти неотличима, а оборот с поджатием виден боковым
+# зрением.
+METKA_ANIM_S = 0.5
+# Начальный радиус равен прежнему ромбу — метка «приходит» той же величины,
+# к которой глаз привык, и уже потом сжимается.
+METKA_R_START = 14.0
+# Конечный — заметно меньше, чтобы метка не закрывала саму цель.
+METKA_R_END = 8.0
+# Тонкая линия: метка указывает на цель, а не заменяет её.
+METKA_TOLSHCHINA = 1
 MAG_ONLY_WHEN_AUX = False
 
 # =========================================================
@@ -5802,16 +5818,39 @@ def draw_crosshair(frame):
 
 
 def draw_corners(frame, box, color, thickness=2):
+    """Метка захваченной цели: квадрат, который на захвате сжимается с оборотом.
+
+    Движение здесь не украшение. Захват — единственное событие, которое пилот
+    задаёт сам, и подтверждение ему нужно мгновенное: в очках, на трясущейся
+    картинке, статичная метка от статичной рамки почти неотличима. Оборот с
+    поджатием читается боковым зрением, не требуя разглядывать.
+    """
     x1, y1, x2, y2 = box
     bcx, bcy = (x1 + x2) // 2, (y1 + y2) // 2
-    DIAMOND_R = 14
-    pts = np.array([
-        [bcx, bcy - DIAMOND_R],
-        [bcx + DIAMOND_R, bcy],
-        [bcx, bcy + DIAMOND_R],
-        [bcx - DIAMOND_R, bcy],
-    ], dtype=np.int32).reshape((-1, 1, 2))
-    cv2.polylines(frame, [pts], True, COLOR_WHITE, 2, cv2.LINE_8)
+
+    dolya = 1.0
+    if METKA_ANIM_S > 0.0 and _metka_t0 is not None:
+        proshlo = time.monotonic() - _metka_t0
+        dolya = proshlo / METKA_ANIM_S
+        if dolya < 0.0:
+            dolya = 0.0
+        elif dolya > 1.0:
+            dolya = 1.0
+    # Замедление к концу: ход начинается резко и мягко останавливается. Ровное
+    # движение читается хуже — глаз цепляется за начало и за остановку.
+    plavno = 1.0 - (1.0 - dolya) ** 2
+    r = METKA_R_START + (METKA_R_END - METKA_R_START) * plavno
+    ugol = 2.0 * math.pi * plavno
+
+    # Квадрат: четыре угла через 90°, начиная с 45°, чтобы в покое он стоял
+    # ровно, а не на ребре.
+    pts = []
+    for i in range(4):
+        a = ugol + math.pi / 4.0 + i * math.pi / 2.0
+        pts.append([int(round(bcx + r * math.cos(a))),
+                    int(round(bcy + r * math.sin(a)))])
+    cv2.polylines(frame, [np.array(pts, dtype=np.int32).reshape((-1, 1, 2))],
+                  True, COLOR_WHITE, METKA_TOLSHCHINA, cv2.LINE_8)
 
 
 def draw_magnifier(frame, box=None):
@@ -6276,11 +6315,23 @@ def draw_control_state(frame):
         pass
 
 
+_metka_t0 = None
+_metka_bylo_vidno = False
+
+
 def draw_overlay_on_frame(frame):
+    global _metka_t0, _metka_bylo_vidno
     with state_lock:
         box = target_box_main
         vis = target_visible
         aux_for_mag = aux4_state
+    # Отсчёт анимации метки — от появления цели, а не от начала захода.
+    # Замечается здесь, в рисовании, а не в ядре слежения: это чисто
+    # оформление, и ядру о нём знать незачем.
+    est = bool(vis and box is not None)
+    if est and not _metka_bylo_vidno:
+        _metka_t0 = time.monotonic()
+    _metka_bylo_vidno = est
     # ПЕРЕКРЕСТЬЕ ПРЯЧЕТСЯ НА ВРЕМЯ ЗАХВАТА.
     #
     # Наведение идёт по постоянному пеленгу: цель обязана СТОЯТЬ в кадре, а не
