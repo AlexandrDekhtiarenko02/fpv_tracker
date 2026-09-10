@@ -291,6 +291,21 @@ SENSOR_LINE_H = 15             # шаг строк отчёта
 SENSOR_X_FRAC = 0.08           # левый край отчёта, доля ширины кадра
 LOCK_LOG_ENABLED = True
 LOCK_LOG_DIR = "zahvaty"
+# --- РАЗБОР ИСХОДА ЗАХОДА ---
+# Сколько последних строк берётся на разбор. 24 при 24 к/с — последняя
+# секунда: именно она решает попадание, а более ранние величины к исходу
+# отношения уже не имеют.
+LOCK_HVOST_ROWS = 24
+# Скорость угла визирования, выше которой заход считается промахом мимо.
+# На курсе столкновения угол СТОИТ. 0.5 °/с за последнюю секунду — это
+# полградуса увода, уже заметно; замеренные промахи давали 2.1 °/с.
+ISHOD_LOS_POROG = 0.5
+# Ниже этого роста рамки сближения фактически не было — заход прерван далеко
+# от цели, и остальные признаки к нему неприменимы.
+ISHOD_MIN_ROST = 2.0
+# Ошибка прицела, выше которой он считается несведённым.
+ISHOD_AIM_POROG_PX = 40.0
+
 LOCK_LOG_FLUSH_ROWS = 30       # через сколько строк сбрасывать на диск (~1 с)
 RECORD_HIRES = False
 if RECORD_HIRES:
@@ -2235,6 +2250,14 @@ _C_DY_RAW = _COLS.index("dy_raw")
 _C_COMP = _COLS.index("pitch_comp_px")
 _C_DX_AIM = _COLS.index("dx_aim")
 _C_DY_AIM = _COLS.index("dy_aim")
+# Для разбора исхода захода. Берутся по имени: вставка колонки в середину
+# списка не должна ломать разбор — на этом уже обжигались.
+_C_ADX = _COLS.index("adx")
+_C_ADY = _COLS.index("ady")
+_C_LOS_RATE = _COLS.index("los_rate")
+_C_ROST = _COLS.index("rost_ot_zahvata")
+_C_FINAL_HOLD = _COLS.index("final_hold")
+_C_MATCH = _COLS.index("match_score")
 _C_ROLL_SAT = _COLS.index("roll_sat")
 _C_PITCH_SAT = _COLS.index("pitch_sat")
 _C_YAW_SAT = _COLS.index("yaw_sat")
@@ -2277,6 +2300,7 @@ class LockLogger:
         self._path = None
         self._t0 = 0.0
         self._rows = 0
+        self._hvost = collections.deque(maxlen=LOCK_HVOST_ROWS)
         # Итог пишут двое: фоновый поток при захвате и камерный при конце.
         # Без замка они могли бы наложиться и оставить обрывок.
         self._itog_lock = threading.Lock()
@@ -2340,6 +2364,7 @@ class LockLogger:
                              buffering=1)
             self._t0 = time.monotonic()
             self._rows = 0
+            self._hvost.clear()
             self.active = True
             # Условия захода известны ПРЯМО СЕЙЧАС — записываем их немедленно,
             # не дожидаясь конца. Прерывается всегда последний заход (сняли
@@ -2356,10 +2381,15 @@ class LockLogger:
             self.active = False
             flight_log.event("ПАПКА ЗАХВАТА не создалась: %s" % exc)
 
-    def row(self, line):
+    def row(self, line, values=None):
         if not self.active:
             return
         try:
+            # Хвост последних строк — для разбора исхода. Держим ЗНАЧЕНИЯ, а
+            # не текст: разбирать обратно из строки значило бы полагаться на
+            # форматирование, которое меняется.
+            if values is not None:
+                self._hvost.append(values)
             self._csv.write(line + "\n")
             self._rows += 1
             # Сброс на диск примерно раз в секунду. Буфер в 64 КБ — это около
@@ -2412,6 +2442,17 @@ class LockLogger:
                     f.write("длительность: %.1f с, строк %d\n"
                             % (dur, self._rows))
                 f.write("окончен: %s\n" % (why or "не указано"))
+                ishod = self._razbor_ishoda()
+                if ishod:
+                    f.write("\nЧЕМ КОНЧИЛОСЬ\n")
+                    f.write("  %s\n" % ishod.pop("вердикт"))
+                    for k, v in ishod.items():
+                        if v is None:
+                            f.write("  %-26s нет\n" % k)
+                        elif isinstance(v, float):
+                            f.write("  %-26s %+.2f\n" % (k, v))
+                        else:
+                            f.write("  %-26s %s\n" % (k, v))
                 f.write("режим наблюдения: %s\n"
                         % ("ДА, управление не трогали" if OBSERVE_ONLY
                            else "нет — трекер вмешивался в управление"))
@@ -2426,6 +2467,77 @@ class LockLogger:
             pass
         finally:
             self._itog_lock.release()
+
+    def _razbor_ishoda(self):
+        """Чем кончился заход. Пишется в итог, чтобы промахи расслаивались.
+
+        БЕЗ ЭТОГО НАСТРОЙКА — УГАДЫВАНИЕ. Знать, что попаданий 70%, мало:
+        тридцать процентов промахов — это не одна болезнь, а несколько, и
+        лечатся они по-разному. Срыв слежения, перелёт, недолёт, несведённый
+        прицел требуют противоположных правок, и без разделения любая из них
+        с равной вероятностью делает хуже.
+
+        Главный признак — СКОРОСТЬ УГЛА ВИЗИРОВАНИЯ. На курсе столкновения с
+        неподвижной целью угол стоит; растёт — пройдём выше, убывает — ниже.
+        Это видно за секунды до самого промаха и не требует знать, попали мы
+        или нет.
+        """
+        h = list(self._hvost)
+        if not h:
+            return None
+
+        def stolbec(i):
+            out = []
+            for r in h:
+                if i < len(r) and r[i] is not None:
+                    try:
+                        out.append(float(r[i]))
+                    except (TypeError, ValueError):
+                        pass
+            return out
+
+        def med(v):
+            v = sorted(v)
+            return v[len(v) // 2] if v else None
+
+        los = med(stolbec(_C_LOS_RATE))
+        ady = med(stolbec(_C_ADY))
+        adx = med(stolbec(_C_ADX))
+        rost = max(stolbec(_C_ROST) or [0.0])
+        match = med(stolbec(_C_MATCH))
+        derzhali = any(bool(r[_C_FINAL_HOLD]) for r in h
+                       if _C_FINAL_HOLD < len(r))
+        sost = h[-1][_C_STATE] if _C_STATE < len(h[-1]) else "?"
+
+        # Порядок проверок — от самого грубого отказа к самому тонкому.
+        # Срыв слежения перекрывает всё: остальные величины при нём бессмысленны.
+        if sost != "TRACKED":
+            verdikt = "СЛЕЖЕНИЕ СОРВАЛОСЬ (в конце состояние %s)" % sost
+        elif rost < ISHOD_MIN_ROST:
+            verdikt = ("НЕ СБЛИЗИЛИСЬ: рамка выросла лишь в %.1f раза "
+                       "(нужно от %.1f)" % (rost, ISHOD_MIN_ROST))
+        elif los is not None and los > ISHOD_LOS_POROG:
+            verdikt = ("ПЕРЕЛЁТ: угол визирования рос на %.2f °/с — цель "
+                       "уходила под нас" % los)
+        elif los is not None and los < -ISHOD_LOS_POROG:
+            verdikt = ("НЕДОЛЁТ: угол визирования убывал на %.2f °/с" % los)
+        elif ady is not None and abs(ady) > ISHOD_AIM_POROG_PX:
+            verdikt = ("ПРИЦЕЛ НЕ СВЕДЁН по вертикали: %+.0f px" % ady)
+        elif adx is not None and abs(adx) > ISHOD_AIM_POROG_PX:
+            verdikt = ("ПРИЦЕЛ НЕ СВЕДЁН по горизонтали: %+.0f px" % adx)
+        else:
+            verdikt = "СОШЛОСЬ: угол стоял, прицел сведён, сблизились"
+
+        return {
+            "вердикт": verdikt,
+            "скорость_угла_°с": los,
+            "ошибка_прицела_верт_px": ady,
+            "ошибка_прицела_гориз_px": adx,
+            "рост_рамки_от_захвата": rost,
+            "качество_слежения": match,
+            "команда_заморожена": derzhali,
+            "состояние_в_конце": sost,
+        }
 
     def end(self, why=""):
         if not self.active:
@@ -7239,7 +7351,7 @@ def _capture_flight_row(cb_t0):
         # Та же строка — в папку этого захвата. Форматируем один раз здесь, а
         # не в фоне: в папке лежит ровно то, что было в этот кадр.
         if lock_log.active:
-            lock_log.row(_fmt_row(_row_values))
+            lock_log.row(_fmt_row(_row_values), _row_values)
     except Exception:
         # Лог не имеет права мешать полёту.
         pass
