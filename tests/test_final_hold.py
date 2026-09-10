@@ -94,4 +94,48 @@ t.FINAL_HOLD_ENABLED = True
 print("    при выключенной заморозке команда снова меняется: %d -> %d" % (a, b))
 assert a != b, "выключатель не работает"
 
-print("\nOK: до порога рулим, за порогом держим последнюю команду")
+print("\n=== 5. Замораживается СРЕДНЕЕ, а не мгновение ===")
+# Выброс ровно в кадре пересечения порога не должен решать судьбу захода:
+# дальше контур молчит, и исправить его будет уже нечем.
+t.FINAL_HOLD_ENABLED = True
+
+
+def progon(vybros):
+    t._final_zamorozhen = False
+    t._final_okno.clear()
+    t._slew_pitch = 1500.0
+    t.pitch_integral = 0.0
+    t.prev_ady_ctrl = 0.0
+    t._pitch_pri_loke = None
+    # Восемь спокойных кадров, потом кадр пересечения порога.
+    for _ in range(10):
+        zahod(rost=1.5, dy_px=10)
+    zahod(rost=t.FINAL_HOLD_ROST + 0.5, dy_px=vybros)
+    return t.global_pitch_cmd
+
+
+spokoyno = progon(vybros=10)
+s_vybrosom = progon(vybros=200)
+print("    без выброса -> %d;  с выбросом 200 px -> %d"
+      % (spokoyno, s_vybrosom))
+raznica = abs(s_vybrosom - spokoyno)
+print("    выброс сдвинул замороженную команду на %d PWM" % raznica)
+assert raznica < 60, (
+    "выброс в 200 px сдвинул заморозку на %d PWM: значит замерло мгновение, "
+    "а не среднее" % raznica)
+
+print("\n=== 6. Копилка чистится между заходами ===")
+t._final_okno.clear()
+for _ in range(5):
+    zahod(rost=1.2, dy_px=0)
+assert len(t._final_okno) > 0
+t.target_visible = False
+t.target_controllable = False
+t.target_box_main = None
+t.update_control_from_target()
+assert len(t._final_okno) == 0, (
+    "команды прошлой цели остались в копилке: заморозка следующего захода "
+    "усреднит их с чужим манёвром")
+print("    после потери цели копилка пуста")
+
+print("\nOK: до порога рулим, за порогом держим среднее по последним кадрам")

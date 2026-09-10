@@ -613,6 +613,21 @@ COLOR_REF_DIST = 20.0
 COLOR_MIN_TARGET_CHROMA_PX = 2
 
 MATCH_MIN_SCORE = 0.22
+
+# --- ДОВЕРИЕ К СЛЕЖЕНИЮ ---
+# Усиление прицельных осей урезается, когда слежение ухудшается. Подробности
+# у самого расчёта; здесь важно одно свойство: сравнение идёт с СОБСТВЕННЫМ
+# недавним уровнем, а не с порогом. Пока слежение стабильно — неважно, на
+# каком уровне, — доверие равно единице и поведение в точности прежнее.
+# Урезание включает только ухудшение.
+TRUST_ENABLED = True
+# Насколько быстро «недавний уровень» забывает прошлое. 0.05 при 24 к/с —
+# около секунды: медленнее самого ухудшения, иначе уровень поедет вслед за
+# ним и падение станет незаметным.
+TRUST_EMA_ALPHA = 0.05
+# До чего урезаем в худшем случае. Не до нуля: полностью глухой контур в
+# финале хуже, чем вялый — он перестанет реагировать вообще.
+TRUST_MIN = 0.35
 # Доверие к матчу падает, если на карте откликов есть конкурент НЕ ХУЖЕ
 # выбранного. Замерено на борту в момент срыва:
 #     t=58.71  score=0.54  второй кандидат=0.78
@@ -1063,6 +1078,11 @@ FINAL_HOLD_ENABLED = True
 # Дальность через высоту врёт на малых углах, а время до контакта пока не
 # работает вовсе — на них опираться нельзя.
 FINAL_HOLD_ROST = 3.0
+# Сколько последних кадров усредняется при заморозке. 8 при 24 к/с — треть
+# секунды: достаточно, чтобы одиночный выброс не решал судьбу захода, и
+# достаточно мало, чтобы среднее оставалось тем манёвром, который шёл
+# непосредственно перед финалом, а не предыдущим.
+FINAL_OKNO_KADROV = 8
 # ПЕРЕКЛЮЧАЕМСЯ ПО ВРЕМЕНИ ДО КОНТАКТА, а не по доле кадра.
 #
 # Замерено по 46 заходам: доля кадра доходила до порога 0.18 лишь в 1.2%
@@ -1701,7 +1721,7 @@ _FLIGHT_LOG_COLUMNS = (
     "pitch_p,pitch_d,pitch_i,pitch_ff,pitch_off,pitch_sat,"
     "launch_pwm,cruise_pwm,rate_damp,roll_damp,pitch_comb,"
     "yaw_filt,yaw_weight,yaw_pd,yaw_ff,yaw_i,yaw_off,yaw_sat,"
-    "los_rate,rost_ot_zahvata,final_hold,base_thr,thr_adjust,thr_i,rc_fresh,"
+    "los_rate,rost_ot_zahvata,final_hold,doverie,base_thr,thr_adjust,thr_i,rc_fresh,"
     "cmd_roll,cmd_pitch,cmd_yaw,cmd_thr,"
     "sent_r,sent_p,sent_t,sent_y,"
     "fc_roll,fc_pitch,fc_yaw,att_age_ms,"
@@ -2744,6 +2764,11 @@ _los_skorost = 0.0
 # Финал: заморожена ли команда и на каких значениях.
 _final_zamorozhen = False
 _final_komandy = (1500, 1500, 1500)
+_final_okno = collections.deque(maxlen=FINAL_OKNO_KADROV)
+# Недавний уровень качества слежения. None означает «ещё не знаем»: первый
+# кадр захода задаёт уровень, а не считается ухудшением.
+_dover_score_ema = None
+_dover_psr_ema = None
 # Счётчик подтверждения режима сближения: сколько кадров подряд время до
 # контакта держится ниже порога. Одиночный выброс режим не включает.
 _closing_schet = 0
@@ -5301,7 +5326,8 @@ def update_control_from_target():
     global global_yaw_cmd, global_pitch_cmd, global_roll_cmd, global_throttle_cmd, override_active
     global _slew_roll, _slew_pitch, _slew_yaw, _pitch_pri_loke
     global _los_ugol, _los_t, _los_skorost
-    global _final_zamorozhen, _final_komandy
+    global _final_zamorozhen, _final_komandy, _final_okno
+    global _dover_score_ema, _dover_psr_ema
     global filtered_dx_yaw, prev_adx, prev_ady_ctrl
     global smooth_throttle_out, throttle_integral, prev_ady
     global roll_integral, pitch_integral, yaw_integral
@@ -5356,6 +5382,12 @@ def update_control_from_target():
         # выброс скорости на первом же кадре нового захода.
         _los_ugol = None
         _los_skorost = 0.0
+        # И уровень качества слежения: он свой у каждой цели, и прошлый на
+        # новой выглядел бы как резкое ухудшение или, наоборот, скрыл бы его.
+        _dover_score_ema = None
+        _dover_psr_ema = None
+        # И копилка команд: усреднять с манёврами прошлой цели бессмысленно.
+        _final_okno.clear()
         filtered_dx_yaw = 0.0
         prev_adx = 0.0
         prev_ady_ctrl = 0.0
@@ -5612,6 +5644,51 @@ def update_control_from_target():
         ff_yaw_eff = FF_GAIN_YAW
 
     # --- ROLL: P+D+I+FF через хелпер с anti-windup ---
+    # --- ДОВЕРИЕ К СЛЕЖЕНИЮ ---
+    #
+    # До сих пор мёртвый захват и еле держащийся обрабатывались одинаково, с
+    # полным усилением. А когда эталон совпадает плохо, коробка шумит — и этот
+    # шум шёл в команду как настоящая ошибка прицела.
+    #
+    # ДВА ПРИЗНАКА, И ОНИ ПРО РАЗНОЕ:
+    #   match_score — насколько хорошо совпал лучший вариант;
+    #   psr         — насколько он лучше остальных. Низкий psr означает, что
+    #                 рядом есть столь же похожее место, и коробка вот-вот
+    #                 перескочит на него. Величина считалась и не читалась
+    #                 нигде.
+    # Берётся ХУДШИЙ из двух: хорошее совпадение с двойником опаснее, чем
+    # посредственное, но единственное.
+    #
+    # ПОЧЕМУ ОТНОСИТЕЛЬНО СВОЕГО ЖЕ УРОВНЯ, А НЕ ПО ПОРОГУ. Абсолютные
+    # значения зависят от цели, фактуры и освещения: на одном заходе 0.4 —
+    # норма, на другом — беда. Порог, выставленный по одному вылету, на
+    # следующем срезал бы усиление на ровном месте. Сравнение с собственным
+    # недавним уровнем от этого свободно и даёт важное свойство: пока слежение
+    # СТАБИЛЬНО (неважно, на каком уровне), доверие равно единице и поведение
+    # в точности прежнее. Урезание включает только УХУДШЕНИЕ.
+    doverie = 1.0
+    if TRUST_ENABLED:
+        _psr = _match_dbg.get("psr")
+        chasti = []
+        for tek, ema_imya in ((last_match_score, "score"), (_psr, "psr")):
+            if tek is None or tek <= 0.0:
+                continue
+            ema = _dover_score_ema if ema_imya == "score" else _dover_psr_ema
+            if ema is None:
+                ema = float(tek)
+            else:
+                ema += TRUST_EMA_ALPHA * (float(tek) - ema)
+            if ema_imya == "score":
+                _dover_score_ema = ema
+            else:
+                _dover_psr_ema = ema
+            if ema > 1e-6:
+                chasti.append(min(1.0, float(tek) / ema))
+        if chasti:
+            doverie = min(chasti)
+    # Урезаем не до нуля: полностью глухой контур в финале хуже, чем вялый.
+    trust_k = TRUST_MIN + (1.0 - TRUST_MIN) * doverie
+
     roll_offset, prev_adx, roll_integral = _pid_axis_step(
         adx, prev_adx, roll_integral,
         target_vx_smoothed,
@@ -5633,8 +5710,13 @@ def update_control_from_target():
                 roll_damp_pwm = ROLL_RATE_DAMP_MAX
             elif roll_damp_pwm < -ROLL_RATE_DAMP_MAX:
                 roll_damp_pwm = -ROLL_RATE_DAMP_MAX
-        roll_offset += roll_damp_pwm
+        # Доверие применяется ДО демпфирования: гироскоп к качеству
+        # слежения отношения не имеет, и при плохом слежении именно
+        # демпфирование удерживает аппарат — резать его было бы наоборот.
+        roll_offset = roll_offset * trust_k + roll_damp_pwm
 
+    else:
+        roll_offset *= trust_k
     target_roll = max(1000, min(2000, 1500 + roll_offset))
 
     # --- PITCH: P+D+I+FF через хелпер с anti-windup ---
@@ -5682,8 +5764,8 @@ def update_control_from_target():
             elif rate_damp_pwm < -PITCH_RATE_DAMP_MAX:
                 rate_damp_pwm = -PITCH_RATE_DAMP_MAX
 
-    combined_pitch = (pitch_offset + launch_pitch_pwm + cruise_pitch_pwm
-                      + rate_damp_pwm)
+    combined_pitch = (pitch_offset * trust_k + launch_pitch_pwm
+                      + cruise_pitch_pwm + rate_damp_pwm)
     target_pitch = max(1000, min(2000, 1500 + combined_pitch))
 
     # --- YAW: фильтр + ослабление при больших adx + I + FF с anti-windup ---
@@ -5712,7 +5794,7 @@ def update_control_from_target():
             yaw_integral = -YAW_INTEGRAL_MAX
     yaw_integral *= YAW_INTEGRAL_DECAY ** k
 
-    yaw_offset = YAW_SIGN * (yaw_pd + yaw_ff + yaw_integral)
+    yaw_offset = YAW_SIGN * (yaw_pd + yaw_ff + yaw_integral) * trust_k
     if yaw_offset > MAX_YAW_DEFLECT:
         yaw_offset = MAX_YAW_DEFLECT
     elif yaw_offset < -MAX_YAW_DEFLECT:
@@ -5884,16 +5966,36 @@ def update_control_from_target():
         if _bok0 > 1.0:
             rost_ot_zahvata = _bok / _bok0
 
+    # Копилка последних команд — из неё берётся то, что замораживается.
+    # Веса — доверие к слежению в тот кадр: кадр, где эталон еле совпадал,
+    # не должен решать судьбу захода наравне с чистым.
+    _final_okno.append((target_roll, target_pitch, target_yaw, trust_k))
+
     if (FINAL_HOLD_ENABLED and rost_ot_zahvata is not None
             and rost_ot_zahvata >= FINAL_HOLD_ROST):
         if not _final_zamorozhen:
             _final_zamorozhen = True
-            _final_komandy = (target_roll, target_pitch, target_yaw)
+            # ЗАМОРАЖИВАЕТСЯ СРЕДНЕЕ, А НЕ МГНОВЕНИЕ.
+            #
+            # Взять команду одного кадра значит поставить весь заход в
+            # зависимость от того, что происходило в этот конкретный кадр.
+            # Попади порог на выброс — держим выброс до самого конца, и
+            # исправить его уже нечем: в том и смысл заморозки, что дальше
+            # контур молчит. Среднее по последним кадрам этот случай убирает
+            # целиком и стоит десяти строк.
+            _ves = sum(w for _, _, _, w in _final_okno)
+            if _ves > 1e-6:
+                _final_komandy = tuple(
+                    int(round(sum(k[i] * k[3] for k in _final_okno) / _ves))
+                    for i in range(3))
+            else:
+                _final_komandy = (target_roll, target_pitch, target_yaw)
             flight_log.event(
                 "ФИНАЛ: команда заморожена, рамка выросла в %.1f раза "
-                "(порог %.1f). Держим roll=%d pitch=%d yaw=%d"
-                % (rost_ot_zahvata, FINAL_HOLD_ROST,
-                   target_roll, target_pitch, target_yaw))
+                "(порог %.1f). Держим roll=%d pitch=%d yaw=%d "
+                "(среднее по %d кадрам, мгновенное было %d/%d/%d)"
+                % ((rost_ot_zahvata, FINAL_HOLD_ROST) + _final_komandy
+                   + (len(_final_okno), target_roll, target_pitch, target_yaw)))
         target_roll, target_pitch, target_yaw = _final_komandy
     else:
         _final_zamorozhen = False
@@ -5995,6 +6097,9 @@ def update_control_from_target():
         # Рост рамки от захвата и признак заморозки: по ним после посадки
         # видно, когда контур перестал рулить и почему.
         "rost_ot_zahvata": rost_ot_zahvata, "final_hold": _final_zamorozhen,
+        # Доверие к слежению: по нему после посадки видно, урезал ли контур
+        # усиление и в какой момент.
+        "doverie": doverie,
         "base_thr": base_thr, "thr_adjust": thr_adjust,
         "thr_i": throttle_integral, "rc_fresh": rc_fresh,
         "launch_phase": launch_phase, "launch_int": launch_intensity,
@@ -7315,6 +7420,7 @@ def _capture_flight_row(cb_t0):
             g("yaw_filt"), g("yaw_weight"), g("yaw_pd"), g("yaw_ff"),
             g("yaw_i"), g("yaw_off"), g("yaw_sat"),
             g("los_rate"), g("rost_ot_zahvata"), g("final_hold"),
+            g("doverie"),
             c.get("base_thr"), g("thr_adjust"), g("thr_i"), g("rc_fresh"),
             r_cmd, p_cmd, y_cmd, t_cmd,
             _idx(sent, 0), _idx(sent, 1), _idx(sent, 2), _idx(sent, 3),
