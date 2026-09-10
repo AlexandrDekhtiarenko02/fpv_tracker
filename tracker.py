@@ -872,6 +872,14 @@ PITCH_RATE_DAMP_MAX = 90.0
 ROLL_RATE_DAMP_ENABLED = True
 ROLL_RATE_DAMP = 0.45
 ROLL_RATE_DAMP_MAX = 90.0
+# --- ДЕМПФИРОВАНИЕ РЫСКАНИЯ ---
+# ВЫКЛЮЧЕНО, пока не замерен знак gyro_z. Подробности у самого расчёта; коротко:
+# член с перепутанным знаком не «работает слабее», а раскачивает.
+# Включать после tools/znak_ryskaniya.py по свежему логу.
+YAW_RATE_DAMP_ENABLED = False
+YAW_RATE_DAMP_SIGN = +1
+YAW_RATE_DAMP = 0.45
+YAW_RATE_DAMP_MAX = 70.0
 
 # --- СКОРОСТЬ ИЗМЕНЕНИЯ КОМАНДЫ ---
 # Ограничивает не величину отклонения, а СКОРОСТЬ подхода к нему: авторитет
@@ -1424,6 +1432,20 @@ LOS_RATE_DEADBAND_DPS = 0.3
 # но не сброс в ноль.
 LOS_THROTTLE_GAIN = 25.0
 LOS_THROTTLE_MAX = 120.0
+
+# --- ПРЕДЕЛ СКОРОСТИ СНИЖЕНИЯ ---
+# Страховка от проваливания, а не регулятор: односторонняя и с мёртвой зоной,
+# поэтому в норме молчит и поведения не меняет. Подробности у самого расчёта.
+VARIO_LIMIT_ENABLED = True
+# Выше этой скорости снижения газ начинает добавляться. 12 м/с — это заметно
+# круче любого нормального захода: на замеренных заходах снижение держалось
+# в пределах 1-5 м/с.
+VARIO_MAX_SINK_MPS = 12.0
+# PWM на каждый м/с сверх предела.
+VARIO_LIMIT_GAIN = 25.0
+VARIO_LIMIT_MAX = 150.0
+# Старше этого вариометр не берётся: запоздалое значение хуже никакого.
+VARIO_FRESH_S = 0.3
 
 THROTTLE_BY_TAU = True         # False = прежнее поведение по пикселям
 TAU_THROTTLE_LO_S = 3.0        # быстрее этого — сбрасываем газ
@@ -5863,6 +5885,35 @@ def update_control_from_target():
     yaw_integral *= YAW_INTEGRAL_DECAY ** k
 
     yaw_offset = YAW_SIGN * (yaw_pd + yaw_ff + yaw_integral) * trust_k
+
+    # Демпфирование рыскания по гироскопу — то же, что у тангажа и крена.
+    #
+    # ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНО, и это не осторожность, а необходимость: знак
+    # gyro_z относительно поворота вправо НЕ ЗАМЕРЕН. У тангажа и крена он
+    # получен регрессией по полётным логам (0.078 и 0.059 °/с на единицу при
+    # r≈0.5), а логи для рыскания были стёрты вместе с остальными.
+    #
+    # Член демпфирования с перепутанным знаком — это не «слабее работает», а
+    # положительная обратная связь: он подкачивает то самое вращение, которое
+    # должен гасить. Включать вслепую нельзя.
+    #
+    # ЧТО НУЖНО, ЧТОБЫ ВКЛЮЧИТЬ: один заход с рысканием, затем
+    # tools/znak_ryskaniya.py по свежему логу. Он даст знак и величину, после
+    # чего сюда ставится YAW_RATE_DAMP_SIGN и YAW_RATE_DAMP_ENABLED = True.
+    yaw_damp_pwm = 0.0
+    if YAW_RATE_DAMP_ENABLED:
+        with state_lock:
+            _gz = app_state.get("gyro")
+            _gz_ts = app_state.get("imu_ts", 0.0)
+        if _gz is not None and len(_gz) > 2 and _gz[2] is not None and (
+                now_mono - _gz_ts) <= GYRO_FRESH_S:
+            yaw_damp_pwm = (-YAW_RATE_DAMP * YAW_RATE_DAMP_SIGN
+                            * float(_gz[2]) * GYRO_UNIT_DPS)
+            if yaw_damp_pwm > YAW_RATE_DAMP_MAX:
+                yaw_damp_pwm = YAW_RATE_DAMP_MAX
+            elif yaw_damp_pwm < -YAW_RATE_DAMP_MAX:
+                yaw_damp_pwm = -YAW_RATE_DAMP_MAX
+        yaw_offset += yaw_damp_pwm
     if yaw_offset > MAX_YAW_DEFLECT:
         yaw_offset = MAX_YAW_DEFLECT
     elif yaw_offset < -MAX_YAW_DEFLECT:
@@ -6067,6 +6118,34 @@ def update_control_from_target():
         target_roll, target_pitch, target_yaw = _final_komandy
     else:
         _final_zamorozhen = False
+
+    # --- ПРЕДЕЛ СКОРОСТИ СНИЖЕНИЯ ---
+    #
+    # Вариометр до сих пор не использовался нигде, хотя это единственное
+    # прямое измерение вертикали на борту.
+    #
+    # ПОЧЕМУ НЕ ДЕМПФИРОВАНИЕ. Напрашивается добавить член, гасящий
+    # вертикальную скорость, как гироскоп гасит вращение. Но в пикировании
+    # снижение ПОСТОЯННО и велико по существу дела, и такой член превратился
+    # бы не в демпфирование, а в постоянную прибавку газа, работающую против
+    # самого захода.
+    #
+    # Поэтому предел ОДНОСТОРОННИЙ и с мёртвой зоной: пока снижение в
+    # разумных пределах, он молчит и поведение в точности прежнее. Он вступает
+    # только когда закон газа по углу визирования увёл аппарат в проваливание,
+    # из которого тот уже не выйдет. Это страховка, а не регулятор.
+    if VARIO_LIMIT_ENABLED and OVERRIDE_THROTTLE:
+        with state_lock:
+            _var = app_state.get("vario_cms")
+            _var_ts = app_state.get("alt_ts", 0.0)
+        if (_var is not None and _var_ts > 0.0
+                and now_mono - _var_ts <= VARIO_FRESH_S):
+            _sink = -float(_var) / 100.0        # положительное = снижаемся
+            if _sink > VARIO_MAX_SINK_MPS:
+                pribavka = (_sink - VARIO_MAX_SINK_MPS) * VARIO_LIMIT_GAIN
+                if pribavka > VARIO_LIMIT_MAX:
+                    pribavka = VARIO_LIMIT_MAX
+                thr_adjust += pribavka
 
     # ОБЩИЙ ХВОСТ ГАЗА — ОДИН НА ВСЕ ЗАКОНЫ.
     #
