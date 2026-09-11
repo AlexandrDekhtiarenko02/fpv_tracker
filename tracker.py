@@ -1455,10 +1455,28 @@ LOS_AIM_ENABLED = True
 # Пикселей прицела на каждый °/с роста угла. При замеренных 2.1 °/с даёт
 # 42 px — вчетверо больше обычной ошибки прицела, то есть величина, способная
 # изменить траекторию, а не потеряться в шуме.
-LOS_AIM_GAIN = 20.0
+# Коэффициент СНИЖЕН с 20 после вылета: 20 подбиралось под медиану за заход
+# (2.13 °/с), то есть под медленный тренд, а прикладывалось к сигналу, где шум
+# от ступеней тангажа втрое больше тренда. Итог — прицел в упоре и рывок.
+# Теперь оценка чистая (наклон по окну), но запас всё равно нужен.
+LOS_AIM_GAIN = 12.0
 # Предел. Прицел не должен уезжать дальше, чем цель может отстоять от центра:
 # иначе контур начнёт гоняться за точкой вне кадра.
-LOS_AIM_MAX_PX = 110.0
+# Предел снижен: прежние 110 — это почти половина кадра по вертикали, и
+# упираться в них поправка не должна вовсе. 45 px при обычной ошибке прицела
+# около 15 — заметная правка, но не подмена прицеливания.
+LOS_AIM_MAX_PX = 45.0
+# Насколько быстро поправка может двигаться. Геометрия захода меняется за
+# секунды — прыгать ей незачем, и это последняя преграда рывку, даже если
+# оценка угла однажды соврёт.
+LOS_AIM_SLEW_PX_S = 30.0
+
+# --- ОЦЕНКА СКОРОСТИ УГЛА ---
+# Наклон прямой по окну, а не разность соседних кадров: тангаж приходит
+# ступенями, и разность превращает ступень 2.5° в 60 °/с. Подробности у
+# самого расчёта.
+LOS_FIT_WINDOW_S = 2.0
+LOS_FIT_MIN_POINTS = 12
 
 # Газ по углу визирования ВЫКЛЮЧЕН: эту работу забрал прицел (см. выше).
 # Держать угол газом — значит лечить геометрию энергией, и в поле это дало
@@ -2859,6 +2877,8 @@ override_active = False
 _los_ugol = None
 _los_t = 0.0
 _los_skorost = 0.0
+_los_aim_tek = 0.0
+_dep_hist = collections.deque(maxlen=256)
 # Финал: заморожена ли команда и на каких значениях.
 _final_zamorozhen = False
 _final_komandy = (1500, 1500, 1500)
@@ -5487,7 +5507,7 @@ def update_control_from_target():
     """
     global global_yaw_cmd, global_pitch_cmd, global_roll_cmd, global_throttle_cmd, override_active
     global _slew_roll, _slew_pitch, _slew_yaw, _pitch_pri_loke
-    global _los_ugol, _los_t, _los_skorost
+    global _los_ugol, _los_t, _los_skorost, _los_aim_tek
     global _final_zamorozhen, _final_komandy, _final_okno
     global _dover_score_ema, _dover_psr_ema
     global _rassh_nakop, _flow_rasshirenie
@@ -5545,6 +5565,8 @@ def update_control_from_target():
         # выброс скорости на первом же кадре нового захода.
         _los_ugol = None
         _los_skorost = 0.0
+        _los_aim_tek = 0.0
+        _dep_hist.clear()
         # И уровень качества слежения: он свой у каждой цели, и прошлый на
         # новой выглядел бы как резкое ухудшение или, наоборот, скрыл бы его.
         _dover_score_ema = None
@@ -5717,12 +5739,31 @@ def update_control_from_target():
     # сама по себе медленнее десятка кадров. Переставлять расчёт выше нельзя:
     # он опирается на размеры коробки, которые считаются как раз между.
     los_aim_px = 0.0
-    if LOS_AIM_ENABLED and _los_skorost:
-        los_aim_px = LOS_AIM_GAIN * _los_skorost
-        if los_aim_px > LOS_AIM_MAX_PX:
-            los_aim_px = LOS_AIM_MAX_PX
-        elif los_aim_px < -LOS_AIM_MAX_PX:
-            los_aim_px = -LOS_AIM_MAX_PX
+    if LOS_AIM_ENABLED:
+        # МЁРТВАЯ ЗОНА ОБЯЗАТЕЛЬНА и раньше применялась только к газу, а к
+        # прицелу — нет. Без неё поправка идёт даже на остаточном шуме оценки.
+        if _los_skorost > LOS_RATE_DEADBAND_DPS:
+            izbytok = _los_skorost - LOS_RATE_DEADBAND_DPS
+        elif _los_skorost < -LOS_RATE_DEADBAND_DPS:
+            izbytok = _los_skorost + LOS_RATE_DEADBAND_DPS
+        else:
+            izbytok = 0.0
+        hochu = LOS_AIM_GAIN * izbytok
+        if hochu > LOS_AIM_MAX_PX:
+            hochu = LOS_AIM_MAX_PX
+        elif hochu < -LOS_AIM_MAX_PX:
+            hochu = -LOS_AIM_MAX_PX
+        # И ОГРАНИЧЕНИЕ СКОРОСТИ. Поправка правит геометрию захода, а та
+        # меняется за секунды: прыгать ей незачем. Даже если оценка угла
+        # однажды всё-таки соврёт, рывка не будет — она доедет плавно.
+        shag = LOS_AIM_SLEW_PX_S * (k / NOMINAL_FPS)
+        if hochu > _los_aim_tek + shag:
+            _los_aim_tek += shag
+        elif hochu < _los_aim_tek - shag:
+            _los_aim_tek -= shag
+        else:
+            _los_aim_tek = hochu
+        los_aim_px = _los_aim_tek
 
     dy_aim = (box_cy + AIM_OFFSET_Y + pitch_comp_px + lead_y
               + los_aim_px) - CENTER_Y
@@ -5770,16 +5811,34 @@ def update_control_from_target():
     # уходит под нас, пройдём выше. Величина внешняя по отношению к контуру:
     # от поворота аппарата она не зависит, потому что тангаж и положение цели
     # в кадре меняются навстречу друг другу.
-    _dep_tek = closure.get("depression_deg")
-    if _dep_tek is not None:
-        _dep_tek = float(_dep_tek)
-        if _los_ugol is not None and now_mono > _los_t:
-            syraya = (_dep_tek - _los_ugol) / (now_mono - _los_t)
-            # Угол собран из тангажа и пикселей — обе величины шумят, а это
-            # ещё и разность. Без фильтра прицел пойдёт за шумом.
-            _los_skorost += alpha_for_dt(LOS_RATE_ALPHA, k) * (
-                syraya - _los_skorost)
-        _los_ugol, _los_t = _dep_tek, now_mono
+    # СЧИТАЕТСЯ НАКЛОНОМ ПО ОКНУ, А НЕ РАЗНОСТЬЮ СОСЕДНИХ КАДРОВ.
+    #
+    # Разность соседних кадров тут не работает, и это стоило вылета. Тангаж
+    # приходит от полётника СТУПЕНЯМИ: в логе 14.3 -> 16.8 -> 17.6 -> 18.1 ->
+    # 21.1. Скачок 2.5° за кадр — это 60 °/с сырой скорости, тогда как
+    # настоящий тренд захода около 2 °/с. Фильтр такую ступень не спасает:
+    # он её лишь размазывает, и на выходе остаётся 5 °/с — втрое больше
+    # сигнала. Прицел уезжал на ±100 px, упираясь в собственный предел.
+    #
+    # Наклон прямой по окну со ступенями обходится иначе: ступень поднимает
+    # весь хвост окна разом, а не одну разность, и на наклон влияет слабо.
+    # Тем же способом считается время до контакта, и там это уже проверено.
+    if _dep_hist is not None:
+        _dep_tek = closure.get("depression_deg")
+        if _dep_tek is not None:
+            _dep_hist.append((now_mono, float(_dep_tek)))
+            while _dep_hist and (now_mono - _dep_hist[0][0]) > LOS_FIT_WINDOW_S:
+                _dep_hist.popleft()
+            if len(_dep_hist) >= LOS_FIT_MIN_POINTS:
+                _xs = [a for a, _ in _dep_hist]
+                _ys = [b for _, b in _dep_hist]
+                _n = len(_xs)
+                _mx = sum(_xs) / _n
+                _my = sum(_ys) / _n
+                _den = sum((x - _mx) ** 2 for x in _xs)
+                if _den > 1e-6:
+                    _los_skorost = sum(
+                        (_xs[i] - _mx) * (_ys[i] - _my) for i in range(_n)) / _den
 
     # РЕЖИМ СБЛИЖЕНИЯ ВКЛЮЧАЕТСЯ НЕ С ПЕРВОГО КАДРА.
     #

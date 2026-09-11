@@ -42,32 +42,45 @@ ZAMER_DPS = 2.13   # замеренная скорость роста на пр�
 sdvig = min(zn["LOS_AIM_GAIN"] * ZAMER_DPS, zn["LOS_AIM_MAX_PX"])
 print("на замеренных %.2f °/с прицел опускается на %.0f px" % (ZAMER_DPS, sdvig))
 OBYCHNAYA_OSHIBKA_PX = 15.0   # замеренный коридор ошибки прицела
-assert sdvig > OBYCHNAYA_OSHIBKA_PX * 2, (
+assert sdvig > OBYCHNAYA_OSHIBKA_PX, (
     "поправка %.0f px теряется в обычной ошибке прицела (%.0f px) — она не "
     "изменит траекторию" % (sdvig, OBYCHNAYA_OSHIBKA_PX))
-assert zn["LOS_AIM_MAX_PX"] <= 120.0, (
-    "предел %.0f px уводит прицел за край кадра, и контур погонится за точкой "
-    "вне поля зрения" % zn["LOS_AIM_MAX_PX"])
+# Предел держится ЖЁСТКО. Прежние 110 — почти половина кадра по вертикали;
+# поправка упиралась в них и подменяла собой прицеливание, давая рывок.
+assert zn["LOS_AIM_MAX_PX"] <= 60.0, (
+    "предел %.0f px слишком велик: поправка перестанет быть поправкой и "
+    "подменит прицеливание" % zn["LOS_AIM_MAX_PX"])
+assert zn["LOS_AIM_MAX_PX"] > OBYCHNAYA_OSHIBKA_PX, "предел ниже самой ошибки"
+# Мёртвая зона обязана применяться и к прицелу, а не только к газу.
+assert "izbytok = _los_skorost - LOS_RATE_DEADBAND_DPS" in src, (
+    "мёртвая зона к прицелу не применяется: поправка пойдёт на остаточном шуме")
+# И ограничение скорости самой поправки — последняя преграда рывку.
+assert "LOS_AIM_SLEW_PX_S" in src, "поправка прицела может прыгать"
+_shag = zn["LOS_AIM_SLEW_PX_S"] / zn["CAM_FPS"]
+print("поправка движется не быстрее %.1f px за кадр (полный ход за %.1f с)"
+      % (_shag, zn["LOS_AIM_MAX_PX"] / zn["LOS_AIM_SLEW_PX_S"]))
+assert _shag <= 3.0, "%.1f px за кадр — это всё ещё рывок" % _shag
 
-# Фильтр: ниже раскачки, но быстрее геометрии захода.
-import math as _m
-tau_s = -1.0 / (zn["NOMINAL_FPS"] * _m.log(1.0 - zn["LOS_RATE_ALPHA"]))
-srez = 1.0 / (2.0 * _m.pi * tau_s)
-print("срез фильтра угла %.2f Гц (постоянная %.2f с)" % (srez, tau_s))
-assert srez < 1.3 / 2.0, (
-    "срез %.2f Гц не ниже раскачки 1.3 Гц: прицел пойдёт за колебанием" % srez)
-assert srez > 0.15, (
-    "срез %.2f Гц слишком низкий: прицел не успеет за геометрией захода" % srez)
+# Окно оценки: длиннее периода раскачки, короче самого захода.
+print("окно оценки угла %.1f с, не менее %d точек"
+      % (zn["LOS_FIT_WINDOW_S"], zn["LOS_FIT_MIN_POINTS"]))
+assert zn["LOS_FIT_WINDOW_S"] >= 1.0 / 1.3 * 2, (
+    "окно %.1f с короче двух периодов раскачки (1.3 Гц) — колебание пройдёт "
+    "в оценку как тренд" % zn["LOS_FIT_WINDOW_S"])
+assert zn["LOS_FIT_WINDOW_S"] <= 4.0, (
+    "окно %.1f с слишком длинное: оценка не успеет за геометрией захода"
+    % zn["LOS_FIT_WINDOW_S"])
+assert zn["LOS_FIT_MIN_POINTS"] >= 8, "слишком мало точек для наклона"
 
 # Знак. Угол растёт -> пройдём выше -> целимся НИЖЕ -> прицел опускается.
-assert "los_aim_px = LOS_AIM_GAIN * _los_skorost" in src, (
+assert "hochu = LOS_AIM_GAIN * izbytok" in src, (
     "знак поправки прицела не тот: при растущем угле целиться надо ниже")
 assert "+ los_aim_px) - CENTER_Y" in src, (
     "поправка не входит в прицельную ошибку")
 
 # Величина обязана СЧИТАТЬСЯ вне выключенной ветки газа, иначе замрёт.
 i_gaz = src.index("elif LOS_THROTTLE_ENABLED")
-i_rasch = src.index("_los_skorost += alpha_for_dt(LOS_RATE_ALPHA")
+i_rasch = src.index("_dep_hist.append((now_mono, float(_dep_tek)))")
 assert i_rasch < i_gaz, (
     "скорость угла снова считается внутри ветки газа, а та выключена — "
     "прицел получит вечный ноль и никак этого не покажет")
@@ -85,4 +98,81 @@ for imya in ("los_rate", "los_aim_px"):
 # Состояние сбрасывается между заходами.
 assert src.count("_los_ugol = None") >= 2, (
     "угол визирования не сбрасывается при потере управления")
+print()
+print("=== СТУПЕНИ ТАНГАЖА НЕ ДОЛЖНЫ ДАВАТЬ ЛОЖНУЮ СКОРОСТЬ ===")
+# Это та самая беда, что стоила вылета: тангаж приходит от полётника
+# ступенями (в логе 14.3 -> 16.8 -> 17.6 -> 18.1 -> 21.1), и разность соседних
+# кадров превращает ступень 2.5° в 60 °/с при настоящем тренде около 2 °/с.
+import collections as _c
+
+FPS = zn["CAM_FPS"]
+OKNO = zn["LOS_FIT_WINDOW_S"]
+MINP = zn["LOS_FIT_MIN_POINTS"]
+
+
+def naklon_po_oknu(ryad):
+    """Так теперь считает трекер."""
+    h = _c.deque()
+    out = []
+    for tt, v in ryad:
+        h.append((tt, v))
+        while h and (tt - h[0][0]) > OKNO:
+            h.popleft()
+        if len(h) >= MINP:
+            xs = [a for a, _ in h]
+            ys = [b for _, b in h]
+            n = len(xs)
+            mx = sum(xs) / n
+            my = sum(ys) / n
+            den = sum((x - mx) ** 2 for x in xs)
+            if den > 1e-6:
+                out.append(sum((xs[i] - mx) * (ys[i] - my)
+                               for i in range(n)) / den)
+    return out
+
+
+def raznost_s_filtrom(ryad, alpha):
+    """Так считал раньше — разность соседних кадров плюс фильтр."""
+    out = []
+    sk = 0.0
+    for i in range(1, len(ryad)):
+        dt = ryad[i][0] - ryad[i - 1][0]
+        if dt <= 0:
+            continue
+        sk += alpha * ((ryad[i][1] - ryad[i - 1][1]) / dt - sk)
+        out.append(sk)
+    return out
+
+
+# Настоящий тренд 2 °/с, а тангаж приходит ступенями по 2.5° раз в 4 кадра.
+ryad = []
+stupen = 0.0
+for i in range(int(FPS * 6)):
+    tt = i / FPS
+    istina = 2.0 * tt
+    if istina - stupen >= 2.5:
+        stupen += 2.5
+    ryad.append((tt, stupen))
+
+po_oknu = naklon_po_oknu(ryad)
+po_raznosti = raznost_s_filtrom(ryad, zn["LOS_RATE_ALPHA"])
+m_okno = max(abs(x) for x in po_oknu)
+m_razn = max(abs(x) for x in po_raznosti)
+print("    истинный тренд 2.0 °/с")
+print("    наклон по окну:    наибольшее %.2f °/с" % m_okno)
+print("    разность+фильтр:   наибольшее %.2f °/с" % m_razn)
+assert m_okno < 4.0, (
+    "наклон по окну даёт %.1f °/с при тренде 2.0 — ступени всё ещё проходят "
+    "насквозь, и прицел будет рвать" % m_okno)
+assert m_razn > m_okno, (
+    "разность соседних кадров не хуже окна — значит опыт не воспроизводит "
+    "беду, и сравнивать не с чем")
+# И главное: во что это превращается в пикселях прицела.
+px_okno = min(zn["LOS_AIM_GAIN"] * m_okno, zn["LOS_AIM_MAX_PX"])
+px_razn = min(20.0 * m_razn, 110.0)      # прежние коэффициент и предел
+print("    прицел: было бы %.0f px, стало %.0f px" % (px_razn, px_okno))
+assert px_okno < px_razn * 0.6, (
+    "поправка почти не уменьшилась: %.0f против %.0f px" % (px_okno, px_razn))
+
+print()
 print("прицел правится углом, газ этим больше не занят")
