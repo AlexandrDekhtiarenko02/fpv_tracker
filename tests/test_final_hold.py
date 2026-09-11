@@ -158,6 +158,32 @@ assert raznica < 60, (
     "выброс в 200 px сдвинул заморозку на %d PWM: значит замерло мгновение, "
     "а не среднее" % raznica)
 
+print("\n=== 5б. Заморозка СНИМАЕТСЯ между заходами ===")
+# Это стоило двух заходов подряд «залочился, а реакции ноль»: признак финала
+# сделан защёлкой, а сбросить её между заходами я забыл — и каждый следующий
+# заход начинался замороженным, с командой прошлой цели.
+t._final_zamorozhen = False
+t._final_schet = 0
+for _ in range(t.FINAL_CONFIRM_FRAMES + 1):
+    zahod(rost=t.FINAL_HOLD_ROST + 0.5, dy_px=0)
+assert t._final_zamorozhen, "заморозка не включилась — опыт негоден"
+t.target_visible = False
+t.target_controllable = False
+t.target_box_main = None
+t.update_control_from_target()
+assert not t._final_zamorozhen, (
+    "заморозка осталась после потери цели: следующий заход начнётся "
+    "замороженным, и контур не отзовётся вовсе")
+# И следующий заход обязан рулить.
+t._slew_pitch = 1500.0
+t.pitch_integral = 0.0
+t.prev_ady_ctrl = 0.0
+t._pitch_pri_loke = None
+a, _ = zahod(rost=1.3, dy_px=0)
+b, _ = zahod(rost=1.3, dy_px=60)
+print("    после снятия команда снова меняется: %d -> %d" % (a, b))
+assert a != b, "новый заход всё ещё заморожен"
+
 print("\n=== 6. Копилка чистится между заходами ===")
 t._final_okno.clear()
 for _ in range(5):
