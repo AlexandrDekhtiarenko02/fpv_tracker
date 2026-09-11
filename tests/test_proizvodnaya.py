@@ -1,0 +1,80 @@
+"""Производная берётся ОДИН раз и с гироскопа, а не дважды.
+
+D по пикселям и демпфирование по гироскопу — это одна и та же величина,
+скорость изменения угла, добытая двумя способами. Гироскоп меряет её напрямую
+и чисто, D получает её дифференцированием шумного ряда коробки. Держать обе
+в полную силу — удваивать производную, причём худшей половиной.
+
+Замерено на заходах 7ba0e82 (2490 кадров середины захода), скачки от кадра к
+кадру на 90-м процентиле:
+    pitch_p     30.5 при уровне 57.8
+    rate_damp   28.5 при уровне 30.2   <- средство от рывков само рвало
+    pitch_d     25.9 при уровне 19.1   <- почти целиком шум
+    pitch_i      2.9 при уровне 18.5
+Запрос превышал предел в 20% кадров, и ограничитель стоял в насыщении.
+"""
+import ast
+import io
+import math
+import os
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+src = io.open(os.path.join(ROOT, "tracker.py"), encoding="utf-8").read()
+tree = ast.parse(src)
+zn = {}
+for node in tree.body:
+    if isinstance(node, ast.Assign) and len(node.targets) == 1:
+        imya = getattr(node.targets[0], "id", None)
+        if imya:
+            try:
+                zn[imya] = ast.literal_eval(node.value)
+            except Exception:
+                pass
+
+print("=== 1. Гироскоп сглаживается перед демпфированием ===")
+assert "GYRO_DAMP_ALPHA" in zn, (
+    "гироскоп подаётся в демпфирование сырым: он приходит ступенями и сам "
+    "становится источником рывков")
+tau = -1.0 / (zn["CAM_FPS"] * math.log(1.0 - zn["GYRO_DAMP_ALPHA"]))
+RASKACHKA_HZ = 1.4
+faza = 360.0 * tau * RASKACHKA_HZ
+print("    постоянная %.3f с -> %.0f° запаздывания на %.1f Гц"
+      % (tau, faza, RASKACHKA_HZ))
+assert faza < 60.0, (
+    "%.0f° запаздывания: демпфирование перестаёт демпфировать раньше, чем "
+    "успеет помочь" % faza)
+assert tau > 0.02, "фильтр настолько быстрый, что ступени пройдут насквозь"
+assert "_gyro_y_sgl" in src and "_gyro_x_sgl" in src, "сглажена не каждая ось"
+
+print("\n=== 2. Производная не удваивается ===")
+# Вклад D в скачок пропорционален его коэффициенту.
+D_SKACHOK_BYL = 25.9      # при D_GAIN_PITCH = 1.2
+d_teper = D_SKACHOK_BYL * zn["D_GAIN_PITCH"] / 1.2
+print("    D по пикселям: коэффициент %.2f -> скачок ~%.1f PWM (был %.1f)"
+      % (zn["D_GAIN_PITCH"], d_teper, D_SKACHOK_BYL))
+assert zn["D_GAIN_PITCH"] < 1.2, "D по пикселям не снижен"
+assert zn["PITCH_RATE_DAMP"] > 0, (
+    "демпфирование по гироскопу выключено — тогда D по пикселям единственный "
+    "источник производной, и снижать его нельзя")
+
+print("\n=== 3. Ожидаемый запрос укладывается в предел ===")
+P_SK, DAMP_SK = 30.5, 28.5
+damp_teper = DAMP_SK * (1.0 - math.exp(-1.0 / (zn["CAM_FPS"] * tau)))
+bylo = math.sqrt(P_SK ** 2 + D_SKACHOK_BYL ** 2 + DAMP_SK ** 2)
+stalo = math.sqrt(P_SK ** 2 + d_teper ** 2 + damp_teper ** 2)
+predel = min(zn["PITCH_SLEW_PWM_PER_S"] / zn["CAM_FPS"], zn["PITCH_SLEW_MAX_STEP"])
+print("    скачок запроса: был ~%.0f, ожидается ~%.0f, предел %.0f"
+      % (bylo, stalo, predel))
+assert stalo < bylo * 0.8, (
+    "запрос почти не уменьшился (%.0f против %.0f) — правка не подействует"
+    % (stalo, bylo))
+assert stalo <= predel * 1.3, (
+    "запрос %.0f всё ещё сильно выше предела %.0f: ограничитель останется в "
+    "насыщении, и команда пойдёт ступенями предельной длины" % (stalo, predel))
+
+print("\n=== 4. Сглажённый гироскоп сбрасывается между заходами ===")
+assert src.count("_gyro_y_sgl = None") >= 2, (
+    "сглажённое значение переходит на новый заход и в первых кадрах даст "
+    "поправку от чужого манёвра")
+
+print("\nOK: производная одна, с гироскопа, и запрос укладывается в предел")

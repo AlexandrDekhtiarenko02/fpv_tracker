@@ -869,6 +869,11 @@ GYRO_UNIT_DPS = 0.068
 # добавляет фазы вместо того, чтобы возвращать её. Замеренный возраст: медиана
 # 67 мс, 90% ниже 126 мс.
 GYRO_FRESH_S = 0.15
+# Сглаживание гироскопа перед демпфированием. Сырой он приходит ступенями и
+# сам становится источником рывков. 0.5 при 24 к/с — постоянная около 0.06 с,
+# то есть 30° запаздывания на частоте раскачки: демпфирование остаётся
+# демпфированием, пока отстаёт меньше чем на 90°.
+GYRO_DAMP_ALPHA = 0.5
 PITCH_RATE_DAMP_ENABLED = True
 # PWM на градус в секунду. Аппарат даёт примерно 1.4 (°/с) на единицу PWM,
 # значит единичный внутренний контур — это 0.7. Взято 0.25: мягкое
@@ -933,7 +938,17 @@ P_GAIN_YAW = 2.5
 P_GAIN_ROLL = 4.0
 D_GAIN_ROLL = 6.0
 P_GAIN_PITCH = 1.8
-D_GAIN_PITCH = 1.2
+# СНИЖЕН, потому что производная теперь берётся с гироскопа.
+#
+# D по пикселям и демпфирование по гироскопу — это ОДНА И ТА ЖЕ величина,
+# добытая двумя способами: скорость изменения угла. Гироскоп меряет её
+# напрямую и чисто, а D получает её дифференцированием шумного ряда коробки.
+# Держать обе — удваивать производную, причём худшей половиной.
+#
+# Замерено на заходах 7ba0e82: вклад D скакал на 25.9 PWM при собственном
+# уровне 19.1 — то есть он почти целиком состоял из шума. Это был один из трёх
+# равных источников рывка наравне с прицельным членом и демпфированием.
+D_GAIN_PITCH = 0.3
 
 # I-компоненты для прицеливания: добивают остаточную ошибку P+D,
 # чтобы крестик стоял в центре рамки, а не у её границы.
@@ -2927,6 +2942,8 @@ _los_t = 0.0
 _los_skorost = 0.0
 _los_aim_tek = 0.0
 _glide_ves_tek = 0.0
+_gyro_y_sgl = None
+_gyro_x_sgl = None
 _dep_hist = collections.deque(maxlen=256)
 # Финал: заморожена ли команда и на каких значениях.
 _final_zamorozhen = False
@@ -5595,6 +5612,7 @@ def update_control_from_target():
     global _final_zamorozhen, _final_komandy, _final_okno, _final_schet
     global _dover_score_ema, _dover_psr_ema
     global _rassh_nakop, _flow_rasshirenie
+    global _gyro_y_sgl, _gyro_x_sgl
     global filtered_dx_yaw, prev_adx, prev_ady_ctrl
     global smooth_throttle_out, throttle_integral, prev_ady
     global roll_integral, pitch_integral, yaw_integral
@@ -5651,6 +5669,8 @@ def update_control_from_target():
         _los_skorost = 0.0
         _los_aim_tek = 0.0
         _glide_ves_tek = 0.0
+        _gyro_y_sgl = None
+        _gyro_x_sgl = None
         _dep_hist.clear()
         # И уровень качества слежения: он свой у каждой цели, и прошлый на
         # новой выглядел бы как резкое ухудшение или, наоборот, скрыл бы его.
@@ -6120,7 +6140,13 @@ def update_control_from_target():
             _gr_ts = app_state.get("imu_ts", 0.0)
         if _gr is not None and _gr[0] is not None and (
                 now_mono - _gr_ts) <= GYRO_FRESH_S:
-            roll_damp_pwm = -ROLL_RATE_DAMP * float(_gr[0]) * GYRO_UNIT_DPS
+            _syroy_r = float(_gr[0]) * GYRO_UNIT_DPS
+            if _gyro_x_sgl is None:
+                _gyro_x_sgl = _syroy_r
+            else:
+                _gyro_x_sgl += alpha_for_dt(GYRO_DAMP_ALPHA, k) * (
+                    _syroy_r - _gyro_x_sgl)
+            roll_damp_pwm = -ROLL_RATE_DAMP * _gyro_x_sgl
             if roll_damp_pwm > ROLL_RATE_DAMP_MAX:
                 roll_damp_pwm = ROLL_RATE_DAMP_MAX
             elif roll_damp_pwm < -ROLL_RATE_DAMP_MAX:
@@ -6172,7 +6198,24 @@ def update_control_from_target():
         # добавляет фазы вместо того, чтобы возвращать её, и раскачивает.
         if _g is not None and _g[1] is not None and (
                 now_mono - _g_ts) <= GYRO_FRESH_S:
-            skorost_dps = float(_g[1]) * GYRO_UNIT_DPS
+            # ГИРОСКОП СГЛАЖИВАЕТСЯ ПЕРЕД ДЕМПФИРОВАНИЕМ.
+            #
+            # Сырой он приходит по MSP со своим темпом и джиттером, и в
+            # кадровом ряду это выглядит как ступени. Замерено: вклад
+            # демпфирования скакал на 28 PWM при собственном уровне 30 — то
+            # есть средство от рывков само было одним из трёх главных их
+            # источников наравне с прицельным членом.
+            #
+            # Здесь сглаживание уместно, в отличие от выхода: запаздывание
+            # 0.06 с на частоте раскачки 1.4 Гц — это 30°, а демпфирование
+            # остаётся демпфированием, пока отстаёт меньше чем на 90°.
+            _syroy = float(_g[1]) * GYRO_UNIT_DPS
+            if _gyro_y_sgl is None:
+                _gyro_y_sgl = _syroy
+            else:
+                _gyro_y_sgl += alpha_for_dt(GYRO_DAMP_ALPHA, k) * (
+                    _syroy - _gyro_y_sgl)
+            skorost_dps = _gyro_y_sgl
             rate_damp_pwm = -PITCH_RATE_DAMP * skorost_dps
             if rate_damp_pwm > PITCH_RATE_DAMP_MAX:
                 rate_damp_pwm = PITCH_RATE_DAMP_MAX
