@@ -1119,6 +1119,11 @@ FINAL_HOLD_ENABLED = True
 # замерен в 125 мс, то есть за полторы секунды аппарат успел бы отработать
 # десяток поправок — но данные в этот момент уже негодны, а рамка огромная.
 FINAL_HOLD_TAU_S = 1.5
+# Сколько кадров подряд признак должен держаться. Заморозка необратима до
+# конца захода, поэтому одиночной оценки мало: мусорная tau в первую секунду
+# захвата уже погубила так целый вылет. 6 кадров при 24 к/с — четверть
+# секунды, на настоящем финале это ничего не стоит.
+FINAL_CONFIRM_FRAMES = 6
 # Запасной признак, когда времени нет. ВЫШЕ предела раздувания безликого
 # эталона (TEMPLATE_STARVED_MAX_X = 3.0), иначе заморозка снова примет
 # раздувание за сближение — ровно это и случилось в поле.
@@ -1364,6 +1369,10 @@ GLIDE_TAU_OFF_S = 4.0
 # Потолок вклада. Ниже LAUNCH_MAX_PWM: это фоновый режим полёта, который
 # работает почти весь заход, а не короткий манёвр.
 GLIDE_MAX_PWM = 120.0
+# За сколько секунд вес наклона доходит от нуля до полного. Переключение
+# скачком даёт ступеньку в GLIDE_MAX_PWM за один кадр — ровно тот рывок, от
+# которого лечимся. Наклон правит режим полёта, а он меняется секундами.
+GLIDE_SLEW_S = 1.5
 # Целевой наклон носом вниз на разгоне, градусы. 15-25 даёт заметное
 # ускорение, оставаясь далеко от опасных углов.
 LAUNCH_TARGET_PITCH_DEG = 20.0
@@ -1705,6 +1714,10 @@ TAU_MIN_GROWTH = 0.002
 # наклон ln(размера) считается уверенно.
 TAU_FIT_WINDOW_S = 1.2
 TAU_FIT_MIN_POINTS = 6
+# И наименьший РАЗМАХ окна по времени. Без него шесть точек за четверть
+# секунды проходят как полноценное окно, а наклон по ним — шум.
+# 0.8 с при окне 1.2: две трети заполнения.
+TAU_FIT_MIN_SPAN_S = 0.8
 # Порог по наклону, 1/с. Прежний TAU_MIN_GROWTH задан на кадр и здесь не
 # годится: 0.002/кадр при 30 к/с это 0.06 1/с.
 TAU_MIN_GROWTH_PER_S = 0.01
@@ -2893,11 +2906,13 @@ _los_ugol = None
 _los_t = 0.0
 _los_skorost = 0.0
 _los_aim_tek = 0.0
+_glide_ves_tek = 0.0
 _dep_hist = collections.deque(maxlen=256)
 # Финал: заморожена ли команда и на каких значениях.
 _final_zamorozhen = False
 _final_komandy = (1500, 1500, 1500)
 _final_okno = collections.deque(maxlen=FINAL_OKNO_KADROV)
+_final_schet = 0
 # Недавний уровень качества слежения. None означает «ещё не знаем»: первый
 # кадр захода задаёт уровень, а не считается ухудшением.
 _dover_score_ema = None
@@ -5250,7 +5265,16 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
     _size_hist.append((now_mono, ryad if ryad is not None else size))
     while _size_hist and (now_mono - _size_hist[0][0]) > TAU_FIT_WINDOW_S:
         _size_hist.popleft()
-    if len(_size_hist) >= TAU_FIT_MIN_POINTS:
+    # ОКНО ОБЯЗАНО БЫТЬ ЗАПОЛНЕНО ПО ВРЕМЕНИ, а не только по числу точек.
+    #
+    # Шести точек за четверть секунды хватает арифметике и не хватает смыслу:
+    # наклон по такому огрызку определяется шумом, а не сближением. В логе это
+    # выглядело так: сразу после захвата tau = 0.126 с и дальше РОСЛА (0.19,
+    # 0.27, 0.45...), хотя обязана убывать. А поскольку по tau срабатывает
+    # заморозка, контур замирал в первую же секунду захода.
+    _razmah = (_size_hist[-1][0] - _size_hist[0][0]) if _size_hist else 0.0
+    if (len(_size_hist) >= TAU_FIT_MIN_POINTS
+            and _razmah >= TAU_FIT_MIN_SPAN_S):
         xs = [t for t, _ in _size_hist]
         ys = [math.log(v) for _, v in _size_hist]
         m = len(xs)
@@ -5522,8 +5546,8 @@ def update_control_from_target():
     """
     global global_yaw_cmd, global_pitch_cmd, global_roll_cmd, global_throttle_cmd, override_active
     global _slew_roll, _slew_pitch, _slew_yaw, _pitch_pri_loke
-    global _los_ugol, _los_t, _los_skorost, _los_aim_tek
-    global _final_zamorozhen, _final_komandy, _final_okno
+    global _los_ugol, _los_t, _los_skorost, _los_aim_tek, _glide_ves_tek
+    global _final_zamorozhen, _final_komandy, _final_okno, _final_schet
     global _dover_score_ema, _dover_psr_ema
     global _rassh_nakop, _flow_rasshirenie
     global filtered_dx_yaw, prev_adx, prev_ady_ctrl
@@ -5581,6 +5605,7 @@ def update_control_from_target():
         _los_ugol = None
         _los_skorost = 0.0
         _los_aim_tek = 0.0
+        _glide_ves_tek = 0.0
         _dep_hist.clear()
         # И уровень качества слежения: он свой у каждой цели, и прошлый на
         # новой выглядел бы как резкое ухудшение или, наоборот, скрыл бы его.
@@ -5588,6 +5613,7 @@ def update_control_from_target():
         _dover_psr_ema = None
         # И копилка команд: усреднять с манёврами прошлой цели бессмысленно.
         _final_okno.clear()
+        _final_schet = 0
         filtered_dx_yaw = 0.0
         prev_adx = 0.0
         prev_ady_ctrl = 0.0
@@ -5894,7 +5920,17 @@ def update_control_from_target():
     # коробка уже крупная, мы близко, и слепой наклон там опаснее всего.
     if GLIDE_ENABLED and not OBSERVE_ONLY:
         if _tau_now is None:
-            ves = 0.0 if box_frac >= CLOSING_BOX_FRAC_THRESHOLD else 1.0
+            # НЕИЗВЕСТНОСТЬ — НЕ ПОВОД ДАВАТЬ ПОЛНЫЙ НАКЛОН.
+            #
+            # Раньше здесь стояла единица: «времени нет, значит цель далеко,
+            # значит нужен разгон». Но сразу после захвата времени нет просто
+            # потому, что окно оценки ещё не набралось, — и наклон уходил в
+            # упор 120 PWM в первые же кадры. Пилот увидел ровно это:
+            # «швыряет вверх, как будто ускорение, которое мы отключили».
+            #
+            # Молчать в неизвестности правильнее: настоящий затянутый заход
+            # даст время через секунду, и наклон придёт плавно.
+            ves = 0.0
         elif _tau_now <= GLIDE_TAU_OFF_S:
             ves = 0.0
         elif _tau_now >= GLIDE_TAU_FULL_S:
@@ -5902,6 +5938,18 @@ def update_control_from_target():
         else:
             ves = ((_tau_now - GLIDE_TAU_OFF_S)
                    / max(0.1, GLIDE_TAU_FULL_S - GLIDE_TAU_OFF_S))
+        # ВЕС МЕНЯЕТСЯ ПЛАВНО. Переключение наклона скачком — это ступенька
+        # в 120 PWM за кадр, то есть тот самый рывок, от которого и лечимся.
+        # Полный ход за GLIDE_SLEW_S: наклон правит режим полёта, а он
+        # меняется секундами.
+        _shag_v = (k / NOMINAL_FPS) / max(0.05, GLIDE_SLEW_S)
+        if ves > _glide_ves_tek + _shag_v:
+            _glide_ves_tek += _shag_v
+        elif ves < _glide_ves_tek - _shag_v:
+            _glide_ves_tek -= _shag_v
+        else:
+            _glide_ves_tek = ves
+        ves = _glide_ves_tek
         glide_ves = ves
         launch_phase = "GLIDE" if ves > 0.0 else "NONE"
         if ves > 0.0:
@@ -6324,14 +6372,20 @@ def update_control_from_target():
     # Время до контакта таких двойных смыслов не имеет — оно отвечает ровно на
     # тот вопрос, который здесь задаётся. Теперь оно считается по расширению
     # точек потока и проверено: -1.003 при истинном -1.
-    final_pora = False
+    # ЗАМОРОЗКА ТРЕБУЕТ ПОДТВЕРЖДЕНИЯ. Она необратима до конца захода, значит
+    # единственной ошибочной оценки достаточно, чтобы погубить заход целиком —
+    # и это уже случилось: мусорная tau = 0.126 с в первую секунду замораживала
+    # команду на весь заход.
+    _hochu_final = False
     if FINAL_HOLD_ENABLED:
         if _tau_now is not None:
-            final_pora = _tau_now <= FINAL_HOLD_TAU_S
+            _hochu_final = _tau_now <= FINAL_HOLD_TAU_S
         elif rost_ot_zahvata is not None:
             # Времени нет — остаётся рост рамки, но с порогом ВЫШЕ предела
             # раздувания, иначе вернётся та же путаница.
-            final_pora = rost_ot_zahvata >= FINAL_HOLD_ROST
+            _hochu_final = rost_ot_zahvata >= FINAL_HOLD_ROST
+    _final_schet = (_final_schet + 1) if _hochu_final else 0
+    final_pora = _final_zamorozhen or _final_schet >= FINAL_CONFIRM_FRAMES
 
     if final_pora:
         if not _final_zamorozhen:

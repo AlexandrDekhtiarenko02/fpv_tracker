@@ -57,9 +57,21 @@ for dy in (0, 40, -40):
 assert len(set(komandy)) > 1, (
     "команда не меняется при разной ошибке — контур не рулит там, где должен")
 
-print("\n=== 2. За порогом команда замирает ===")
+print("\n=== 2. За порогом команда замирает (после подтверждения) ===")
 t._final_zamorozhen = False
-p0, r0 = zahod(rost=t.FINAL_HOLD_ROST + 0.5, dy_px=0)
+t._final_schet = 0
+# Заморозка требует подтверждения: одиночная оценка её не включает. Это
+# спасает от мусорной оценки времени в первую секунду захвата, которая уже
+# губила заходы целиком.
+zahod(rost=t.FINAL_HOLD_ROST + 0.5, dy_px=0)
+assert not t._final_zamorozhen, (
+    "заморозка включилась с первого кадра: одна ошибочная оценка погубит "
+    "весь заход, а отменить её нечем")
+for _ in range(t.FINAL_CONFIRM_FRAMES):
+    p0, r0 = zahod(rost=t.FINAL_HOLD_ROST + 0.5, dy_px=0)
+assert t._final_zamorozhen, "после подтверждения заморозка так и не включилась"
+print("    одиночная оценка не замораживает, %d подряд — замораживают"
+      % t.FINAL_CONFIRM_FRAMES)
 print("    первый кадр финала -> тангаж %d, крен %d" % (p0, r0))
 zamerlo = True
 for dy in (60, -60, 100):
@@ -81,8 +93,11 @@ assert t.FINAL_HOLD_ROST > t.TEMPLATE_STARVED_MAX_X, (
 assert 0.5 <= t.FINAL_HOLD_TAU_S <= 3.0, (
     "время финала %.1f с вне разумного" % t.FINAL_HOLD_TAU_S)
 _src = io.open(os.path.join(_ROOT, "tracker.py"), encoding="utf-8").read()
-assert "final_pora = _tau_now <= FINAL_HOLD_TAU_S" in _src, (
+assert "_hochu_final = _tau_now <= FINAL_HOLD_TAU_S" in _src, (
     "финал снова определяется ростом рамки, а он означает не только сближение")
+assert "_final_schet >= FINAL_CONFIRM_FRAMES" in _src, (
+    "заморозка снова включается с одной оценки")
+assert t.FINAL_CONFIRM_FRAMES >= 3, "подтверждение короче трёх кадров бесполезно"
 print("    время финала %.1f с; рост как запасной — %.1f (раздувание до %.1f)"
       % (t.FINAL_HOLD_TAU_S, t.FINAL_HOLD_ROST, t.TEMPLATE_STARVED_MAX_X))
 
@@ -125,9 +140,11 @@ def progon(vybros):
     t.prev_ady_ctrl = 0.0
     t._pitch_pri_loke = None
     # Восемь спокойных кадров, потом кадр пересечения порога.
+    t._final_schet = 0
     for _ in range(10):
         zahod(rost=1.5, dy_px=10)
-    zahod(rost=t.FINAL_HOLD_ROST + 0.5, dy_px=vybros)
+    for _ in range(t.FINAL_CONFIRM_FRAMES + 1):
+        zahod(rost=t.FINAL_HOLD_ROST + 0.5, dy_px=vybros)
     return t.global_pitch_cmd
 
 
