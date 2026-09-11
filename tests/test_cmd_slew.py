@@ -56,4 +56,39 @@ assert "_slew_roll = _slew_pitch = _slew_yaw = 1500.0" in src, (
 # Шаг считается от длительности кадра, иначе предел зависел бы от частоты.
 assert "CMD_SLEW_PWM_PER_S * (k / NOMINAL_FPS)" in src, (
     "шаг не привязан к длительности кадра")
+
+print("\n=== ДЛИННЫЙ КАДР НЕ ДАЁТ ПРАВА НА СТУПЕНЬКУ ===")
+# Здесь жили оставшиеся рывки, и нашлись они только сравнением логов между
+# версиями: обычный скачок команды удалось срезать с 46 до 5 PWM, а 99-й
+# процентиль как был 60-90, так и остался. Все прежние правки меняли ВХОДЫ,
+# а беда была в самом ограничителе: допуск рос вместе с длительностью кадра.
+assert "CMD_SLEW_MAX_STEP" in zn, (
+    "нет абсолютного предела шага: длинный кадр снова разрешит ступеньку")
+NOM = zn["CMD_SLEW_PWM_PER_S"] / zn["NOMINAL_FPS"] * (zn["NOMINAL_FPS"] / zn["CAM_FPS"])
+print("  %-10s %6s %10s %10s" % ("dt мс", "k", "было", "стало"))
+for dt_ms, zamer in ((42, None), (60, None), (81, 95), (90, 107), (94, 113)):
+    k = (dt_ms / 1000.0) * zn["NOMINAL_FPS"]
+    bylo = zn["CMD_SLEW_PWM_PER_S"] * k / zn["NOMINAL_FPS"]
+    stalo = min(bylo, zn["CMD_SLEW_MAX_STEP"])
+    print("  %-10d %6.2f %10.0f %10.0f%s"
+          % (dt_ms, k, bylo, stalo,
+             ("   (в логе скачок %d)" % zamer) if zamer else ""))
+    if zamer:
+        assert abs(bylo - zamer) < 12, (
+            "расчёт не сходится с замером: при dt=%d допуск %.0f, а в логе "
+            "скачок %d — значит причина не та" % (dt_ms, bylo, zamer))
+        assert stalo <= zn["CMD_SLEW_MAX_STEP"]
+# На ровном ходу предел не вмешивается.
+k_rovno = (1.0 / zn["CAM_FPS"]) * zn["NOMINAL_FPS"]
+shag_rovno = zn["CMD_SLEW_PWM_PER_S"] * k_rovno / zn["NOMINAL_FPS"]
+assert shag_rovno <= zn["CMD_SLEW_MAX_STEP"], (
+    "абсолютный предел (%.0f) ниже шага на ровном ходу (%.0f) — ограничитель "
+    "станет резать там, где резать нечего"
+    % (zn["CMD_SLEW_MAX_STEP"], shag_rovno))
+print("  на ровном ходу шаг %.0f, предел %.0f — не вмешивается"
+      % (shag_rovno, zn["CMD_SLEW_MAX_STEP"]))
+assert zn["CMD_SLEW_MAX_STEP"] < 70, (
+    "предел %.0f всё ещё пропускает ступеньку" % zn["CMD_SLEW_MAX_STEP"])
+assert "min(CMD_SLEW_PWM_PER_S * (k / NOMINAL_FPS)," in src, (
+    "абсолютный предел не применяется")
 print("ограничитель на месте, после насыщения, со сбросом")
