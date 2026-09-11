@@ -103,6 +103,19 @@ md5. Нужно увидеть СОВПАДАЕТ и правильный ком
     python3 ~/fpv_tracker/tools/baro_probe.py
     sudo systemctl start tracker
 
+**Сравнить версии по рывкам** [малина]. Главный инструмент разбора контура:
+показывает распределение скачков команды по коммитам. Смотреть ХВОСТ (90-й,
+99-й процентиль, максимум), а не медиану — пилот чувствует редкие крупные
+рывки, а не среднее.
+
+    python3 ~/fpv_tracker/tools/sravnit_versii.py           # тангаж
+    python3 ~/fpv_tracker/tools/sravnit_versii.py cmd_roll  # крен
+
+**Вердикты последних заходов** [малина]. Чем кончился каждый: срыв слежения,
+перелёт, недолёт, не сблизились или сошлось.
+
+    for d in $(ls -dt ~/fpv_tracker/flight_logs/zahvaty/*/ | head -8); do grep -A1 "ЧЕМ КОНЧИЛОСЬ" "$d/итог.txt" | tail -1; done
+
 **Прогнать проверки** [мак]. Работает и на борту:
 
     cd ~/Desktop/fpv_tracker && ./run_tests.sh

@@ -54,7 +54,7 @@ assert "_slew_roll = _slew_pitch = _slew_yaw = 1500.0" in src, (
     "насыщенной команды предыдущего")
 
 # Шаг считается от длительности кадра, иначе предел зависел бы от частоты.
-assert "CMD_SLEW_PWM_PER_S * (k / NOMINAL_FPS)" in src, (
+assert "_dolya = k / NOMINAL_FPS" in src, (
     "шаг не привязан к длительности кадра")
 
 print("\n=== ДЛИННЫЙ КАДР НЕ ДАЁТ ПРАВА НА СТУПЕНЬКУ ===")
@@ -89,6 +89,39 @@ print("  на ровном ходу шаг %.0f, предел %.0f — не вм
       % (shag_rovno, zn["CMD_SLEW_MAX_STEP"]))
 assert zn["CMD_SLEW_MAX_STEP"] < 70, (
     "предел %.0f всё ещё пропускает ступеньку" % zn["CMD_SLEW_MAX_STEP"])
-assert "min(CMD_SLEW_PWM_PER_S * (k / NOMINAL_FPS)," in src, (
+assert "min(CMD_SLEW_PWM_PER_S * _dolya, CMD_SLEW_MAX_STEP)" in src, (
     "абсолютный предел не применяется")
+
+print("\n=== ТАНГАЖ ВЕДЁТСЯ МЯГЧЕ ОСТАЛЬНЫХ ОСЕЙ ===")
+# После абсолютного ограничения ступеньки исчезли (максимум 113 -> 55), но
+# 10% кадров всё ещё просили больше 36 PWM — это и ощущается как «прыгает».
+shag_p = min(zn["PITCH_SLEW_PWM_PER_S"] / zn["CAM_FPS"], zn["PITCH_SLEW_MAX_STEP"])
+shag_r = min(zn["CMD_SLEW_PWM_PER_S"] / zn["CAM_FPS"], zn["CMD_SLEW_MAX_STEP"])
+print("  тангаж        %5.1f PWM за кадр, до края за %.2f с"
+      % (shag_p, zn["MAX_PITCH_DEFLECT"] / (shag_p * zn["CAM_FPS"])))
+print("  крен/рыскание %5.1f PWM за кадр, до края за %.2f с"
+      % (shag_r, zn["MAX_ROLL_DEFLECT"] / (shag_r * zn["CAM_FPS"])))
+assert shag_p < shag_r, "тангаж не мягче остальных осей"
+ZAMER_90 = 36.0   # 90-й процентиль скачка по замеру
+assert shag_p < ZAMER_90, (
+    "предел %.0f выше замеренного 90-го процентиля (%.0f) — смягчать нечего"
+    % (shag_p, ZAMER_90))
+# Но и не настолько мягко, чтобы контур перестал успевать в финале.
+do_kraya = zn["MAX_PITCH_DEFLECT"] / (shag_p * zn["CAM_FPS"])
+assert do_kraya <= 0.6, (
+    "до полного отклонения %.2f с — в последние секунды захода это уже поздно"
+    % do_kraya)
+assert "_slew_pitch = _ogranich_skorost(_slew_pitch, target_pitch, shag_p)" in src, (
+    "тангаж использует общий предел, а не свой")
+
+print("\n=== СМЯГЧАЕМ ОГРАНИЧИТЕЛЕМ, А НЕ СГЛАЖИВАНИЕМ ===")
+# Ограничитель нелинеен: на мелких движениях не работает и фазы не съедает.
+# Сглаживание запаздывает всегда, и при запасе в 39° фильтр с постоянной
+# 0.12 с забрал бы его целиком — вместо мягкости вышла бы раскачка.
+_telo = src[src.index("if CMD_SLEW_ENABLED:"):]
+_telo = _telo[:3000]
+assert "alpha_for_dt" not in _telo, (
+    "на прицельные оси добавлено сглаживание: оно запаздывает всегда и "
+    "съест запас по фазе, дав раскачку вместо мягкости")
+print("  сглаживания на прицельных осях нет — только ограничение скорости")
 print("ограничитель на месте, после насыщения, со сбросом")
