@@ -21,9 +21,32 @@ if ! git fetch origin; then
     exit 1
 fi
 VETKA="$(git rev-parse --abbrev-ref HEAD)"
-if ! git merge --ff-only "origin/${VETKA}"; then
-    echo "    НЕ ВЫШЛО перемотать ветку ${VETKA}."
-    echo "    Либо на борту есть свои коммиты, либо репозиторий повреждён."
+VYVOD="$(git merge --ff-only "origin/${VETKA}" 2>&1)"
+if [ $? -ne 0 ]; then
+    echo "$VYVOD" | sed 's/^/    /'
+    echo
+    echo "    НЕ ВЫШЛО перемотать ветку ${VETKA}. Что делать:"
+    # Разбираем ПО ПРИЧИНЕ, а не перечисляем догадки: прежде скрипт называл
+    # две возможные причины, и в первом же случае ни одна не подошла —
+    # мешал файл, созданный на борту мимо git.
+    if echo "$VYVOD" | grep -q "untracked working tree files"; then
+        MESHAYUT="$(echo "$VYVOD" | sed -n 's/^\t//p')"
+        echo "    На борту есть файлы, которых нет в учёте git, и обновление"
+        echo "    затёрло бы их. Если они не нужны — удалить и повторить:"
+        for F in $MESHAYUT; do echo "        rm ${F}"; done
+        echo "        ./obnovit.sh"
+    elif echo "$VYVOD" | grep -qi "local changes\|would be overwritten by merge"; then
+        echo "    Файлы правили прямо на борту. Посмотреть, что изменено:"
+        echo "        git status --porcelain"
+        echo "    Отказаться от правок и обновиться:"
+        echo "        git checkout -- . && ./obnovit.sh"
+    elif echo "$VYVOD" | grep -qi "not possible to fast-forward\|diverge"; then
+        echo "    На борту есть свои коммиты, которых нет в origin."
+        echo "        git log --oneline origin/${VETKA}..HEAD"
+    else
+        echo "    Похоже на повреждение репозитория:"
+        echo "        ./pochinit.sh"
+    fi
     exit 1
 fi
 
