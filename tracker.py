@@ -1073,7 +1073,26 @@ MAX_PITCH_COMP_PX = 100.0
 # Низкочастотный фильтр на fc_pitch_deg — без него aim-точка прыгает на каждом твике.
 PITCH_COMP_ALPHA = 0.30
 # Если данные с FC старше этого порога — компенсация не применяется.
-FC_PITCH_TIMEOUT = 0.20
+# ПОРОГ ПОДНЯТ, ПОТОМУ ЧТО УГОЛ ТЕПЕРЬ ДОВОДИТСЯ ПО ГИРОСКОПУ.
+#
+# Прежние 0.20 были выставлены для СЫРОГО угла: старше этого он просто врал.
+# Но замерено, что в 10% кадров возраст больше 228 мс — и в этих кадрах
+# компенсация тангажа молча падала в ноль, а потом возвращалась. Ступенька на
+# ровном месте, причём тем чаще, чем хуже связь с полётником.
+#
+# С доведением по гироскопу угол остаётся годным дольше: поправка ограничена
+# 12°, то есть заведомо меньше того, что накопится за 0.35 с даже при сильном
+# вращении. Лучше слегка приблизительный угол, чем его отсутствие.
+FC_PITCH_TIMEOUT = 0.35
+# --- ДОВЕДЕНИЕ ТАНГАЖА ДО ТЕКУЩЕГО МОМЕНТА ---
+# Угол из MSP_ATTITUDE устарел медианно на 76 мс, в 10% кадров больше чем на
+# 228 (замерено на 5070 кадрах). Гироскоп приходит свежее и меряет скорость
+# вращения — им угол и доводится. Подробности у самой функции.
+EXTRAP_TANGAZH = True
+# Предел поправки. На большом возрасте экстраполяция сама становится
+# выдумкой: 12° — это 280 мс при вращении 42 °/с, то есть уже край
+# осмысленного.
+EXTRAP_MAX_DEG = 12.0
 
 # --- УПРЕЖДЕНИЕ ПО СКОРОСТИ ЦЕЛИ (LEAD / PREDICTIVE AIM) ---
 # Считаем скорость центра коробки в пикселях/кадр, экстраполируем позицию
@@ -5463,8 +5482,12 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
     with state_lock:
         alt_cm = app_state.get("alt_cm")
         alt_ts = app_state.get("alt_ts", 0.0)
-        fc_pitch = app_state.get("fc_pitch_deg")
         armed = app_state.get("armed")
+    # Тангаж — доведённый до кадра: из него считается угол визирования, а он
+    # складывается с положением цели, снятым именно сейчас. Разные моменты
+    # давали ложную скорость угла, из-за которой поправка прицела вставала в
+    # упор и аппарат клевал носом.
+    fc_pitch, _ = svezhiy_tangazh(now_mono)
     if alt_cm is None or fc_pitch is None or (now_mono - alt_ts) > 1.0:
         return out
     # БЕЗ АРМА ВЫСОТЫ НЕТ ВОВСЕ. Опросник tools/baro_probe.py показал прямо:
@@ -5641,6 +5664,49 @@ def _pitch_angle_hold_pwm(target_deg, now_mono, k):
     return out, abs(err) <= 2.0
 
 
+def svezhiy_tangazh(now_mono):
+    """Тангаж, доведённый до ТЕКУЩЕГО момента по гироскопу.
+
+    ЗАЧЕМ. Угол из MSP_ATTITUDE всегда устарел: замерено на 5070 кадрах, что
+    его возраст медианно 76 мс, в 10% кадров больше 228 мс, максимум 439.
+    При вращении 42 °/с (90-й процентиль) это ошибка в 9.7 градуса, а в
+    клевке при 90 °/с — все 18.
+
+    Из-за этого ломалось всё, что складывает угол полётника с положением цели
+    в кадре: угол визирования, компенсация тангажа, дальность. Величины
+    относятся к РАЗНЫМ моментам, и разность между ними копит ложную скорость.
+    Вчера я просто запретил считать угол при быстром вращении — это обходило
+    беду, а не лечило.
+
+    Лечится прямо: гироскоп меряет скорость вращения и приходит свежее
+    (медиана 67 мс против 76). Доведя угол на его возраст вперёд, получаем
+    оценку на момент кадра.
+
+    Экстраполяция ограничена EXTRAP_MAX_DEG: на большом возрасте она сама
+    становится выдумкой, и лучше вернуть меньшую поправку, чем большую ложь.
+    """
+    with state_lock:
+        pitch = app_state.get("fc_pitch_deg")
+        ts = app_state.get("fc_pitch_ts", 0.0)
+        g = app_state.get("gyro")
+        g_ts = app_state.get("imu_ts", 0.0)
+    if pitch is None or ts <= 0.0:
+        return None, None
+    vozrast = now_mono - ts
+    if vozrast > FC_PITCH_TIMEOUT:
+        return None, vozrast
+    if (not EXTRAP_TANGAZH or g is None or len(g) < 2 or g[1] is None
+            or g_ts <= 0.0 or (now_mono - g_ts) > GYRO_FRESH_S):
+        return float(pitch), vozrast
+    # Знак тот же, что у демпфирования: положительный gyro_y = тангаж растёт.
+    popravka = float(g[1]) * GYRO_UNIT_DPS * vozrast
+    if popravka > EXTRAP_MAX_DEG:
+        popravka = EXTRAP_MAX_DEG
+    elif popravka < -EXTRAP_MAX_DEG:
+        popravka = -EXTRAP_MAX_DEG
+    return float(pitch) + popravka, vozrast
+
+
 def _compute_pitch_attitude_comp_px(now_mono, k=1.0):
     """Возвращает (compensation_px, обновлено?). Compensation добавляется
     к aim_y. Положительное значение = aim сдвигается ВНИЗ в кадре (бóльшая y),
@@ -5653,11 +5719,11 @@ def _compute_pitch_attitude_comp_px(now_mono, k=1.0):
     if not PITCH_ATTITUDE_COMP_ENABLED:
         return 0.0
 
-    with state_lock:
-        fc_pitch = app_state.get("fc_pitch_deg")
-        fc_pitch_ts = app_state.get("fc_pitch_ts", 0.0)
-
-    if fc_pitch is None or (now_mono - fc_pitch_ts) > FC_PITCH_TIMEOUT:
+    # Тангаж берём ДОВЕДЁННЫЙ до текущего кадра: сырой устарел медианно на
+    # 76 мс, и складывать его с положением цели, снятым сейчас, значит
+    # сравнивать разные моменты.
+    fc_pitch, _vozrast = svezhiy_tangazh(now_mono)
+    if fc_pitch is None:
         return 0.0
 
     if _pitch_pri_loke is None:
