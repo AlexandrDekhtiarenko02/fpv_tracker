@@ -1541,6 +1541,24 @@ LOS_AIM_MAX_PX = 45.0
 # оценка угла однажды соврёт.
 LOS_AIM_SLEW_PX_S = 30.0
 
+# --- ПОПРАВКА ПРИЦЕЛА ВБОК ПО СКОРОСТИ АЗИМУТА ---
+# То же, что вертикальная поправка, но в горизонтальной плоскости. На курсе
+# столкновения азимут цели СТОИТ; крутится — проходим мимо стороной.
+#
+# Замерено на заходах 9d4ecb6: азимут крутится с медианой 2.86 °/с и 8.19 на
+# 90-м процентиле, а ошибка прицела по горизонтали при этом мизерная (4-19 px).
+# Перекрестье на цели, а аппарат идёт мимо — пилот видит «крен не
+# доворачивает».
+LOS_AIM_X_ENABLED = True
+# Пикселей на °/с. Меньше вертикального (12), потому что и сами скорости
+# азимута больше: при медианных 2.86 °/с даёт 12 px, на 90-м процентиле
+# упирается в предел.
+LOS_AIM_X_GAIN = 5.0
+LOS_AIM_X_MAX_PX = 30.0
+# Мёртвая зона. Замеренный разброс азимута на ровных заходах — доли градуса
+# в секунду, так что 0.5 отсекает их, не трогая настоящий увод.
+LOS_AZ_DEADBAND_DPS = 0.5
+
 # --- ОЦЕНКА СКОРОСТИ УГЛА ---
 # Наклон прямой по окну, а не разность соседних кадров: тангаж приходит
 # ступенями, и разность превращает ступень 2.5° в 60 °/с. Подробности у
@@ -1642,6 +1660,10 @@ GROUND_SPEED_STALE_S = 1.0
 GROUND_EVERY_N = 2
 # Вертикальный угол обзора IMX219 в этом режиме, градусы.
 CAMERA_VFOV_DEG = 41.4
+# Пикселей на градус ПО ГОРИЗОНТАЛИ. Кадр 640x480 при квадратном пикселе,
+# поэтому масштаб тот же, что по вертикали, — но выражен явно: путать оси в
+# расчёте азимута нельзя, а по имени константы это видно сразу.
+PX_NA_GRAD_GOR = MAIN_H / CAMERA_VFOV_DEG
 # Наклон камеры на раме, градусы (вверх положительный). 0 = смотрит вперёд.
 # Наклон камеры ВВЕРХ относительно рамы, градусы. Не ноль на реальном борту:
 # камеру почти никогда не ставят строго по оси.
@@ -1896,7 +1918,7 @@ _FLIGHT_LOG_COLUMNS = (
     "pitch_p,pitch_d,pitch_i,pitch_ff,pitch_off,pitch_sat,"
     "launch_pwm,cruise_pwm,rate_damp,roll_damp,pitch_comb,"
     "yaw_filt,yaw_weight,yaw_pd,yaw_ff,yaw_i,yaw_off,yaw_sat,"
-    "los_rate,los_aim_px,rost_ot_zahvata,final_hold,doverie,base_thr,thr_adjust,thr_i,rc_fresh,"
+    "los_rate,los_aim_px,az_rate,los_aim_x_px,rost_ot_zahvata,final_hold,doverie,base_thr,thr_adjust,thr_i,rc_fresh,"
     "cmd_roll,cmd_pitch,cmd_yaw,cmd_thr,"
     "sent_r,sent_p,sent_t,sent_y,"
     "fc_roll,fc_pitch,fc_yaw,att_age_ms,"
@@ -2952,6 +2974,11 @@ _los_ugol = None
 _los_t = 0.0
 _los_skorost = 0.0
 _los_aim_tek = 0.0
+_los_aim_x_tek = 0.0
+_az_skorost = 0.0
+_az_nakop = 0.0
+_az_pred = None
+_az_hist = collections.deque(maxlen=256)
 _glide_ves_tek = 0.0
 _gyro_y_sgl = None
 _gyro_x_sgl = None
@@ -5620,6 +5647,7 @@ def update_control_from_target():
     global global_yaw_cmd, global_pitch_cmd, global_roll_cmd, global_throttle_cmd, override_active
     global _slew_roll, _slew_pitch, _slew_yaw, _pitch_pri_loke
     global _los_ugol, _los_t, _los_skorost, _los_aim_tek, _glide_ves_tek
+    global _los_aim_x_tek, _az_skorost, _az_nakop, _az_pred
     global _final_zamorozhen, _final_komandy, _final_okno, _final_schet
     global _dover_score_ema, _dover_psr_ema
     global _rassh_nakop, _flow_rasshirenie
@@ -5679,6 +5707,13 @@ def update_control_from_target():
         _los_ugol = None
         _los_skorost = 0.0
         _los_aim_tek = 0.0
+        # И вбок: азимут прошлой цели к новой отношения не имеет, а
+        # накопленное развёртывание курса дало бы выброс на первом же кадре.
+        _los_aim_x_tek = 0.0
+        _az_skorost = 0.0
+        _az_nakop = 0.0
+        _az_pred = None
+        _az_hist.clear()
         _glide_ves_tek = 0.0
         _gyro_y_sgl = None
         _gyro_x_sgl = None
@@ -5832,7 +5867,31 @@ def update_control_from_target():
     pitch_comp_px = _compute_pitch_attitude_comp_px(now_mono, k)
 
     # Прицельная точка: текущая позиция + статический оффсет + компенсация тангажа + упреждение.
-    dx_aim = (box_cx + AIM_OFFSET_X + lead_x) - CENTER_X
+    # Поправка вбок по скорости азимута — см. пояснение у самого расчёта.
+    # Берётся с прошлого кадра, как и вертикальная: расчёт ниже по коду.
+    los_aim_x_px = 0.0
+    if LOS_AIM_X_ENABLED:
+        if _az_skorost > LOS_AZ_DEADBAND_DPS:
+            _izb_x = _az_skorost - LOS_AZ_DEADBAND_DPS
+        elif _az_skorost < -LOS_AZ_DEADBAND_DPS:
+            _izb_x = _az_skorost + LOS_AZ_DEADBAND_DPS
+        else:
+            _izb_x = 0.0
+        _hochu_x = LOS_AIM_X_GAIN * _izb_x
+        if _hochu_x > LOS_AIM_X_MAX_PX:
+            _hochu_x = LOS_AIM_X_MAX_PX
+        elif _hochu_x < -LOS_AIM_X_MAX_PX:
+            _hochu_x = -LOS_AIM_X_MAX_PX
+        _shag_x = LOS_AIM_SLEW_PX_S * (k / NOMINAL_FPS)
+        if _hochu_x > _los_aim_x_tek + _shag_x:
+            _los_aim_x_tek += _shag_x
+        elif _hochu_x < _los_aim_x_tek - _shag_x:
+            _los_aim_x_tek -= _shag_x
+        else:
+            _los_aim_x_tek = _hochu_x
+        los_aim_x_px = _los_aim_x_tek
+
+    dx_aim = (box_cx + AIM_OFFSET_X + lead_x + los_aim_x_px) - CENTER_X
     # --- ТОЧКА ПРИЦЕЛИВАНИЯ ОПУСКАЕТСЯ, ПОКА УГОЛ ВИЗИРОВАНИЯ РАСТЁТ ---
     #
     # Это и есть то, что пилот делал руками и называл «держать нос ниже цели».
@@ -5920,6 +5979,58 @@ def update_control_from_target():
     # срабатывает слишком поздно (замерено — в 1.2% кадров), но лучше, чем
     # ничего, когда рамка не растёт и время не считается.
     _tau_now = closure.get("tau_s") if isinstance(closure, dict) else None
+    # --- СКОРОСТЬ АЗИМУТА ЛИНИИ ВИЗИРОВАНИЯ ---
+    #
+    # ТА ЖЕ БОЛЕЗНЬ, ЧТО ПЕРЕЛЁТ, ТОЛЬКО ВБОК. На курсе столкновения азимут
+    # цели СТОИТ. Крутится — значит проходим мимо стороной.
+    #
+    # Замерено на заходах 9d4ecb6: азимут крутится с медианой 2.86 °/с и 8.19
+    # на 90-м процентиле — быстрее, чем вертикальный угол на промахах (2.13).
+    # И при этом ошибка прицела по горизонтали мизерная: в заходе с азимутом
+    # -8.19 °/с она была 4 px, в заходе с -12.43 °/с — 19 px. Перекрестье на
+    # цели, а аппарат идёт мимо. Пилот видит это как «крен не доворачивает».
+    #
+    # Поправка та же, что для вертикали: сдвигаем точку прицеливания вбок,
+    # пока азимут крутится. Наклон по окну, а не разность соседних кадров —
+    # курс от полётника приходит ступенями точно так же, как тангаж, и на
+    # разностях это уже давало ложную скорость впятеро выше настоящей.
+    with state_lock:
+        fc_yaw_tek = app_state.get("fc_yaw_deg")
+        fc_yaw_ts = app_state.get("fc_pitch_ts", 0.0)
+    # Несвежий курс в расчёт не идёт: запоздалое значение даст ложную
+    # скорость азимута ровно так же, как запоздалый тангаж давал её вертикали.
+    if fc_yaw_ts <= 0.0 or (now_mono - fc_yaw_ts) > FC_PITCH_TIMEOUT:
+        fc_yaw_tek = None
+
+    _az_tek = None
+    if fc_yaw_tek is not None:
+        # Азимут = курс аппарата плюс смещение цели по горизонтали.
+        _az_tek = float(fc_yaw_tek) + (box_cx - CENTER_X) / PX_NA_GRAD_GOR
+    if _az_tek is not None:
+        # Курс замкнут по кругу: копим РАЗВЁРНУТОЕ значение, иначе один
+        # переход через ноль портит окно целиком.
+        if _az_pred is not None:
+            _d = _az_tek - _az_pred
+            while _d > 180.0:
+                _d -= 360.0
+            while _d < -180.0:
+                _d += 360.0
+            _az_nakop += _d
+        _az_pred = _az_tek
+        _az_hist.append((now_mono, _az_nakop))
+        while _az_hist and (now_mono - _az_hist[0][0]) > LOS_FIT_WINDOW_S:
+            _az_hist.popleft()
+        if len(_az_hist) >= LOS_FIT_MIN_POINTS:
+            _xs = [a for a, _ in _az_hist]
+            _ys = [b for _, b in _az_hist]
+            _n = len(_xs)
+            _mx = sum(_xs) / _n
+            _my = sum(_ys) / _n
+            _den = sum((x - _mx) ** 2 for x in _xs)
+            if _den > 1e-6:
+                _az_skorost = sum(
+                    (_xs[i] - _mx) * (_ys[i] - _my) for i in range(_n)) / _den
+
     # --- СКОРОСТЬ УГЛА ВИЗИРОВАНИЯ ---
     #
     # Считается ЗДЕСЬ, а не внутри закона газа, потому что ею пользуются двое:
@@ -6677,6 +6788,9 @@ def update_control_from_target():
         # Скорость изменения угла визирования — главный признак промаха:
         # на курсе столкновения она ноль, при перелёте растёт.
         "los_rate": _los_skorost, "los_aim_px": los_aim_px,
+        # Азимут и поправка вбок: по ним видно, уходит ли аппарат мимо
+        # стороной, — а ошибка прицела этого не показывает.
+        "az_rate": _az_skorost, "los_aim_x_px": los_aim_x_px,
         # Рост рамки от захвата и признак заморозки: по ним после посадки
         # видно, когда контур перестал рулить и почему.
         "rost_ot_zahvata": rost_ot_zahvata, "final_hold": _final_zamorozhen,
@@ -8029,7 +8143,8 @@ def _capture_flight_row(cb_t0):
             g("pitch_comb"),
             g("yaw_filt"), g("yaw_weight"), g("yaw_pd"), g("yaw_ff"),
             g("yaw_i"), g("yaw_off"), g("yaw_sat"),
-            g("los_rate"), g("los_aim_px"), g("rost_ot_zahvata"),
+            g("los_rate"), g("los_aim_px"), g("az_rate"), g("los_aim_x_px"),
+            g("rost_ot_zahvata"),
             g("final_hold"),
             g("doverie"),
             c.get("base_thr"), g("thr_adjust"), g("thr_i"), g("rc_fresh"),
