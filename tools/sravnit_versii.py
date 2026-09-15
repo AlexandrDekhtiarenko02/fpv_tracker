@@ -74,7 +74,8 @@ def main():
         print("    python3 tools/sravnit_versii.py %s <папка>" % kol)
         return 1
     print("папка: %s" % BAZA)
-    po = defaultdict(lambda: {"sk": [], "lok": 0, "kadr": 0, "t": 0.0})
+    po = defaultdict(lambda: {"sk": [], "lok": 0, "kadr": 0, "t": 0.0,
+                              "p90_po_lokam": [], "ugol": [], "ramka": []})
     for p in sorted(glob.glob(os.path.join(BAZA, "*"))):
         m = re.search(r"_([0-9a-f]{7})$", os.path.basename(p))
         if not m:
@@ -129,20 +130,47 @@ def main():
         d["kadr"] += n_godnyh
         d["t"] = max(d["t"], os.path.getmtime(p))
         d["sk"].extend(sk)
+        # ПОКАЗАТЕЛЬ ПО КАЖДОМУ ЛОКУ ОТДЕЛЬНО.
+        #
+        # Без него сравнение версий обманывает: заходы отличаются друг от
+        # друга круче, чем версии. Замерено, что разброс 90-го процентиля
+        # между локами одной версии доходит до 38 PWM, тогда как разница
+        # между соседними версиями была 3. Такая разница ничего не значит.
+        d["p90_po_lokam"].append(q(sk, 0.9))
+        ug = [ch(r.get("depression_deg")) for r in rows]
+        ra = [ch(r.get("box_size_px")) for r in rows]
+        ug = [x for x in ug if x is not None]
+        ra = [x for x in ra if x is not None]
+        if ug:
+            d["ugol"].append(q(ug, 0.5))
+        if ra:
+            d["ramka"].append(q(ra, 0.5))
     if not po:
         print("нет заходов с хешем версии в имени")
         return 1
     print("скачки «%s» между кадрами, PWM (только середина захода)" % kol)
     print()
-    print("%-10s %6s %8s %8s %8s %8s %8s"
-          % ("версия", "локов", "кадров", "50%", "90%", "99%", "макс"))
+    print("%-10s %6s %8s %8s %8s %8s %8s %11s %9s %8s"
+          % ("версия", "локов", "кадров", "50%", "90%", "99%", "макс",
+             "90% по локам", "угол°", "рамка"))
     for v, d in sorted(po.items(), key=lambda kv: kv[1]["t"]):
         s = d["sk"]
         if len(s) < 50:
             continue
-        print("%-10s %6d %8d %8.1f %8.1f %8.1f %8.1f"
+        p90 = d["p90_po_lokam"]
+        razbros = ("%.0f..%.0f" % (min(p90), max(p90))) if p90 else "—"
+        print("%-10s %6d %8d %8.1f %8.1f %8.1f %8.1f %11s %9.1f %8.0f"
               % (v, d["lok"], d["kadr"], q(s, 0.5), q(s, 0.9),
-                 q(s, 0.99), max(s)))
+                 q(s, 0.99), max(s), razbros,
+                 q(d["ugol"], 0.5) if d["ugol"] else 0.0,
+                 q(d["ramka"], 0.5) if d["ramka"] else 0.0))
+    print()
+    print("КАК ЧИТАТЬ. «90% по локам» — разброс этого показателя МЕЖДУ")
+    print("заходами одной версии. Если разница между версиями меньше этого")
+    print("разброса, она ничего не значит: заходы отличаются круче самих")
+    print("правок. Столбцы «угол» и «рамка» показывают, сопоставимы ли")
+    print("условия вообще — версия, летавшая по крупной цели, несравнима с")
+    print("версией, летавшей по мелкой.")
     print()
     print("Хвост важнее медианы: пилот чувствует редкие крупные рывки.")
     return 0
