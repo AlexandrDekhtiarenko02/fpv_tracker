@@ -8,13 +8,49 @@
 
 Папки заходов названы хешем коммита, поэтому разбивка берётся из имён.
 
-    python3 tools/sravnit_versii.py           # тангаж
-    python3 tools/sravnit_versii.py cmd_roll  # другая ось
+    python3 tools/sravnit_versii.py                      # тангаж
+    python3 tools/sravnit_versii.py cmd_roll             # другая ось
+    python3 tools/sravnit_versii.py cmd_pitch ~/Desktop/Logs
+
+Папка с заходами ищется сама: сначала та, что в аргументе, потом FPV_LOGS,
+потом обычные места на борту и на Маке. Инструмент нужен на обеих машинах —
+на борту сразу после вылета, на Маке при разборе.
 """
 import csv, glob, math, os, re, sys
 from collections import defaultdict
 
-BAZA = os.path.expanduser("~/fpv_tracker/flight_logs/zahvaty")
+# Больше этого промежутка соседние записи соседними не считаются: между ними
+# что-то выпало, и разность охватила бы разрыв.
+MAX_RAZRYV_S = 0.15
+
+MESTA = (
+    "~/fpv_tracker/flight_logs/zahvaty",      # борт
+    "~/Desktop/Logs/zahvaty",                 # Мак, забранные логи
+    "~/Desktop/fpv_tracker/flight_logs/zahvaty",
+    "./flight_logs/zahvaty",
+    "./zahvaty",
+)
+
+
+def nayti_papku(yavno=None):
+    """Где лежат заходы. Явный путь важнее, дальше — привычные места."""
+    kandidaty = []
+    if yavno:
+        kandidaty.append(yavno)
+    if os.environ.get("FPV_LOGS"):
+        kandidaty.append(os.environ["FPV_LOGS"])
+    kandidaty.extend(MESTA)
+    for k in kandidaty:
+        put = os.path.expanduser(k)
+        # Вложенную папку проверяем ПЕРВОЙ: передают обычно каталог логов, а
+        # заходы лежат в zahvaty/ внутри него. Иначе вернули бы родителя, в
+        # котором заходов нет, и получили бы «нет заходов с хешем версии».
+        vnutri = os.path.join(put, "zahvaty")
+        if os.path.isdir(vnutri):
+            return vnutri
+        if os.path.isdir(put):
+            return put
+    return None
 
 
 def ch(v):
@@ -32,6 +68,12 @@ def q(a, pr):
 
 def main():
     kol = sys.argv[1] if len(sys.argv) > 1 else "cmd_pitch"
+    BAZA = nayti_papku(sys.argv[2] if len(sys.argv) > 2 else None)
+    if BAZA is None:
+        print("не нашёл папку с заходами. Укажи её явно:")
+        print("    python3 tools/sravnit_versii.py %s <папка>" % kol)
+        return 1
+    print("папка: %s" % BAZA)
     po = defaultdict(lambda: {"sk": [], "lok": 0, "kadr": 0, "t": 0.0})
     for p in sorted(glob.glob(os.path.join(BAZA, "*"))):
         m = re.search(r"_([0-9a-f]{7})$", os.path.basename(p))
@@ -47,20 +89,46 @@ def main():
         t0 = ch(rows[0].get("t")) or 0.0
         # Середина захода: без первой секунды (оценки ещё набираются) и без
         # замороженных кадров — там команда не меняется по замыслу.
-        sred = [r for r in rows
-                if (ch(r.get("t")) or 0) - t0 > 1.0
-                and str(r.get("final_hold")) not in ("True", "1")
-                and r.get("state") == "TRACKED"]
-        if len(sred) < 20:
+        # ГОДНОСТЬ КАДРА И СОСЕДСТВО — РАЗНЫЕ ВЕЩИ.
+        #
+        # Раньше строки сначала отфильтровывались, а потом бралась разность
+        # между соседями В ОТФИЛЬТРОВАННОМ списке. Если между ними выпадали
+        # кадры (потеря цели, заморозка), разность охватывала разрыв и
+        # выглядела как огромный скачок. Так в отчёте появился максимум 50 PWM
+        # при пределе оси 32 — величина, которой быть не могло.
+        #
+        # Теперь пара берётся только из ПОДРЯД ИДУЩИХ кадров, и оба должны
+        # быть годными.
+        def godnyy(r):
+            return ((ch(r.get("t")) or 0) - t0 > 1.0
+                    and str(r.get("final_hold")) not in ("True", "1")
+                    and r.get("state") == "TRACKED")
+
+        sk = []
+        n_godnyh = 0
+        for i in range(len(rows)):
+            if godnyy(rows[i]):
+                n_godnyh += 1
+            if i == 0:
+                continue
+            a, b = rows[i - 1], rows[i]
+            if not (godnyy(a) and godnyy(b)):
+                continue
+            # И по времени соседи: пропущенная запись тоже даёт разрыв.
+            ta, tb = ch(a.get("t")), ch(b.get("t"))
+            if ta is None or tb is None or (tb - ta) > MAX_RAZRYV_S:
+                continue
+            va, vb = ch(a.get(kol)), ch(b.get(kol))
+            if va is None or vb is None:
+                continue
+            sk.append(abs(vb - va))
+        if n_godnyh < 20 or not sk:
             continue
         d = po[m.group(1)]
         d["lok"] += 1
-        d["kadr"] += len(sred)
+        d["kadr"] += n_godnyh
         d["t"] = max(d["t"], os.path.getmtime(p))
-        c = [ch(r.get(kol)) for r in sred]
-        for i in range(1, len(c)):
-            if c[i] is not None and c[i - 1] is not None:
-                d["sk"].append(abs(c[i] - c[i - 1]))
+        d["sk"].extend(sk)
     if not po:
         print("нет заходов с хешем версии в имени")
         return 1

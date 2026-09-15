@@ -65,6 +65,19 @@ assert zn["GYRO_FRESH_S"] <= 0.2, (
 zaderzhka_s = 0.125
 srez_prezhde = 2.2
 srez = srez_prezhde * zn["P_GAIN_PITCH"] / 3.5
+# И отдельно: усиление не должно просить больше, чем выход способен выдать.
+# Избыток срезается ограничителем и остаётся ступенькой.
+OSHIBKA_90_PX = 15.9      # замеренный 90-й процентиль ошибки прицела
+D_SK, DAMP_SK = 5.7, 13.9  # замеренные скачки прочих слагаемых
+import math as _m2
+spros = _m2.sqrt((OSHIBKA_90_PX * zn["P_GAIN_PITCH"]) ** 2
+                 + D_SK ** 2 + DAMP_SK ** 2)
+predel = min(zn["PITCH_SLEW_PWM_PER_S"] / zn["CAM_FPS"],
+             zn["PITCH_SLEW_MAX_STEP"])
+print("запрос на 90%% ~%.0f PWM при пределе оси %.0f" % (spros, predel))
+assert spros <= predel * 1.1, (
+    "усиление просит %.0f при пределе %.0f: избыток срежется и останется "
+    "ступенькой — это не усиление, а рывок" % (spros, predel))
 faza = 90.0 + 360.0 * zaderzhka_s * srez
 print("P=%.1f -> частота среза ~%.1f Гц, фаза ~%.0f°, запас ~%.0f°"
       % (zn["P_GAIN_PITCH"], srez, faza, 180.0 - faza))
