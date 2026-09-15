@@ -50,10 +50,16 @@ md5. Нужно увидеть СОВПАДАЕТ и правильный ком
 
     cat "$(ls -dt ~/fpv_tracker/flight_logs/zahvaty/*/ | head -1)/итог.txt"
 
-**Забрать логи к себе** [мак]. Адрес борта можно задать:
-`PI=192.168.1.50 ./fetch_logs.sh`
+**Забрать логи к себе** [мак]. Запускается из любого места — скрипт сам
+переходит к себе в каталог. Без аргумента кладёт в `flight_logs/` рядом с
+собой, с аргументом — куда скажешь.
 
-    cd ~/Desktop/fpv_tracker && ./fetch_logs.sh
+    ~/Desktop/fpv_tracker/fetch_logs.sh
+    ~/Desktop/fpv_tracker/fetch_logs.sh ~/Desktop/Logs
+
+Если имя борта не резолвится, адрес задаётся отдельно:
+
+    PI=192.168.1.50 ~/Desktop/fpv_tracker/fetch_logs.sh ~/Desktop/Logs
 
 **Посмотреть, что уйдёт при чистке** [малина]. Ничего не удаляет:
 
