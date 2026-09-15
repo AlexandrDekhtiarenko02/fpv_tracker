@@ -1616,7 +1616,18 @@ THROTTLE_BY_TAU = True         # False = прежнее поведение по 
 TAU_THROTTLE_LO_S = 3.0        # быстрее этого — сбрасываем газ
 TAU_THROTTLE_HI_S = 9.0        # медленнее этого — добавляем
 TAU_THROTTLE_GAIN = 12.0       # PWM на секунду выхода за границу
-TAU_THROTTLE_MAX = 120.0       # предел поправки по времени
+TAU_THROTTLE_MAX = 120.0
+# --- УБЫВАНИЕ ВРЕМЕНИ ДО КОНТАКТА ---
+# На нормальном сближении оно убывает секунда в секунду, то есть d(tau)/dt
+# около -1, сколько бы времени ни оставалось. Этим «далеко» отличается от
+# «буксуем», а без этого различения газ упирался в предел на каждом заходе
+# издалека.
+# Хуже этого считаем, что не закрываемся (убывание вялое или его нет).
+TAU_UBYV_PLOHO = -0.4
+# Окно, по которому меряется убывание. Длиннее окна самой оценки времени:
+# нам нужен ход, а не мгновенное значение.
+TAU_UBYV_OKNO_S = 2.5
+TAU_UBYV_MIN_TOCHEK = 12       # предел поправки по времени
 # УДЕРЖАНИЕ ВРЕМЕНИ, когда рост рамки временно пропал.
 #
 # Замерено: время до контакта заполнено лишь в 51% кадров — на вялом
@@ -1931,7 +1942,7 @@ _FLIGHT_LOG_COLUMNS = (
     "pitch_p,pitch_d,pitch_i,pitch_ff,pitch_off,pitch_sat,"
     "launch_pwm,cruise_pwm,rate_damp,roll_damp,pitch_comb,"
     "yaw_filt,yaw_weight,yaw_pd,yaw_ff,yaw_i,yaw_off,yaw_sat,"
-    "los_rate,los_aim_px,az_rate,los_aim_x_px,rost_ot_zahvata,final_hold,doverie,base_thr,thr_adjust,thr_i,rc_fresh,"
+    "los_rate,los_aim_px,az_rate,los_aim_x_px,tau_ubyv,rost_ot_zahvata,final_hold,doverie,base_thr,thr_adjust,thr_i,rc_fresh,"
     "cmd_roll,cmd_pitch,cmd_yaw,cmd_thr,"
     "sent_r,sent_p,sent_t,sent_y,"
     "fc_roll,fc_pitch,fc_yaw,att_age_ms,"
@@ -2992,6 +3003,10 @@ _az_skorost = 0.0
 _az_nakop = 0.0
 _az_pred = None
 _az_hist = collections.deque(maxlen=256)
+# Ход времени до контакта. По умолчанию считаем, что НЕ закрываемся: пока
+# хода не измерили, добавлять газ не за что.
+_tau_ubyvanie = 0.0
+_tau_hist = collections.deque(maxlen=256)
 _glide_ves_tek = 0.0
 _gyro_y_sgl = None
 _gyro_x_sgl = None
@@ -5661,6 +5676,7 @@ def update_control_from_target():
     global _slew_roll, _slew_pitch, _slew_yaw, _pitch_pri_loke
     global _los_ugol, _los_t, _los_skorost, _los_aim_tek, _glide_ves_tek
     global _los_aim_x_tek, _az_skorost, _az_nakop, _az_pred
+    global _tau_ubyvanie
     global _final_zamorozhen, _final_komandy, _final_okno, _final_schet
     global _dover_score_ema, _dover_psr_ema
     global _rassh_nakop, _flow_rasshirenie
@@ -5727,6 +5743,8 @@ def update_control_from_target():
         _az_nakop = 0.0
         _az_pred = None
         _az_hist.clear()
+        _tau_ubyvanie = 0.0
+        _tau_hist.clear()
         _glide_ves_tek = 0.0
         _gyro_y_sgl = None
         _gyro_x_sgl = None
@@ -5992,6 +6010,24 @@ def update_control_from_target():
     # срабатывает слишком поздно (замерено — в 1.2% кадров), но лучше, чем
     # ничего, когда рамка не растёт и время не считается.
     _tau_now = closure.get("tau_s") if isinstance(closure, dict) else None
+    # УБЫВАНИЕ ВРЕМЕНИ ДО КОНТАКТА — наклон по окну, как и всё остальное.
+    #
+    # Отличает «цель далеко» от «не закрываемся». На нормальном сближении
+    # время убывает секунда в секунду, каким бы большим оно ни было.
+    if _tau_now is not None:
+        _tau_hist.append((now_mono, float(_tau_now)))
+        while _tau_hist and (now_mono - _tau_hist[0][0]) > TAU_UBYV_OKNO_S:
+            _tau_hist.popleft()
+        if len(_tau_hist) >= TAU_UBYV_MIN_TOCHEK:
+            _xs = [a for a, _ in _tau_hist]
+            _ys = [b for _, b in _tau_hist]
+            _n = len(_xs)
+            _mx = sum(_xs) / _n
+            _my = sum(_ys) / _n
+            _den = sum((x - _mx) ** 2 for x in _xs)
+            if _den > 1e-6:
+                _tau_ubyvanie = sum(
+                    (_xs[i] - _mx) * (_ys[i] - _my) for i in range(_n)) / _den
     # --- СКОРОСТЬ АЗИМУТА ЛИНИИ ВИЗИРОВАНИЯ ---
     #
     # ТА ЖЕ БОЛЕЗНЬ, ЧТО ПЕРЕЛЁТ, ТОЛЬКО ВБОК. На курсе столкновения азимут
@@ -6590,9 +6626,27 @@ def update_control_from_target():
             if tau_now < TAU_THROTTLE_LO_S:
                 # Слишком быстро: не успеем довернуть — сбрасываем.
                 thr_adjust = -(TAU_THROTTLE_LO_S - tau_now) * TAU_THROTTLE_GAIN
-            elif tau_now > TAU_THROTTLE_HI_S:
-                # Заход затягивается — добавляем.
+            elif tau_now > TAU_THROTTLE_HI_S and _tau_ubyvanie > TAU_UBYV_PLOHO:
+                # ЗАХОД БУКСУЕТ — И ЭТО НЕ ТО ЖЕ, ЧТО «ЦЕЛЬ ДАЛЕКО».
+                #
+                # Раньше здесь стояло одно условие: время до контакта больше
+                # порога — добавить газ. Но при захвате издалека оно ВЕЛИКО ПО
+                # СУЩЕСТВУ ДЕЛА. Замерено: 90-й процентиль времени 19.3 с, и
+                # поправка газа стояла на упоре +120 в 13.7% кадров, ни разу не
+                # уйдя в минус. В начале каждого пологого захода газ получал
+                # почти полный упор, и аппарат лез вверх — пилот видел это как
+                # «швыряет вверх на пологом заходе».
+                #
+                # Отличить одно от другого позволяет УБЫВАНИЕ. На нормальном
+                # сближении время до контакта убывает секунда в секунду,
+                # сколько бы его ни оставалось. Убывает — всё в порядке,
+                # добавлять нечего. Стоит или растёт — вот тогда мы не
+                # закрываемся, и газ нужен.
                 thr_adjust = (tau_now - TAU_THROTTLE_HI_S) * TAU_THROTTLE_GAIN
+                # Доля: ноль при здоровом убывании, единица когда время
+                # не убывает вовсе. Знаменатель — расстояние от порога до нуля.
+                _dolya_buks = (_tau_ubyvanie - TAU_UBYV_PLOHO) / (-TAU_UBYV_PLOHO)
+                thr_adjust *= max(0.0, min(1.0, _dolya_buks))
             # ОСЛАБЛЯЕМ ПОПРАВКУ, КОГДА ВРЕМЕНИ ВЕРИТЬ НЕЛЬЗЯ. Замерено: на
             # вялом сближении рамка почти не растёт, и время врёт в разы.
             # Отрабатывать газом такую оценку вслепую — рвать заход.
@@ -6842,6 +6896,9 @@ def update_control_from_target():
         # Азимут и поправка вбок: по ним видно, уходит ли аппарат мимо
         # стороной, — а ошибка прицела этого не показывает.
         "az_rate": _az_skorost, "los_aim_x_px": los_aim_x_px,
+        # Ход времени до контакта: -1 значит сближаемся как положено, около
+        # нуля — буксуем. Именно он решает, нужен ли газ.
+        "tau_ubyv": _tau_ubyvanie,
         # Рост рамки от захвата и признак заморозки: по ним после посадки
         # видно, когда контур перестал рулить и почему.
         "rost_ot_zahvata": rost_ot_zahvata, "final_hold": _final_zamorozhen,
@@ -8195,6 +8252,7 @@ def _capture_flight_row(cb_t0):
             g("yaw_filt"), g("yaw_weight"), g("yaw_pd"), g("yaw_ff"),
             g("yaw_i"), g("yaw_off"), g("yaw_sat"),
             g("los_rate"), g("los_aim_px"), g("az_rate"), g("los_aim_x_px"),
+            g("tau_ubyv"),
             g("rost_ot_zahvata"),
             g("final_hold"),
             g("doverie"),
