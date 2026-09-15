@@ -24,8 +24,30 @@ src = io.open(os.path.join(_ROOT, "tracker.py"), encoding="utf-8").read()
 ns = {"np": np, "cv2": cv2}
 ns["HIRES_TRACKING"] = eval(
     re.search(r"^HIRES_TRACKING = (.+?)(?:\s+#.*)?$", src, re.M).group(1))
-for name in ("TRACK_SCALE", "SIZE_SCALE_STEP", "SIZE_SCALE_MIN_LEAD",
-             "SIZE_SCALE_DOWNSAMPLE", "SIZE_SCALE_DS_MIN", "SEARCH_MARGIN_MIN"):
+# Константы по префиксу, а не списком: список подводил трижды — новая
+# константа отсутствует в окружении, функция падает на NameError внутри
+# своего try и молча возвращает None, а тест показывает «рост не обнаружен».
+ns["TRACK_SCALE"] = eval(
+    re.search(r"^TRACK_SCALE = (.+?)(?:\s+#.*)?$", src, re.M).group(1), dict(ns))
+_im = sorted(set(mm.group(1) for mm in re.finditer(
+    r"^((?:SIZE|TEMPLATE|LOCK|SEARCH_MARGIN)_[A-Z0-9_]+) = ", src, re.M)))
+_ost = list(_im)
+for _ in range(6):
+    _ne = []
+    for name in _ost:
+        mm = re.search(r"^%s = (.+?)(?:\s+#.*)?$" % name, src, re.M)
+        if mm is None:
+            continue
+        try:
+            ns[name] = eval(mm.group(1), dict(ns))
+        except Exception:
+            _ne.append(name)
+    if not _ne or _ne == _ost:
+        _ost = _ne
+        break
+    _ost = _ne
+assert not _ost, "не вычислились константы: %s" % _ost
+for name in ():
     ns[name] = eval(
         re.search(r"^%s = (.+?)(?:\s+#.*)?$" % name, src, re.M).group(1), dict(ns))
 for _fn in ("clamp", "clamp_rect_center", "crop_center"):

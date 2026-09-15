@@ -1287,6 +1287,14 @@ SIZE_SCALE_DOWNSAMPLE = 2
 SIZE_SCALE_DS_MIN = 64
 SIZE_SCALE_STEP = 1.18        # во сколько раз примеряем крупнее и мельче
 SIZE_SCALE_MIN_LEAD = 0.012   # насколько сосед должен обойти текущий масштаб
+# Для РОСТА перевес нужен больше: мера сходства сама по себе предпочитает
+# крупный эталон (замерено: «крупнее» в 59% проверок против 6% «мельче»).
+# Подробности у самой примерки.
+SIZE_SCALE_MIN_LEAD_GROW = 0.050
+# Насколько совпадение должно просесть относительно уровня на прошлом росте,
+# чтобы дальнейший рост запретить. 0.08 при обычном совпадении 0.85 — это
+# заметное ухудшение, а не дрожание.
+SIZE_GROW_SCORE_PADENIE = 0.08
 SIZE_ADAPT_ENABLED = True
 # ПОСЧИТАНО по заходу 152533 (383 с слежения, оператор водил цель на метр
 # туда-обратно, жалоба: «когда цель маленькая, sz вообще не меняется»):
@@ -3007,6 +3015,9 @@ _az_hist = collections.deque(maxlen=256)
 # хода не измерили, добавлять газ не за что.
 _tau_ubyvanie = 0.0
 _tau_hist = collections.deque(maxlen=256)
+# Совпадение на момент последнего разрешённого роста рамки. None означает
+# «росла ещё не проверяли».
+_score_do_rosta = None
 _glide_ves_tek = 0.0
 _gyro_y_sgl = None
 _gyro_x_sgl = None
@@ -4615,7 +4626,22 @@ def measure_scale_change(gray, cx, cy):
                 best_v, best_s = v, s_
         if base_v is None or best_v is None:
             return None
-        if best_s == 1.0 or (best_v - base_v) < SIZE_SCALE_MIN_LEAD:
+        if best_s == 1.0:
+            return 1.0
+        # ПЕРЕВЕС ДЛЯ РОСТА НУЖЕН БОЛЬШИЙ, ЧЕМ ДЛЯ УМЕНЬШЕНИЯ.
+        #
+        # У TM_CCOEFF_NORMED перекос к росту систематический: крупный эталон
+        # захватывает больше фона, фон гладкий и коррелирует со всем вокруг.
+        # Замерено на 5064 кадрах: «крупнее» выигрывало в 59% проверок,
+        # «мельче» — в 6%. Это не измерение цели, а свойство меры сходства.
+        #
+        # Прежний общий порог 0.012 такой перевес не отсекал: 1.2% корреляции
+        # даёт обычный шум. И заканчивалось это положительной обратной связью —
+        # рамка росла с 24 до 90 px, эталон набирал фон, совпадение падало с
+        # 1.000 до 0.169, цель терялась.
+        nuzhno = (SIZE_SCALE_MIN_LEAD_GROW if best_s > 1.0
+                  else SIZE_SCALE_MIN_LEAD)
+        if (best_v - base_v) < nuzhno:
             return 1.0
         return best_s
     except Exception:
@@ -7885,6 +7911,27 @@ def process_locked_tracker(gray):
                 _t_pr = time.monotonic()
                 k_scale = measure_scale_change(gray, lock_cx, lock_cy)
                 _etap("primerka", _t_pr)
+                # РОСТ ЗАПРЕЩЁН, ПОКА СОВПАДЕНИЕ УХУДШАЕТСЯ.
+                #
+                # Проверка простая и не требует настройки: если рамка растёт,
+                # а слежение от этого становится хуже — рост был неверен.
+                # В логе это видно прямо: рамка 24 -> 90 px, и совпадение
+                # ровно по ходу этого роста падает 1.000 -> 0.169.
+                #
+                # Мера сходства сама себя проверить не может: ей крупный
+                # эталон нравится по построению. А вот последствие роста —
+                # может, и оно однозначно.
+                global _score_do_rosta
+                if k_scale is not None and k_scale > 1.0:
+                    if (_score_do_rosta is not None
+                            and score < _score_do_rosta - SIZE_GROW_SCORE_PADENIE):
+                        k_scale = 1.0
+                        _match_dbg["rost_zapreshchen"] = 1
+                    else:
+                        _score_do_rosta = score
+                elif k_scale is not None and k_scale < 1.0:
+                    # Уменьшились — отсчёт начинаем заново.
+                    _score_do_rosta = score
                 _match_dbg["size_scale"] = k_scale
                 if template_std < TEMPLATE_STARVED_STD:
                     # Эталон безлик — он внутри однородного предмета. Растём,

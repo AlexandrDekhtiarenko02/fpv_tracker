@@ -19,13 +19,62 @@ src = io.open(os.path.join(_ROOT, "tracker.py"), encoding="utf-8").read()
 ns = {"np": np, "cv2": cv2}
 ns["HIRES_TRACKING"] = eval(
     re.search(r"^HIRES_TRACKING = (.+?)(?:\s+#.*)?$", src, re.M).group(1))
-for name in ("TRACK_SCALE", "SIZE_SCALE_STEP", "SIZE_SCALE_MIN_LEAD",
-             "SIZE_SCALE_ALPHA", "SIZE_SCALE_DOWNSAMPLE", "SIZE_SCALE_DS_MIN",
-             "SEARCH_MARGIN_MIN", "TEMPLATE_MIN", "TEMPLATE_MAX",
-             "TEMPLATE_SCALE", "LOCK_MIN_W", "LOCK_MAX_W",
-             "ACQ_DEFAULT_LOCK_W"):
-    ns[name] = eval(
-        re.search(r"^%s = (.+?)(?:\s+#.*)?$" % name, src, re.M).group(1), dict(ns))
+# Константы берутся ПО ПРЕФИКСУ, а не списком поимённо.
+#
+# Список уже дважды подводил: добавляешь константу в tracker.py, в окружении
+# теста её нет, measure_scale_change падает на NameError ВНУТРИ СВОЕГО try и
+# молча возвращает None. Тест при этом показывает «коробка не растёт» — то
+# есть врёт про поведение, а не про отсутствие имени.
+#
+# Порядок вычисления важен: одни константы выражены через другие. Поэтому
+# проходим списком столько раз, сколько нужно, и если что-то так и не
+# вычислилось — падаем ЯВНО, а не пропускаем молча. Молчаливый пропуск и был
+# причиной, по которой тест врал.
+# TRACK_SCALE — самый корень: от него зависят и размеры кадра, и почти все
+# пороги. Вычисляем его ПЕРВЫМ, до всего остального.
+_m = re.search(r"^TRACK_SCALE = (.+?)(?:\s+#.*)?$", src, re.M)
+ns["TRACK_SCALE"] = eval(_m.group(1), dict(ns))
+
+# Базовые размеры кадра: от них выражены многие константы, а сами они под
+# префиксы не подпадают.
+for _bazovoe in ("MAIN_W", "MAIN_H", "LORES_W", "LORES_H"):
+    _m = re.search(r"^%s.* = (.+?)(?:\s+#.*)?$" % _bazovoe, src, re.M)
+    if _m and _bazovoe not in ns:
+        try:
+            _znach = eval(_m.group(1), dict(ns))
+            if isinstance(_znach, tuple):
+                ns["MAIN_W"], ns["MAIN_H"] = _znach
+            else:
+                ns[_bazovoe] = _znach
+        except Exception:
+            pass
+if "LORES_W" not in ns:
+    _m = re.search(r"^LORES_W, LORES_H = (.+?)(?:\s+#.*)?$", src, re.M)
+    if _m:
+        ns["LORES_W"], ns["LORES_H"] = eval(_m.group(1), dict(ns))
+
+_imena = sorted(set(m.group(1) for m in re.finditer(
+    r"^((?:SIZE|TEMPLATE|LOCK|SEARCH_MARGIN|ACQ|TRACK)_[A-Z0-9_]+) = ", src, re.M)))
+_ostalos = list(_imena)
+for _ in range(6):
+    _ne_vyshlo = []
+    for name in _ostalos:
+        m = re.search(r"^%s = (.+?)(?:\s+#.*)?$" % name, src, re.M)
+        if m is None:
+            continue
+        try:
+            ns[name] = eval(m.group(1), dict(ns))
+        except Exception:
+            _ne_vyshlo.append(name)
+    if not _ne_vyshlo or _ne_vyshlo == _ostalos:
+        _ostalos = _ne_vyshlo
+        break
+    _ostalos = _ne_vyshlo
+assert not _ostalos, (
+    "не вычислились константы: %s. Молча пропускать нельзя — функция упадёт "
+    "на NameError внутри своего try и вернёт None, а тест покажет это как "
+    "«коробка не растёт»" % _ostalos)
+
 for fn in ("clamp", "clamp_rect_center", "crop_center"):
     m = re.search(r"^def %s\(.*?(?=\n\ndef )" % fn, src, re.S | re.M)
     if m:
