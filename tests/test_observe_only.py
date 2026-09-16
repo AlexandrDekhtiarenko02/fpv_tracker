@@ -42,8 +42,11 @@ assert found, "нигде не видно связи оверрайда с ре�
 
 print("\n=== 3. В режиме наблюдения RC-команды по MSP не отправляются ===")
 lines = src.splitlines()
+# Вызов теперь присваивается (sent_ok = send_msp_set_raw_rc(...)), поэтому
+# ищем строку с вызовом, исключая определение функции.
 send_lines = [i for i, line in enumerate(lines)
-              if line.strip().startswith("send_msp_set_raw_rc(")]
+              if "send_msp_set_raw_rc(channels)" in line
+              and not line.strip().startswith("def ")]
 assert send_lines, "в коде не найден вызов send_msp_set_raw_rc"
 for send_i in send_lines:
     guards = [i for i in range(send_i)

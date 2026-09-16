@@ -23,9 +23,32 @@ t = offline.load_tracker()
 CX, CY = t.CENTER_X, t.CENTER_Y
 MASHTAB = float(t.MAIN_W) / float(t.LORES_W)
 
+# ДЕТЕРМИНИРОВАННЫЕ ЧАСЫ. Финал теперь подтверждается по времени, а не по числу
+# кадров. Гонять реальный time.sleep — медленно и зыбко: под нагрузкой сон
+# плывёт, и за выдержку набегает то 6, то 9 кадров, а окно усреднения всего 8.
+# Поэтому подменяем монотонные часы на управляемые и двигаем их РОВНО на один
+# кадровый интервал за кадр — как ~43 мс у цели в полёте.
+FRAME_DT = 0.043
+
+
+class _Chasy:
+    def __init__(self, t0=1000.0):
+        self.t = t0
+
+    def monotonic(self):
+        return self.t
+
+    def tick(self, dt=FRAME_DT):
+        self.t += dt
+
+
+_clk = _Chasy()
+t.time.monotonic = _clk.monotonic
+
 
 def zahod(rost, dy_px):
     """Кадр захода: рамка выросла в rost раз, цель смещена на dy_px."""
+    _clk.tick()  # один кадр = один шаг часов
     # Размер при захвате — в координатах lores, коробка — в координатах кадра.
     t.lock_w0 = t.lock_h0 = 20.0
     storona = 20.0 * MASHTAB * rost
@@ -47,6 +70,22 @@ def zahod(rost, dy_px):
     return t.global_pitch_cmd, t.global_roll_cmd
 
 
+def derzhi_finala(rost, dy_px=0):
+    """Держать признак финала кадр за кадром, пока не сработает выдержка.
+
+    Часы двигает zahod (один кадр = FRAME_DT), поэтому реального сна нет:
+    выдержка набирается ровно за FINAL_CONFIRM_TIME_S / FRAME_DT кадров — как в
+    полёте. Возвращает последнюю команду; на защитном пределе просто выходит —
+    вызывающий проверит через assert.
+    """
+    p = r = None
+    for _ in range(200):
+        p, r = zahod(rost=rost, dy_px=dy_px)
+        if t._final_zamorozhen:
+            return p, r
+    return p, r
+
+
 t._final_zamorozhen = False
 print("=== 1. До порога контур рулит: команда следует за ошибкой ===")
 komandy = []
@@ -57,9 +96,9 @@ for dy in (0, 40, -40):
 assert len(set(komandy)) > 1, (
     "команда не меняется при разной ошибке — контур не рулит там, где должен")
 
-print("\n=== 2. За порогом команда замирает (после подтверждения) ===")
+print("\n=== 2. За порогом команда замирает (после подтверждения по времени) ===")
 t._final_zamorozhen = False
-t._final_schet = 0
+t._vyderzhka_sbros(t._vyderzhka_final)
 # Заморозка требует подтверждения: одиночная оценка её не включает. Это
 # спасает от мусорной оценки времени в первую секунду захвата, которая уже
 # губила заходы целиком.
@@ -67,11 +106,10 @@ zahod(rost=t.FINAL_HOLD_ROST + 0.5, dy_px=0)
 assert not t._final_zamorozhen, (
     "заморозка включилась с первого кадра: одна ошибочная оценка погубит "
     "весь заход, а отменить её нечем")
-for _ in range(t.FINAL_CONFIRM_FRAMES):
-    p0, r0 = zahod(rost=t.FINAL_HOLD_ROST + 0.5, dy_px=0)
+p0, r0 = derzhi_finala(rost=t.FINAL_HOLD_ROST + 0.5, dy_px=0)
 assert t._final_zamorozhen, "после подтверждения заморозка так и не включилась"
-print("    одиночная оценка не замораживает, %d подряд — замораживают"
-      % t.FINAL_CONFIRM_FRAMES)
+print("    одиночная оценка не замораживает, выдержка %.2f с — замораживает"
+      % t.FINAL_CONFIRM_TIME_S)
 print("    первый кадр финала -> тангаж %d, крен %d" % (p0, r0))
 zamerlo = True
 for dy in (60, -60, 100):
@@ -95,9 +133,9 @@ assert 0.5 <= t.FINAL_HOLD_TAU_S <= 3.0, (
 _src = io.open(os.path.join(_ROOT, "tracker.py"), encoding="utf-8").read()
 assert "_hochu_final = _tau_now <= FINAL_HOLD_TAU_S" in _src, (
     "финал снова определяется ростом рамки, а он означает не только сближение")
-assert "_final_schet >= FINAL_CONFIRM_FRAMES" in _src, (
+assert "final_pora = _final_zamorozhen or _final_podtverzhdeno" in _src, (
     "заморозка снова включается с одной оценки")
-assert t.FINAL_CONFIRM_FRAMES >= 3, "подтверждение короче трёх кадров бесполезно"
+assert t.FINAL_CONFIRM_TIME_S >= 0.15, "подтверждение короче 0.15 с бесполезно"
 print("    время финала %.1f с; рост как запасной — %.1f (раздувание до %.1f)"
       % (t.FINAL_HOLD_TAU_S, t.FINAL_HOLD_ROST, t.TEMPLATE_STARVED_MAX_X))
 
@@ -128,7 +166,9 @@ assert a != b, "выключатель не работает"
 
 print("\n=== 5. Замораживается СРЕДНЕЕ, а не мгновение ===")
 # Выброс ровно в кадре пересечения порога не должен решать судьбу захода:
-# дальше контур молчит, и исправить его будет уже нечем.
+# дальше контур молчит, и исправить его будет уже нечем. Моделируем именно
+# ОДИНОЧНЫЙ выброс на кадре входа в финал, а не смещение на всю выдержку:
+# усреднение по окну обязано его растворить.
 t.FINAL_HOLD_ENABLED = True
 
 
@@ -139,33 +179,34 @@ def progon(vybros):
     t.pitch_integral = 0.0
     t.prev_ady_ctrl = 0.0
     t._pitch_pri_loke = None
-    # Восемь спокойных кадров, потом кадр пересечения порога.
-    t._final_schet = 0
+    # Спокойные кадры до порога.
+    t._vyderzhka_sbros(t._vyderzhka_final)
     for _ in range(10):
         zahod(rost=1.5, dy_px=10)
-    for _ in range(t.FINAL_CONFIRM_FRAMES + 1):
-        zahod(rost=t.FINAL_HOLD_ROST + 0.5, dy_px=vybros)
+    # ОДИН кадр пересечения порога — с выбросом; дальше спокойно держим порог
+    # до заморозки. Так проверяем именно устойчивость к одиночному выбросу.
+    zahod(rost=t.FINAL_HOLD_ROST + 0.5, dy_px=vybros)
+    derzhi_finala(rost=t.FINAL_HOLD_ROST + 0.5, dy_px=10)
     return t.global_pitch_cmd
 
 
 spokoyno = progon(vybros=10)
 s_vybrosom = progon(vybros=200)
-print("    без выброса -> %d;  с выбросом 200 px -> %d"
+print("    без выброса -> %d;  с одиночным выбросом 200 px -> %d"
       % (spokoyno, s_vybrosom))
 raznica = abs(s_vybrosom - spokoyno)
-print("    выброс сдвинул замороженную команду на %d PWM" % raznica)
+print("    одиночный выброс сдвинул замороженную команду на %d PWM" % raznica)
 assert raznica < 60, (
-    "выброс в 200 px сдвинул заморозку на %d PWM: значит замерло мгновение, "
-    "а не среднее" % raznica)
+    "одиночный выброс в 200 px сдвинул заморозку на %d PWM: значит замерло "
+    "мгновение, а не среднее" % raznica)
 
 print("\n=== 5б. Заморозка СНИМАЕТСЯ между заходами ===")
 # Это стоило двух заходов подряд «залочился, а реакции ноль»: признак финала
 # сделан защёлкой, а сбросить её между заходами я забыл — и каждый следующий
 # заход начинался замороженным, с командой прошлой цели.
 t._final_zamorozhen = False
-t._final_schet = 0
-for _ in range(t.FINAL_CONFIRM_FRAMES + 1):
-    zahod(rost=t.FINAL_HOLD_ROST + 0.5, dy_px=0)
+t._vyderzhka_sbros(t._vyderzhka_final)
+derzhi_finala(rost=t.FINAL_HOLD_ROST + 0.5, dy_px=0)
 assert t._final_zamorozhen, "заморозка не включилась — опыт негоден"
 t.target_visible = False
 t.target_controllable = False

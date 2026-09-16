@@ -1226,11 +1226,17 @@ FINAL_HOLD_ENABLED = True
 # замерен в 125 мс, то есть за полторы секунды аппарат успел бы отработать
 # десяток поправок — но данные в этот момент уже негодны, а рамка огромная.
 FINAL_HOLD_TAU_S = 1.5
-# Сколько кадров подряд признак должен держаться. Заморозка необратима до
+# Сколько ВРЕМЕНИ подряд признак должен держаться. Заморозка необратима до
 # конца захода, поэтому одиночной оценки мало: мусорная tau в первую секунду
-# захвата уже погубила так целый вылет. 6 кадров при 24 к/с — четверть
-# секунды, на настоящем финале это ничего не стоит.
-FINAL_CONFIRM_FRAMES = 6
+# захвата уже погубила так целый вылет.
+#
+# Раньше стояло «6 кадров подряд». Но FPS плавает (24 у старта, 17 у цели —
+# рамка растёт, матчинг дорожает), и «6 кадров» на финале растягивались с
+# 0.25 c до 0.35 c именно там, где задержка критична. Теперь по ВРЕМЕНИ.
+# Значение — не 6/24, а замер по логам 9d4ecb6: медиана dt в фазе tau<=1.5 c
+# была 42.5 мс, шесть кадров = 0.255 c. Берём 0.25 c, поведение при номинале
+# то же, но одинаковое при любом FPS.
+FINAL_CONFIRM_TIME_S = 0.25
 # Запасной признак, когда времени нет. ВЫШЕ предела раздувания безликого
 # эталона (TEMPLATE_STARVED_MAX_X = 3.0), иначе заморозка снова примет
 # раздувание за сближение — ровно это и случилось в поле.
@@ -1251,11 +1257,16 @@ FINAL_OKNO_KADROV = 8
 # цели, ни от разрешения. При доле кадра 0.05 время до контакта было 6.8 с
 # по медиане, то есть решать надо примерно там.
 CLOSING_TAU_S = 4.0                 # ближе этого по времени — режим сближения
-# Сколько кадров подряд время должно быть ниже порога, чтобы войти в режим.
-# 6 кадров при 24 к/с — четверть секунды: одиночный выброс от дёрганья рамки
-# не проходит, настоящее сближение проходит незаметно. Выход из режима
+# Сколько ВРЕМЕНИ подряд время до контакта должно быть ниже порога, чтобы
+# войти в режим. По времени, а не по кадрам, по той же причине, что и финал:
+# при падении FPS «6 кадров» плывут. Замер по логам: медиана dt в фазе
+# tau<=4 c — 42.8 мс, шесть кадров = 0.257 c. Берём 0.25 c. Выход из режима
 # выдержки не имеет: задерживать возврат к обычным коэффициентам опаснее.
-CLOSING_CONFIRM_FRAMES = 6
+CLOSING_CONFIRM_TIME_S = 0.25
+# Провал между кадрами, после которого выдержка обнуляется. Зависание камеры
+# на треть секунды не должно засчитываться как «признак держался»: между двумя
+# кадрами через большой разрыв связи о промежутке ничего не известно.
+CONFIRM_MAX_GAP_S = 0.2
 CLOSING_P_MULTIPLIER = 1.6          # P-гэйны умножаем на это в сближении
 CLOSING_I_MULTIPLIER = 0.3          # I-гэйны срезаем (нет времени интегрировать)
 CLOSING_FF_MULTIPLIER = 1.3         # FF тоже приподнимаем — реакция должна быть резче
@@ -3082,14 +3093,12 @@ _dep_hist = collections.deque(maxlen=256)
 _final_zamorozhen = False
 _final_komandy = (1500, 1500, 1500)
 _final_okno = collections.deque(maxlen=FINAL_OKNO_KADROV)
-_final_schet = 0
 # Недавний уровень качества слежения. None означает «ещё не знаем»: первый
 # кадр захода задаёт уровень, а не считается ухудшением.
 _dover_score_ema = None
 _dover_psr_ema = None
-# Счётчик подтверждения режима сближения: сколько кадров подряд время до
-# контакта держится ниже порога. Одиночный выброс режим не включает.
-_closing_schet = 0
+# Выдержки финала и сближения теперь по ВРЕМЕНИ, а не по счётчику кадров —
+# состояние живёт в _vyderzhka_final / _vyderzhka_closing (см. ниже).
 
 smooth_throttle_out = None
 throttle_integral = 0.0
@@ -3274,12 +3283,57 @@ def msp_request(cmd):
             return None
         return data_
     except Exception:
+        # Исключение (в отличие от пустого ответа) — признак отвалившегося
+        # порта. Пустой ответ/таймаут нормальны, когда FC занят, и порт при
+        # них не трогаем; переоткрываем только на настоящем сбое ввода-вывода.
+        _fc_reconnect()
         return None
 
 
-def send_msp_set_raw_rc(channels):
-    if fc is None:
+_fc_reconnect_ts = 0.0
+FC_RECONNECT_THROTTLE_S = 1.0
+
+
+def _fc_reconnect():
+    """Переоткрыть порт FC после обрыва.
+
+    Порт открывался один раз при старте (см. serial.Serial выше), а любой
+    сбой чтения/записи глушился без переоткрытия. Кратковременный обрыв USB
+    превращался в постоянную потерю связи без следа в логе. Теперь на сбой
+    порт переоткрывается — не чаще раза в FC_RECONNECT_THROTTLE_S, иначе поток
+    забьётся попытками открыть отсутствующее устройство.
+
+    Вызывается только из потока fc_io_loop (msp_request/send_msp_set_raw_rc),
+    поэтому переприсваивание fc без замка безопасно: другой поток порт не трогает.
+    """
+    global fc, _fc_reconnect_ts
+    now = time.monotonic()
+    if (now - _fc_reconnect_ts) < FC_RECONNECT_THROTTLE_S:
         return
+    _fc_reconnect_ts = now
+    staryy = fc
+    if staryy is not None:
+        try:
+            staryy.close()
+        except Exception:
+            pass
+    try:
+        fc = serial.Serial(PORT, baudrate=BAUD, timeout=0.05)
+    except Exception:
+        fc = None
+
+
+def send_msp_set_raw_rc(channels):
+    """Отправить 8 каналов на FC. Возвращает True ТОЛЬКО при успешной записи.
+
+    Раньше ошибки записи глушились молча и возврата не было, а вызывающий
+    помечал last_sent_channels ДО отправки — в логе команда выглядела ушедшей
+    даже когда порт уже отвалился. Теперь отправка честно докладывает результат,
+    а при сбое инициирует переоткрытие порта.
+    """
+    if fc is None:
+        _fc_reconnect()
+        return False
     try:
         channels = (list(channels) + [1500] * 8)[:8]
         channels = [max(885, min(2115, int(x))) for x in channels]
@@ -3291,12 +3345,17 @@ def send_msp_set_raw_rc(channels):
             checksum ^= b
         packet = b'$M<' + struct.pack('<BB', size, cmd) + data + struct.pack('<B', checksum)
         fc.write(packet)
+        return True
     except Exception:
-        pass
+        _fc_reconnect()
+        return False
 
 
 _ovr_zhaloba_ts = 0.0
 _ovr_zhaloba_s = 0.0
+# Для видимой ошибки отправки: логируем ТОЛЬКО смену состояния (ушло↔не ушло),
+# а не каждый кадр, иначе при обрыве лог зальётся. None — ещё не отправляли.
+_send_ok_prev = None
 
 
 def _preduprezhdenie_ob_overrayde(rulim):
@@ -3419,10 +3478,26 @@ def fc_io_loop():
                         # считаем данные чистыми: до подъёма AUX4 оверрайд
                         # физически не может быть включён.
                         stale_ovr = (now_rc - fc_ovr_ts) > 1.0
-                        # В OBSERVE_ONLY исходящих MSP RC-кадров нет, поэтому
-                        # даже при поднятом mode box MSP_RC после истечения
-                        # старого MSP-значения снова показывает приёмник.
-                        if OBSERVE_ONLY or not fc_ovr or stale_ovr:
+                        # КОГО СЧИТАТЬ ПРИЁМНИКОМ. Пока на FC активен MSP
+                        # OVERRIDE, MSP_RC по МАСКИРУЕМЫМ каналам отдаёт наши же
+                        # присланные значения, а не стики. Принять их за стики —
+                        # это скормить контуру собственный выход как «опору»
+                        # (газ начинает копить сам себя).
+                        #
+                        # Раньше здесь стояло `stale_ovr` в роли РАЗРЕШЕНИЯ на
+                        # приём: если статус override устарел (>1 c) — принимали
+                        # MSP_RC как приёмник. Но статус приходит из MSP_STATUS
+                        # (опрос 0.25 c), а MSP_RC — из 0.04 c; при заминке
+                        # статуса override реально активен, а мы уже пишем эхо в
+                        # кеш. Теперь наоборот: устаревание делает нас ОСТОРОЖНЕЕ.
+                        #
+                        # Опорный признак — AUX4 (ch[7]). Он в маску не входит,
+                        # поэтому честен всегда. Override может маскировать
+                        # только при поднятом AUX4 И (подтверждённом режиме ИЛИ
+                        # неизвестном — устаревшем — статусе). Опущенный AUX4 =
+                        # переключатель снят = MSP_RC честный по всем каналам.
+                        override_maybe_masking = aux4_state and (fc_ovr or stale_ovr)
+                        if OBSERVE_ONLY or not override_maybe_masking:
                             app_state["receiver_channels"] = list(ch[:8])
                             app_state["receiver_ts"] = now_rc
                             app_state["rc_throttle"] = ch[3]
@@ -3674,16 +3749,34 @@ def fc_io_loop():
                 apply_ov = ov and aux_now
                 channels = build_output_channels(
                     live, r_cmd, p_cmd, y_cmd, t_cmd, apply_ov)
+                # СНАЧАЛА отправляем, ПОТОМ помечаем отправленным. Раньше было
+                # наоборот: last_sent_channels писался до send, и при потерянном
+                # порте лог показывал ушедшую команду, которой не было.
+                sent_ok = send_msp_set_raw_rc(channels)
+                now_send = time.monotonic()
                 with state_lock:
-                    app_state["last_sent_channels"] = list(channels[:8])
+                    # last_sent_channels — то, что РЕАЛЬНО ушло. При сбое не
+                    # трогаем: пусть держит последнее честно отправленное.
+                    if sent_ok:
+                        app_state["last_sent_channels"] = list(channels[:8])
+                    app_state["sent_ok"] = sent_ok
+                    app_state["sent_ts"] = now_send
                     # Рулит ли трекер прямо сейчас. Нужно отдельно от ov:
                     # ov — «есть цель», а команды уходят только при поднятом
-                    # AUX4. Ниже по этой пометке ловится случай, когда трекер
-                    # шлёт, а борт не принимает.
-                    app_state["steering"] = apply_ov
-                    app_state["steering_ts"] = time.monotonic()
-                send_msp_set_raw_rc(channels)
-                _preduprezhdenie_ob_overrayde(apply_ov)
+                    # AUX4 И реально ушедшем кадре. Ниже по этой пометке ловится
+                    # случай, когда трекер шлёт, а борт не принимает.
+                    app_state["steering"] = apply_ov and sent_ok
+                    app_state["steering_ts"] = now_send
+                # Видимая ошибка отправки — только на СМЕНЕ состояния, не каждый
+                # кадр. Иначе при обрыве лог зальётся сотнями строк в секунду.
+                global _send_ok_prev
+                if sent_ok != _send_ok_prev:
+                    if not sent_ok:
+                        flight_log.event("FC: отправка не проходит — порт потерян, переоткрываю")
+                    elif _send_ok_prev is False:
+                        flight_log.event("FC: отправка восстановлена")
+                    _send_ok_prev = sent_ok
+                _preduprezhdenie_ob_overrayde(apply_ov and sent_ok)
             # Без связи с FC вообще ничего не шлём — иначе он получит
             # стартовое «среднее» из app_state.
         except Exception:
@@ -5306,6 +5399,46 @@ def _ogranich_skorost(bylo, hochu, shag):
     return float(hochu)
 
 
+# Состояние выдержек по времени (вместо счётчиков кадров). Ключ 't0' — когда
+# условие стало истинным непрерывно; 'tik' — время прошлого вызова, чтобы
+# ловить провал между кадрами.
+_vyderzhka_final = {"t0": None, "tik": None}
+_vyderzhka_closing = {"t0": None, "tik": None}
+
+
+def _vyderzhka_gotova(sost, uslovie, now_mono, nuzhno_s,
+                      max_razryv_s=CONFIRM_MAX_GAP_S):
+    """Подтверждение по ВРЕМЕНИ, а не по числу кадров.
+
+    Возвращает True, когда uslovie держалось непрерывно не меньше nuzhno_s.
+    Считает по монотонному времени, поэтому не зависит от FPS.
+
+    Сбрасывается в двух случаях:
+      - условие нарушилось (t0 обнуляется);
+      - провал между кадрами больше max_razryv_s — зависание камеры не должно
+        засчитываться как «признак держался»: о промежутке ничего не известно.
+
+    sost мутируется на месте. Вызывать раз за кадр.
+    """
+    tik = sost.get("tik")
+    sost["tik"] = now_mono
+    razryv_bolshoy = (tik is not None) and ((now_mono - tik) > max_razryv_s)
+    if not uslovie:
+        sost["t0"] = None
+        return False
+    if sost.get("t0") is None or razryv_bolshoy:
+        # Начало выдержки — или перезапуск после провала кадров.
+        sost["t0"] = now_mono
+        return False
+    return (now_mono - sost["t0"]) >= nuzhno_s
+
+
+def _vyderzhka_sbros(sost):
+    """Обнулить выдержку между заходами."""
+    sost["t0"] = None
+    sost["tik"] = None
+
+
 def _pid_axis_step(error, prev_error, integral, ff_value,
                    p_gain, d_gain, i_gain, ff_gain,
                    integral_max, integral_decay,
@@ -5806,7 +5939,7 @@ def update_control_from_target():
     global _los_ugol, _los_t, _los_skorost, _los_aim_tek, _glide_ves_tek
     global _los_aim_x_tek, _az_skorost, _az_nakop, _az_pred
     global _tau_ubyvanie
-    global _final_zamorozhen, _final_komandy, _final_okno, _final_schet
+    global _final_zamorozhen, _final_komandy, _final_okno
     global _dover_score_ema, _dover_psr_ema
     global _rassh_nakop, _flow_rasshirenie
     global _gyro_y_sgl, _gyro_x_sgl
@@ -5818,6 +5951,7 @@ def update_control_from_target():
     global launch_phase, launch_counter, prev_controllable_for_launch
     global overlay_text, overlay_color, _ctl_dbg, prev_control_mono
     global prev_launch_pitch_deg, prev_box_size_px, box_growth_smoothed
+    global _score_do_rosta, _tau_hold_val, _tau_hold_t, _size_R_boost
 
     with state_lock:
         box = target_box_main
@@ -5884,7 +6018,10 @@ def update_control_from_target():
         _dover_psr_ema = None
         # И копилка команд: усреднять с манёврами прошлой цели бессмысленно.
         _final_okno.clear()
-        _final_schet = 0
+        # Выдержки финала и сближения — по времени, обнуляем между заходами,
+        # иначе накопленное время прошлой цели зачлось бы новой.
+        _vyderzhka_sbros(_vyderzhka_final)
+        _vyderzhka_sbros(_vyderzhka_closing)
         # И САМА ЗАМОРОЗКА. Это стоило двух заходов подряд «залочился, а
         # реакции ноль»: признак финала стал защёлкой (final_pora включает
         # _final_zamorozhen, иначе он моргал бы на границе), но сбрасывать её
@@ -5912,6 +6049,20 @@ def update_control_from_target():
         # захода, у новой цели свой размер и свой отсчёт.
         _rassh_nakop = 0.0
         _flow_rasshirenie = None
+        # СОСТОЯНИЕ КОНКРЕТНОГО ЗАХВАТА, которое раньше протекало в следующий.
+        # Эти жили только внутри одного захода, но между заходами не чистились:
+        #  - _score_do_rosta: планка качества для разрешения роста рамки
+        #    (защита из 5498c4c). Высокий score прошлой цели неопределённо долго
+        #    ЗАПРЕЩАЛ рост рамки новой — самый вредный перенос из четырёх.
+        #  - _tau_hold_val/_t: последнее годное время до контакта. Свой возраст
+        #    (1.5 c) его прикрывал, но у нового захода прошлого времени быть не
+        #    должно вовсе.
+        #  - _size_R_boost: расширение области замера размера. Само сбрасывалось
+        #    лишь после удачного замера — до него новый заход мерил чужим окном.
+        _score_do_rosta = None
+        _tau_hold_val = None
+        _tau_hold_t = 0.0
+        _size_R_boost = 1.0
         prev_box_cx = None
         prev_box_cy = None
         target_vx_smoothed = 0.0
@@ -6280,23 +6431,20 @@ def update_control_from_target():
     # сближения: подняты P, срезан I, и наклон отключён. В воздухе тот же
     # дёрг рамки далеко от цели даст ровно это же.
     #
-    # Лечится выдержкой: время должно быть ниже порога подряд несколько
-    # кадров. Одиночный выброс её не проходит, настоящее сближение проходит
-    # за долю секунды. Выход — сразу, без выдержки: задерживать возврат к
-    # обычным коэффициентам опаснее, чем задержать вход.
-    global _closing_schet
+    # Лечится выдержкой ПО ВРЕМЕНИ: условие должно держаться подряд не меньше
+    # CLOSING_CONFIRM_TIME_S. Одиночный выброс её не проходит, настоящее
+    # сближение проходит за долю секунды. Выход — сразу, без выдержки:
+    # задерживать возврат к обычным коэффициентам опаснее, чем задержать вход.
     if not CLOSING_MODE_ENABLED:
-        _closing_schet = 0
+        _vyderzhka_sbros(_vyderzhka_closing)
         in_closing = False
     elif _tau_now is not None:
-        if _tau_now <= CLOSING_TAU_S:
-            _closing_schet += 1
-        else:
-            _closing_schet = 0
-        in_closing = _closing_schet >= CLOSING_CONFIRM_FRAMES
+        in_closing = _vyderzhka_gotova(
+            _vyderzhka_closing, _tau_now <= CLOSING_TAU_S,
+            now_mono, CLOSING_CONFIRM_TIME_S)
     else:
         # Времени нет — режима сближения нет (почему, написано у настройки).
-        _closing_schet = 0
+        _vyderzhka_sbros(_vyderzhka_closing)
         in_closing = False
 
     # --- НАКЛОН ПО ЗАТЯНУТОСТИ ЗАХОДА ---
@@ -6735,7 +6883,8 @@ def update_control_from_target():
         tau_sig = closure.get("tau_sigma_s") if isinstance(closure, dict) else None
         # УДЕРЖАНИЕ: если оценка пропала, продолжаем её сами — время убывает
         # секунда за секунду. Так газ не бездействует от незнания.
-        global _tau_hold_val, _tau_hold_t
+        # (_tau_hold_val/_t объявлены global в начале функции — там же, где их
+        # сброс между заходами.)
         if tau_now is not None:
             _tau_hold_val, _tau_hold_t = tau_now, now_mono
         elif _tau_hold_val is not None:
@@ -6864,8 +7013,12 @@ def update_control_from_target():
             # Времени нет — остаётся рост рамки, но с порогом ВЫШЕ предела
             # раздувания, иначе вернётся та же путаница.
             _hochu_final = rost_ot_zahvata >= FINAL_HOLD_ROST
-    _final_schet = (_final_schet + 1) if _hochu_final else 0
-    final_pora = _final_zamorozhen or _final_schet >= FINAL_CONFIRM_FRAMES
+    # Подтверждение по ВРЕМЕНИ (см. FINAL_CONFIRM_TIME_S): признак должен
+    # держаться непрерывно, а не N кадров — иначе на падающем FPS выдержка
+    # растягивается там, где задержка критична.
+    _final_podtverzhdeno = _vyderzhka_gotova(
+        _vyderzhka_final, _hochu_final, now_mono, FINAL_CONFIRM_TIME_S)
+    final_pora = _final_zamorozhen or _final_podtverzhdeno
 
     if final_pora:
         if not _final_zamorozhen:

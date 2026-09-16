@@ -44,13 +44,17 @@ assert span >= okno * 0.5, (
 assert span < okno, "размах не может быть больше самого окна"
 assert "_razmah >= TAU_FIT_MIN_SPAN_S" in src, "проверка размаха не применяется"
 
-print("\n=== 2. Заморозка требует подтверждения ===")
-assert "_final_schet >= FINAL_CONFIRM_FRAMES" in src, (
-    "заморозка снова включается с одной оценки, а отменить её нечем")
-print("    подтверждение %d кадров (%.2f с при %g к/с)"
-      % (zn["FINAL_CONFIRM_FRAMES"],
-         zn["FINAL_CONFIRM_FRAMES"] / zn["CAM_FPS"], zn["CAM_FPS"]))
-assert zn["FINAL_CONFIRM_FRAMES"] >= 3
+print("\n=== 2. Заморозка требует подтверждения (по ВРЕМЕНИ, не по кадрам) ===")
+assert "_vyderzhka_final" in src and "_vyderzhka_gotova(" in src, (
+    "заморозка больше не подтверждается выдержкой — включится с одной оценки")
+assert "final_pora = _final_zamorozhen or _final_podtverzhdeno" in src, (
+    "решение о финале не опирается на подтверждённую выдержку")
+assert "FINAL_CONFIRM_TIME_S" in zn, "нет времени подтверждения финала"
+t_final = zn["FINAL_CONFIRM_TIME_S"]
+print("    подтверждение %.2f с непрерывно (монотонное время, не зависит от FPS)"
+      % t_final)
+assert t_final >= 0.15, (
+    "выдержка финала %.2f с слишком коротка — одиночный выброс пройдёт" % t_final)
 
 print("\n=== 3. Неизвестное время НЕ даёт полный наклон ===")
 i = src.index("if _tau_now is None:")
@@ -70,10 +74,13 @@ assert za_kadr <= 8.0, (
 assert zn["GLIDE_SLEW_S"] <= 4.0, "наклон не успеет за затянутым заходом"
 
 print("\n=== 5. Состояние чистится между заходами ===")
-for imya in ("_glide_ves_tek = 0.0", "_final_schet = 0", "_los_aim_tek = 0.0"):
+for imya in ("_glide_ves_tek = 0.0", "_los_aim_tek = 0.0"):
     assert src.count(imya) >= 2, (
         "%s не сбрасывается при потере цели: следующий заход начнётся с "
         "накопленным состоянием прошлого" % imya.split()[0])
-print("    вес наклона, счётчик финала и поправка прицела сбрасываются")
+assert "_vyderzhka_sbros(_vyderzhka_final)" in src, (
+    "выдержка финала не сбрасывается при потере цели: следующий заход "
+    "начнётся с накопленным временем прошлого")
+print("    вес наклона, выдержка финала и поправка прицела сбрасываются")
 
 print("\nOK: первая секунда захвата ничем не швыряет")
