@@ -307,6 +307,10 @@ ISHOD_MIN_ROST = 2.0
 ISHOD_AIM_POROG_PX = 40.0
 
 LOCK_LOG_FLUSH_ROWS = 30       # через сколько строк сбрасывать на диск (~1 с)
+# Предельный размер очереди строк лока в памяти. При 30 fps это ~30 секунд
+# заходов, за которые SD ДОЛЖНА успеть — если не успевает, лучше отбросить
+# строку и продолжить полёт, чем встать в горячем пути.
+LOCK_LOG_MAX_QUEUE = 900
 RECORD_HIRES = False
 if RECORD_HIRES:
     CAM_W, CAM_H = LORES_W * 2, LORES_H * 2
@@ -2635,6 +2639,17 @@ class LockLogger:
         # Итог пишут двое: фоновый поток при захвате и камерный при конце.
         # Без замка они могли бы наложиться и оставить обрывок.
         self._itog_lock = threading.Lock()
+        # Очередь и поток для фоновой записи строк. Раньше row() ФОРМАТИРОВАЛ
+        # и СИНХРОННО писал строку в CSV прямо из камерного колбэка. На Zero
+        # 2W карта microSD — самый медленный узел, её latency ходит в
+        # десятки мс, и любой её всхлип съедал целый кадр PID. Теперь колбэк
+        # только кладёт кортеж значений в очередь, всё остальное — в фоне.
+        self._q = collections.deque()
+        self._q_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+        self._dropped = 0
+        self._drain_error_reported = False
 
     def _snapshot(self):
         """Условия в момент захвата: чем определяется эта выборка."""
@@ -2696,6 +2711,14 @@ class LockLogger:
             self._t0 = time.monotonic()
             self._rows = 0
             self._hvost.clear()
+            with self._q_lock:
+                self._q.clear()
+            self._dropped = 0
+            self._drain_error_reported = False
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._writer_thread, daemon=True)
+            self._thread.start()
             self.active = True
             # Условия захода известны ПРЯМО СЕЙЧАС — записываем их немедленно,
             # не дожидаясь конца. Прерывается всегда последний заход (сняли
@@ -2712,25 +2735,82 @@ class LockLogger:
             self.active = False
             flight_log.event("ПАПКА ЗАХВАТА не создалась: %s" % exc)
 
-    def row(self, line, values=None):
+    def row(self, values):
+        """Вызывается из камерного колбэка. Никакого I/O и форматирования.
+
+        Хвост держим прямо здесь: он должен относиться к САМЫМ ПОСЛЕДНИМ
+        кадрам на момент end(), а если оставить его наполнение фону, то при
+        обрыве захода часть очереди ещё не разобралась и разбор исхода пойдёт
+        по старому хвосту.
+        """
         if not self.active:
             return
+        # Хвост последних строк — для разбора исхода. Держим ЗНАЧЕНИЯ, а не
+        # текст: разбирать обратно из строки значило бы полагаться на
+        # форматирование, которое меняется.
+        self._hvost.append(values)
+        with self._q_lock:
+            if len(self._q) >= LOCK_LOG_MAX_QUEUE:
+                # Диск не тянет темп — лучше потерять строку, чем встать на
+                # SD-карте прямо в кадре. Пропуски считаем и логируем в
+                # событиях, чтобы не молчать о них.
+                self._dropped += 1
+                return
+            self._q.append(values)
+
+    def _writer_thread(self):
+        """Форматирование и запись — здесь и только здесь.
+
+        Держим тот же ритм flush, что и синхронная версия: примерно раз в
+        секунду (LOCK_LOG_FLUSH_ROWS). Работаем циклом с коротким сном на
+        пустой очереди — очередь и без того забирается пачками при каждом
+        пробуждении, и опрашивать её чаще смысла нет.
+        """
+        last_dropped_note = 0
         try:
-            # Хвост последних строк — для разбора исхода. Держим ЗНАЧЕНИЯ, а
-            # не текст: разбирать обратно из строки значило бы полагаться на
-            # форматирование, которое меняется.
-            if values is not None:
-                self._hvost.append(values)
-            self._csv.write(line + "\n")
-            self._rows += 1
-            # Сброс на диск примерно раз в секунду. Буфер в 64 КБ — это около
-            # четырёх секунд захода, и при обрыве терялись именно последние
-            # секунды перед целью, ради которых всё и пишется. Раз в секунду
-            # SD-карту не нагружает: система и так пишет не чаще.
-            if self._rows % LOCK_LOG_FLUSH_ROWS == 0:
-                self._csv.flush()
-        except Exception:
-            pass
+            while True:
+                rows_batch = None
+                with self._q_lock:
+                    if self._q:
+                        rows_batch = list(self._q)
+                        self._q.clear()
+                if rows_batch is None:
+                    if self._stop.is_set():
+                        break
+                    time.sleep(0.005)
+                    continue
+                try:
+                    lines = [_fmt_row(v) for v in rows_batch]
+                    if self._csv is not None:
+                        self._csv.write("\n".join(lines) + "\n")
+                        self._rows += len(lines)
+                        if (self._rows // LOCK_LOG_FLUSH_ROWS) != (
+                                (self._rows - len(lines)) // LOCK_LOG_FLUSH_ROWS):
+                            self._csv.flush()
+                except Exception as exc:
+                    if not self._drain_error_reported:
+                        self._drain_error_reported = True
+                        try:
+                            flight_log.event(
+                                "ЛОК-ЛОГ: сбой записи (%s), заход пишется "
+                                "неполно" % exc)
+                        except Exception:
+                            pass
+                if self._dropped != last_dropped_note:
+                    try:
+                        flight_log.event(
+                            "ЛОК-ЛОГ: потеряно %d строк (карта не тянет)"
+                            % self._dropped)
+                    except Exception:
+                        pass
+                    last_dropped_note = self._dropped
+        finally:
+            # Финальный flush гарантирует, что последняя пачка легла на диск.
+            try:
+                if self._csv is not None:
+                    self._csv.flush()
+            except Exception:
+                pass
 
     def event(self, text):
         if not self.active:
@@ -2874,6 +2954,15 @@ class LockLogger:
         if not self.active:
             return
         self.active = False
+        # Останавливаем фонового писателя И ЖДЁМ ЕГО. Без join строки, ещё
+        # лежащие в очереди, ушли бы в закрытый _csv и потерялись.
+        self._stop.set()
+        try:
+            if self._thread is not None:
+                self._thread.join(timeout=2.0)
+        except Exception:
+            pass
+        self._thread = None
         # Итог переписывается поверх предварительного, записанного при
         # захвате: теперь известны и длительность, и чем всё кончилось.
         self._zapisat_itog(why, time.monotonic() - self._t0)
@@ -8675,10 +8764,13 @@ def _capture_flight_row(cb_t0):
             _ground_flow_dbg.get("dt_ms"),
         )
         flight_log.row(_row_values)
-        # Та же строка — в папку этого захвата. Форматируем один раз здесь, а
-        # не в фоне: в папке лежит ровно то, что было в этот кадр.
+        # Та же строка — в папку этого захвата. Формат раньше собирался прямо
+        # тут, чтобы в папке лежало ровно то, что было в этот кадр; но
+        # _fmt_row + _csv.write это I/O в горячем пути, и на SD Zero 2W
+        # ловилось периодическими всхлипами кадра. Теперь колбэк передаёт
+        # только значения, форматирование и запись — в фоне LockLogger'а.
         if lock_log.active:
-            lock_log.row(_fmt_row(_row_values), _row_values)
+            lock_log.row(_row_values)
     except Exception:
         # Лог не имеет права мешать полёту.
         pass
