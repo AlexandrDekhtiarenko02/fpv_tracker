@@ -3072,6 +3072,12 @@ except Exception:
 
 state_lock = threading.Lock()
 io_thread_stop = threading.Event()
+# Свежая команда посчитана в update_control_from_target. fc_io_loop ждёт
+# этот сигнал вместо свободного sleep 40 мс: пришло — сразу идём отправлять,
+# не пришло — уходим по номинальному таймауту, как раньше (MSP override
+# на Betaflight обязан идти непрерывно, иначе он перестаёт слушать).
+# Убирает джиттер 0-40 мс между «PID решил» и «FC получил».
+cmd_ready_event = threading.Event()
 
 
 def _baro_zhivoy(st):
@@ -3924,9 +3930,20 @@ def fc_io_loop():
         next_t += MSP_RC_PERIOD
         sleep_for = next_t - time.monotonic()
         if sleep_for > 0:
-            time.sleep(sleep_for)
+            # ЖДЁМ ИЛИ ТАЙМАУТ, СМОТРЯ ЧТО РАНЬШЕ. Если callback уже посчитал
+            # новую команду, cmd_ready_event разбудит нас немедленно и
+            # следующая итерация отправит её без 0-40 мс паузы. Не пришёл
+            # событий — уходим по таймауту, как раньше (MSP override на
+            # Betaflight обязан идти непрерывно). Clear СРАЗУ ПОСЛЕ пробуждения:
+            # событие относится к следующему кадру, и если callback уже стоит
+            # в _c_ready_event.set() в момент нашего цикла, мы этого не
+            # заметим — clear до отправки съел бы ровно только что пришедшую
+            # свежую команду.
+            cmd_ready_event.wait(timeout=sleep_for)
+            cmd_ready_event.clear()
         else:
             next_t = time.monotonic()
+            cmd_ready_event.clear()
 
 # =========================================================
 # 7. ГЕОМЕТРИЯ
@@ -7382,6 +7399,12 @@ def update_control_from_target():
         "alt_min_m": closure["alt_min_m"],
         "alt_reason": closure["alt_reason"],
     }
+    # СИГНАЛ fc_io_loop: команда посчитана, шли её на FC не дожидаясь конца
+    # своего 40-мс sleep. Убирает джиттер 0-40 мс между «PID решил» и «FC
+    # получил». На кадрах, где команда не пересчиталась (ACQ/HOLD/LOST +
+    # ветка not-controllable в начале функции), сигнал тоже полезен: там
+    # ставится passthrough 1500, и он тоже должен уходить свежим.
+    cmd_ready_event.set()
 
 # =========================================================
 # 9. DRAWING
