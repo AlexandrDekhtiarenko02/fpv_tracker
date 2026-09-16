@@ -3056,6 +3056,9 @@ app_state = {
     "gps_course": None,
     "gps_ts": 0.0,
     "last_sent_channels": [1500] * 8,
+    # Время последней УСПЕШНОЙ отправки на FC. Пишет fc_io_loop только при
+    # sent_ok=True, читает update_control_from_target для расчёта k PID.
+    "last_ok_send_ts": 0.0,
 }
 
 aux4_state = False
@@ -3121,6 +3124,12 @@ _pcs_sx = _pcs_sxx = _pcs_sy = _pcs_sxy = _pcs_sz = _pcs_sxz = 0.0
 # Момент прошлого вызова управления — из него берётся фактическая длительность
 # кадра. None = первый кадр после захвата, длительность ещё не измерить.
 prev_control_mono = None
+# Метка ПРЕДЫДУЩЕГО УСПЕШНОГО send'а на FC (то, что видел прошлый вызов PID).
+# По интервалу между двумя такими метками считается k: он и есть то время,
+# за которое на FC успела дойти новая команда. При пропуске отправки этот
+# интервал вырастет — и D/I/decay посчитаются по реальному, а не по
+# номинальному 40 мс, за которое всё могло простоять на прошлой команде.
+_prev_ok_send_ts_pid = 0.0
 
 # Прошлый тангаж от FC — для демпфирования углового контура разгона.
 prev_launch_pitch_deg = None
@@ -3769,6 +3778,14 @@ def fc_io_loop():
                     # трогаем: пусть держит последнее честно отправленное.
                     if sent_ok:
                         app_state["last_sent_channels"] = list(channels[:8])
+                        # ВРЕМЯ УСПЕШНОЙ отправки, отдельно от sent_ts (которое
+                        # пишется на любой попытке). Нужно PID: интервал между
+                        # двумя последними успехами — это тот интервал, за
+                        # который на FC реально сменилась команда. Пропуск
+                        # отправки удваивает его — и PID (D/I/decay) обязан
+                        # это увидеть, иначе демпфирование считается по
+                        # мнимому 40 мс вместо реальных 80.
+                        app_state["last_ok_send_ts"] = now_send
                     app_state["sent_ok"] = sent_ok
                     app_state["sent_ts"] = now_send
                     # Рулит ли трекер прямо сейчас. Нужно отдельно от ov:
@@ -5987,17 +6004,39 @@ def update_control_from_target():
     global overlay_text, overlay_color, _ctl_dbg, prev_control_mono
     global prev_launch_pitch_deg, prev_box_size_px, box_growth_smoothed
     global _score_do_rosta, _tau_hold_val, _tau_hold_t, _size_R_boost
+    global _prev_ok_send_ts_pid
 
     with state_lock:
         box = target_box_main
         controllable = target_controllable
         live_thr = app_state.get("rc_throttle", 1500)
         live_thr_ts = app_state.get("rc_throttle_ts", 0.0)
+        _last_ok_send_ts = app_state.get("last_ok_send_ts", 0.0)
 
     now_mono = time.monotonic()
     # Фактическая длительность кадра в единицах номинального (k=1 при 30 к/с).
-    k = dt_ratio(None if prev_control_mono is None
-                 else now_mono - prev_control_mono)
+    #
+    # ЧТО МЕРИТЬ. Прежде k считался как (now - prev_control_mono) — интервал
+    # между двумя вызовами PID. Но D/I/decay должны считаться по интервалу,
+    # ЗА КОТОРЫЙ КОМАНДА РЕАЛЬНО МЕНЯЛАСЬ НА FC: fc_io_loop мог сорвать
+    # send'ы, и прошлая команда простояла 80 мс вместо 40, а PID думал,
+    # что 40. Замер по стенду: медиана 41 мс, 90-й процентиль 74 мс — при
+    # раскачке 1.9 Гц это ощутимая ошибка демпфирования.
+    #
+    # РЕШЕНИЕ. Опираемся на интервал между двумя последними УСПЕШНЫМИ
+    # отправками. Если провалов не было, dt_send ≈ dt_frame и поведение
+    # прежнее. Если провалы были — dt_send больше, и D/I/decay считаются
+    # честно. Fallback на кадровый интервал: пока связи с FC ещё не было
+    # (первый заход, порт не открыт) или между двумя вызовами PID вообще
+    # не случилось ни одной успешной отправки.
+    if (_last_ok_send_ts > 0.0 and _prev_ok_send_ts_pid > 0.0
+            and _last_ok_send_ts > _prev_ok_send_ts_pid):
+        k = dt_ratio(_last_ok_send_ts - _prev_ok_send_ts_pid)
+    else:
+        k = dt_ratio(None if prev_control_mono is None
+                     else now_mono - prev_control_mono)
+    if _last_ok_send_ts > 0.0:
+        _prev_ok_send_ts_pid = _last_ok_send_ts
     prev_control_mono = now_mono
     # ОПОРНЫЙ ГАЗ — это стик пилота, и только он.
     #
@@ -6071,6 +6110,9 @@ def update_control_from_target():
         throttle_integral = 0.0
         roll_integral = 0.0
         pitch_integral = 0.0
+        # Сброс опоры k по send-времени вместе с прочими накопителями. Иначе
+        # первый кадр нового захода посчитал бы k по пропасти между заходами.
+        _prev_ok_send_ts_pid = 0.0
         yaw_integral = 0.0
         smoothed_pitch_deg = 0.0
         prev_control_mono = None
