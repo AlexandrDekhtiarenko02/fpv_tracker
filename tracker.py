@@ -5808,11 +5808,13 @@ def _pitch_angle_hold_pwm(target_deg, now_mono, k):
     дать разгона совсем, чем крутить квад вслепую.
     """
     global prev_launch_pitch_deg
-    with state_lock:
-        fc_pitch = app_state.get("fc_pitch_deg")
-        fc_ts = app_state.get("fc_pitch_ts", 0.0)
+    # ДОВЕДЁННЫЙ ДО КАДРА, а не сырой из app_state. LAUNCH удерживает угол по
+    # реакции на команду; тангаж, устаревший на 76 мс медианно (замер, см.
+    # svezhiy_tangazh), давал ложную ошибку и раскачивал держание угла.
+    fc_pitch, vozrast = svezhiy_tangazh(now_mono)
+    fc_ts = now_mono - (vozrast if vozrast is not None else 0.0)
 
-    if fc_pitch is None or (now_mono - fc_ts) > LAUNCH_ATT_TIMEOUT:
+    if fc_pitch is None or (vozrast is not None and vozrast > LAUNCH_ATT_TIMEOUT):
         prev_launch_pitch_deg = None
         return 0.0, False
 
@@ -6261,8 +6263,12 @@ def update_control_from_target():
     dy_aim = (box_cy + AIM_OFFSET_Y + pitch_comp_px + lead_y
               + los_aim_px) - CENTER_Y
 
-    with state_lock:
-        _fcp = app_state.get("fc_pitch_deg")
+    # СЕЛФЧЕК ДОЛЖЕН СРАВНИВАТЬ ДВЕ ВЕЛИЧИНЫ НА ОДНОМ МОМЕНТЕ. Прицел уже
+    # построен по svezhiy_tangazh (через _compute_pitch_attitude_comp_px), а
+    # чистый fc_pitch_deg отстаёт от него на возраст MSP_ATTITUDE. Разность
+    # между «свежим» и «сырым» и есть та самая ложная скорость угла, от
+    # которой уходили. Кормим селфчек тем же тангажом, что и остальной контур.
+    _fcp, _ = svezhiy_tangazh(now_mono)
     if _fcp is not None:
         _pitch_comp_selfcheck(float(_fcp), float(box_cy), float(dy_aim))
 
