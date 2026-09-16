@@ -3071,6 +3071,15 @@ except Exception:
     fc = None
 
 state_lock = threading.Lock()
+# ОТДЕЛЬНЫЙ ЗАМОК ПОД КОМАНДЫ И override_active. Прежде всё сидело под
+# state_lock, и запись PID в global_*_cmd конкурировала с любым чтением
+# app_state (RC, attitude, altitude, motors, GPS...) из других потоков.
+# На Zero 2W под GIL это выражалось в микро-стеках; хуже — что fc_io_loop
+# на каждой итерации берёт state_lock и для чтения RC, и для чтения
+# global_*_cmd в одном блоке, а значит PID стоит и на первом. Разделение
+# держит две группы независимыми: cmd_lock короткий (2-3 присваивания),
+# state_lock — на данных сенсоров.
+cmd_lock = threading.Lock()
 io_thread_stop = threading.Event()
 # Свежая команда посчитана в update_control_from_target. fc_io_loop ждёт
 # этот сигнал вместо свободного sleep 40 мс: пришло — сразу идём отправлять,
@@ -3827,8 +3836,17 @@ def fc_io_loop():
                         app_state["motors_ts"] = now
                 next_motor_t = now + MOTOR_DEBUG_PERIOD
 
-            with state_lock:
+            # Команды и приёмник — под РАЗНЫМИ замками. Прежде оба сидели в
+            # одном with state_lock, и PID, писавший global_*_cmd, ждал
+            # блокировку любого чтения app_state (RC, attitude...) из других
+            # потоков. Теперь cmd_lock и state_lock независимы.
+            with cmd_lock:
                 ov = override_active
+                r_cmd = global_roll_cmd
+                p_cmd = global_pitch_cmd
+                y_cmd = global_yaw_cmd
+                t_cmd = global_throttle_cmd
+            with state_lock:
                 aux_now = aux4_state
                 # ИСТОЧНИК PASSTHROUGH — кэш приёмника, а НЕ MSP_RC.
                 #
@@ -3841,10 +3859,6 @@ def fc_io_loop():
                 # держал последний манёвр до опускания AUX4.
                 live = list(app_state.get("receiver_channels", [1500] * 8))
                 rc_ts = app_state.get("rc_link_ts", 0.0)
-                r_cmd = global_roll_cmd
-                p_cmd = global_pitch_cmd
-                y_cmd = global_yaw_cmd
-                t_cmd = global_throttle_cmd
 
             # В рабочем режиме непрерывно шлём поток MSP override, как только
             # пришёл хотя бы один успешный MSP_RC. Это лечит «после AUX OFF
@@ -6257,6 +6271,7 @@ def update_control_from_target():
         prev_controllable_for_launch = False
         with state_lock:
             app_state["dyn_throttle"] = base_thr
+        with cmd_lock:
             override_active = False
             global_roll_cmd = 1500.0
             global_pitch_cmd = 1500.0
@@ -7318,6 +7333,7 @@ def update_control_from_target():
 
     with state_lock:
         app_state["dyn_throttle"] = target_throttle
+    with cmd_lock:
         # В режиме наблюдения оверрайд не включается НИКОГДА — см. пояснение
         # у OBSERVE_ONLY. Иначе MSP_RC вернёт наши же значения вместо стиков.
         override_active = not OBSERVE_ONLY
@@ -7999,7 +8015,7 @@ def process_locked_tracker(gray):
         if falling_aux or track_state != TRACK_STATE_IDLE:
             reset_tracking(to_acq=False)
         auto_reacq_attempts = 0
-        with state_lock:
+        with cmd_lock:
             global global_roll_cmd, global_pitch_cmd, global_yaw_cmd, global_throttle_cmd, override_active
             override_active = False
             global_roll_cmd = 1500.0
@@ -8548,13 +8564,14 @@ def print_debug_once_per_second():
     with state_lock:
         ch = list(app_state.get("rc_channels", [1500] * 8))
         motors = list(app_state.get("motors", []))
-        ov = override_active
         st = track_state
+        sent = list(app_state.get("last_sent_channels", [1500] * 8))
+    with cmd_lock:
+        ov = override_active
         r_out = int(global_roll_cmd)
         p_out = int(global_pitch_cmd)
         y_out = int(global_yaw_cmd)
         t_out = int(global_throttle_cmd)
-        sent = list(app_state.get("last_sent_channels", [1500] * 8))
 
     c0 = int(ch[0]) if len(ch) > 0 else 1500
     c1 = int(ch[1]) if len(ch) > 1 else 1500
@@ -8593,8 +8610,9 @@ def fast_idle_update():
 
     with state_lock:
         app_state["dyn_throttle"] = live_thr
-        override_active = False
         _ctl_dbg = {"active": False, "base_thr": live_thr}
+    with cmd_lock:
+        override_active = False
         global_roll_cmd = 1500.0
         global_pitch_cmd = 1500.0
         global_yaw_cmd = 1500.0
@@ -8621,19 +8639,23 @@ def _capture_flight_row(cb_t0):
         c = _ctl_dbg
         active = c.get("active", False)
 
-        with state_lock:
-            st = track_state
-            ctrl = target_controllable
-            aux = aux4_state
+        # Команды — под cmd_lock; всё остальное состояние — под state_lock.
+        # Разделение стоит доли микросекунды, зато PID больше не ждёт
+        # сборки этой строки за общим замком.
+        with cmd_lock:
             ov = override_active
-            # Отдельно от ov: ov — «трекер считает себя управляющим», fc_ovr —
-            # «полётник принимает». Разбор после посадки без этой пары
-            # неотличим: команды в логе есть, а аппарат их не выполнял.
-            fc_ovr_row = app_state.get("fc_override_on")
             r_cmd = int(global_roll_cmd)
             p_cmd = int(global_pitch_cmd)
             y_cmd = int(global_yaw_cmd)
             t_cmd = int(global_throttle_cmd)
+        with state_lock:
+            st = track_state
+            ctrl = target_controllable
+            aux = aux4_state
+            # Отдельно от ov: ov — «трекер считает себя управляющим», fc_ovr —
+            # «полётник принимает». Разбор после посадки без этой пары
+            # неотличим: команды в логе есть, а аппарат их не выполнял.
+            fc_ovr_row = app_state.get("fc_override_on")
             sent = app_state.get("last_sent_channels", (1500,) * 8)
             rc = app_state.get("rc_channels", (1500,) * 8)
             motors = app_state.get("motors", ())
