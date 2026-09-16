@@ -3356,6 +3356,16 @@ _ovr_zhaloba_s = 0.0
 # Для видимой ошибки отправки: логируем ТОЛЬКО смену состояния (ушло↔не ушло),
 # а не каждый кадр, иначе при обрыве лог зальётся. None — ещё не отправляли.
 _send_ok_prev = None
+# Счётчик пропусков MSP-отправки. Смена состояния уже логируется, но она видит
+# только ГРАНИЦУ провала, а не его длительность и частоту. Для контура важно
+# именно КОЛИЧЕСТВО пропущенных кадров в секунду: каждый пропуск = 40 мс, в
+# течение которых Betaflight держит последнюю принятую команду. Считаем в
+# fc_io_loop и сбрасываем раз в секунду в flight_log; текущее значение видит
+# _capture_flight_row по колонке app_state["msp_miss_1s"].
+_msp_miss_cnt = 0
+_msp_send_cnt = 0
+_msp_miss_period_t = 0.0
+MSP_MISS_LOG_PERIOD_S = 1.0
 
 
 def _preduprezhdenie_ob_overrayde(rulim):
@@ -3769,13 +3779,36 @@ def fc_io_loop():
                     app_state["steering_ts"] = now_send
                 # Видимая ошибка отправки — только на СМЕНЕ состояния, не каждый
                 # кадр. Иначе при обрыве лог зальётся сотнями строк в секунду.
-                global _send_ok_prev
+                global _send_ok_prev, _msp_miss_cnt, _msp_send_cnt, _msp_miss_period_t
                 if sent_ok != _send_ok_prev:
                     if not sent_ok:
                         flight_log.event("FC: отправка не проходит — порт потерян, переоткрываю")
                     elif _send_ok_prev is False:
                         flight_log.event("FC: отправка восстановлена")
                     _send_ok_prev = sent_ok
+                # Счётчик пропусков: смена состояния показывает границу, но не
+                # частоту. Один пропуск = 40 мс задержки, десяток за секунду
+                # означает переход к 3 Гц эффективного управления — а из
+                # прежнего лога этот сдвиг не был виден вовсе.
+                _msp_send_cnt += 1
+                if not sent_ok:
+                    _msp_miss_cnt += 1
+                if _msp_miss_period_t == 0.0:
+                    _msp_miss_period_t = now_send
+                if (now_send - _msp_miss_period_t) >= MSP_MISS_LOG_PERIOD_S:
+                    with state_lock:
+                        app_state["msp_miss_1s"] = _msp_miss_cnt
+                        app_state["msp_send_1s"] = _msp_send_cnt
+                    # Логируем только когда есть что показывать: 0 пропусков за
+                    # секунду — норма, шуметь незачем.
+                    if _msp_miss_cnt > 0:
+                        flight_log.event(
+                            "MSP: пропущено %d из %d кадров отправки за %.1f с"
+                            % (_msp_miss_cnt, _msp_send_cnt,
+                               now_send - _msp_miss_period_t))
+                    _msp_miss_cnt = 0
+                    _msp_send_cnt = 0
+                    _msp_miss_period_t = now_send
                 _preduprezhdenie_ob_overrayde(apply_ov and sent_ok)
             # Без связи с FC вообще ничего не шлём — иначе он получит
             # стартовое «среднее» из app_state.
