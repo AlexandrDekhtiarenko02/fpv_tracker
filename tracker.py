@@ -3152,6 +3152,15 @@ _final_okno = collections.deque(maxlen=FINAL_OKNO_KADROV)
 # процессе, и его первые значения не имеют права необратимо замораживать
 # контур. Обнуляется на выходе из controllable — новый заход, новый отсчёт.
 _tracked_since_t = None
+# Номер захвата, при котором PID последний раз пересчитывал состояние. Нужен,
+# чтобы разорвать протечку: ветка not-controllable в update_control_from_target
+# чистит накопленные величины (tau_hold, los_skorost, prev_send_ts_pid), но
+# срабатывает только на кадре с controllable=False. При очень быстром
+# reacq/auto-reacq можно уйти прямо с TRACKED старого захвата в TRACKED
+# нового, не задев ветки; тогда «последнее годное tau» прошлой цели
+# продолжит двигать газ на новой. Сравнение lock_sequence перекрывает
+# этот случай отдельно от controllable.
+_pid_last_lock_seq = -1
 # Недавний уровень качества слежения. None означает «ещё не знаем»: первый
 # кадр захода задаёт уровень, а не считается ухудшением.
 _dover_score_ema = None
@@ -6012,13 +6021,27 @@ def update_control_from_target():
     global overlay_text, overlay_color, _ctl_dbg, prev_control_mono
     global prev_launch_pitch_deg, prev_box_size_px, box_growth_smoothed
     global _score_do_rosta, _tau_hold_val, _tau_hold_t, _size_R_boost
-    global _tracked_since_t
+    global _tracked_since_t, _pid_last_lock_seq
 
     with state_lock:
         box = target_box_main
         controllable = target_controllable
         live_thr = app_state.get("rc_throttle", 1500)
         live_thr_ts = app_state.get("rc_throttle_ts", 0.0)
+        _cur_lock_seq = lock_sequence
+
+    # ЗАХВАТ СМЕНИЛСЯ — обнуляем состояние прошлой цели, которое не имеет
+    # смысла на новой. Ветка not-controllable ниже делает то же самое, но
+    # только на кадре с controllable=False; при очень быстром reacq/AUX
+    # toggle возможно уйти из TRACKED старого лока прямо в TRACKED нового.
+    # Тогда hold tau прошлой цели продолжит двигать газ на новой, а
+    # _tracked_since_t считал бы возраст от прежней метки — и заморозка
+    # защёлкнулась бы мгновенно, не дав FINAL_MIN_ZAHOD_AGE_S сработать.
+    if _cur_lock_seq != _pid_last_lock_seq:
+        _pid_last_lock_seq = _cur_lock_seq
+        _tau_hold_val = None
+        _tau_hold_t = 0.0
+        _tracked_since_t = None
 
     now_mono = time.monotonic()
     # Фактическая длительность кадра в единицах номинального (k=1 при 30 к/с).
