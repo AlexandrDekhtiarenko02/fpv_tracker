@@ -7318,9 +7318,12 @@ def update_control_from_target():
         # Рост рамки от захвата и признак заморозки: по ним после посадки
         # видно, когда контур перестал рулить и почему.
         "rost_ot_zahvata": rost_ot_zahvata, "final_hold": _final_zamorozhen,
-        # Доверие к слежению: по нему после посадки видно, урезал ли контур
-        # усиление и в какой момент.
-        "doverie": doverie,
+        # Доверие к слежению: пишем ИМЕННО trust_k — фактический множитель
+        # команды PID. Раньше здесь стояло doverie, и его значение затиралось
+        # тау-веткой газа (перезапись через локальное имя doverie в законе
+        # THROTTLE_BY_TAU), из-за чего колонка врала на десятки процентов
+        # и повела следующий диагноз по ложному следу.
+        "doverie": trust_k,
         "base_thr": base_thr, "thr_adjust": thr_adjust,
         "thr_i": throttle_integral, "rc_fresh": rc_fresh,
         "launch_phase": launch_phase, "launch_int": launch_intensity,
