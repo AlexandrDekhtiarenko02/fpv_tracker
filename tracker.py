@@ -1675,6 +1675,11 @@ LOS_THROTTLE_ENABLED = False
 # 0.08 при номинале 30 к/с — постоянная 0.40 с, срез около 0.40 Гц: ниже
 # замеренной раскачки 1.3 Гц, но выше скорости изменения геометрии захода.
 LOS_RATE_ALPHA = 0.08
+# Максимальный возраст скорости LOS/азимута, при котором ей ещё верят.
+# Больше — считаем нулём (см. пояснение у _los_skorost_ts). Взят чуть
+# больше окна оценщика LOS_FIT_WINDOW_S: если за это время новую точку
+# так и не приняли, дальше держать старую бессмысленно.
+LOS_RATE_STALE_S = LOS_FIT_WINDOW_S + 0.5
 # Мёртвая зона. Замеренная скорость роста на промахе +2.13 °/с, так что 0.3
 # отсекает шум, не трогая полезный сигнал.
 LOS_RATE_DEADBAND_DPS = 0.3
@@ -3112,9 +3117,18 @@ override_active = False
 _los_ugol = None
 _los_t = 0.0
 _los_skorost = 0.0
+# Возраст оценки — свой у скорости и азимута. Оценщики останавливают
+# обновление на быстром вращении, на очищенном dep_hist, на выходе
+# gyro за порог и т.п. — но саму величину ни один сайт до этого не
+# инвалидировал: los_aim_px продолжал читать старое число и продолжал
+# сдвигать прицел. Замерено в свежих логах: одно и то же значение
+# держалось 1-2.8 сек, поправка сидела в упоре. Возраст лечится
+# прямо: истекло — величина считается нулём (см. LOS_RATE_STALE_S).
+_los_skorost_ts = 0.0
 _los_aim_tek = 0.0
 _los_aim_x_tek = 0.0
 _az_skorost = 0.0
+_az_skorost_ts = 0.0
 _az_nakop = 0.0
 _az_pred = None
 _az_hist = collections.deque(maxlen=256)
@@ -5983,6 +5997,7 @@ def update_control_from_target():
     global _slew_roll, _slew_pitch, _slew_yaw, _pitch_pri_loke
     global _los_ugol, _los_t, _los_skorost, _los_aim_tek, _glide_ves_tek
     global _los_aim_x_tek, _az_skorost, _az_nakop, _az_pred
+    global _los_skorost_ts, _az_skorost_ts
     global _tau_ubyvanie
     global _final_zamorozhen, _final_komandy, _final_okno
     global _dover_score_ema, _dover_psr_ema
@@ -6044,11 +6059,13 @@ def update_control_from_target():
         # выброс скорости на первом же кадре нового захода.
         _los_ugol = None
         _los_skorost = 0.0
+        _los_skorost_ts = 0.0
         _los_aim_tek = 0.0
         # И вбок: азимут прошлой цели к новой отношения не имеет, а
         # накопленное развёртывание курса дало бы выброс на первом же кадре.
         _los_aim_x_tek = 0.0
         _az_skorost = 0.0
+        _az_skorost_ts = 0.0
         _az_nakop = 0.0
         _az_pred = None
         _az_hist.clear()
@@ -6236,10 +6253,16 @@ def update_control_from_target():
     # Берётся с прошлого кадра, как и вертикальная: расчёт ниже по коду.
     los_aim_x_px = 0.0
     if LOS_AIM_X_ENABLED:
-        if _az_skorost > LOS_AZ_DEADBAND_DPS:
-            _izb_x = _az_skorost - LOS_AZ_DEADBAND_DPS
-        elif _az_skorost < -LOS_AZ_DEADBAND_DPS:
-            _izb_x = _az_skorost + LOS_AZ_DEADBAND_DPS
+        # Если оценка азимута протухла (см. LOS_RATE_STALE_S), трактуем её
+        # как ноль — иначе прицел сдвигается по значению секунды подряд,
+        # пока измерения не обновились (это как раз и было в логах 12:08).
+        _az_svezh = (_az_skorost_ts > 0.0
+                     and (now_mono - _az_skorost_ts) <= LOS_RATE_STALE_S)
+        _az_val = _az_skorost if _az_svezh else 0.0
+        if _az_val > LOS_AZ_DEADBAND_DPS:
+            _izb_x = _az_val - LOS_AZ_DEADBAND_DPS
+        elif _az_val < -LOS_AZ_DEADBAND_DPS:
+            _izb_x = _az_val + LOS_AZ_DEADBAND_DPS
         else:
             _izb_x = 0.0
         _hochu_x = LOS_AIM_X_GAIN * _izb_x
@@ -6289,10 +6312,17 @@ def update_control_from_target():
     if LOS_AIM_ENABLED:
         # МЁРТВАЯ ЗОНА ОБЯЗАТЕЛЬНА и раньше применялась только к газу, а к
         # прицелу — нет. Без неё поправка идёт даже на остаточном шуме оценки.
-        if _los_skorost > LOS_RATE_DEADBAND_DPS:
-            izbytok = _los_skorost - LOS_RATE_DEADBAND_DPS
-        elif _los_skorost < -LOS_RATE_DEADBAND_DPS:
-            izbytok = _los_skorost + LOS_RATE_DEADBAND_DPS
+        # Плюс: если оценка протухла (LOS_RATE_STALE_S), берём ноль. Иначе
+        # прицел сдвигается по старому значению секунды подряд — и это
+        # именно так и было в свежих логах: одна и та же скорость висела
+        # 1-2.8 с, а поправка все эти секунды стояла в упоре.
+        _los_svezh = (_los_skorost_ts > 0.0
+                      and (now_mono - _los_skorost_ts) <= LOS_RATE_STALE_S)
+        _los_val = _los_skorost if _los_svezh else 0.0
+        if _los_val > LOS_RATE_DEADBAND_DPS:
+            izbytok = _los_val - LOS_RATE_DEADBAND_DPS
+        elif _los_val < -LOS_RATE_DEADBAND_DPS:
+            izbytok = _los_val + LOS_RATE_DEADBAND_DPS
         else:
             izbytok = 0.0
         hochu = LOS_AIM_GAIN * izbytok
@@ -6411,6 +6441,7 @@ def update_control_from_target():
             if _den > 1e-6:
                 _az_skorost = sum(
                     (_xs[i] - _mx) * (_ys[i] - _my) for i in range(_n)) / _den
+                _az_skorost_ts = now_mono
 
     # --- СКОРОСТЬ УГЛА ВИЗИРОВАНИЯ ---
     #
@@ -6476,6 +6507,7 @@ def update_control_from_target():
                 if _den > 1e-6:
                     _los_skorost = sum(
                         (_xs[i] - _mx) * (_ys[i] - _my) for i in range(_n)) / _den
+                    _los_skorost_ts = now_mono
 
     # РЕЖИМ СБЛИЖЕНИЯ ВКЛЮЧАЕТСЯ НЕ С ПЕРВОГО КАДРА.
     #
@@ -6913,10 +6945,15 @@ def update_control_from_target():
         # ни GPS. Угол складывается из тангажа полётника и положения цели в
         # кадре, и обе величины есть на серийном борту.
         thr_adjust = 0.0
-        if abs(_los_skorost) > LOS_RATE_DEADBAND_DPS:
-            _izbytok = (_los_skorost - LOS_RATE_DEADBAND_DPS
-                        if _los_skorost > 0
-                        else _los_skorost + LOS_RATE_DEADBAND_DPS)
+        # Свежесть оценки — та же логика, что у поправки прицела: старая
+        # скорость не имеет права тянуть газ вниз секунды подряд.
+        _los_svezh_g = (_los_skorost_ts > 0.0
+                        and (now_mono - _los_skorost_ts) <= LOS_RATE_STALE_S)
+        _los_val_g = _los_skorost if _los_svezh_g else 0.0
+        if abs(_los_val_g) > LOS_RATE_DEADBAND_DPS:
+            _izbytok = (_los_val_g - LOS_RATE_DEADBAND_DPS
+                        if _los_val_g > 0
+                        else _los_val_g + LOS_RATE_DEADBAND_DPS)
             # Угол растёт -> пройдём выше -> снижаемся -> газ убрать.
             thr_adjust = -LOS_THROTTLE_GAIN * _izbytok
             if thr_adjust > LOS_THROTTLE_MAX:

@@ -52,8 +52,13 @@ assert zn["LOS_AIM_MAX_PX"] <= 60.0, (
     "подменит прицеливание" % zn["LOS_AIM_MAX_PX"])
 assert zn["LOS_AIM_MAX_PX"] > OBYCHNAYA_OSHIBKA_PX, "предел ниже самой ошибки"
 # Мёртвая зона обязана применяться и к прицелу, а не только к газу.
-assert "izbytok = _los_skorost - LOS_RATE_DEADBAND_DPS" in src, (
+# С введением проверки свежести (LOS_RATE_STALE_S) чтение идёт через
+# промежуточную _los_val — но само вычитание мёртвой зоны должно остаться.
+assert "- LOS_RATE_DEADBAND_DPS" in src, (
     "мёртвая зона к прицелу не применяется: поправка пойдёт на остаточном шуме")
+assert "izbytok = _los_val - LOS_RATE_DEADBAND_DPS" in src or \
+       "izbytok = _los_skorost - LOS_RATE_DEADBAND_DPS" in src, (
+    "изменилось имя переменной, проверить логику мёртвой зоны в прицеле")
 # И ограничение скорости самой поправки — последняя преграда рывку.
 assert "LOS_AIM_SLEW_PX_S" in src, "поправка прицела может прыгать"
 _shag = zn["LOS_AIM_SLEW_PX_S"] / zn["CAM_FPS"]
