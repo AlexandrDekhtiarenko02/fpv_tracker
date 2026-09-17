@@ -2034,13 +2034,43 @@ _FLIGHT_LOG_COLUMNS = (
     "gps_age_ms,"
     "gps_range_m,ground_speed_ms,"
     "ground_flow_dx_px,ground_flow_dy_px,ground_flow_px_s,"
-    "ground_flow_points,ground_flow_dt_ms"
+    "ground_flow_points,ground_flow_dt_ms,"
+    # ДИАГНОСТИКА «ПРОПАЛО ВИДЕО ВНЕ ЛОКА». Camera_callback работал, кадры
+    # шли ровно 42 мс, но пилот видел чёрный экран, до перезапуска не
+    # восстанавливалось. Чтобы отличить «камера отдаёт чёрное» от «выход
+    # чернеет ниже нашего слоя», пишем среднюю яркость главного кадра
+    # ПЕРЕД оверлеем: наш рисунок в неё не входит. И свободную CMA-память
+    # раз в секунду: pipeline libcamera на Zero 2W чернеет при её нехватке.
+    "mean_gray,cma_free_kb"
 )
 
 # Снимок внутренностей управления за текущий кадр. Заполняется в
 # update_control_from_target()/fast_idle_update(), читается один раз в
 # camera_callback. Обычный dict: ~3 мкс на кадр, на фоне 33 мс кадра — ничто.
 _ctl_dbg = {}
+# Диагностика «пропало видео вне лока». Обновляется в camera_callback раз в
+# кадр ДО отрисовки оверлея (иначе наши линии/лупа искажали бы среднюю
+# яркость). CMA-память читается раз в секунду: чтение /proc/meminfo — это
+# небольшая операция, но 24 раза в секунду ей делать нечего.
+_last_main_mean = None
+_cma_free_kb = None
+_cma_read_t = 0.0
+CMA_READ_PERIOD_S = 1.0
+
+
+def _read_cma_free_kb():
+    """Свободная CMA-память из /proc/meminfo. None если поле недоступно."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("CmaFree:"):
+                    parts = line.split()
+                    return int(parts[1])
+    except Exception:
+        pass
+    return None
+
+
 # Слагаемые PID по осям, складывает _pid_axis_step.
 _pid_dbg = {}
 # Внутренности сопоставления шаблона за текущий кадр. Нужны, чтобы понять
@@ -8592,6 +8622,9 @@ def _capture_flight_row(cb_t0):
             _ground_flow_dbg.get("dx_px"), _ground_flow_dbg.get("dy_px"),
             _ground_flow_dbg.get("px_s"), _ground_flow_dbg.get("points"),
             _ground_flow_dbg.get("dt_ms"),
+            # Диагностика чёрного экрана: ЯРКОСТЬ ДО ОВЕРЛЕЯ и свободная
+            # CMA-память. Замер сделан в camera_callback, читаем последнее.
+            _last_main_mean, _cma_free_kb,
         )
         flight_log.row(_row_values)
         # Та же строка — в папку этого захвата. Форматируем один раз здесь, а
@@ -8863,7 +8896,14 @@ KADR_OSHIBKA_PERIOD_S = 2.0
 
 def camera_callback(request):
     global chroma_u, chroma_v, _gs_n
+    global _last_main_mean, _cma_free_kb, _cma_read_t
     _cb_t0 = time.monotonic()
+    # CMA раз в секунду: чтение /proc/meminfo дешевле, чем блокировать
+    # callback, но каждый кадр всё равно ни к чему. Обновляем и в
+    # idle-ветке — иначе на длинной паузе значение устареет.
+    if _cb_t0 - _cma_read_t >= CMA_READ_PERIOD_S:
+        _cma_free_kb = _read_cma_free_kb()
+        _cma_read_t = _cb_t0
     try:
         with state_lock:
             aux_snapshot = aux4_state
@@ -8878,6 +8918,15 @@ def camera_callback(request):
                 frame_recorder.stop("AUX4 выключен")
             print_debug_once_per_second()
             with MappedArray(request, "main") as mm:
+                # СРЕДНЯЯ ЯРКОСТЬ ДО ОВЕРЛЕЯ. После — в неё войдут наши линии
+                # и лупа, и «камера почернела» станет неотличимо от «мы
+                # много нарисовали». Берём G-канал: он ближе всего к
+                # человеческому восприятию яркости и присутствует в любом
+                # формате main (BGR/RGB — во всех второй канал зелёный).
+                try:
+                    _last_main_mean = float(mm.array[:, :, 1].mean())
+                except Exception:
+                    _last_main_mean = None
                 draw_overlay_on_frame(mm.array)
             _capture_flight_row(_cb_t0)
             return
@@ -8938,6 +8987,12 @@ def camera_callback(request):
         print_debug_once_per_second()
 
         with MappedArray(request, "main") as mm:
+            # Средняя яркость главного кадра ДО оверлея — см. пояснение
+            # у той же операции в idle-ветке.
+            try:
+                _last_main_mean = float(mm.array[:, :, 1].mean())
+            except Exception:
+                _last_main_mean = None
             draw_overlay_on_frame(mm.array)
         _capture_flight_row(_cb_t0)
     except Exception:
