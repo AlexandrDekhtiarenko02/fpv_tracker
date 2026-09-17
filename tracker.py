@@ -9156,7 +9156,43 @@ LAUNCH_RAMP_DOWN_FRAMES = max(1, int(round(LAUNCH_RAMP_DOWN_S * CAM_FPS)))
 # =========================================================
 # 12. START
 # =========================================================
+_pid_lock_fh = None
+
+
+def _uzhe_zapushchen():
+    """Флок на /tmp/fpv_tracker.pid. Второй процесс не сможет открыть камеру и
+    начнёт конкурировать за MSP-порт с первым — а в логах это выглядит как
+    хаос, который тяжело разбирать (сессия 12:08 с pid=725 ещё летела, а
+    рядом стартовали pid=722/719/721/727 из скриптов запуска). Пилот об
+    этом не узнаёт без ручной проверки: службу systemd можно запустить
+    несколько раз в разных cgroup, и первый процесс ей не мешает.
+
+    Файл — на /tmp: он всегда есть и на нём точно можно писать; flock даёт
+    гарантию не хуже pid-файла, а мусор после падения сам исчезнет при
+    следующем перезапуске (flock снимается ядром при завершении процесса).
+    """
+    import fcntl
+    global _pid_lock_fh
+    try:
+        _pid_lock_fh = open("/tmp/fpv_tracker.pid", "w")
+        fcntl.flock(_pid_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _pid_lock_fh.write("%d\n" % os.getpid())
+        _pid_lock_fh.flush()
+        return False
+    except (OSError, IOError):
+        # Замок держит другой процесс. Пишем причину в stderr и завершаемся:
+        # это единственный способ не сломать данные другим экземпляром.
+        try:
+            print("[tracker] уже запущен другой экземпляр — выхожу",
+                  flush=True)
+        except Exception:
+            pass
+        return True
+
+
 def main():
+    if _uzhe_zapushchen():
+        raise SystemExit(1)
     global picam2
     picam2 = Picamera2()
 
