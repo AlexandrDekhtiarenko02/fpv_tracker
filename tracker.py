@@ -9179,31 +9179,68 @@ _pid_lock_fh = None
 
 
 def _uzhe_zapushchen():
-    """Флок на /tmp/fpv_tracker.pid. Второй процесс не сможет открыть камеру и
-    начнёт конкурировать за MSP-порт с первым — а в логах это выглядит как
-    хаос, который тяжело разбирать (сессия 12:08 с pid=725 ещё летела, а
-    рядом стартовали pid=722/719/721/727 из скриптов запуска). Пилот об
-    этом не узнаёт без ручной проверки: службу systemd можно запустить
-    несколько раз в разных cgroup, и первый процесс ей не мешает.
+    """Проверка «единственный экземпляр» с двумя предохранителями.
 
-    Файл — на /tmp: он всегда есть и на нём точно можно писать; flock даёт
-    гарантию не хуже pid-файла, а мусор после падения сам исчезнет при
-    следующем перезапуске (flock снимается ядром при завершении процесса).
+    Прежняя версия сразу ставила flock на /tmp/fpv_tracker.pid и полагалась
+    на то, что другой процесс уже держит замок. В вылете 14:03 это НЕ
+    сработало: первый процесс, стартовавший в 13:52 (до появления
+    flock-защиты в коммите 4d3ccbf), не держал замок вовсе, второй pid=724
+    успешно взял его и стартовал рядом. Оба грузили камеру и MSP, картинка
+    почернела на третьей минуте — по признакам, конфликтом за DRM.
+
+    Теперь порядок такой:
+    1. Прочитать /tmp/fpv_tracker.pid, если файл существует. Проверить
+       живой ли этот pid (kill(pid, 0)) И зовётся ли образ tracker.py
+       (/proc/PID/cmdline). Если да — выходим сразу, старый экземпляр
+       ещё жив.
+    2. Только после этого open("w") с flock. Второй одновременный запуск
+       поймает flock и тоже выйдет.
+
+    Проверка cmdline нужна, чтобы не отпугнуть от pid, который переехал к
+    чужому процессу (system reuse) после нашего падения.
     """
     import fcntl
     global _pid_lock_fh
+    pid_path = "/tmp/fpv_tracker.pid"
+    # Шаг 1. Проверяем pid, оставшийся от прошлой сессии.
+    if os.path.exists(pid_path):
+        try:
+            with open(pid_path) as f:
+                _stary = int((f.read() or "0").strip() or "0")
+            if _stary > 0 and _stary != os.getpid():
+                # kill(pid, 0) не убивает, а проверяет существование.
+                try:
+                    os.kill(_stary, 0)
+                    zhiv = True
+                except (ProcessLookupError, PermissionError, OSError):
+                    zhiv = False
+                if zhiv:
+                    # Проверяем, что это ИМЕННО наш tracker.py, а не
+                    # чужой процесс с тем же pid.
+                    try:
+                        with open("/proc/%d/cmdline" % _stary, "rb") as c:
+                            _cm = c.read().replace(b"\x00", b" ").decode(
+                                "utf-8", "ignore")
+                    except Exception:
+                        _cm = ""
+                    if "tracker.py" in _cm:
+                        print("[tracker] уже запущен pid=%d (%s) — выхожу"
+                              % (_stary, _cm.strip()), flush=True)
+                        return True
+        except Exception:
+            pass
+    # Шаг 2. Открываем и берём flock. Второй одновременный запуск
+    # (когда pid ещё не успел записаться) поймает EWOULDBLOCK.
     try:
-        _pid_lock_fh = open("/tmp/fpv_tracker.pid", "w")
+        _pid_lock_fh = open(pid_path, "w")
         fcntl.flock(_pid_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         _pid_lock_fh.write("%d\n" % os.getpid())
         _pid_lock_fh.flush()
         return False
     except (OSError, IOError):
-        # Замок держит другой процесс. Пишем причину в stderr и завершаемся:
-        # это единственный способ не сломать данные другим экземпляром.
         try:
-            print("[tracker] уже запущен другой экземпляр — выхожу",
-                  flush=True)
+            print("[tracker] flock на %s занят — второй экземпляр стартует "
+                  "одновременно, выхожу" % pid_path, flush=True)
         except Exception:
             pass
         return True
