@@ -112,13 +112,30 @@ print("    одиночная оценка не замораживает, выд
       % t.FINAL_CONFIRM_TIME_S)
 print("    первый кадр финала -> тангаж %d, крен %d" % (p0, r0))
 zamerlo = True
-for dy in (60, -60, 100):
+# Держим МЕНЬШЕ порога отпускания: hold — про тишину при малой остаточной
+# ошибке, а при большом расхождении с прицелом мы теперь ЧЕСТНО отпускаем
+# (см. FINAL_HOLD_ABORT_PX). Ниже отдельный пункт про этот отпуск.
+_maloy = int(t.FINAL_HOLD_ABORT_PX * 0.5)
+for dy in (_maloy, -_maloy, 0):
     p, r = zahod(rost=t.FINAL_HOLD_ROST + 0.5, dy_px=dy)
     print("    смещение %+4d px -> тангаж %d, крен %d" % (dy, p, r))
     if (p, r) != (p0, r0):
         zamerlo = False
 assert zamerlo, (
     "команда в финале продолжает меняться вслед за ошибкой — заморозки нет")
+
+print("\n=== 2в. Hold отпускается, если ошибка ушла на > FINAL_HOLD_ABORT_PX ===")
+# В свежих логах (14:03) hold фиксировал уехавшую траекторию: zahvat25
+# держал команду, пока dy шёл 4→-34, zahvat28 — пока 13→35. Смысл hold
+# теряется, когда цель уже не там, куда мы целим.
+_bolshoy = int(t.FINAL_HOLD_ABORT_PX + 20)
+p, r = zahod(rost=t.FINAL_HOLD_ROST + 0.5, dy_px=_bolshoy)
+print("    смещение %+d px (> порога %.0f) -> тангаж %d, крен %d"
+      % (_bolshoy, t.FINAL_HOLD_ABORT_PX, p, r))
+assert not t._final_zamorozhen, (
+    "заморозка не отпустилась при ошибке %d px > порога %.0f — контур "
+    "продолжит держать промах до конца захода"
+    % (_bolshoy, t.FINAL_HOLD_ABORT_PX))
 
 print("\n=== 2б. Признак финала — ВРЕМЯ, а не рост рамки ===")
 # В поле заморозка срабатывала при росте ровно 3.00, когда до цели было

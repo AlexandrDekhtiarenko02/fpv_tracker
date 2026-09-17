@@ -1251,6 +1251,13 @@ FINAL_CONFIRM_TIME_S = 0.25
 # эталона (TEMPLATE_STARVED_MAX_X = 3.0), иначе заморозка снова примет
 # раздувание за сближение — ровно это и случилось в поле.
 FINAL_HOLD_ROST = 4.5
+# СБРОС ЗАМОРОЗКИ ПО УШЕДШЕЙ ОШИБКЕ. Даже созревший заход может влететь в
+# hold на ложной траектории, если оценщик tau «сходит с ума» на близких
+# кадрах (шум растёт, а порог низкий). В свежих логах (14:03) это дало
+# несколько недолётов подряд: zahvat25 при hold шёл dx -78→-120, dy 4→-34;
+# zahvat28 dx -21→-36, dy 13→35. Команда была фиксирована и не следила.
+# Отпускаем hold, если ошибка прицела ушла от базовой более чем на N px.
+FINAL_HOLD_ABORT_PX = 40.0
 # Сколько последних кадров усредняется при заморозке. 8 при 24 к/с — треть
 # секунды: достаточно, чтобы одиночный выброс не решал судьбу захода, и
 # достаточно мало, чтобы среднее оставалось тем манёвром, который шёл
@@ -3146,6 +3153,10 @@ _dep_hist = collections.deque(maxlen=256)
 # Финал: заморожена ли команда и на каких значениях.
 _final_zamorozhen = False
 _final_komandy = (1500, 1500, 1500)
+# Ошибка прицела в момент включения hold. По ней проверяется, не ушла ли
+# траектория дальше — если да, hold отпускается (см. FINAL_HOLD_ABORT_PX).
+_final_dx0 = None
+_final_dy0 = None
 _final_okno = collections.deque(maxlen=FINAL_OKNO_KADROV)
 # Момент, когда PID увидел controllable=True после not-controllable. Нужен
 # заморозке: до FINAL_MIN_ZAHOD_AGE_S оценщик tau ещё в переходном
@@ -6008,7 +6019,7 @@ def update_control_from_target():
     global _los_aim_x_tek, _az_skorost, _az_nakop, _az_pred
     global _los_skorost_ts, _az_skorost_ts
     global _tau_ubyvanie
-    global _final_zamorozhen, _final_komandy, _final_okno
+    global _final_zamorozhen, _final_komandy, _final_okno, _final_dx0, _final_dy0
     global _dover_score_ema, _dover_psr_ema
     global _rassh_nakop, _flow_rasshirenie
     global _gyro_y_sgl, _gyro_x_sgl
@@ -6114,6 +6125,8 @@ def update_control_from_target():
         # между заходами я забыл. Один раз заморозилось — и каждый следующий
         # заход начинался замороженным, с командой прошлой цели.
         _final_zamorozhen = False
+        _final_dx0 = None
+        _final_dy0 = None
         filtered_dx_yaw = 0.0
         prev_adx = 0.0
         prev_ady_ctrl = 0.0
@@ -7157,9 +7170,31 @@ def update_control_from_target():
         _vyderzhka_final, _hochu_final, now_mono, FINAL_CONFIRM_TIME_S)
     final_pora = _final_zamorozhen or _final_podtverzhdeno
 
+    # ОТПУСКАЕМ HOLD, ЕСЛИ ТРАЕКТОРИЯ УШЛА. Заморозка задумана держать
+    # прицел на цели последние секунды перед контактом. Если после
+    # включения hold ошибка прицела уходит на > FINAL_HOLD_ABORT_PX —
+    # цель уже не там, куда мы целим, дальше держать замороженную
+    # команду вредно. В свежих логах (14:03) hold фиксировал ушедшую
+    # траекторию в zahvat25/28 (недолёт) и zahvat24 (перелёт).
+    if _final_zamorozhen and _final_dx0 is not None:
+        _ushlo_dx = abs(dx_aim - _final_dx0)
+        _ushlo_dy = abs(dy_aim - _final_dy0)
+        if _ushlo_dx > FINAL_HOLD_ABORT_PX or _ushlo_dy > FINAL_HOLD_ABORT_PX:
+            _final_zamorozhen = False
+            final_pora = False
+            _final_dx0 = None
+            _final_dy0 = None
+            _vyderzhka_sbros(_vyderzhka_final)
+            flight_log.event(
+                "ФИНАЛ отпущен: ошибка прицела ушла на %.0fx / %.0fy px "
+                "(порог %.0f) — контур снова рулит"
+                % (_ushlo_dx, _ushlo_dy, FINAL_HOLD_ABORT_PX))
+
     if final_pora:
         if not _final_zamorozhen:
             _final_zamorozhen = True
+            _final_dx0 = float(dx_aim)
+            _final_dy0 = float(dy_aim)
             # ЗАМОРАЖИВАЕТСЯ СРЕДНЕЕ, А НЕ МГНОВЕНИЕ.
             #
             # Взять команду одного кадра значит поставить весь заход в
@@ -7186,6 +7221,8 @@ def update_control_from_target():
         target_roll, target_pitch, target_yaw = _final_komandy
     else:
         _final_zamorozhen = False
+        _final_dx0 = None
+        _final_dy0 = None
 
     # --- ПРЕДЕЛ СКОРОСТИ СНИЖЕНИЯ ---
     #
