@@ -1226,6 +1226,16 @@ FINAL_HOLD_ENABLED = True
 # замерен в 125 мс, то есть за полторы секунды аппарат успел бы отработать
 # десяток поправок — но данные в этот момент уже негодны, а рамка огромная.
 FINAL_HOLD_TAU_S = 1.5
+# МИНИМАЛЬНЫЙ ВОЗРАСТ ЗАХВАТА ДЛЯ ЗАМОРОЗКИ. Оценщик tau собирает окно
+# TAU_FIT_WINDOW_S = 1.2 с и требует TAU_FIT_MIN_POINTS точек — до этого
+# первые же значения tau переходные и могут быть сколь угодно малы.
+# Захват 14 сессии 12:08 — образцовый случай: первые оценки шли 0.60,
+# 0.74, 0.86, 0.99, 1.15, 1.31 (растёт из перегиба логарифма), заморозка
+# защёлкнулась через 1.06 с после лока, а следом tau ушла к 1.5/1.6/4.1
+# — то есть на самом деле цель была далеко, но команда уже стояла и не
+# следила: ошибка прицела дошла до +226 px. Не пускаем заморозку, пока
+# окно оценщика не наполнилось + запас на подтверждение.
+FINAL_MIN_ZAHOD_AGE_S = 1.5
 # Сколько ВРЕМЕНИ подряд признак должен держаться. Заморозка необратима до
 # конца захода, поэтому одиночной оценки мало: мусорная tau в первую секунду
 # захвата уже погубила так целый вылет.
@@ -3123,6 +3133,11 @@ _dep_hist = collections.deque(maxlen=256)
 _final_zamorozhen = False
 _final_komandy = (1500, 1500, 1500)
 _final_okno = collections.deque(maxlen=FINAL_OKNO_KADROV)
+# Момент, когда PID увидел controllable=True после not-controllable. Нужен
+# заморозке: до FINAL_MIN_ZAHOD_AGE_S оценщик tau ещё в переходном
+# процессе, и его первые значения не имеют права необратимо замораживать
+# контур. Обнуляется на выходе из controllable — новый заход, новый отсчёт.
+_tracked_since_t = None
 # Недавний уровень качества слежения. None означает «ещё не знаем»: первый
 # кадр захода задаёт уровень, а не считается ухудшением.
 _dover_score_ema = None
@@ -5982,6 +5997,7 @@ def update_control_from_target():
     global overlay_text, overlay_color, _ctl_dbg, prev_control_mono
     global prev_launch_pitch_deg, prev_box_size_px, box_growth_smoothed
     global _score_do_rosta, _tau_hold_val, _tau_hold_t, _size_R_boost
+    global _tracked_since_t
 
     with state_lock:
         box = target_box_main
@@ -6093,6 +6109,9 @@ def update_control_from_target():
         _tau_hold_val = None
         _tau_hold_t = 0.0
         _size_R_boost = 1.0
+        # Отсчёт «возраста захвата» тоже сбрасывается: новый лок — новый
+        # оценщик tau, ему опять нужны TAU_FIT_WINDOW_S на прогрев.
+        _tracked_since_t = None
         prev_box_cx = None
         prev_box_cy = None
         target_vx_smoothed = 0.0
@@ -6113,6 +6132,11 @@ def update_control_from_target():
         # наведение простояло и в каком состоянии, вместо дыры в логе.
         _ctl_dbg = {"active": False, "base_thr": base_thr}
         return
+
+    # Первый кадр после not-controllable — фиксируем «возраст захвата».
+    # По нему заморозка решит, успел ли оценщик tau собрать полное окно.
+    if _tracked_since_t is None:
+        _tracked_since_t = now_mono
 
     # --- Геометрия. РАЗДЕЛЬНЫЕ dy для pitch и для газа. ---
     box_cx = (box[0] + box[2]) / 2.0
@@ -7036,7 +7060,14 @@ def update_control_from_target():
     # и это уже случилось: мусорная tau = 0.126 с в первую секунду замораживала
     # команду на весь заход.
     _hochu_final = False
-    if FINAL_HOLD_ENABLED:
+    # ЗАХОД ДОЛЖЕН СОЗРЕТЬ. Пока с момента входа в controllable не прошло
+    # FINAL_MIN_ZAHOD_AGE_S, оценщик tau ещё в переходном процессе (окно
+    # TAU_FIT_WINDOW_S не наполнено), и его значения способны срочно
+    # соврать в меньшую сторону. Единственная такая оценка защёлкнула
+    # заморозку на весь заход в zahvat14 сессии 12:08 — образец беды.
+    _zahod_zrel = (_tracked_since_t is not None
+                   and (now_mono - _tracked_since_t) >= FINAL_MIN_ZAHOD_AGE_S)
+    if FINAL_HOLD_ENABLED and _zahod_zrel:
         if _tau_now is not None:
             _hochu_final = _tau_now <= FINAL_HOLD_TAU_S
         elif rost_ot_zahvata is not None:
