@@ -2153,7 +2153,15 @@ _FLIGHT_LOG_COLUMNS = (
     # flow_scale/flow_scale_confidence — сам результат подгонки, отдельно
     # от финальных lock_cx/lock_cy (те уже включают вклад матча).
     "flow_lk_ok,flow_quality,flow_translation_x,flow_translation_y,"
-    "flow_scale,flow_scale_confidence"
+    "flow_scale,flow_scale_confidence,"
+    # ВАЛИДНОСТЬ TEMPORAL SCALE HISTORY (п.10). geometry_epoch растёт на
+    # каждый разрыв непрерывности (новый лок ИЛИ пауза внутри одного лока)
+    # — derivative-величины (tau_ubyv, los_rate, az_rate, growth) корректны
+    # только внутри одной эпохи, и по номеру их легко сегментировать при
+    # разборе, не гадая по времени. scale_source — что мерило размер в этом
+    # кадре: match_scale (примерка масштаба), segment (связная компонента)
+    # или none (в этом кадре не мерили вовсе).
+    "geometry_epoch,scale_source"
 )
 
 # Снимок внутренностей управления за текущий кадр. Заполняется в
@@ -6333,6 +6341,75 @@ def _compute_pitch_attitude_comp_px(now_mono, k=1.0):
     return comp_px
 
 
+# Номер эпохи непрерывной геометрии (ТЗ next-commit spec §10). Растёт на
+# каждый разрыв — новый лок ИЛИ разрыв внутри одного лока по времени (см.
+# _reset_geometry_history). Полезен на разборе: derivative-величины (tau,
+# LOS-rate, азимут-rate, рост коробки) корректны только внутри одной эпохи,
+# и по этому номеру их легко сегментировать, не гадая по времени.
+geometry_epoch = 0
+
+
+def _reset_geometry_history(reason):
+    """Разрывает непрерывность temporal scale/geometry history (ТЗ §10).
+
+    ОТДЕЛЬНО ОТ ПОЛНОГО СБРОСА В ВЕТКЕ not-controllable: там сбрасывается
+    ВСЁ (PID-интеграторы, launch, final-hold) — здесь только то, что
+    накапливается ПО ВРЕМЕНИ и корректно лишь при непрерывном наблюдении
+    ОДНОГО И ТОГО ЖЕ лока: tau, скорость угла визирования, скорость
+    азимута, рост коробки, расширение потока, EMA доверия.
+
+    Используется двумя вызывающими: полным сбросом лока (не меняет его
+    поведение — просто убирает дублирование тех же клиров) и НОВЫМ путём —
+    разрывом ВНУТРИ одного лока по времени (camera_callback застрял, но
+    track_state не упал в LOST). В этом втором случае control-state (PID,
+    final hold, launch) трогать НЕЛЬЗЯ: аппарат должен продолжать лететь
+    той же командой, а не дёргаться из-за тайминг-паузы в трекере.
+    """
+    global geometry_epoch
+    global _tau_ubyvanie, _az_nakop, _az_pred, _az_skorost, _az_skorost_ts
+    global _los_ugol, _los_skorost, _los_skorost_ts
+    global prev_box_size_px, box_growth_smoothed
+    global _rassh_nakop, _flow_rasshirenie
+    global _score_do_rosta, _tau_hold_val, _tau_hold_t
+    global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed
+    global stable_track_frames
+    global _dover_score_ema, _dover_psr_ema
+
+    geometry_epoch += 1
+    _tau_ubyvanie = 0.0
+    _tau_hist.clear()
+    _dep_hist.clear()
+    _az_hist.clear()
+    _az_nakop = 0.0
+    _az_pred = None
+    _az_skorost = 0.0
+    _az_skorost_ts = 0.0
+    _los_ugol = None
+    _los_skorost = 0.0
+    _los_skorost_ts = 0.0
+    prev_box_size_px = None
+    box_growth_smoothed = 0.0
+    _size_hist.clear()
+    _rassh_nakop = 0.0
+    _flow_rasshirenie = None
+    _score_do_rosta = None
+    _tau_hold_val = None
+    _tau_hold_t = 0.0
+    prev_box_cx = None
+    prev_box_cy = None
+    target_vx_smoothed = 0.0
+    target_vy_smoothed = 0.0
+    stable_track_frames = 0
+    _dover_score_ema = None
+    _dover_psr_ema = None
+    try:
+        flight_log.event(
+            "GEOMETRY_EPOCH %d: разрыв непрерывности (%s)"
+            % (geometry_epoch, reason))
+    except Exception:
+        pass
+
+
 def update_control_from_target():
     """Roll/Pitch/Yaw — P+D+I через _pid_axis_step с anti-windup.
        Прицельная точка по pitch учитывает текущий тангаж квада (MSP_ATTITUDE).
@@ -6385,9 +6462,15 @@ def update_control_from_target():
         _tracked_since_t = None
 
     now_mono = time.monotonic()
+    # СЫРОЙ интервал — до dt_ratio(), который его ЗАЖИМАЕТ до DT_MAX (см.
+    # ТЗ §10, разрыв геометрии без потери лока). k нужен PID и не должен
+    # видеть многосекундные паузы — ради этого зажим и придуман. А вот
+    # признаку «был ли разрыв» зажатое значение врёт: k=7.5 выглядит
+    # одинаково при паузе 0.25 с и при 5 с, а разница для tau/LOS-rate
+    # огромна. Поэтому здесь берём _raw_dt отдельно, ДО зажима.
+    _raw_dt = None if prev_control_mono is None else now_mono - prev_control_mono
     # Фактическая длительность кадра в единицах номинального (k=1 при 30 к/с).
-    k = dt_ratio(None if prev_control_mono is None
-                 else now_mono - prev_control_mono)
+    k = dt_ratio(_raw_dt)
     prev_control_mono = now_mono
     # ОПОРНЫЙ ГАЗ — это стик пилота, и только он.
     #
@@ -6419,30 +6502,18 @@ def update_control_from_target():
         _slew_roll = _slew_pitch = _slew_yaw = 1500.0
         # Отсчёт компенсации тоже: новый захват — новое начало.
         _pitch_pri_loke = None
-        # И угол визирования: разность через паузу между локами дала бы
-        # выброс скорости на первом же кадре нового захода.
-        _los_ugol = None
-        _los_skorost = 0.0
-        _los_skorost_ts = 0.0
         _los_aim_tek = 0.0
-        # И вбок: азимут прошлой цели к новой отношения не имеет, а
-        # накопленное развёртывание курса дало бы выброс на первом же кадре.
         _los_aim_x_tek = 0.0
-        _az_skorost = 0.0
-        _az_skorost_ts = 0.0
-        _az_nakop = 0.0
-        _az_pred = None
-        _az_hist.clear()
-        _tau_ubyvanie = 0.0
-        _tau_hist.clear()
         _glide_ves_tek = 0.0
         _gyro_y_sgl = None
         _gyro_x_sgl = None
-        _dep_hist.clear()
-        # И уровень качества слежения: он свой у каждой цели, и прошлый на
-        # новой выглядел бы как резкое ухудшение или, наоборот, скрыл бы его.
-        _dover_score_ema = None
-        _dover_psr_ema = None
+        # ВСЯ temporal scale/geometry history (tau, LOS-rate, азимут-rate,
+        # рост коробки, расширение потока, EMA доверия) — общим вызовом,
+        # тем же, что и разрыв ВНУТРИ одного лока (см. GEOMETRY_GAP выше и
+        # _reset_geometry_history). Раньше эти же клиры дублировались тут
+        # построчно — раздельные копии одного намерения рано или поздно
+        # расходятся, и это уже стоило вылета (см. коммит про _tau_hold leak).
+        _reset_geometry_history("not_controllable")
         # И копилка команд: усреднять с манёврами прошлой цели бессмысленно.
         _final_okno.clear()
         # Выдержки финала и сближения — по времени, обнуляем между заходами,
@@ -6469,37 +6540,14 @@ def update_control_from_target():
         smoothed_pitch_deg = 0.0
         prev_control_mono = None
         prev_launch_pitch_deg = None
-        # Оценку сближения тоже сбрасываем: размер коробки после нового
-        # захвата не связан с прежним, и прирост между ними — мусор.
-        prev_box_size_px = None
-        box_growth_smoothed = 0.0
-        _size_hist.clear()
-        # И накопленное расширение: оно осмысленно только внутри одного
-        # захода, у новой цели свой размер и свой отсчёт.
-        _rassh_nakop = 0.0
-        _flow_rasshirenie = None
-        # СОСТОЯНИЕ КОНКРЕТНОГО ЗАХВАТА, которое раньше протекало в следующий.
-        # Эти жили только внутри одного захода, но между заходами не чистились:
-        #  - _score_do_rosta: планка качества для разрешения роста рамки
-        #    (защита из 5498c4c). Высокий score прошлой цели неопределённо долго
-        #    ЗАПРЕЩАЛ рост рамки новой — самый вредный перенос из четырёх.
-        #  - _tau_hold_val/_t: последнее годное время до контакта. Свой возраст
-        #    (1.5 c) его прикрывал, но у нового захода прошлого времени быть не
-        #    должно вовсе.
-        #  - _size_R_boost: расширение области замера размера. Само сбрасывалось
-        #    лишь после удачного замера — до него новый заход мерил чужим окном.
-        _score_do_rosta = None
-        _tau_hold_val = None
-        _tau_hold_t = 0.0
+        # _size_R_boost: расширение области замера размера. Само сбрасывалось
+        # лишь после удачного замера — до него новый заход мерил чужим окном.
+        # Не часть _reset_geometry_history: это состояние ПОИСКА, а не
+        # НАКОПЛЕННАЯ ПО ВРЕМЕНИ история.
         _size_R_boost = 1.0
         # Отсчёт «возраста захвата» тоже сбрасывается: новый лок — новый
         # оценщик tau, ему опять нужны TAU_FIT_WINDOW_S на прогрев.
         _tracked_since_t = None
-        prev_box_cx = None
-        prev_box_cy = None
-        target_vx_smoothed = 0.0
-        target_vy_smoothed = 0.0
-        stable_track_frames = 0
         # Launch тоже сбрасывается — следующее controllable=True переоткроет манёвр.
         launch_phase = "NONE"
         launch_counter = 0
@@ -6520,6 +6568,18 @@ def update_control_from_target():
     # По нему заморозка решит, успел ли оценщик tau собрать полное окно.
     if _tracked_since_t is None:
         _tracked_since_t = now_mono
+
+    # РАЗРЫВ ГЕОМЕТРИИ БЕЗ ПОТЕРИ ЛОКА (ТЗ §10). camera_callback мог
+    # застрять (SD-карта, тепловой throttling, конкуренция за CPU — см.
+    # диагностику cpu_temp_c/cpu_freq_mhz) без падения track_state: рамка
+    # просто ждала своего кадра. Но derivative-оценки МЕЖДУ этим и прошлым
+    # кадром (tau/LOS-rate/азимут-rate/рост) относились бы к неправдоподобно
+    # растянутому интервалу — то же самое, от чего защищает лок-переход, но
+    # ВНУТРИ одного лока. Порог — FLOW_RASSH_SVEZH_S: тот же, что уже отделяет
+    # свежий flow_rasshirenie от устаревшего (если поток недостоверен после
+    # такой паузы, деривативы выше по цепочке тем более).
+    if _raw_dt is not None and _raw_dt > FLOW_RASSH_SVEZH_S:
+        _reset_geometry_history("frame_gap %.3fs" % _raw_dt)
 
     # --- Геометрия. РАЗДЕЛЬНЫЕ dy для pitch и для газа. ---
     box_cx = (box[0] + box[2]) / 2.0
@@ -8683,6 +8743,11 @@ def process_locked_tracker(gray, cb_t0=None):
                      (time.monotonic() - cb_t0) * 1000.0
                      <= FRAME_BUDGET_MS * FRAME_BUDGET_SECONDARY_FRAC)
         _primerka_pora = frame_index % _period_primerki() == 0
+        # По умолчанию «в этом кадре размер не мерили» — переписывается
+        # ниже, если сработает match_scale или segment. Без явного "none"
+        # колонка держала бы значение с прошлого замера и выглядела бы так,
+        # будто измерение было каждый кадр.
+        _match_dbg["scale_source"] = "none"
         if _primerka_pora and not _budget_ok:
             # Было ПОРА, но бюджет кадра уже исчерпан. Отдельный код — чтобы
             # «не мерили, не успели» не спутать с «мерили и не получилось»
@@ -8699,6 +8764,7 @@ def process_locked_tracker(gray, cb_t0=None):
         if (SIZE_BY_SCALE_ENABLED and SIZE_ADAPT_ENABLED
                 and _primerka_pora and _budget_ok):
             # Размер по масштабу совпадения. Сегментация не участвует.
+            _match_dbg["scale_source"] = "match_scale"
             if not match_ok:
                 _match_dbg["size_skip"] = 1
             elif score < SIZE_ADAPT_MIN_SCORE:
@@ -8806,6 +8872,7 @@ def process_locked_tracker(gray, cb_t0=None):
                             if _ta_allowed:
                                 _adapt_template_base(gray)
         elif SIZE_ADAPT_ENABLED and _primerka_pora and _budget_ok:
+            _match_dbg["scale_source"] = "segment"
             # Область поиска растягиваем под ТЕКУЩИЙ размер коробки, иначе
             # крупная цель заведомо в неё не помещается и измерить её нельзя.
             est_w, est_h = estimate_size_at_position(
@@ -9170,6 +9237,7 @@ def _capture_flight_row(cb_t0):
             _flow_dbg.get("lk_ok"), _flow_dbg.get("quality"),
             _flow_dbg.get("translation_x"), _flow_dbg.get("translation_y"),
             _flow_dbg.get("scale"), _flow_dbg.get("scale_confidence"),
+            geometry_epoch, _match_dbg.get("scale_source"),
         )
         flight_log.row(_row_values)
         # Та же строка — в папку этого захвата. Форматируем один раз здесь, а
