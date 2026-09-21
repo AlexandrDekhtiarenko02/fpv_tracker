@@ -690,6 +690,38 @@ MATCH_BIG_TMPL_PX = 70
 # границе.
 MATCH_BIG_ZAPAS_PX = 6
 
+# --- НОРМАЛИЗАЦИЯ РАЗМЕРА ДЛЯ МАТЧА (ТЗ next-commit spec, §3/§8) ---
+#
+# cv2.matchTemplate стоит пропорционально площади search * площади template.
+# Обе площади растут с рамкой (эталон растёт до TEMPLATE_MAX при примерке
+# масштабов), и это даёт ровно ту просадку, что описана в спеке: долгий
+# TRACKED -> объект крупнее -> совпадение дороже -> FPS падает.
+#
+# ЧТО ДЕЛАЕТ. Если ФАКТИЧЕСКИЙ эталон (template_gray, как он есть — растить
+# его никто не перестаёт) крупнее этого порога, для САМОГО ВЫЗОВА
+# matchTemplate берётся УМЕНЬШЕННАЯ копия и эталона, и окна поиска — в одном
+# и том же масштабе. Позиция найденного пика возвращается в РЕАЛЬНЫЕ
+# пиксели делением на тот же масштаб. Всё остальное — рост lock_w/lock_h,
+# TEMPLATE_STARVED_STD, адаптация шаблона, SIZE_BY_SCALE_ENABLED — работает
+# как прежде, в реальном разрешении: уменьшается только вычислительное
+# представление, используемое ОДНИМ ЭТИМ вызовом.
+#
+# ПОЧЕМУ НЕ ТРОГАЕТ measure_scale_change. Там ровно такая нормализация уже
+# была опробована и провалилась: коробка перестала отслеживать рост (тест
+# test_acq_default показал 1.00 вместо истинных 3.08, см. комментарий у
+# самой функции). Причина в разных задачах: measure_scale_change ИЩЕТ
+# разницу масштаба, и нормализация к общему размеру эту разницу стирает.
+# Здесь задача другая — искать ПОЗИЦИЮ при уже известном масштабе, и оба
+# участника (эталон и окно) масштабируются ОДИНАКОВО, так что их взаимная
+# геометрия не искажается — как при равномерном уменьшении фотографии.
+#
+# ПОРОГ. При эталоне <= этого размера scale=1.0 и поведение побитово прежнее
+# — типичные/мелкие локи (основная масса времени TRACKED) не меняются
+# вовсе. Взят близко к историческому "дешёвому" размеру 58 px (5.6 мс на
+# борту, см. комментарий у TEMPLATE_MAX) — крупнее него функция трогается,
+# мельче — работает как раньше.
+MATCH_CANONICAL_PX = 64
+
 MAX_LOCK_STEP = 32
 # --- ПЛАВНОЕ НЕДОВЕРИЕ К МАТЧУ, ТЯНУЩЕМУ ОТ ПОТОКА ---
 # Расхождение, до которого матчу верим полностью. Выше — вес падает обратно
@@ -5329,12 +5361,36 @@ def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0,
     if search.shape[0] < tmpl_h or search.shape[1] < tmpl_w:
         return False, pred_cx, pred_cy, 0.0
 
+    # НОРМАЛИЗАЦИЯ К КАНОНИЧЕСКОМУ РАЗМЕРУ (см. MATCH_CANONICAL_PX). Реальный
+    # эталон и реальное окно поиска НЕ меняются — уменьшенные копии нужны
+    # только этому вызову matchTemplate. При tmpl <= канонического размера
+    # scale=1.0 и match_search/match_tmpl это те же объекты, что search и
+    # template_gray — поведение побитово прежнее.
+    scale = 1.0
+    if max(tmpl_w, tmpl_h) > MATCH_CANONICAL_PX:
+        scale = MATCH_CANONICAL_PX / float(max(tmpl_w, tmpl_h))
+    if scale < 1.0:
+        match_search = cv2.resize(
+            search, (max(1, int(round(search.shape[1] * scale))),
+                     max(1, int(round(search.shape[0] * scale)))),
+            interpolation=cv2.INTER_AREA)
+        match_tmpl = cv2.resize(
+            template_gray, (max(1, int(round(tmpl_w * scale))),
+                            max(1, int(round(tmpl_h * scale)))),
+            interpolation=cv2.INTER_AREA)
+        if (match_search.shape[0] < match_tmpl.shape[0]
+                or match_search.shape[1] < match_tmpl.shape[1]):
+            return False, pred_cx, pred_cy, 0.0
+    else:
+        match_search = search
+        match_tmpl = template_gray
+
     try:
         if template_std < 3.0:
-            res = cv2.matchTemplate(search, template_gray, cv2.TM_SQDIFF_NORMED)
+            res = cv2.matchTemplate(match_search, match_tmpl, cv2.TM_SQDIFF_NORMED)
             score_map = 1.0 - res
         else:
-            score_map = cv2.matchTemplate(search, template_gray, cv2.TM_CCOEFF_NORMED)
+            score_map = cv2.matchTemplate(match_search, match_tmpl, cv2.TM_CCOEFF_NORMED)
     except Exception:
         return False, pred_cx, pred_cy, 0.0
 
@@ -5345,8 +5401,12 @@ def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0,
     _match_dbg["map_h"] = score_map.shape[0]
     rh, rw = score_map.shape[:2]
     yy, xx = np.mgrid[0:rh, 0:rw]
-    centers_x = sx1 + xx + tmpl_w / 2.0
-    centers_y = sy1 + yy + tmpl_h / 2.0
+    # ЦЕНТРЫ КАНДИДАТОВ В РЕАЛЬНЫХ ПИКСЕЛЯХ. score_map теперь может быть в
+    # уменьшенном представлении (scale < 1): шаг между соседними позициями
+    # карты равен 1/scale реального пикселя, а не одному. При scale=1.0
+    # деление на 1.0 — формула побитово та же, что раньше.
+    centers_x = sx1 + xx / scale + tmpl_w / 2.0
+    centers_y = sy1 + yy / scale + tmpl_h / 2.0
     dist = np.sqrt((centers_x - pred_cx) ** 2 + (centers_y - pred_cy) ** 2)
     # Нормируем штраф по фактическому margin, не по константе.
     norm = max(margin, 1)
@@ -5354,21 +5414,37 @@ def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0,
     # Цветовой отсев. Добавляется к тому же штрафу, что и расстояние, поэтому
     # выбор пика учитывает цвет, но сама величина score остаётся чисто
     # яркостной — сравнимой с прежними логами.
-    cmap = color_penalty_map(sx1, sy1, tmpl_w, tmpl_h, score_map.shape)
+    #
+    # ФОРМА ЗАПРАШИВАЕТСЯ РЕАЛЬНАЯ, а не score_map.shape: color_penalty_map
+    # сама переводит tmpl_w/sx1 в координаты цветности через целочисленное
+    # деление на 2, и эта арифметика предполагает, что shape соответствует
+    # РЕАЛЬНОМУ окну поиска. Передать ей уменьшенный shape — значит вырезать
+    # кусок цветности не там (проверено на бумаге: при scale=0.5 область
+    # сместилась бы к углу окна, а не покрывала его целиком). Дальше карту
+    # уменьшаем сами, отдельным resize, под размер score_map.
+    _real_map_h = search.shape[0] - tmpl_h + 1
+    _real_map_w = search.shape[1] - tmpl_w + 1
+    cmap = color_penalty_map(sx1, sy1, tmpl_w, tmpl_h, (_real_map_h, _real_map_w))
     _match_dbg["color_on"] = 1 if cmap is not None else 0
     if cmap is not None:
+        if scale < 1.0:
+            cmap = cv2.resize(cmap, (rw, rh), interpolation=cv2.INTER_AREA)
         penalized = penalized - COLOR_PENALTY * cmap
 
     # Отсев по движению. Не зависит от размера цели, поэтому работает там, где
     # сравнение по виду упирается в потолок: мелкая цель на фактурном фоне.
+    # Та же оговорка про форму, что у цвета: motion_penalty_map режет свой
+    # промежуточный кадр разности по shape в РЕАЛЬНЫХ координатах.
     if MOTION_GUARD_ENABLED:
         mmap, bg, sep = motion_penalty_map(
             prev_gray, gray, sx1, sy1, sx2, sy2, tmpl_w, tmpl_h,
-            score_map.shape, tgt_dx, tgt_dy)
+            (_real_map_h, _real_map_w), tgt_dx, tgt_dy)
         motion_bg = bg
         motion_separation = sep
         motion_active = mmap is not None
         if mmap is not None:
+            if scale < 1.0:
+                mmap = cv2.resize(mmap, (rw, rh), interpolation=cv2.INTER_AREA)
             penalized = penalized - MOTION_PENALTY * mmap
         _match_dbg["motion_sep"] = sep
         _match_dbg["motion_on"] = 1 if motion_active else 0
@@ -5434,8 +5510,11 @@ def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0,
     # (точность теперь ~0.1 px вместо ±0.5 px), особенно важно с маленьким
     # DEADBAND_X/Y — снимает «дребезг» крестика на покоящейся цели.
     sub_dx, sub_dy = subpixel_peak(score_map, mx, my)
-    new_cx = sx1 + mx + sub_dx + tmpl_w / 2.0
-    new_cy = sy1 + my + sub_dy + tmpl_h / 2.0
+    # (mx+sub_dx, my+sub_dy) — координаты пика В МАСШТАБЕ score_map (canonical
+    # при scale<1). Делим на scale, чтобы вернуться в реальные пиксели —
+    # при scale=1.0 это деление на 1.0, формула побитово прежняя.
+    new_cx = sx1 + (mx + sub_dx) / scale + tmpl_w / 2.0
+    new_cy = sy1 + (my + sub_dy) / scale + tmpl_h / 2.0
 
     if raw_score < MATCH_MIN_SCORE:
         return False, pred_cx, pred_cy, raw_score
