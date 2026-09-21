@@ -752,6 +752,19 @@ FLOW_RASSH_MAX = 1.12
 # и подставлять старое расширение как новое — то же, чем болел бег земли.
 FLOW_RASSH_SVEZH_S = 0.20
 
+# --- РАЗДЕЛЕНИЕ СДВИГА И МАСШТАБА В ПОТОКЕ (ТЗ next-commit spec §7) ---
+#
+# Во сколько раз медианный остаток подгонки должен быть превышен, чтобы
+# точку сочли выбросом при повторной (устойчивой) подгонке. 3x — обычный,
+# не агрессивный порог: единичная точка, зацепившаяся за фон или за чужую
+# деталь, будет отсеяна, а нормальный разброс LK-шума (доли пикселя) —
+# нет.
+FLOW_ROBUST_RESID_MULT = 3.0
+# Пол порога отсева. На чистых данных (тесты, спокойная неподвижная цель)
+# медианный остаток может быть почти нулевым — без пола порог ужался бы до
+# долей пикселя и отсеивал бы нормальные точки на собственном дрожании LK.
+FLOW_ROBUST_RESID_FLOOR_PX = 0.5
+
 FLOW_MAX_STEP = 30.0 * TRACK_SCALE
 FLOW_REFRESH_EVERY = 1
 # Параметры расчёта потока вынесены сюда, чтобы их можно было мерить перебором
@@ -2133,7 +2146,14 @@ _FLIGHT_LOG_COLUMNS = (
     "expensive_stage_skipped,skip_reason,"
     # ЗАПРЕТ АДАПТАЦИИ НА СОМНИТЕЛЬНЫХ КАДРАХ (п.9): разрешено ли шаблону
     # учиться на этом кадре и, если нет, — какая именно проверка не пройдена.
-    "template_adaptation_allowed,adapt_skip_reason"
+    "template_adaptation_allowed,adapt_skip_reason,"
+    # РАЗДЕЛЕНИЕ СДВИГА И МАСШТАБА В ПОТОКЕ (п.7): flow_lk_ok — сколько точек
+    # LK довёл до конца (до отсева выбросов), flow_quality — доля из них,
+    # согласившихся с совместной подгонкой сдвиг+масштаб. flow_translation_*/
+    # flow_scale/flow_scale_confidence — сам результат подгонки, отдельно
+    # от финальных lock_cx/lock_cy (те уже включают вклад матча).
+    "flow_lk_ok,flow_quality,flow_translation_x,flow_translation_y,"
+    "flow_scale,flow_scale_confidence"
 )
 
 # Снимок внутренностей управления за текущий кадр. Заполняется в
@@ -4053,9 +4073,100 @@ def refresh_flow_points(gray, cx, cy, w, h):
     return pts
 
 
+def _flow_fit_translation_scale(old, new, cx, cy):
+    """Совместная оценка сдвига (Tx,Ty) и масштаба (1+k) относительно
+    ИЗВЕСТНОГО центра (cx,cy) — ТЗ next-commit spec §7.
+
+    МОДЕЛЬ: new_i = (cx,cy) + T + (1+k)*(old_i - (cx,cy)), то есть каждая
+    точка сдвигается на T ПЛЮС масштабируется относительно known-центра.
+
+    ЗАЧЕМ ОТДЕЛЬНО ОТ МЕДИАНЫ (new_i - old_i). Приближающаяся цель
+    одновременно и сдвигается, и растёт. Медиана разности не различает
+    два эффекта: точка справа от центра при чистом росте (T=0) уезжает
+    ВПРАВО на величину k*rx_i, точка слева — ВЛЕВО на k*rx_i. При
+    СИММЕТРИЧНОМ облаке точек эти вклады взаимно гасятся в медиане, и
+    результат похож на правду. При НЕСИММЕТРИЧНОМ (типично: текстура есть
+    только с одной стороны цели) вклад масштаба не гасится и УТЕКАЕТ в
+    оценку сдвига — рамка едет туда, где было больше точек, хотя истинный
+    центр стоял на месте. Модель здесь оценивает T и k СОВМЕСТНО, поэтому
+    масштабный вклад объясняется своим членом, а не просачивается в T.
+
+    УСТОЙЧИВОСТЬ: один проход подгонки, отсев точек с остатком выше
+    FLOW_ROBUST_RESID_MULT медиан, повторная подгонка по уцелевшим —
+    единичная точка, зацепившаяся за фон, не должна решать общий результат.
+
+    Если облако точек слишком кучное (r_med < FLOW_RASSH_MIN_R — тот же
+    порог, что у оценки расширения, порог наблюдаемости масштаба один и
+    тот же по смыслу) или точек меньше четырёх (не хватает степеней
+    свободы на T и k сразу), масштаб не оценивается (k=0) — сдвиг берётся
+    медианой, как раньше. Это не откат к старой формуле, а частный случай
+    той же модели там, где k физически не отделить от шума.
+
+    Возвращает (Tx, Ty, k, inlier_count, scale_confidence). scale_confidence
+    — простая, без новых магических порогов, мера того, насколько остаток
+    подгонки мал относительно масштаба смещений, из которых он получен:
+    1 / (1 + RMS(остаток) / характерный_радиус). Единица — остаток пропал
+    совсем, ноль — остаток того же порядка, что сами смещения точек.
+    """
+    rx_all = old[:, 0] - cx
+    ry_all = old[:, 1] - cy
+    ddx_all = new[:, 0] - old[:, 0]
+    ddy_all = new[:, 1] - old[:, 1]
+
+    def _fit(idx):
+        rxi, ryi = rx_all[idx], ry_all[idx]
+        dxi, dyi = ddx_all[idx], ddy_all[idx]
+        r_med = float(np.median(np.hypot(rxi, ryi)))
+        k = 0.0
+        if r_med >= FLOW_RASSH_MIN_R and len(rxi) >= 4:
+            n = len(rxi)
+            A = np.zeros((2 * n, 3), dtype=np.float64)
+            b = np.zeros(2 * n, dtype=np.float64)
+            A[:n, 0] = 1.0
+            A[:n, 2] = rxi
+            b[:n] = dxi
+            A[n:, 1] = 1.0
+            A[n:, 2] = ryi
+            b[n:] = dyi
+            sol, _res, rank, _sv = np.linalg.lstsq(A, b, rcond=None)
+            if rank >= 3:
+                tx, ty, k = float(sol[0]), float(sol[1]), float(sol[2])
+            else:
+                tx, ty = float(np.median(dxi)), float(np.median(dyi))
+        else:
+            tx, ty = float(np.median(dxi)), float(np.median(dyi))
+        resid = np.hypot(dxi - (tx + k * rxi), dyi - (ty + k * ryi))
+        return tx, ty, k, resid
+
+    idx0 = np.arange(len(old))
+    Tx, Ty, k, resid = _fit(idx0)
+    med = float(np.median(resid)) if len(resid) else 0.0
+    thresh = max(FLOW_ROBUST_RESID_FLOOR_PX, med * FLOW_ROBUST_RESID_MULT)
+    inliers = idx0[resid <= thresh]
+    if FLOW_MIN_POINTS <= len(inliers) < len(idx0):
+        Tx, Ty, k, resid = _fit(inliers)
+    else:
+        resid = resid[resid <= thresh] if len(resid) else resid
+    if len(resid):
+        rms_resid = float(np.sqrt(np.mean(resid ** 2)))
+        r_char = max(float(np.median(np.hypot(
+            rx_all[inliers], ry_all[inliers]))) if len(inliers) else 0.0,
+            FLOW_RASSH_MIN_R)
+        scale_confidence = 1.0 / (1.0 + rms_resid / r_char)
+    else:
+        scale_confidence = 0.0
+    return Tx, Ty, k, len(inliers), scale_confidence
+
+
 def flow_predict(prev_g, cur_g, pts, cx, cy):
     _flow_dbg["points"] = 0 if pts is None else len(pts)
+    _flow_dbg["lk_ok"] = 0
     _flow_dbg["inliers"] = 0
+    _flow_dbg["quality"] = 0.0
+    _flow_dbg["translation_x"] = None
+    _flow_dbg["translation_y"] = None
+    _flow_dbg["scale"] = None
+    _flow_dbg["scale_confidence"] = 0.0
     if prev_g is None or pts is None or len(pts) < FLOW_MIN_POINTS:
         return False, cx, cy
     try:
@@ -4115,11 +4226,30 @@ def flow_predict(prev_g, cur_g, pts, cx, cy):
         if err is not None:
             keep = err[st].reshape(-1) < FLOW_ERR_MAX
             old, new = old[keep], new[keep]
-        _flow_dbg["inliers"] = len(new)
+        _flow_dbg["lk_ok"] = len(new)
         if len(new) < FLOW_MIN_POINTS:
             return False, cx, cy
-        dx = float(np.median(new[:, 0] - old[:, 0]))
-        dy = float(np.median(new[:, 1] - old[:, 1]))
+        # СДВИГ И МАСШТАБ СОВМЕСТНО, ОТНОСИТЕЛЬНО ИЗВЕСТНОГО ЦЕНТРА
+        # (cx, cy) — см. _flow_fit_translation_scale. При симметричном
+        # облаке точек результат совпадает с прежней медианой разности
+        # (k~0, Tx/Ty~median); расходится ровно там, где облако
+        # несимметрично, а объект одновременно и растёт — то есть ровно
+        # там, где прежняя формула была не права.
+        dx, dy, k_fit, n_inliers, scale_conf = _flow_fit_translation_scale(
+            old, new, cx, cy)
+        _flow_dbg["inliers"] = n_inliers
+        _flow_dbg["quality"] = n_inliers / float(len(new))
+        _flow_dbg["translation_x"] = dx
+        _flow_dbg["translation_y"] = dy
+        _flow_dbg["scale"] = 1.0 + k_fit
+        _flow_dbg["scale_confidence"] = scale_conf
+        # ЕСЛИ ПОСЛЕ ОТСЕВА ВЫБРОСОВ ИНЛАЙЕРОВ СЛИШКОМ МАЛО — измерение
+        # невалидно, а не «старое красивое число» (ТЗ: "не возвращать
+        # invalid measurement" в буквальном смысле — но здесь у функции нет
+        # отдельного канала для 'invalid', и контракт вызывающей стороны
+        # (True/False) уже это выражает: False = не считать результат).
+        if n_inliers < FLOW_MIN_POINTS:
+            return False, cx, cy
         if math.hypot(dx, dy) > FLOW_MAX_STEP:
             return False, cx, cy
 
@@ -9037,6 +9167,9 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("skip_reason"),
             _match_dbg.get("template_adaptation_allowed"),
             _match_dbg.get("adapt_skip_reason"),
+            _flow_dbg.get("lk_ok"), _flow_dbg.get("quality"),
+            _flow_dbg.get("translation_x"), _flow_dbg.get("translation_y"),
+            _flow_dbg.get("scale"), _flow_dbg.get("scale_confidence"),
         )
         flight_log.row(_row_values)
         # Та же строка — в папку этого захвата. Форматируем один раз здесь, а
