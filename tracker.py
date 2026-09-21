@@ -2181,7 +2181,7 @@ _FLIGHT_LOG_COLUMNS = (
     # растут, яркая улица -> падают), а не просто поверить документации.
     # ColourGains пишем тоже: AWB заморожен, но если яркость снаружи иная,
     # полезно видеть, не начали ли цвета от этого плыть.
-    "cam_exp_us,cam_gain,cam_colour_u,cam_colour_v"
+    "cam_exp_us,cam_gain,cam_colour_gain_r,cam_colour_gain_b"
 )
 
 # Снимок внутренностей управления за текущий кадр. Заполняется в
@@ -2242,26 +2242,36 @@ def _read_cpu_freq_mhz():
 # AeEnable=True). Чтобы на бортовом бенче было видно, что автоматика
 # реально следует за освещением (тёмная комната -> выдержка/gain растут,
 # яркая улица -> падают), а не просто "мы поверили документации" — читаем
-# фактические значения из camera_metadata тем же 1-Гц таймером, что CMA и
-# CPU. capture_metadata() — синхронный вызов к камере, гонять его каждый
-# кадр (24 раза в секунду) незачем: экспозиция не меняется настолько быстро.
+# фактические значения раз в секунду тем же таймером, что CMA и CPU.
+#
+# ИСТОЧНИК — request.get_metadata(), а НЕ picam2.capture_metadata(). Эта
+# функция вызывается из camera_callback, который сам является
+# picam2.pre_callback — то есть уже выполняется внутри event loop камеры.
+# capture_metadata() сам инициирует отдельный запрос и ждёт его — вызов
+# такого рода из pre_callback официально не рекомендован (риск дедлока
+# вплоть до зависания камеры). У текущего request, который и так передан
+# в callback, метаданные уже готовы — берём их напрямую, без дополнительных
+# запросов к камере и без нового потока.
 _cam_exp_us = None
 _cam_gain = None
-_cam_colour_u = None
-_cam_colour_v = None
+_cam_colour_gain_r = None
+_cam_colour_gain_b = None
 
 
-def _read_cam_exposure_metadata():
-    """(exp_us, gain, colour_u, colour_v) из живых метаданных камеры, или
-    (None, None, None, None) при любой ошибке — камера может быть ещё не
-    готова, и диагностика не должна ронять кадр из-за этого."""
+def _read_cam_exposure_metadata(request):
+    """(exp_us, gain, colour_gain_r, colour_gain_b) из метаданных ТЕКУЩЕГО
+    request (уже переданного в camera_callback), или (None, None, None,
+    None) при любой ошибке — метаданные могут быть ещё не готовы, и
+    диагностика не должна ронять кадр из-за этого. ColourGains — не
+    цветность изображения (ту несёт chroma_u/chroma_v), а коэффициенты
+    баланса белого (red/blue gain) — отсюда разные имена."""
     try:
-        md = picam2.capture_metadata()
+        md = request.get_metadata()
         exp = md.get("ExposureTime")
         gain = md.get("AnalogueGain")
         colour = md.get("ColourGains")
-        cu, cv_ = (colour[0], colour[1]) if colour else (None, None)
-        return exp, gain, cu, cv_
+        gr, gb = (colour[0], colour[1]) if colour else (None, None)
+        return exp, gain, gr, gb
     except Exception:
         return None, None, None, None
 
@@ -9619,7 +9629,7 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("manual_nudge_dy"),
             _match_dbg.get("aux2_raw"), _match_dbg.get("aux3_raw"),
             _match_dbg.get("nudge_rc_fresh"),
-            _cam_exp_us, _cam_gain, _cam_colour_u, _cam_colour_v,
+            _cam_exp_us, _cam_gain, _cam_colour_gain_r, _cam_colour_gain_b,
         )
         flight_log.row(_row_values)
         # Та же строка — в папку этого захвата. Форматируем один раз здесь, а
@@ -9893,21 +9903,23 @@ def camera_callback(request):
     global chroma_u, chroma_v, _gs_n
     global _last_main_mean, _cma_free_kb, _cma_read_t
     global _cpu_temp_c, _cpu_freq_mhz
-    global _cam_exp_us, _cam_gain, _cam_colour_u, _cam_colour_v
+    global _cam_exp_us, _cam_gain, _cam_colour_gain_r, _cam_colour_gain_b
     _cb_t0 = time.monotonic()
-    # CMA + CPU temp/freq + экспозиция раз в секунду: чтение /proc, /sys и
-    # capture_metadata() дешевле, чем блокировать callback, но каждый кадр
-    # всё равно ни к чему — экспозиция не меняется настолько быстро, а
-    # частый опрос camera_metadata рискует задеть frame interval, который
-    # обязан остаться около 1/CAM_FPS (динамический AE это не меняет).
+    # CMA + CPU temp/freq + экспозиция раз в секунду: чтение /proc, /sys
+    # дешевле, чем блокировать callback, но каждый кадр всё равно ни к
+    # чему — экспозиция не меняется настолько быстро. Метаданные экспозиции
+    # берём из ТЕКУЩЕГО request (см. _read_cam_exposure_metadata) — никакого
+    # отдельного запроса к камере тут нет, поэтому частота колбэка это не
+    # задевает; обновляем всё равно раз в секунду просто чтобы не тратить
+    # время на парсинг словаря metadata каждый кадр.
     # Обновляем и в idle-ветке — иначе на длинной паузе значение устареет.
     # Один и тот же таймер на все метрики: меняются на одном масштабе времени.
     if _cb_t0 - _cma_read_t >= CMA_READ_PERIOD_S:
         _cma_free_kb = _read_cma_free_kb()
         _cpu_temp_c = _read_cpu_temp_c()
         _cpu_freq_mhz = _read_cpu_freq_mhz()
-        _cam_exp_us, _cam_gain, _cam_colour_u, _cam_colour_v = (
-            _read_cam_exposure_metadata())
+        _cam_exp_us, _cam_gain, _cam_colour_gain_r, _cam_colour_gain_b = (
+            _read_cam_exposure_metadata(request))
         _cma_read_t = _cb_t0
     try:
         with state_lock:
@@ -10291,11 +10303,14 @@ def main():
         else:
             # ОТКАТ: AeEnable не значится в camera_controls этой камеры/
             # сборки picamera2 — прежнее (статичное) поведение честнее,
-            # чем слепая попытка включить неподдерживаемый control.
+            # чем слепая попытка включить неподдерживаемый control. Ключ
+            # "AeEnable" здесь НЕ ставим вовсе (ни True, ни False) — раз
+            # его нет в camera_controls, любое его значение потенциально
+            # неподдерживаемый control; настоящий откат — просто не трогать
+            # его и явно задать ExposureTime/AnalogueGain, как раньше.
             exp = int(md.get("ExposureTime", 8000))
             exp = min(exp, 33000)
             ctrl = {
-                "AeEnable": False,
                 "AwbEnable": False,
                 "ExposureTime": exp,
                 "AnalogueGain": float(md.get("AnalogueGain", 1.0)),

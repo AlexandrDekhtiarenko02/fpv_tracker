@@ -42,15 +42,19 @@ for v in vilki:
 
 print("\n=== 3. Закрепляется ПОВТОРНО после настройки AE ===")
 # Иначе в части версий libcamera частота уедет обратно к «как получится»,
-# причём молча и только на борту. Якорь — ctrl["FrameDurationLimits"]:
-# он ставится ОДИН РАЗ после if/else (динамический AE или статичный откат,
-# если AeEnable нет в camera_controls этой камеры), а не внутри одной
-# конкретной ветки — оба пути обязаны получить это закрепление одинаково.
-i = src.index('ctrl["FrameDurationLimits"]')
-golova = src[max(0, i - 800):i]
-assert "AeEnable" in golova, (
-    "закрепление FrameDurationLimits найдено не в блоке настройки AE — "
-    "тест сам по себе не там ищет")
+# причём молча и только на борту. Якорь — начало блока настройки AE
+# (проверка camera_controls), а не фиксированное окно символов назад от
+# FrameDurationLimits: комментарии внутри блока меняются по длине, и
+# окно-в-символах — хрупкий якорь. Порядок важен: FrameDurationLimits
+# обязан идти ПОСЛЕ начала блока (после if/else — динамический AE или
+# статичный откат, если AeEnable нет в camera_controls этой камеры), а не
+# где-то в другом, не связанном с AE месте файла.
+i_ae_block = src.index('_controls_dostupny = getattr(picam2, "camera_controls"')
+i_fd = src.index('ctrl["FrameDurationLimits"]', i_ae_block)
+i_except = src.index("except Exception:\n        pass", i_ae_block)
+assert i_ae_block < i_fd < i_except, (
+    "закрепление FrameDurationLimits найдено не внутри блока настройки AE "
+    "— тест сам по себе не там ищет")
 print("    закрепляется после обеих веток (динамический AE / статичный откат)")
 
 print("\n=== 4. Бюджет кадра больше замеренной обработки ===")
