@@ -109,18 +109,25 @@ CAM_W, CAM_H = LORES_W, LORES_H   # уточняется ниже, после RE
 
 # DRM preview — окно картинки на физическом дисплее/VTX.
 # PREVIEW_W / PREVIEW_H — размер окна. На FPV-выходах часто полезно слегка
-# уменьшить, чтобы интерфейс не уходил за safe area дисплея.
+# уменьшить, чтобы интерфейс не уходил за safe area дисплея. Камера отдаёт
+# 640x480 (4:3), окно тут 720x576 (5:4/PAL-подобное) — разное соотношение
+# сторон, и чёрная полоса сверху может рождаться именно на этом
+# несовпадении/масштабировании DRM plane, а не в вертикальном offset'е.
 # PREVIEW_X / PREVIEW_Y — смещение окна на дисплее. ТОЛЬКО экран: этот
 # offset — параметр DRM-композитора, к main/lores буферам и координатам
 # трекера отношения не имеет (start_preview ниже — единственное место,
 # где он используется). Сдвигать прицел и рамку он не может.
 #
-# PREVIEW_Y=-2 лечит тонкую чёрную полосу сверху (offset композитора DRM
-# на паре пикселей — сдвигаем картинку вверх, чтобы её съесть).
-# Подбирай эмпирически: полоса сверху → уменьшай PREVIEW_Y ещё,
-# обрезается снизу → уменьшай PREVIEW_H, обрезается справа → PREVIEW_W.
+# PREVIEW_Y=-2 ПРОВЕРЕНО СТЕНДОМ И НЕ ПОМОГЛО: чёрная полоса сверху осталась
+# на месте — гипотеза "простой vertical offset DRM-композитора" не
+# подтвердилась. Возвращено на 0. Диагностика (см. _mean_top_strip в
+# camera_callback, поле cam_top_row_mean в CSV) должна сначала показать,
+# есть ли эта полоса ВНУТРИ main-кадра (тогда дело в камере/ISP) или она
+# рождается только на физическом DRM/VTX выводе (тогда дело в scaling/mode
+# самого DRM plane, см. несовпадение 640x480 vs 720x576 выше) — до этого
+# офсет менять вслепую не имеет смысла.
 PREVIEW_W, PREVIEW_H = 720, 576
-PREVIEW_X, PREVIEW_Y = 0, -2
+PREVIEW_X, PREVIEW_Y = 0, 0
 CENTER_X, CENTER_Y = MAIN_W // 2, MAIN_H // 2
 CENTER_X_LORES, CENTER_Y_LORES = LORES_W // 2, LORES_H // 2
 
@@ -2175,13 +2182,19 @@ _FLIGHT_LOG_COLUMNS = (
     # бортовом логе сразу было видно, что копии стика реально приходят и
     # плавно идут вместе с рукой, а не застыли на каком-то значении.
     "aux2_raw,aux3_raw,nudge_rc_fresh,"
-    # ДИНАМИЧЕСКАЯ ЭКСПОЗИЦИЯ (camera/display commit). ExposureTime/
-    # AnalogueGain больше не фиксируются после старта — на разборе должно
-    # быть видно, что они реально следуют за освещением (тёмная комната ->
-    # растут, яркая улица -> падают), а не просто поверить документации.
-    # ColourGains пишем тоже: AWB заморожен, но если яркость снаружи иная,
-    # полезно видеть, не начали ли цвета от этого плыть.
-    "cam_exp_us,cam_gain,cam_colour_gain_r,cam_colour_gain_b"
+    # ДИНАМИЧЕСКАЯ ЭКСПОЗИЦИЯ И AWB (camera/display commit). ExposureTime/
+    # AnalogueGain/ColourGains больше не фиксируются после старта — на
+    # разборе должно быть видно, что они реально следуют за освещением
+    # (тёмная комната -> выдержка/gain растут, яркая улица -> падают,
+    # ColourGains едут вслед за цветовой температурой), а не просто
+    # поверить документации.
+    "cam_exp_us,cam_gain,cam_colour_gain_r,cam_colour_gain_b,"
+    # ДИАГНОСТИКА ЧЁРНОЙ ПОЛОСЫ СВЕРХУ PREVIEW. cam_top_row_mean — средняя
+    # яркость первых нескольких строк main-кадра (ДО оверлея). Сравнить с
+    # mean_gray (вся яркость кадра, уже пишется рядом с чёрным экраном) —
+    # если top_row заметно темнее общего, полоса внутри данных камеры;
+    # если совпадает — полоса рождается только на физическом DRM-выводе.
+    "cam_top_row_mean"
 )
 
 # Снимок внутренностей управления за текущий кадр. Заполняется в
@@ -2196,6 +2209,26 @@ _last_main_mean = None
 _cma_free_kb = None
 _cma_read_t = 0.0
 CMA_READ_PERIOD_S = 1.0
+
+# ДИАГНОСТИКА ЧЁРНОЙ ПОЛОСЫ СВЕРХУ PREVIEW (camera/display commit).
+# На стенде PREVIEW_Y=-2 не убрал полосу — значит гипотеза "простой offset
+# DRM-композитора" неверна, и прежде чем трогать что-либо ещё, нужно
+# установить, есть ли эта полоса ВНУТРИ main-кадра (данные камеры/ISP) или
+# только на физическом DRM/VTX выводе (display path). Меряем среднюю
+# яркость (G-канал) первых нескольких строк main-буфера — если она заметно
+# темнее, чем средняя яркость всего кадра, полоса внутри самих данных
+# камеры; если совпадает — источник строго в выводе на экран.
+_MAIN_TOP_STRIP_ROWS = 4
+_last_main_top_mean = None
+
+
+def _mean_top_strip(main_array):
+    """Средняя яркость (G-канал) первых _MAIN_TOP_STRIP_ROWS строк
+    main-кадра, или None при ошибке."""
+    try:
+        return float(main_array[:_MAIN_TOP_STRIP_ROWS, :, 1].mean())
+    except Exception:
+        return None
 
 
 def _read_cma_free_kb():
@@ -9377,13 +9410,16 @@ def print_debug_once_per_second():
 
     mot_s = " ".join([f"M{i+1}:{int(v)}" for i, v in enumerate(motors[:4])]) if motors else "M:NA"
 
-    # Экспозиция динамическая (AeEnable=True после старта) — на бенчевом
-    # переносе тёмное/светлое эти два числа обязаны сами ехать, без
-    # перезапуска программы. mean_gray — из того же снимка, что уже пишется
-    # в CSV (диагностика чёрного экрана), сюда добавлен для одного взгляда.
+    # Экспозиция/AWB динамические (AeEnable/AwbEnable=True после старта) —
+    # на бенчевом переносе тёмное/светлое эти числа обязаны сами ехать, без
+    # перезапуска программы. MEAN/TOPMEAN — диагностика чёрной полосы
+    # сверху preview: если TOPMEAN заметно ниже MEAN, полоса внутри
+    # main-кадра (камера/ISP), а не только на физическом DRM-выводе.
     _exp_s = "%d" % _cam_exp_us if _cam_exp_us is not None else "NA"
     _gain_s = "%.2f" % _cam_gain if _cam_gain is not None else "NA"
     _mg_s = "%.0f" % _last_main_mean if _last_main_mean is not None else "NA"
+    _tmg_s = ("%.0f" % _last_main_top_mean
+              if _last_main_top_mean is not None else "NA")
 
     print(
         f"FPS:{fps_current:5.1f} | {st:<7} | OV:{ov} | "
@@ -9391,7 +9427,7 @@ def print_debug_once_per_second():
         f"AUX2(nudgeR):{a2} AUX3(nudgeP):{a3} | "
         f"CMD R{r_out:4d} P{p_out:4d} Y{y_out:4d} T{t_out:4d} | "
         f"SENT AETR R{s0:4d} P{s1:4d} T{s2:4d} Y{s3:4d} | "
-        f"EXP:{_exp_s}us GAIN:{_gain_s} MEAN:{_mg_s} | "
+        f"EXP:{_exp_s}us GAIN:{_gain_s} MEAN:{_mg_s} TOPMEAN:{_tmg_s} | "
         f"{mot_s}",
         flush=True
     )
@@ -9630,6 +9666,7 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("aux2_raw"), _match_dbg.get("aux3_raw"),
             _match_dbg.get("nudge_rc_fresh"),
             _cam_exp_us, _cam_gain, _cam_colour_gain_r, _cam_colour_gain_b,
+            _last_main_top_mean,
         )
         flight_log.row(_row_values)
         # Та же строка — в папку этого захвата. Форматируем один раз здесь, а
@@ -9901,7 +9938,7 @@ KADR_OSHIBKA_PERIOD_S = 2.0
 
 def camera_callback(request):
     global chroma_u, chroma_v, _gs_n
-    global _last_main_mean, _cma_free_kb, _cma_read_t
+    global _last_main_mean, _last_main_top_mean, _cma_free_kb, _cma_read_t
     global _cpu_temp_c, _cpu_freq_mhz
     global _cam_exp_us, _cam_gain, _cam_colour_gain_r, _cam_colour_gain_b
     _cb_t0 = time.monotonic()
@@ -9944,6 +9981,7 @@ def camera_callback(request):
                     _last_main_mean = float(mm.array[:, :, 1].mean())
                 except Exception:
                     _last_main_mean = None
+                _last_main_top_mean = _mean_top_strip(mm.array)
                 draw_overlay_on_frame(mm.array)
             _capture_flight_row(_cb_t0)
             return
@@ -10010,6 +10048,7 @@ def camera_callback(request):
                 _last_main_mean = float(mm.array[:, :, 1].mean())
             except Exception:
                 _last_main_mean = None
+            _last_main_top_mean = _mean_top_strip(mm.array)
             draw_overlay_on_frame(mm.array)
         _capture_flight_row(_cb_t0)
     except Exception:
@@ -10196,20 +10235,13 @@ def main():
     config = picam2.create_preview_configuration(**kwargs)
     picam2.configure(config)
     picam2.pre_callback = camera_callback
-    # ИЗОЛИРОВАНО В DISPLAY PATH. Если конкретный DRM backend не принимает
-    # отрицательный y (поведение зависит от композитора/драйвера, не
-    # проверено на всех платах), откатываемся на y=0 — то есть на прежнее
-    # поведение с полосой — а НЕ подменяем офсет кропом tracking-кадра:
-    # это два разных слоя, и путать их значило бы чинить экран ценой
-    # смещения координат, по которым решает трекер.
-    try:
-        picam2.start_preview(Preview.DRM, x=PREVIEW_X, y=PREVIEW_Y,
-                             width=PREVIEW_W, height=PREVIEW_H)
-    except Exception as _exc:
-        print("[tracker] PREVIEW_Y=%d отклонён DRM backend (%s), "
-              "откат на y=0" % (PREVIEW_Y, _exc), flush=True)
-        picam2.start_preview(Preview.DRM, x=PREVIEW_X, y=0,
-                             width=PREVIEW_W, height=PREVIEW_H)
+    # ИЗОЛИРОВАНО В DISPLAY PATH — offset тут параметр DRM-композитора,
+    # к main/lores буферам и координатам трекера отношения не имеет.
+    # PREVIEW_Y=-2 проверено стендом и не убрало чёрную полосу сверху —
+    # сейчас 0 (см. константы выше), пока диагностика не покажет
+    # действительный источник полосы.
+    picam2.start_preview(Preview.DRM, x=PREVIEW_X, y=PREVIEW_Y,
+                         width=PREVIEW_W, height=PREVIEW_H)
     picam2.start()
 
     # ЧАСТОТА КАДРОВ ЗАКРЕПЛЯЕТСЯ ЖЁСТКО, а не задаётся вилкой.
@@ -10266,7 +10298,7 @@ def main():
             stable = 0
         prev = cur
     _settle_s = time.monotonic() - t_wait0
-    # ЭКСПОЗИЦИЯ ОСТАЁТСЯ ДИНАМИЧЕСКОЙ, БАЛАНС БЕЛОГО — ЗАМОРАЖИВАЕТСЯ.
+    # ЭКСПОЗИЦИЯ И БАЛАНС БЕЛОГО — ОБА ДИНАМИЧЕСКИЕ.
     #
     # Раньше ExposureTime/AnalogueGain фиксировались тем значением, к
     # которому камера пришла за первые CAM_SETTLE_MAX_S секунд. Если
@@ -10275,16 +10307,23 @@ def main():
     # перезапуска программы: замороженная выдержка не следит за реальным
     # освещением уже никак.
     #
-    # AWB остаётся замороженным ПОСЛЕ того же ожидания: ColourGains — то,
-    # к чему автоматика пришла за CAM_SETTLE_MAX_S. Динамический AWB в
-    # этом же коммите НЕ включается — блуждание U/V во время работы
-    # отдельно повлияет на цветовой отсев слежения (COLOR_GUARD_ENABLED/
-    # TRACK_ON_COLOR), а разбираться разом с двумя новыми источниками
-    # изменчивости в одном заходе — усложнить диагностику вдвое.
+    # AWB СНАЧАЛА тоже замораживался (AwbEnable=False + ColourGains, снятые
+    # за то же CAM_SETTLE_MAX_S) — решение из первой версии этого коммита,
+    # чтобы не разбираться разом с двумя новыми источниками изменчивости.
+    # Стендовый прогон это решение опроверг: старт в тёмном помещении с
+    # тёплым искусственным светом даёт ColourGains под этот свет, а после
+    # выноса на дневной — AE (динамический) верно уменьшает выдержку, но
+    # ЦВЕТ остаётся «комнатным», и картинка идёт сине-фиолетовым оттенком.
+    # Постоянно неверный баланс белого при смене освещения хуже, чем риск
+    # некоторого дрейфа ColourGains во время работы — поэтому AWB теперь
+    # тоже AwbEnable=True, ColourGains после startup-settle не фиксируются.
+    # COLOR_GUARD_ENABLED/TRACK_ON_COLOR/пороги цветового трекинга в этом
+    # же коммите не трогаются — если динамический AWB создаст им проблему,
+    # это отдельная, следующая правка по факту нового стендового прогона.
     #
-    # ПРОВЕРКА ДОСТУПНЫХ CONTROLS, а не слепая установка: AeEnable — то,
-    # что драйвер и так использует по умолчанию до этого самого кода
-    # (следовательно, он обязан быть в списке для этой камеры), но
+    # ПРОВЕРКА ДОСТУПНЫХ CONTROLS, а не слепая установка: AeEnable/AwbEnable
+    # — то, что драйвер и так использует по умолчанию до этого самого кода
+    # (следовательно, они обязаны быть в списке для этой камеры), но
     # падать в незнакомое исключение при старте — хуже, чем откатиться
     # на прежнее (статичное) поведение с понятной причиной в логе.
     try:
@@ -10292,14 +10331,13 @@ def main():
     except Exception:
         _controls_dostupny = {}
     _ae_dostupen = "AeEnable" in _controls_dostupny
+    _awb_dostupen = "AwbEnable" in _controls_dostupny
     try:
         md = picam2.capture_metadata()
         colour = md.get("ColourGains", None)
+        ctrl = {}
         if _ae_dostupen:
-            ctrl = {
-                "AeEnable": True,
-                "AwbEnable": False,
-            }
+            ctrl["AeEnable"] = True
         else:
             # ОТКАТ: AeEnable не значится в camera_controls этой камеры/
             # сборки picamera2 — прежнее (статичное) поведение честнее,
@@ -10310,36 +10348,39 @@ def main():
             # его и явно задать ExposureTime/AnalogueGain, как раньше.
             exp = int(md.get("ExposureTime", 8000))
             exp = min(exp, 33000)
-            ctrl = {
-                "AwbEnable": False,
-                "ExposureTime": exp,
-                "AnalogueGain": float(md.get("AnalogueGain", 1.0)),
-            }
-        if colour is not None:
+            ctrl["ExposureTime"] = exp
+            ctrl["AnalogueGain"] = float(md.get("AnalogueGain", 1.0))
+        if _awb_dostupen:
+            ctrl["AwbEnable"] = True
+        elif colour is not None:
+            # ОТКАТ: тот же принцип, что для AE — AwbEnable отсутствует в
+            # camera_controls, значит настоящий откат — прежнее статичное
+            # поведение (зафиксированные ColourGains), а не попытка
+            # включить неподдерживаемый control.
             ctrl["ColourGains"] = tuple(colour)
         # Закрепляем частоту ЗАНОВО: в некоторых версиях libcamera установка
-        # AE-контролов сбрасывает предел длительности кадра, и частота
-        # уезжает обратно к «как получится». AE обязан оставаться в
-        # пределах этого потолка — сама выдержка меняться может, частота
-        # кадров нет.
+        # AE/AWB-контролов сбрасывает предел длительности кадра, и частота
+        # уезжает обратно к «как получится». AE/AWB обязаны оставаться в
+        # пределах этого потолка — сама выдержка и цвет меняться могут,
+        # частота кадров нет.
         ctrl["FrameDurationLimits"] = (_fd, _fd)
         picam2.set_controls(ctrl)
-        # ЧТО ИМЕННО ЗАФИКСИРОВАНО/ОСТАВЛЕНО ЖИВЫМ — в журнал. Баланс белого
-        # фиксируется тем, к чему камера успела прийти. Если она не успела
-        # или свет другой, цвета уезжают, а цветовой отсев остаётся без
-        # работы: в вечерних прогонах цель приходила почти серой (U=125
-        # V=126 при нейтрали 128), тогда как утром тот же предмет давал
-        # U=85 V=203. Без этой записи причину не отличить от «предмет
-        # просто не цветной».
+        # ЧТО ИМЕННО ДИНАМИЧЕСКОЕ/ЗАФИКСИРОВАНО — в журнал. Раньше в
+        # вечерних прогонах со статичным AWB цель приходила почти серой
+        # (U=125 V=126 при нейтрали 128), тогда как утром тот же предмет
+        # давал U=85 V=203 — без этой записи причину не отличить от
+        # «предмет просто не цветной».
         flight_log.event(
             "КАМЕРА: настройка за %.1f с. Экспозиция %s (снимок на момент "
-            "старта: выдержка %d мкс, усиление %.2f), баланс белого "
-            "зафиксирован: %s"
+            "старта: выдержка %d мкс, усиление %.2f), баланс белого %s "
+            "(снимок ColourGains на момент старта: %s)"
             % (_settle_s,
                "ДИНАМИЧЕСКАЯ (AeEnable=True)" if _ae_dostupen
                else "СТАТИЧНАЯ — AeEnable нет в camera_controls, откат",
                int(md.get("ExposureTime", 0)),
                float(md.get("AnalogueGain", 1.0)),
+               "ДИНАМИЧЕСКИЙ (AwbEnable=True)" if _awb_dostupen
+               else "СТАТИЧНЫЙ — AwbEnable нет в camera_controls, откат",
                ("%.2f/%.2f" % tuple(colour)) if colour else "не задан"))
     except Exception:
         pass
