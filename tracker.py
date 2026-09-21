@@ -2161,7 +2161,11 @@ _FLIGHT_LOG_COLUMNS = (
     # разборе, не гадая по времени. scale_source — что мерило размер в этом
     # кадре: match_scale (примерка масштаба), segment (связная компонента)
     # или none (в этом кадре не мерили вовсе).
-    "geometry_epoch,scale_source"
+    "geometry_epoch,scale_source,"
+    # РУЧНАЯ КОРРЕКЦИЯ РАМКИ (п.11/п.13): активна ли она в этом кадре и
+    # какой сдвиг применён — отдельно от geometry_epoch/template_
+    # adaptation_allowed, которые эта коррекция запускает.
+    "manual_nudge,manual_nudge_dx,manual_nudge_dy"
 )
 
 # Снимок внутренностей управления за текущий кадр. Заполняется в
@@ -5708,12 +5712,23 @@ def _template_adaptation_gate(score, flow_ok):
     сомнителен и для того, чтобы кормить шаблон. flow_ok добавлен отдельно:
     без потока нечем подтвердить, что абсолютный якорь не сидит на фоне.
 
-    НЕ ЗАКРЫВАЕТ manual_correction_active и geometry_discontinuity из
-    спеки — этих понятий в коде пока нет (soft re-anchor / geometry_epoch,
-    следующий этап). Место для них — здесь, двумя новыми условиями.
+    ЗАКРЫВАЕТ manual_correction_active/geometry_discontinuity ОДНИМ общим
+    условием: после reanchor_tracker_at_current_box (ручная коррекция или
+    любой будущий источник re-anchor) позиция ещё не подтверждена свежим
+    измерением — учить эталон на непроверенном месте рискованно. Флаг сам
+    снимается первым же кадром со свежим потоком, дальше решают обычные
+    проверки ниже.
 
     Возвращает (allowed, reason). reason пусто, если allowed=True.
     """
+    global _adapt_frozen_posle_reanchor
+    if _adapt_frozen_posle_reanchor:
+        if flow_ok:
+            # Первый кадр со свежим потоком после re-anchor — позиция
+            # подтверждена, дальше решают обычные проверки ниже.
+            _adapt_frozen_posle_reanchor = False
+        else:
+            return False, "reanchor_cooldown"
     if not flow_ok:
         return False, "no_flow"
     if MATCH_AMBIGUITY_GUARD:
@@ -8345,6 +8360,76 @@ def draw_overlay_on_frame(frame):
     draw_sensor_report(frame)
     draw_control_state(frame)
 
+# --- РУЧНАЯ КОРРЕКЦИЯ РАМКИ ВО ВРЕМЯ TRACKED (ТЗ next-commit spec §11/§12) ---
+#
+# Оператору нужен способ поправить чуть съехавшую рамку без полного
+# LOST -> ACQ (пересъём эталона на новом месте, пауза до готовности). По
+# указанию пилота — на ПРАВОМ стике, каналы roll/pitch: во время TRACKED
+# с override эти каналы и так подменяются PID-выходом трекера, и полётник
+# их живое значение от пилота не видит вовсе (Betaflight ждёт override-
+# кадры). Стик, который сейчас ничего не делает для полётника, становится
+# входом для трекера — это не отнимает у пилота ничего, чем он уже владеет.
+#
+# ВХОД СКОРОСТНОЙ, а не абсолютный: отклонение стика задаёт СКОРОСТЬ сдвига
+# рамки (px/с), а не координату. Абсолютный mapping заставил бы рамку
+# дёргаться к точке, куда указывает стик В ЭТОТ МОМЕНТ, что для стика без
+# самоцентровки на позицию неприменимо и физически не то, чем стик является.
+MANUAL_NUDGE_ENABLED = True
+# Мёртвая зона вокруг центра стика (в единицах RC, центр 1500). Меньше — и
+# обычное дрожание пальца на стике во время обычного полёта с override
+# постоянно чуть двигало бы рамку. Взято долей от полного хода (500 от
+# центра до края): 60 из 500 — это 12%, заметно шире обычного шума канала,
+# но оставляет достаточно хода для самой коррекции.
+MANUAL_NUDGE_DEADBAND_US = 60.0
+# Скорость рамки при полном отклонении стика, px/с (в координатах LORES).
+# 60 px/с пересекает весь кадр 320 px примерно за 5 секунд при полном
+# стике — управляемая, не резкая коррекция; спеке важно "аккуратно
+# поправить", а не быстро перебросить рамку.
+MANUAL_NUDGE_MAX_PX_S = 60.0
+# Знаки осей — как ROLL_SIGN/PITCH_SIGN у самого управления: физическая
+# ориентация приёмника и камеры не гарантирует «стик вправо = рамка
+# вправо» без проверки на конкретном борту. Меняются на месте так же, как
+# и остальные знаки в этом файле.
+MANUAL_NUDGE_ROLL_SIGN = 1
+MANUAL_NUDGE_PITCH_SIGN = 1
+
+# Был ли nudge активен на ПРОШЛОМ кадре — нужно для edge-детекта отпускания
+# стика (переход True -> False = «оператор закончил, пора re-anchor»).
+_nudge_was_active = False
+# Заморозка адаптации шаблона после re-anchor (ТЗ §12 п.6): позиция ещё не
+# подтверждена свежим match/flow, учить эталон на непроверенном месте
+# рискованно. Снимается, как только придёт хотя бы один кадр со свежим
+# потоком (flow_ok=True) после re-anchor.
+_adapt_frozen_posle_reanchor = False
+
+
+def reanchor_tracker_at_current_box(gray, reason):
+    """Мягкая перепривязка ВНУТРИ TRACKED, без LOST->ACQ (ТЗ §12).
+
+    Вызывается при отпускании manual nudge: центр/размер box уже поправлены
+    оператором (или иным источником коррекции в будущем — сигнатура не
+    привязана конкретно к стику), трекеру нужно продолжить именно с этой
+    геометрии.
+
+    1. prev_pts переснимаются НА НОВОМ месте — старые несли бы смещение
+       коррекции как будто это было движение самой цели, и следующий
+       flow_predict увидел бы ложный рывок.
+    2. Derivative-история рвётся начисто через _reset_geometry_history —
+       новая geometry_epoch, размер до и после коррекции не считается
+       одной производной (ТЗ §12 п.5).
+    3. Адаптация шаблона замораживается до первого кадра со свежим потоком
+       — позиция после ручной правки ещё не подтверждена измерением.
+    """
+    global prev_pts, prev_gray, _adapt_frozen_posle_reanchor
+    _reset_geometry_history(reason)
+    prev_pts = refresh_flow_points(gray, lock_cx, lock_cy, lock_w, lock_h)
+    prev_gray = gray.copy()
+    _adapt_frozen_posle_reanchor = True
+    flight_log.event(
+        "REANCHOR epoch=%d after=(%.1f,%.1f,%.1f,%.1f)"
+        % (geometry_epoch, lock_cx, lock_cy, lock_w, lock_h))
+
+
 # =========================================================
 # 10. TRACKING CORE (без изменений)
 # =========================================================
@@ -8363,6 +8448,7 @@ def process_locked_tracker(gray, cb_t0=None):
     global auto_reacq_attempts
     global template_scale_acc, color_axis
     global lock_w0, lock_h0
+    global _nudge_was_active
 
     frame_index += 1
 
@@ -8559,6 +8645,89 @@ def process_locked_tracker(gray, cb_t0=None):
 
     if lock_cx is None or lock_w is None or template_gray is None:
         reset_tracking(to_acq=True)
+        return
+
+    # РУЧНАЯ КОРРЕКЦИЯ РАМКИ (ТЗ §11) — правым стиком, каналы roll/pitch.
+    # Проверяется РАНЬШЕ flow/match: пока оператор правит рамку рукой, эти
+    # два измерения не должны вообще запускаться — иначе искусственный
+    # (от коррекции) сдвиг рамки flow_predict принял бы за движение цели
+    # (ТЗ: "нельзя считать сдвиг рамки физическим optical-flow motion"), а
+    # matchTemplate искал бы совпадение там, где его больше нет.
+    _nudge_active = False
+    _nudge_dx = _nudge_dy = 0.0
+    if MANUAL_NUDGE_ENABLED:
+        with state_lock:
+            _rc_live = app_state.get("receiver_channels")
+        if _rc_live and len(_rc_live) >= 2:
+            # RPYT-порядок MSP_RC: ch[0]=Roll, ch[1]=Pitch (см. fc_io_loop).
+            # Живой стик пилота, а не эхо оверрайда — receiver_channels уже
+            # отфильтрован от этого в fc_io_loop.
+            _roll_dev = float(_rc_live[0]) - 1500.0
+            _pitch_dev = float(_rc_live[1]) - 1500.0
+            _half = 500.0 - MANUAL_NUDGE_DEADBAND_US
+            if abs(_roll_dev) > MANUAL_NUDGE_DEADBAND_US:
+                _roll_exc = _roll_dev - math.copysign(
+                    MANUAL_NUDGE_DEADBAND_US, _roll_dev)
+                _roll_norm = clamp(_roll_exc / _half, -1.0, 1.0)
+                _nudge_dx = (MANUAL_NUDGE_ROLL_SIGN * _roll_norm
+                            * MANUAL_NUDGE_MAX_PX_S / CAM_FPS)
+                _nudge_active = True
+            if abs(_pitch_dev) > MANUAL_NUDGE_DEADBAND_US:
+                _pitch_exc = _pitch_dev - math.copysign(
+                    MANUAL_NUDGE_DEADBAND_US, _pitch_dev)
+                _pitch_norm = clamp(_pitch_exc / _half, -1.0, 1.0)
+                _nudge_dy = (MANUAL_NUDGE_PITCH_SIGN * _pitch_norm
+                            * MANUAL_NUDGE_MAX_PX_S / CAM_FPS)
+                _nudge_active = True
+
+    _match_dbg["manual_nudge"] = 1 if _nudge_active else 0
+    _match_dbg["manual_nudge_dx"] = _nudge_dx
+    _match_dbg["manual_nudge_dy"] = _nudge_dy
+
+    if _nudge_active:
+        if not _nudge_was_active:
+            flight_log.event("MANUAL_NUDGE start")
+        _nudge_was_active = True
+        lock_cx = float(clamp(lock_cx + _nudge_dx, 0, LORES_W - 1))
+        lock_cy = float(clamp(lock_cy + _nudge_dy, 0, LORES_H - 1))
+        lost_frames = 0
+        box = lores_box_to_main(lock_cx, lock_cy, lock_w, lock_h)
+        with state_lock:
+            track_state = TRACK_STATE_TRACKED
+            target_visible = True
+            target_controllable = True
+            target_box_main = box
+            overlay_text = "NUDGE"
+            overlay_color = COLOR_GREEN
+        update_control_from_target()
+        return
+    elif _nudge_was_active:
+        # Стик вернулся в мёртвую зону — оператор закончил правку. Мягкая
+        # перепривязка ВНУТРИ TRACKED: новые flow-точки на новом месте,
+        # новая geometry_epoch, адаптация шаблона на паузе до первого
+        # свежего измерения (см. reanchor_tracker_at_current_box).
+        #
+        # ВОЗВРАТ ОБЯЗАТЕЛЕН ЗДЕСЬ, а не падение дальше в flow_predict.
+        # reanchor только что поставил prev_gray = gray.copy() — сравнить
+        # их же в ЭТОМ кадре значит сравнить кадр с самим собой: flow
+        # вернёт нулевое движение и flow_ok=True, а гейт адаптации,
+        # увидев flow_ok, тут же снял бы заморозку — на кадре, где
+        # никакого свежего измерения ещё не было. Настоящее свежее
+        # измерение появится ровно со СЛЕДУЮЩЕГО кадра, когда prev_gray
+        # и gray разойдутся по-настоящему.
+        _nudge_was_active = False
+        flight_log.event("MANUAL_NUDGE end")
+        reanchor_tracker_at_current_box(gray, "manual_reanchor")
+        lost_frames = 0
+        box = lores_box_to_main(lock_cx, lock_cy, lock_w, lock_h)
+        with state_lock:
+            track_state = TRACK_STATE_TRACKED
+            target_visible = True
+            target_controllable = True
+            target_box_main = box
+            overlay_text = "TRACKED"
+            overlay_color = COLOR_RED
+        update_control_from_target()
         return
 
     _t_etap = time.monotonic()
@@ -9238,6 +9407,8 @@ def _capture_flight_row(cb_t0):
             _flow_dbg.get("translation_x"), _flow_dbg.get("translation_y"),
             _flow_dbg.get("scale"), _flow_dbg.get("scale_confidence"),
             geometry_epoch, _match_dbg.get("scale_source"),
+            _match_dbg.get("manual_nudge"), _match_dbg.get("manual_nudge_dx"),
+            _match_dbg.get("manual_nudge_dy"),
         )
         flight_log.row(_row_values)
         # Та же строка — в папку этого захвата. Форматируем один раз здесь, а
