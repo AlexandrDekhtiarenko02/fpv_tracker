@@ -1462,6 +1462,27 @@ SIZE_ADAPT_EVERY_FRAMES = 8          # период проверки
 # меняется вовсе.
 SIZE_ADAPT_BIG_PX = 100          # с какой рамки считаем эталон дорогим
 SIZE_ADAPT_BIG_EVERY = 24        # период проверки для дорогого эталона
+
+# --- БЮДЖЕТ КАДРА ДЛЯ ДОРОГИХ ВТОРИЧНЫХ ЭТАПОВ (ТЗ next-commit spec §4) ---
+#
+# SIZE_ADAPT_EVERY_FRAMES/_BIG_EVERY решают, как ЧАСТО планировать примерку
+# масштаба, но не смотрят, сколько времени УЖЕ потрачено в ЭТОМ кадре.
+# «Пришла пора мерить масштаб» (по частоте) и «есть на это время» (по факту)
+# — разные вопросы, а до сих пор отвечали только на первый.
+#
+# Ядро слежения (поток + матч) — ПРИОРИТЕТ, оно уже выполнилось к этой
+# проверке (см. process_locked_tracker). Вторичный этап (примерка масштаба)
+# пропускается, если бюджет кадра уже исчерпан, даже когда по частоте он
+# «запланирован». Пропуск логируется отдельным кодом size_skip=8, чтобы «не
+# мерили, не успели» не перепутать с «мерили и не получилось» — иначе
+# отсутствие измерения на замедлившемся борту выглядело бы как отказ
+# алгоритма, а не как честная нехватка времени.
+FRAME_BUDGET_MS = 1000.0 / CAM_FPS
+# Доля номинального бюджета кадра, после которой вторичный этап уже не
+# запускаем. Запас нужен на то, что идёт ПОСЛЕ process_locked_tracker в
+# camera_callback (отрисовка оверлея, сбор строки лога) — эти этапы не
+# охвачены отдельным бюджетом, и без запаса вторичный этап забрал бы их время.
+FRAME_BUDGET_SECONDARY_FRAC = 0.65
 SIZE_ADAPT_MIN_SCORE = 0.55          # минимальный score для доверия размеру
 SIZE_ADAPT_ALPHA = 0.45              # доля нового размера в старом (per update)
 SIZE_ADAPT_MIN_W = 5                 # нижний предел осмысленного размера
@@ -2105,7 +2126,11 @@ _FLIGHT_LOG_COLUMNS = (
     # CPU-температура и частота (п.6): отличает алгоритмический рост
     # стоимости кадра от теплового throttling — снаружи оба выглядят
     # одинаково как «FPS упал», а лечатся по-разному.
-    "cpu_temp_c,cpu_freq_mhz"
+    "cpu_temp_c,cpu_freq_mhz,"
+    # БЮДЖЕТ КАДРА (п.4/п.5): пропуск примерки масштаба по нехватке времени —
+    # отдельно от size_skip=1..7 (которые про «мерили и не получилось»),
+    # иначе замедление борта на разборе выглядело бы как отказ алгоритма.
+    "expensive_stage_skipped,skip_reason"
 )
 
 # Снимок внутренностей управления за текущий кадр. Заполняется в
@@ -8090,7 +8115,12 @@ def draw_overlay_on_frame(frame):
 # =========================================================
 # 10. TRACKING CORE (без изменений)
 # =========================================================
-def process_locked_tracker(gray):
+def process_locked_tracker(gray, cb_t0=None):
+    """cb_t0: момент начала камерного колбэка (time.monotonic()), нужен для
+    бюджета вторичных этапов (см. FRAME_BUDGET_MS). None — как в offline-
+    прогонах и профилировщике: там нет живого колбэка с реальным дедлайном,
+    и вторичные этапы не режутся вовсе (не бюджет решает, а исследователь).
+    """
     global track_state, target_visible, target_controllable, overlay_text, overlay_color, target_box_main
     global lock_cx, lock_cy, lock_w, lock_h, template_gray, prev_gray, prev_pts
     global template_base, target_uv, color_active, color_separation
@@ -8462,8 +8492,30 @@ def process_locked_tracker(gray):
                 and frame_index % TRACK_ON_COLOR_BG_EVERY == 0):
             refresh_color_axis(lock_cx, lock_cy, lock_w, lock_h)
 
+        # БЮДЖЕТ КАДРА (ТЗ §4). Ядро (поток+матч) уже отработало — приоритет
+        # у него. Вторичный этап (примерка масштаба) запускается только если
+        # он и без того запланирован ПО ЧАСТОТЕ И в кадре есть время: cb_t0
+        # известен (реальный колбэк, не offline-прогон) и с его начала прошло
+        # меньше FRAME_BUDGET_SECONDARY_FRAC от номинального бюджета кадра.
+        _budget_ok = (cb_t0 is None or
+                     (time.monotonic() - cb_t0) * 1000.0
+                     <= FRAME_BUDGET_MS * FRAME_BUDGET_SECONDARY_FRAC)
+        _primerka_pora = frame_index % _period_primerki() == 0
+        if _primerka_pora and not _budget_ok:
+            # Было ПОРА, но бюджет кадра уже исчерпан. Отдельный код — чтобы
+            # «не мерили, не успели» не спутать с «мерили и не получилось»
+            # (коды 1-7 ниже): при замедлении борта иначе выглядело бы так,
+            # будто алгоритм сам стал давать сбой, а не что ему не хватило
+            # времени именно в ЭТОМ кадре.
+            _match_dbg["size_skip"] = 8
+            _match_dbg["expensive_stage_skipped"] = 1
+            _match_dbg["skip_reason"] = "budget"
+        else:
+            _match_dbg["expensive_stage_skipped"] = 0
+            _match_dbg["skip_reason"] = ""
+
         if (SIZE_BY_SCALE_ENABLED and SIZE_ADAPT_ENABLED
-                and frame_index % _period_primerki() == 0):
+                and _primerka_pora and _budget_ok):
             # Размер по масштабу совпадения. Сегментация не участвует.
             if not match_ok:
                 _match_dbg["size_skip"] = 1
@@ -8555,7 +8607,7 @@ def process_locked_tracker(gray):
                             # и всегда по СВЕЖИМ данным — исходный эталон не
                             # пересчитывается сам из себя и не размывается.
                             _adapt_template_base(gray)
-        elif SIZE_ADAPT_ENABLED and frame_index % _period_primerki() == 0:
+        elif SIZE_ADAPT_ENABLED and _primerka_pora and _budget_ok:
             # Область поиска растягиваем под ТЕКУЩИЙ размер коробки, иначе
             # крупная цель заведомо в неё не помещается и измерить её нельзя.
             est_w, est_h = estimate_size_at_position(
@@ -8913,6 +8965,8 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("map_w"), _match_dbg.get("map_h"),
             _flow_dbg.get("points"), _flow_dbg.get("inliers"),
             _cpu_temp_c, _cpu_freq_mhz,
+            _match_dbg.get("expensive_stage_skipped"),
+            _match_dbg.get("skip_reason"),
         )
         flight_log.row(_row_values)
         # Та же строка — в папку этого захвата. Форматируем один раз здесь, а
@@ -9257,7 +9311,7 @@ def camera_callback(request):
         if GROUND_SPEED_ENABLED and _gs_n % GROUND_EVERY_N == 0:
             estimate_ground_speed(gray, _cb_t0)
 
-        process_locked_tracker(gray)
+        process_locked_tracker(gray, _cb_t0)
         # Запись начинается при первом TRACKED и после этого пишет КАЖДЫЙ кадр
         # до выключения AUX4. HOLD, LOST, ACQ и любая их длительность относятся
         # к тому же локу: по ним как раз и разбирается потеря цели.
