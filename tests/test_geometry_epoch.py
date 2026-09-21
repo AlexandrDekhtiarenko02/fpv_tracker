@@ -69,18 +69,31 @@ def not_controllable_frame():
     t.update_control_from_target()
 
 
-print("=== A. Первый лок поднимает эпоху, обычные кадры — нет ===")
-not_controllable_frame()  # старт с чистого состояния
+print("=== A. Первый лок за сессию НЕ поднимает эпоху (нечего разрывать), "
+      "обычные кадры — тоже нет ===")
+# 30 кадров ПОДРЯД вне управления (типичная затянувшаяся ACQ/HOLD/LOST,
+# acceptance test из review п.3) не должны плодить эпоху на каждый кадр —
+# только на РЕАЛЬНОЙ границе controllable -> not-controllable. Старт
+# сессии никогда controllable не был, поэтому границы тут вообще нет.
+for _ in range(30):
+    not_controllable_frame()
+e0 = t.geometry_epoch
+assert e0 == 0, (
+    "30 кадров подряд вне управления без единого реального перехода "
+    "подняли эпоху до %d — должна была остаться на стартовом 0" % e0)
 frame()
 e1 = t.geometry_epoch
-assert e1 >= 1, "первый controllable-кадр не поднял geometry_epoch"
+assert e1 == e0, (
+    "первый лок за сессию поднял geometry_epoch (%d -> %d), хотя "
+    "разрывать было нечего — до этого не было ни кадра валидной геометрии"
+    % (e0, e1))
 for _ in range(10):
     frame()
 assert t.geometry_epoch == e1, (
     "geometry_epoch меняется на обычных кадрах без разрыва (%d -> %d)"
     % (e1, t.geometry_epoch))
-print("    эпоха после лока: %d, держится %d обычных кадров подряд"
-      % (e1, 10))
+print("    30 кадров вне управления и лок держат эпоху на %d, 10 обычных "
+      "кадров подряд — тоже" % e1)
 
 print("\n=== B. Разрыв ВНУТРИ лока: эпоха растёт, история чистится, "
       "control-state цел ===")
@@ -124,14 +137,33 @@ assert t._tracked_since_t == tracked_since_before, (
 print("    override_active цел, _tracked_since_t не тронут — "
       "control-state пережил разрыв без сброса")
 
-print("\n=== C. Полная потеря лока тоже поднимает эпоху ===")
+print("\n=== C. Потеря лока поднимает эпоху РОВНО ОДИН РАЗ, а не на "
+      "каждый кадр LOST ===")
 e2 = t.geometry_epoch
+# Граница переход в not-controllable — эпоха растёт здесь и только здесь.
 not_controllable_frame()
-frame()
 assert t.geometry_epoch == e2 + 1, (
-    "потеря и повторный захват лока не подняли geometry_epoch (%d -> %d)"
+    "переход в not-controllable не поднял geometry_epoch (%d -> %d)"
     % (e2, t.geometry_epoch))
-print("    эпоха: %d -> %d" % (e2, t.geometry_epoch))
+e2b = t.geometry_epoch
+# Ещё 10 кадров подряд БЕЗ лока — та самая затянувшаяся LOST/ACQ. Эпоха
+# не должна расти на каждый из них: граница уже пройдена один раз.
+for _ in range(10):
+    not_controllable_frame()
+assert t.geometry_epoch == e2b, (
+    "10 кадров подряд вне управления после уже случившегося разрыва "
+    "снова подняли эпоху (%d -> %d) — граница не edge-triggered"
+    % (e2b, t.geometry_epoch))
+# Новый захват сам по себе тоже не поднимает эпоху (см. сценарий A) —
+# только граница ДО него уже подняла её ровно на единицу.
+frame()
+assert t.geometry_epoch == e2b, (
+    "новый захват поднял geometry_epoch (%d -> %d) в дополнение к уже "
+    "случившейся границе" % (e2b, t.geometry_epoch))
+print("    эпоха: %d -> %d на границе, держится на %d все 10 кадров LOST "
+      "и на новом захвате" % (e2, e2b, e2b))
 
-print("\nOK: geometry_epoch отмечает разрывы (новый лок и пауза внутри "
-      "лока), derivative-история чистится, control-state цел")
+print("\nOK: geometry_epoch отмечает РЕАЛЬНЫЕ разрывы (границу потери "
+      "лока и паузу внутри лока) РОВНО ОДИН РАЗ каждый, а не всё время, "
+      "пока состояние остаётся невалидным; derivative-история чистится, "
+      "control-state цел")

@@ -2165,7 +2165,12 @@ _FLIGHT_LOG_COLUMNS = (
     # РУЧНАЯ КОРРЕКЦИЯ РАМКИ (п.11/п.13): активна ли она в этом кадре и
     # какой сдвиг применён — отдельно от geometry_epoch/template_
     # adaptation_allowed, которые эта коррекция запускает.
-    "manual_nudge,manual_nudge_dx,manual_nudge_dy"
+    "manual_nudge,manual_nudge_dx,manual_nudge_dy,"
+    # ДИАГНОСТИКА ВХОДА. Сырые значения AUX2/AUX3 (копии правого стика,
+    # заведённые в обход маски MSP-оверрайда) и свежесть MSP_RC — чтобы на
+    # бортовом логе сразу было видно, что копии стика реально приходят и
+    # плавно идут вместе с рукой, а не застыли на каком-то значении.
+    "aux2_raw,aux3_raw,nudge_rc_fresh"
 )
 
 # Снимок внутренностей управления за текущий кадр. Заполняется в
@@ -5758,6 +5763,7 @@ def reset_tracking(to_acq=False):
     global smoothed_pitch_deg
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
+    global _nudge_was_active, _nudge_prev_t, _adapt_frozen_posle_reanchor
 
     track_state = TRACK_STATE_ACQ if to_acq else TRACK_STATE_IDLE
     target_visible = False
@@ -5810,6 +5816,18 @@ def reset_tracking(to_acq=False):
     launch_phase = "NONE"
     launch_counter = 0
     prev_controllable_for_launch = False
+
+    # СОСТОЯНИЕ РУЧНОЙ КОРРЕКЦИИ — НЕ ПЕРЕЖИВАЕТ ЗАХОД (code review по
+    # 15ce5bf, п.2). Без этого: начать nudge -> не отпустить стик -> AUX
+    # off или потеря лока -> новый захват увидел бы старое
+    # _nudge_was_active=True и на первом же кадре TRACKED выполнил бы
+    # ложный «nudge ended -> re-anchor» уже для НОВОЙ цели — с чужой
+    # geometry_epoch и чужой заморозкой адаптации. reset_tracking — точка,
+    # общая для ВСЕХ путей начала нового захода (rising_aux, LOST-предел,
+    # AUX off), поэтому здесь и чистим.
+    _nudge_was_active = False
+    _nudge_prev_t = None
+    _adapt_frozen_posle_reanchor = False
 
 # =========================================================
 # 8. CONTROL — главные исправления здесь
@@ -6528,7 +6546,19 @@ def update_control_from_target():
         # _reset_geometry_history). Раньше эти же клиры дублировались тут
         # построчно — раздельные копии одного намерения рано или поздно
         # расходятся, и это уже стоило вылета (см. коммит про _tau_hold leak).
-        _reset_geometry_history("not_controllable")
+        #
+        # ТОЛЬКО НА ГРАНИЦЕ, не каждый кадр вне управления (code review по
+        # 15ce5bf, п.3). До этой правки функция звалась на КАЖДОМ вызове
+        # с controllable=False — а такие вызовы идут каждый кадр всё время
+        # ACQ/HOLD/LOST, то есть geometry_epoch рос и событие писалось в
+        # events.log почти на каждый кадр длинного ACQ, а не один раз на
+        # настоящий разрыв. prev_controllable_for_launch тут же хранит «был
+        # ли controllable ПРОШЛЫЙ вызов» (та же бухгалтерия, что нужна launch
+        # — заводить отдельный флаг ради одного и того же вопроса означало
+        # бы держать две копии, которые могут разойтись). Читаем его ДО
+        # перезаписи в False несколькими строками ниже.
+        if prev_controllable_for_launch:
+            _reset_geometry_history("not_controllable")
         # И копилка команд: усреднять с манёврами прошлой цели бессмысленно.
         _final_okno.clear()
         # Выдержки финала и сближения — по времени, обнуляем между заходами,
@@ -8363,18 +8393,47 @@ def draw_overlay_on_frame(frame):
 # --- РУЧНАЯ КОРРЕКЦИЯ РАМКИ ВО ВРЕМЯ TRACKED (ТЗ next-commit spec §11/§12) ---
 #
 # Оператору нужен способ поправить чуть съехавшую рамку без полного
-# LOST -> ACQ (пересъём эталона на новом месте, пауза до готовности). По
-# указанию пилота — на ПРАВОМ стике, каналы roll/pitch: во время TRACKED
-# с override эти каналы и так подменяются PID-выходом трекера, и полётник
-# их живое значение от пилота не видит вовсе (Betaflight ждёт override-
-# кадры). Стик, который сейчас ничего не делает для полётника, становится
-# входом для трекера — это не отнимает у пилота ничего, чем он уже владеет.
+# LOST -> ACQ (пересъём эталона на новом месте, пауза до готовности).
+#
+# ИСТОЧНИК СИГНАЛА — ROLL/PITCH ПРАВОГО СТИКА, НО НЕ НАПРЯМУЮ. Каналы
+# Roll/Pitch (ch[0]/ch[1]) во время TRACKED+override подменены PID-выходом
+# трекера, и MSP_RC по НИМ отдаёт уже подменённое значение, а не живой
+# стик — проверено на стенде: рамка не двигалась вовсе, потому что
+# receiver_channels (честный, но замирающий при оверрайде массив) для этих
+# каналов не обновлялся с момента входа в оверрайд.
+#
+# Правильный путь оказался проще любой перестройки протокола: на
+# RadioMaster Boxer правый стик задублирован миксом на два СВОБОДНЫХ AUX-
+# канала — AUX2 (Roll) и AUX3 (Pitch), физически то же движение стика, но
+# по каналам ВНЕ маски оверрайда. AUX-каналы Betaflight никогда не
+# подменяет (это же используется для AUX4 — тумблера лока), поэтому их
+# значение в СЫРОМ MSP_RC (app_state["rc_channels"], пишется КАЖДЫЙ опрос
+# без всяких условий — см. fc_io_loop) остаётся живым и плавным всегда,
+# независимо от состояния оверрайда. В Betaflight Modes на AUX2/AUX3
+# ничего не назначено — они существуют только как этот ввод.
+#
+# ЧИТАЕМ ИМЕННО rc_channels, А НЕ receiver_channels. Второй массив
+# замирает ЦЕЛИКОМ (не только по Roll/Pitch) при подтверждённом оверрайде
+# — то же самое замирание, что уже сломало nudge один раз, задело бы и
+# AUX-копии, если брать их оттуда.
 #
 # ВХОД СКОРОСТНОЙ, а не абсолютный: отклонение стика задаёт СКОРОСТЬ сдвига
 # рамки (px/с), а не координату. Абсолютный mapping заставил бы рамку
 # дёргаться к точке, куда указывает стик В ЭТОТ МОМЕНТ, что для стика без
 # самоцентровки на позицию неприменимо и физически не то, чем стик является.
 MANUAL_NUDGE_ENABLED = True
+# Индексы AUX2/AUX3 в массиве rc_channels/ch (RPYT+AUX1..4, 0-based):
+# ch[0]=Roll ch[1]=Pitch ch[2]=Yaw ch[3]=Throttle ch[4]=AUX1 ch[5]=AUX2
+# ch[6]=AUX3 ch[7]=AUX4 (AUX4 уже используется как ch[7] для тумблера
+# лока — та же нумерация, тот же массив). ПРОВЕРИТЬ НА БОРТУ по логу
+# aux2_raw/aux3_raw из _capture_flight_row: значения обязаны плавно идти
+# вместе с правым стиком, а не стоять на месте.
+MANUAL_NUDGE_ROLL_AUX_IDX = 5
+MANUAL_NUDGE_PITCH_AUX_IDX = 6
+# Свежесть MSP_RC, при которой AUX-копиям ещё верим. То же окно, что и у
+# основного приёмника (RC_FRESH_WINDOW) — величина одна и та же по
+# смыслу: сколько без нового опроса допустимо считать канал живым.
+MANUAL_NUDGE_RC_FRESH_S = RC_FRESH_WINDOW
 # Мёртвая зона вокруг центра стика (в единицах RC, центр 1500). Меньше — и
 # обычное дрожание пальца на стике во время обычного полёта с override
 # постоянно чуть двигало бы рамку. Взято долей от полного хода (500 от
@@ -8396,6 +8455,13 @@ MANUAL_NUDGE_PITCH_SIGN = 1
 # Был ли nudge активен на ПРОШЛОМ кадре — нужно для edge-детекта отпускания
 # стика (переход True -> False = «оператор закончил, пора re-anchor»).
 _nudge_was_active = False
+# Момент последнего кадра, где nudge реально сдвигал рамку — для перевода
+# px/с в px/кадр по РЕАЛЬНОМУ интервалу, а не по номинальному CAM_FPS.
+# При просевшем FPS (крупная цель, тепловой throttling) номинал завышает
+# частоту кадров, и рамка при одном и том же стике ехала бы медленнее —
+# для ручного интерфейса это неприятно: одинаковое усилие пилота должно
+# давать примерно одинаковое смещение за равное РЕАЛЬНОЕ время.
+_nudge_prev_t = None
 # Заморозка адаптации шаблона после re-anchor (ТЗ §12 п.6): позиция ещё не
 # подтверждена свежим match/flow, учить эталон на непроверенном месте
 # рискованно. Снимается, как только придёт хотя бы один кадр со свежим
@@ -8448,7 +8514,7 @@ def process_locked_tracker(gray, cb_t0=None):
     global auto_reacq_attempts
     global template_scale_acc, color_axis
     global lock_w0, lock_h0
-    global _nudge_was_active
+    global _nudge_was_active, _nudge_prev_t
 
     frame_index += 1
 
@@ -8647,42 +8713,96 @@ def process_locked_tracker(gray, cb_t0=None):
         reset_tracking(to_acq=True)
         return
 
-    # РУЧНАЯ КОРРЕКЦИЯ РАМКИ (ТЗ §11) — правым стиком, каналы roll/pitch.
-    # Проверяется РАНЬШЕ flow/match: пока оператор правит рамку рукой, эти
-    # два измерения не должны вообще запускаться — иначе искусственный
-    # (от коррекции) сдвиг рамки flow_predict принял бы за движение цели
-    # (ТЗ: "нельзя считать сдвиг рамки физическим optical-flow motion"), а
-    # matchTemplate искал бы совпадение там, где его больше нет.
+    # РУЧНАЯ КОРРЕКЦИЯ РАМКИ (ТЗ §11) — AUX2/AUX3, живые копии правого стика
+    # (см. пояснение у констант выше). Проверяется РАНЬШЕ flow/match: пока
+    # оператор правит рамку рукой, эти два измерения не должны вообще
+    # запускаться — иначе искусственный (от коррекции) сдвиг рамки
+    # flow_predict принял бы за движение цели, а matchTemplate искал бы
+    # совпадение там, где его больше нет.
+    #
+    # ДОПУСТИМО ТОЛЬКО ВНУТРИ УЖЕ ПОДТВЕРЖДЁННОГО TRACKED. HOLD доходит до
+    # этой точки кода точно так же, как TRACKED (у него нет отдельной
+    # ранней ветки, в отличие от ACQ/LOST выше) — без этой проверки стик,
+    # отклонённый на кадре, где слежение просело до HOLD (например, цель
+    # на миг закрыл столб), сам вернул бы target_controllable=True без
+    # единого подтверждения от flow/match. Ручная коррекция не имеет права
+    # ОЖИВЛЯТЬ слежение — только править уже живое.
     _nudge_active = False
     _nudge_dx = _nudge_dy = 0.0
-    if MANUAL_NUDGE_ENABLED:
+    _aux2_raw = _aux3_raw = None
+    _nudge_rc_fresh = False
+    _nudge_eligible = MANUAL_NUDGE_ENABLED and track_state == TRACK_STATE_TRACKED
+
+    if _nudge_eligible:
         with state_lock:
-            _rc_live = app_state.get("receiver_channels")
-        if _rc_live and len(_rc_live) >= 2:
-            # RPYT-порядок MSP_RC: ch[0]=Roll, ch[1]=Pitch (см. fc_io_loop).
-            # Живой стик пилота, а не эхо оверрайда — receiver_channels уже
-            # отфильтрован от этого в fc_io_loop.
-            _roll_dev = float(_rc_live[0]) - 1500.0
-            _pitch_dev = float(_rc_live[1]) - 1500.0
+            _rc_raw = app_state.get("rc_channels")
+            _rc_link_ts = app_state.get("rc_link_ts", 0.0)
+        _nudge_rc_fresh = (_rc_link_ts > 0.0
+                           and (time.monotonic() - _rc_link_ts)
+                           <= MANUAL_NUDGE_RC_FRESH_S)
+        _have_aux = (_rc_raw is not None
+                    and len(_rc_raw) > max(MANUAL_NUDGE_ROLL_AUX_IDX,
+                                           MANUAL_NUDGE_PITCH_AUX_IDX))
+        if _have_aux and _nudge_rc_fresh:
+            _aux2_raw = float(_rc_raw[MANUAL_NUDGE_ROLL_AUX_IDX])
+            _aux3_raw = float(_rc_raw[MANUAL_NUDGE_PITCH_AUX_IDX])
             _half = 500.0 - MANUAL_NUDGE_DEADBAND_US
+            # Избыток отклонения СВЕРХ мёртвой зоны, со знаком — 0, если
+            # внутри зоны. Считаем ОДИН раз: и для решения «активен ли
+            # nudge», и для самой величины сдвига — нет риска разойтись
+            # между двумя независимыми проверками одного порога.
+            _roll_exc = 0.0
+            _roll_dev = _aux2_raw - 1500.0
             if abs(_roll_dev) > MANUAL_NUDGE_DEADBAND_US:
                 _roll_exc = _roll_dev - math.copysign(
                     MANUAL_NUDGE_DEADBAND_US, _roll_dev)
-                _roll_norm = clamp(_roll_exc / _half, -1.0, 1.0)
-                _nudge_dx = (MANUAL_NUDGE_ROLL_SIGN * _roll_norm
-                            * MANUAL_NUDGE_MAX_PX_S / CAM_FPS)
-                _nudge_active = True
+            _pitch_exc = 0.0
+            _pitch_dev = _aux3_raw - 1500.0
             if abs(_pitch_dev) > MANUAL_NUDGE_DEADBAND_US:
                 _pitch_exc = _pitch_dev - math.copysign(
                     MANUAL_NUDGE_DEADBAND_US, _pitch_dev)
+            _nudge_active = (_roll_exc != 0.0) or (_pitch_exc != 0.0)
+
+            if _nudge_active:
+                # ШАГ ЗА КАДР ПО РЕАЛЬНОМУ ВРЕМЕНИ, а не по номинальному
+                # CAM_FPS (review: «manual nudge должен быть независим от
+                # фактического FPS»). При просевшем FPS (крупная цель,
+                # тепловой throttling) номинал завышает частоту кадров, и
+                # рамка при том же усилии стика ехала бы медленнее в
+                # реальном времени — для ручного интерфейса это неприятно.
+                _now_nudge = time.monotonic()
+                if _nudge_prev_t is not None:
+                    _nudge_dt = _now_nudge - _nudge_prev_t
+                else:
+                    _nudge_dt = 1.0 / CAM_FPS
+                # Потолок на случай паузы (первый кадр после входа в
+                # TRACKED, застрявший callback) — рамка не прыгает на всю
+                # накопленную паузу разом.
+                _nudge_dt = min(_nudge_dt, 3.0 / CAM_FPS)
+                _nudge_prev_t = _now_nudge
+
+                _roll_norm = clamp(_roll_exc / _half, -1.0, 1.0)
                 _pitch_norm = clamp(_pitch_exc / _half, -1.0, 1.0)
+                _nudge_dx = (MANUAL_NUDGE_ROLL_SIGN * _roll_norm
+                            * MANUAL_NUDGE_MAX_PX_S * _nudge_dt)
                 _nudge_dy = (MANUAL_NUDGE_PITCH_SIGN * _pitch_norm
-                            * MANUAL_NUDGE_MAX_PX_S / CAM_FPS)
-                _nudge_active = True
+                            * MANUAL_NUDGE_MAX_PX_S * _nudge_dt)
+
+    if not _nudge_active:
+        # Стик в мёртвой зоне, RC несвежий или nudge недопустим в этом
+        # состоянии — часы сдвига сбрасываем, чтобы следующая АКТИВАЦИЯ
+        # считала dt от своего первого кадра, а не от давно прошедшего.
+        _nudge_prev_t = None
 
     _match_dbg["manual_nudge"] = 1 if _nudge_active else 0
     _match_dbg["manual_nudge_dx"] = _nudge_dx
     _match_dbg["manual_nudge_dy"] = _nudge_dy
+    # Диагностика по прямому требованию: сырые значения AUX2/AUX3 и
+    # свежесть MSP_RC — чтобы на бортовом логе сразу было видно, что
+    # копии стика реально приходят и не застывают.
+    _match_dbg["aux2_raw"] = _aux2_raw
+    _match_dbg["aux3_raw"] = _aux3_raw
+    _match_dbg["nudge_rc_fresh"] = 1 if _nudge_rc_fresh else 0
 
     if _nudge_active:
         if not _nudge_was_active:
@@ -9166,12 +9286,21 @@ def print_debug_once_per_second():
     s1 = int(sent[1]) if len(sent) > 1 else 1500
     s2 = int(sent[2]) if len(sent) > 2 else 1500
     s3 = int(sent[3]) if len(sent) > 3 else 1000
+    # AUX2/AUX3 — живые копии правого стика для manual nudge (см. пояснение
+    # у MANUAL_NUDGE_ROLL_AUX_IDX). Печатаются всегда, не только при
+    # активном nudge, — чтобы на бортовом логе сразу было видно, идут ли
+    # они вообще с рукой, ещё до первой попытки воспользоваться коррекцией.
+    a2 = (int(ch[MANUAL_NUDGE_ROLL_AUX_IDX])
+          if len(ch) > MANUAL_NUDGE_ROLL_AUX_IDX else None)
+    a3 = (int(ch[MANUAL_NUDGE_PITCH_AUX_IDX])
+          if len(ch) > MANUAL_NUDGE_PITCH_AUX_IDX else None)
 
     mot_s = " ".join([f"M{i+1}:{int(v)}" for i, v in enumerate(motors[:4])]) if motors else "M:NA"
 
     print(
         f"FPS:{fps_current:5.1f} | {st:<7} | OV:{ov} | "
         f"RPYT in: R{c0:4d} P{c1:4d} Y{c2:4d} T{c3:4d} | "
+        f"AUX2(nudgeR):{a2} AUX3(nudgeP):{a3} | "
         f"CMD R{r_out:4d} P{p_out:4d} Y{y_out:4d} T{t_out:4d} | "
         f"SENT AETR R{s0:4d} P{s1:4d} T{s2:4d} Y{s3:4d} | "
         f"{mot_s}",
@@ -9409,6 +9538,8 @@ def _capture_flight_row(cb_t0):
             geometry_epoch, _match_dbg.get("scale_source"),
             _match_dbg.get("manual_nudge"), _match_dbg.get("manual_nudge_dx"),
             _match_dbg.get("manual_nudge_dy"),
+            _match_dbg.get("aux2_raw"), _match_dbg.get("aux3_raw"),
+            _match_dbg.get("nudge_rc_fresh"),
         )
         flight_log.row(_row_values)
         # Та же строка — в папку этого захвата. Форматируем один раз здесь, а

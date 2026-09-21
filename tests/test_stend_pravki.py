@@ -52,12 +52,22 @@ print("    last_sent_channels только на успехе; порт пере�
 
 
 print("\n=== 3. Состояние захвата чистится между заходами ===")
-# Выставляем состояние «как в разгар захода».
+# Выставляем состояние «как в разгар захода». В реальном полёте
+# _score_do_rosta/_tau_hold_*/_size_R_boost могут стать ненулевыми ТОЛЬКО
+# пока controllable=True (их пишет код внутри ветки controllable) —
+# поэтому prev_controllable_for_launch=True здесь не произвольная деталь
+# теста, а честное отражение того единственного пути, которым это
+# состояние вообще могло появиться.
 t._score_do_rosta = 0.9
 t._tau_hold_val = 3.0
 t._tau_hold_t = t.time.monotonic()
 t._size_R_boost = 2.5
-# Теряем цель — уходим в ветку not controllable.
+t.prev_controllable_for_launch = True
+# Теряем цель — уходим в ветку not controllable. Сброс geometry-history
+# теперь edge-triggered (code review по 15ce5bf, п.3): срабатывает на
+# ГРАНИЦЕ controllable->not-controllable, а не на каждом кадре вне
+# управления — иначе долгий ACQ/HOLD/LOST плодил бы новую geometry_epoch
+# и событие в лог почти на каждый кадр.
 t.target_visible = False
 t.target_controllable = False
 t.target_box_main = None
