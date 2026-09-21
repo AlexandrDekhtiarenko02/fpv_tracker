@@ -126,7 +126,7 @@ CAM_W, CAM_H = LORES_W, LORES_H   # уточняется ниже, после RE
 # рождается только на физическом DRM/VTX выводе (тогда дело в scaling/mode
 # самого DRM plane, см. несовпадение 640x480 vs 720x576 выше) — до этого
 # офсет менять вслепую не имеет смысла.
-PREVIEW_W, PREVIEW_H = 720, 576
+PREVIEW_W, PREVIEW_H = 720, 480
 PREVIEW_X, PREVIEW_Y = 0, 0
 CENTER_X, CENTER_Y = MAIN_W // 2, MAIN_H // 2
 CENTER_X_LORES, CENTER_Y_LORES = LORES_W // 2, LORES_H // 2
