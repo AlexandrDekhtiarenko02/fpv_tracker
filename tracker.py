@@ -110,13 +110,17 @@ CAM_W, CAM_H = LORES_W, LORES_H   # уточняется ниже, после RE
 # DRM preview — окно картинки на физическом дисплее/VTX.
 # PREVIEW_W / PREVIEW_H — размер окна. На FPV-выходах часто полезно слегка
 # уменьшить, чтобы интерфейс не уходил за safe area дисплея.
-# PREVIEW_X / PREVIEW_Y — смещение окна на дисплее. Если сверху видна тонкая
-# чёрная полоса в пару пикселей — это offset композитора DRM, лечится
-# отрицательным PREVIEW_Y (сдвигаем картинку вверх).
-# Подбирай эмпирически: чёрная полоса сверху → уменьшай PREVIEW_Y,
+# PREVIEW_X / PREVIEW_Y — смещение окна на дисплее. ТОЛЬКО экран: этот
+# offset — параметр DRM-композитора, к main/lores буферам и координатам
+# трекера отношения не имеет (start_preview ниже — единственное место,
+# где он используется). Сдвигать прицел и рамку он не может.
+#
+# PREVIEW_Y=-2 лечит тонкую чёрную полосу сверху (offset композитора DRM
+# на паре пикселей — сдвигаем картинку вверх, чтобы её съесть).
+# Подбирай эмпирически: полоса сверху → уменьшай PREVIEW_Y ещё,
 # обрезается снизу → уменьшай PREVIEW_H, обрезается справа → PREVIEW_W.
 PREVIEW_W, PREVIEW_H = 720, 576
-PREVIEW_X, PREVIEW_Y = 0, 0
+PREVIEW_X, PREVIEW_Y = 0, -2
 CENTER_X, CENTER_Y = MAIN_W // 2, MAIN_H // 2
 CENTER_X_LORES, CENTER_Y_LORES = LORES_W // 2, LORES_H // 2
 
@@ -2170,7 +2174,14 @@ _FLIGHT_LOG_COLUMNS = (
     # заведённые в обход маски MSP-оверрайда) и свежесть MSP_RC — чтобы на
     # бортовом логе сразу было видно, что копии стика реально приходят и
     # плавно идут вместе с рукой, а не застыли на каком-то значении.
-    "aux2_raw,aux3_raw,nudge_rc_fresh"
+    "aux2_raw,aux3_raw,nudge_rc_fresh,"
+    # ДИНАМИЧЕСКАЯ ЭКСПОЗИЦИЯ (camera/display commit). ExposureTime/
+    # AnalogueGain больше не фиксируются после старта — на разборе должно
+    # быть видно, что они реально следуют за освещением (тёмная комната ->
+    # растут, яркая улица -> падают), а не просто поверить документации.
+    # ColourGains пишем тоже: AWB заморожен, но если яркость снаружи иная,
+    # полезно видеть, не начали ли цвета от этого плыть.
+    "cam_exp_us,cam_gain,cam_colour_u,cam_colour_v"
 )
 
 # Снимок внутренностей управления за текущий кадр. Заполняется в
@@ -2223,6 +2234,36 @@ def _read_cpu_freq_mhz():
             return int(f.read().strip()) / 1000.0
     except Exception:
         return None
+
+
+# --- ДИАГНОСТИКА ЭКСПОЗИЦИИ (динамический AE, camera/display commit) ---
+#
+# ExposureTime/AnalogueGain больше не фиксируются после старта (см. main:
+# AeEnable=True). Чтобы на бортовом бенче было видно, что автоматика
+# реально следует за освещением (тёмная комната -> выдержка/gain растут,
+# яркая улица -> падают), а не просто "мы поверили документации" — читаем
+# фактические значения из camera_metadata тем же 1-Гц таймером, что CMA и
+# CPU. capture_metadata() — синхронный вызов к камере, гонять его каждый
+# кадр (24 раза в секунду) незачем: экспозиция не меняется настолько быстро.
+_cam_exp_us = None
+_cam_gain = None
+_cam_colour_u = None
+_cam_colour_v = None
+
+
+def _read_cam_exposure_metadata():
+    """(exp_us, gain, colour_u, colour_v) из живых метаданных камеры, или
+    (None, None, None, None) при любой ошибке — камера может быть ещё не
+    готова, и диагностика не должна ронять кадр из-за этого."""
+    try:
+        md = picam2.capture_metadata()
+        exp = md.get("ExposureTime")
+        gain = md.get("AnalogueGain")
+        colour = md.get("ColourGains")
+        cu, cv_ = (colour[0], colour[1]) if colour else (None, None)
+        return exp, gain, cu, cv_
+    except Exception:
+        return None, None, None, None
 
 
 # Слагаемые PID по осям, складывает _pid_axis_step.
@@ -9326,12 +9367,21 @@ def print_debug_once_per_second():
 
     mot_s = " ".join([f"M{i+1}:{int(v)}" for i, v in enumerate(motors[:4])]) if motors else "M:NA"
 
+    # Экспозиция динамическая (AeEnable=True после старта) — на бенчевом
+    # переносе тёмное/светлое эти два числа обязаны сами ехать, без
+    # перезапуска программы. mean_gray — из того же снимка, что уже пишется
+    # в CSV (диагностика чёрного экрана), сюда добавлен для одного взгляда.
+    _exp_s = "%d" % _cam_exp_us if _cam_exp_us is not None else "NA"
+    _gain_s = "%.2f" % _cam_gain if _cam_gain is not None else "NA"
+    _mg_s = "%.0f" % _last_main_mean if _last_main_mean is not None else "NA"
+
     print(
         f"FPS:{fps_current:5.1f} | {st:<7} | OV:{ov} | "
         f"RPYT in: R{c0:4d} P{c1:4d} Y{c2:4d} T{c3:4d} | "
         f"AUX2(nudgeR):{a2} AUX3(nudgeP):{a3} | "
         f"CMD R{r_out:4d} P{p_out:4d} Y{y_out:4d} T{t_out:4d} | "
         f"SENT AETR R{s0:4d} P{s1:4d} T{s2:4d} Y{s3:4d} | "
+        f"EXP:{_exp_s}us GAIN:{_gain_s} MEAN:{_mg_s} | "
         f"{mot_s}",
         flush=True
     )
@@ -9569,6 +9619,7 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("manual_nudge_dy"),
             _match_dbg.get("aux2_raw"), _match_dbg.get("aux3_raw"),
             _match_dbg.get("nudge_rc_fresh"),
+            _cam_exp_us, _cam_gain, _cam_colour_u, _cam_colour_v,
         )
         flight_log.row(_row_values)
         # Та же строка — в папку этого захвата. Форматируем один раз здесь, а
@@ -9842,15 +9893,21 @@ def camera_callback(request):
     global chroma_u, chroma_v, _gs_n
     global _last_main_mean, _cma_free_kb, _cma_read_t
     global _cpu_temp_c, _cpu_freq_mhz
+    global _cam_exp_us, _cam_gain, _cam_colour_u, _cam_colour_v
     _cb_t0 = time.monotonic()
-    # CMA + CPU temp/freq раз в секунду: чтение /proc и /sys дешевле, чем
-    # блокировать callback, но каждый кадр всё равно ни к чему. Обновляем
-    # и в idle-ветке — иначе на длинной паузе значение устареет. Один и тот
-    # же таймер на все три метрики: они меняются на одном масштабе времени.
+    # CMA + CPU temp/freq + экспозиция раз в секунду: чтение /proc, /sys и
+    # capture_metadata() дешевле, чем блокировать callback, но каждый кадр
+    # всё равно ни к чему — экспозиция не меняется настолько быстро, а
+    # частый опрос camera_metadata рискует задеть frame interval, который
+    # обязан остаться около 1/CAM_FPS (динамический AE это не меняет).
+    # Обновляем и в idle-ветке — иначе на длинной паузе значение устареет.
+    # Один и тот же таймер на все метрики: меняются на одном масштабе времени.
     if _cb_t0 - _cma_read_t >= CMA_READ_PERIOD_S:
         _cma_free_kb = _read_cma_free_kb()
         _cpu_temp_c = _read_cpu_temp_c()
         _cpu_freq_mhz = _read_cpu_freq_mhz()
+        _cam_exp_us, _cam_gain, _cam_colour_u, _cam_colour_v = (
+            _read_cam_exposure_metadata())
         _cma_read_t = _cb_t0
     try:
         with state_lock:
@@ -10127,8 +10184,20 @@ def main():
     config = picam2.create_preview_configuration(**kwargs)
     picam2.configure(config)
     picam2.pre_callback = camera_callback
-    picam2.start_preview(Preview.DRM, x=PREVIEW_X, y=PREVIEW_Y,
-                         width=PREVIEW_W, height=PREVIEW_H)
+    # ИЗОЛИРОВАНО В DISPLAY PATH. Если конкретный DRM backend не принимает
+    # отрицательный y (поведение зависит от композитора/драйвера, не
+    # проверено на всех платах), откатываемся на y=0 — то есть на прежнее
+    # поведение с полосой — а НЕ подменяем офсет кропом tracking-кадра:
+    # это два разных слоя, и путать их значило бы чинить экран ценой
+    # смещения координат, по которым решает трекер.
+    try:
+        picam2.start_preview(Preview.DRM, x=PREVIEW_X, y=PREVIEW_Y,
+                             width=PREVIEW_W, height=PREVIEW_H)
+    except Exception as _exc:
+        print("[tracker] PREVIEW_Y=%d отклонён DRM backend (%s), "
+              "откат на y=0" % (PREVIEW_Y, _exc), flush=True)
+        picam2.start_preview(Preview.DRM, x=PREVIEW_X, y=0,
+                             width=PREVIEW_W, height=PREVIEW_H)
     picam2.start()
 
     # ЧАСТОТА КАДРОВ ЗАКРЕПЛЯЕТСЯ ЖЁСТКО, а не задаётся вилкой.
@@ -10185,36 +10254,76 @@ def main():
             stable = 0
         prev = cur
     _settle_s = time.monotonic() - t_wait0
+    # ЭКСПОЗИЦИЯ ОСТАЁТСЯ ДИНАМИЧЕСКОЙ, БАЛАНС БЕЛОГО — ЗАМОРАЖИВАЕТСЯ.
+    #
+    # Раньше ExposureTime/AnalogueGain фиксировались тем значением, к
+    # которому камера пришла за первые CAM_SETTLE_MAX_S секунд. Если
+    # старт был в тёмном помещении, а борт потом вынесли на улицу (или
+    # наоборот) — картинка оставалась пересвеченной или пере тёмной до
+    # перезапуска программы: замороженная выдержка не следит за реальным
+    # освещением уже никак.
+    #
+    # AWB остаётся замороженным ПОСЛЕ того же ожидания: ColourGains — то,
+    # к чему автоматика пришла за CAM_SETTLE_MAX_S. Динамический AWB в
+    # этом же коммите НЕ включается — блуждание U/V во время работы
+    # отдельно повлияет на цветовой отсев слежения (COLOR_GUARD_ENABLED/
+    # TRACK_ON_COLOR), а разбираться разом с двумя новыми источниками
+    # изменчивости в одном заходе — усложнить диагностику вдвое.
+    #
+    # ПРОВЕРКА ДОСТУПНЫХ CONTROLS, а не слепая установка: AeEnable — то,
+    # что драйвер и так использует по умолчанию до этого самого кода
+    # (следовательно, он обязан быть в списке для этой камеры), но
+    # падать в незнакомое исключение при старте — хуже, чем откатиться
+    # на прежнее (статичное) поведение с понятной причиной в логе.
+    try:
+        _controls_dostupny = getattr(picam2, "camera_controls", {}) or {}
+    except Exception:
+        _controls_dostupny = {}
+    _ae_dostupen = "AeEnable" in _controls_dostupny
     try:
         md = picam2.capture_metadata()
-        exp = int(md.get("ExposureTime", 8000))
-        exp = min(exp, 33000)
-        ctrl = {
-            "AeEnable": False,
-            "AwbEnable": False,
-            "ExposureTime": exp,
-            "AnalogueGain": float(md.get("AnalogueGain", 1.0)),
-        }
         colour = md.get("ColourGains", None)
+        if _ae_dostupen:
+            ctrl = {
+                "AeEnable": True,
+                "AwbEnable": False,
+            }
+        else:
+            # ОТКАТ: AeEnable не значится в camera_controls этой камеры/
+            # сборки picamera2 — прежнее (статичное) поведение честнее,
+            # чем слепая попытка включить неподдерживаемый control.
+            exp = int(md.get("ExposureTime", 8000))
+            exp = min(exp, 33000)
+            ctrl = {
+                "AeEnable": False,
+                "AwbEnable": False,
+                "ExposureTime": exp,
+                "AnalogueGain": float(md.get("AnalogueGain", 1.0)),
+            }
         if colour is not None:
             ctrl["ColourGains"] = tuple(colour)
         # Закрепляем частоту ЗАНОВО: в некоторых версиях libcamera установка
-        # выдержки сбрасывает предел длительности кадра, и частота уезжает
-        # обратно к «как получится».
+        # AE-контролов сбрасывает предел длительности кадра, и частота
+        # уезжает обратно к «как получится». AE обязан оставаться в
+        # пределах этого потолка — сама выдержка меняться может, частота
+        # кадров нет.
         ctrl["FrameDurationLimits"] = (_fd, _fd)
         picam2.set_controls(ctrl)
-        # ЧТО ИМЕННО ЗАМОРОЖЕНО — в журнал. Баланс белого фиксируется через
-        # полсекунды после запуска, тем, к чему камера успела прийти. Если она
-        # не успела или свет другой, цвета уезжают, а цветовой отсев остаётся
-        # без работы: в вечерних прогонах цель приходила почти серой
-        # (U=125 V=126 при нейтрали 128), тогда как утром тот же предмет давал
-        # U=85 V=203. Без этой записи причину не отличить от «предмет просто
-        # не цветной».
+        # ЧТО ИМЕННО ЗАФИКСИРОВАНО/ОСТАВЛЕНО ЖИВЫМ — в журнал. Баланс белого
+        # фиксируется тем, к чему камера успела прийти. Если она не успела
+        # или свет другой, цвета уезжают, а цветовой отсев остаётся без
+        # работы: в вечерних прогонах цель приходила почти серой (U=125
+        # V=126 при нейтрали 128), тогда как утром тот же предмет давал
+        # U=85 V=203. Без этой записи причину не отличить от «предмет
+        # просто не цветной».
         flight_log.event(
-            "КАМЕРА зафиксирована за %.1f с: выдержка %d мкс%s, усиление %.2f, "
-            "баланс белого %s"
-            % (_settle_s, exp,
-               " (ПОТОЛОК — автоматика не сошлась)" if exp >= 32900 else "",
+            "КАМЕРА: настройка за %.1f с. Экспозиция %s (снимок на момент "
+            "старта: выдержка %d мкс, усиление %.2f), баланс белого "
+            "зафиксирован: %s"
+            % (_settle_s,
+               "ДИНАМИЧЕСКАЯ (AeEnable=True)" if _ae_dostupen
+               else "СТАТИЧНАЯ — AeEnable нет в camera_controls, откат",
+               int(md.get("ExposureTime", 0)),
                float(md.get("AnalogueGain", 1.0)),
                ("%.2f/%.2f" % tuple(colour)) if colour else "не задан"))
     except Exception:
