@@ -17,6 +17,7 @@ for _im in ("FLOW_RASSH_MIN_R", "FLOW_RASSH_MIN", "FLOW_RASSH_MAX",
                               _src_all, re.M).group(1))
 ns["_flow_rasshirenie"] = None
 ns["_flow_rasshirenie_t"] = 0.0
+ns["_flow_dbg"] = {}
 exec("def flow_predict(" + src.split("def flow_predict(")[1].split("\ndef estimate_size_at_position")[0], ns)
 win_fn = ns["flow_predict"]
 

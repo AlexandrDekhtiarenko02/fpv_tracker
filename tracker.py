@@ -2063,7 +2063,17 @@ _FLIGHT_LOG_COLUMNS = (
     # чернеет ниже нашего слоя», пишем среднюю яркость главного кадра
     # ПЕРЕД оверлеем: наш рисунок в неё не входит. И свободную CMA-память
     # раз в секунду: pipeline libcamera на Zero 2W чернеет при её нехватке.
-    "mean_gray,cma_free_kb"
+    "mean_gray,cma_free_kb,"
+    # ПРОФИЛИРОВАНИЕ СТОИМОСТИ КАДРА ПО ГЕОМЕТРИИ (спецификация «next commit»,
+    # п.5). Матч стоит пропорционально площади template * площади search, а
+    # обе площади растут вместе с рамкой — по одному ms_sovpadenie не понять,
+    # чем именно вызван рост: увеличением эталона, окна поиска или тем и тем.
+    "template_w,template_h,search_w,search_h,match_map_w,match_map_h,"
+    "flow_points,flow_inliers,"
+    # CPU-температура и частота (п.6): отличает алгоритмический рост
+    # стоимости кадра от теплового throttling — снаружи оба выглядят
+    # одинаково как «FPS упал», а лечатся по-разному.
+    "cpu_temp_c,cpu_freq_mhz"
 )
 
 # Снимок внутренностей управления за текущий кадр. Заполняется в
@@ -2093,11 +2103,41 @@ def _read_cma_free_kb():
     return None
 
 
+# CPU-температура и частота (ТЗ п.6). Нужны не для управления, а чтобы
+# отделить рост стоимости кадра ОТ АЛГОРИТМА (растёт template/search с
+# рамкой) от thermal throttling (Zero 2W режет частоту при перегреве, и
+# тогда FPS падает без всякой связи с размером цели — разные диагнозы,
+# разные лекарства). Читаются раз в секунду тем же таймером, что CMA.
+_cpu_temp_c = None
+_cpu_freq_mhz = None
+
+
+def _read_cpu_temp_c():
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as f:
+            return int(f.read().strip()) / 1000.0
+    except Exception:
+        return None
+
+
+def _read_cpu_freq_mhz():
+    try:
+        with open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq") as f:
+            return int(f.read().strip()) / 1000.0
+    except Exception:
+        return None
+
+
 # Слагаемые PID по осям, складывает _pid_axis_step.
 _pid_dbg = {}
 # Внутренности сопоставления шаблона за текущий кадр. Нужны, чтобы понять
 # ПОЧЕМУ матч встал именно сюда, а не просто насколько он уверенный.
 _match_dbg = {}
+# Внутренности оптического потока за текущий кадр (ТЗ п.5, flow_points /
+# flow_inliers): сколько точек было заведено и сколько дожило после
+# фильтра по статусу LK и по err. Разница между ними — как раз то, что
+# определяет, можно ли верить медиане сдвига, а не гадать по итоговому dx/dy.
+_flow_dbg = {}
 # Время по этапам обработки кадра, миллисекунды. Заводится каждый кадр заново.
 #
 # ЗАЧЕМ. Замерено, что кадр у крупной цели идёт вдвое дольше (50 мс против
@@ -3954,6 +3994,8 @@ def refresh_flow_points(gray, cx, cy, w, h):
 
 
 def flow_predict(prev_g, cur_g, pts, cx, cy):
+    _flow_dbg["points"] = 0 if pts is None else len(pts)
+    _flow_dbg["inliers"] = 0
     if prev_g is None or pts is None or len(pts) < FLOW_MIN_POINTS:
         return False, cx, cy
     try:
@@ -4013,6 +4055,7 @@ def flow_predict(prev_g, cur_g, pts, cx, cy):
         if err is not None:
             keep = err[st].reshape(-1) < FLOW_ERR_MAX
             old, new = old[keep], new[keep]
+        _flow_dbg["inliers"] = len(new)
         if len(new) < FLOW_MIN_POINTS:
             return False, cx, cy
         dx = float(np.median(new[:, 0] - old[:, 0]))
@@ -5274,6 +5317,14 @@ def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0,
             margin = int(SEARCH_MARGIN_MIN)
     sw = int(tmpl_w + margin * 2)
     sh = int(tmpl_h + margin * 2)
+    # Геометрия рабочих массивов — для профилирования стоимости кадра
+    # (ТЗ п.5): без неё «FPS упал» нельзя отличить от «шаблон разросся» или
+    # «окно поиска разросся». cv2.matchTemplate стоит пропорционально
+    # площади search * площади template, и обе площади растут с рамкой.
+    _match_dbg["tmpl_w"] = tmpl_w
+    _match_dbg["tmpl_h"] = tmpl_h
+    _match_dbg["search_w"] = sw
+    _match_dbg["search_h"] = sh
     search, (sx1, sy1, sx2, sy2) = crop_center(gray, pred_cx, pred_cy, sw, sh)
     if search.shape[0] < tmpl_h or search.shape[1] < tmpl_w:
         return False, pred_cx, pred_cy, 0.0
@@ -5290,6 +5341,8 @@ def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0,
     if score_map.size == 0:
         return False, pred_cx, pred_cy, 0.0
 
+    _match_dbg["map_w"] = score_map.shape[1]
+    _match_dbg["map_h"] = score_map.shape[0]
     rh, rw = score_map.shape[:2]
     yy, xx = np.mgrid[0:rh, 0:rw]
     centers_x = sx1 + xx + tmpl_w / 2.0
@@ -8772,6 +8825,15 @@ def _capture_flight_row(cb_t0):
             # Диагностика чёрного экрана: ЯРКОСТЬ ДО ОВЕРЛЕЯ и свободная
             # CMA-память. Замер сделан в camera_callback, читаем последнее.
             _last_main_mean, _cma_free_kb,
+            # Геометрия рабочих массивов текущего кадра — заполняется в
+            # template_match_locked; на кадрах без попытки матча (ACQ/HOLD/
+            # LOST) хранит значение с прошлого TRACKED, это нормально: сама
+            # колонка state в той же строке снимает неоднозначность.
+            _match_dbg.get("tmpl_w"), _match_dbg.get("tmpl_h"),
+            _match_dbg.get("search_w"), _match_dbg.get("search_h"),
+            _match_dbg.get("map_w"), _match_dbg.get("map_h"),
+            _flow_dbg.get("points"), _flow_dbg.get("inliers"),
+            _cpu_temp_c, _cpu_freq_mhz,
         )
         flight_log.row(_row_values)
         # Та же строка — в папку этого захвата. Форматируем один раз здесь, а
@@ -9044,12 +9106,16 @@ KADR_OSHIBKA_PERIOD_S = 2.0
 def camera_callback(request):
     global chroma_u, chroma_v, _gs_n
     global _last_main_mean, _cma_free_kb, _cma_read_t
+    global _cpu_temp_c, _cpu_freq_mhz
     _cb_t0 = time.monotonic()
-    # CMA раз в секунду: чтение /proc/meminfo дешевле, чем блокировать
-    # callback, но каждый кадр всё равно ни к чему. Обновляем и в
-    # idle-ветке — иначе на длинной паузе значение устареет.
+    # CMA + CPU temp/freq раз в секунду: чтение /proc и /sys дешевле, чем
+    # блокировать callback, но каждый кадр всё равно ни к чему. Обновляем
+    # и в idle-ветке — иначе на длинной паузе значение устареет. Один и тот
+    # же таймер на все три метрики: они меняются на одном масштабе времени.
     if _cb_t0 - _cma_read_t >= CMA_READ_PERIOD_S:
         _cma_free_kb = _read_cma_free_kb()
+        _cpu_temp_c = _read_cpu_temp_c()
+        _cpu_freq_mhz = _read_cpu_freq_mhz()
         _cma_read_t = _cb_t0
     try:
         with state_lock:
