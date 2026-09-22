@@ -114,7 +114,7 @@ print("\n=== 5. PREVIEW_X/Y не встречаются в функциях тр
 # существу важно другое: PREVIEW_X/Y не должны встречаться ВНУТРИ тел
 # функций, которые считают прицел, рамку или координаты слежения.
 _GEOMETRY_FUNCS = (
-    "def process_locked_tracker", "def update_control_from_target",
+    "def process_locked_tracker", "def _update_control_from_target_impl",
     "def template_match_locked", "def flow_predict",
 )
 found_any = False

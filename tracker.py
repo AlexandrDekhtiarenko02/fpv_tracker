@@ -656,6 +656,17 @@ TRUST_ENABLED = True
 # Насколько быстро «недавний уровень» забывает прошлое. 0.05 при 24 к/с —
 # около секунды: медленнее самого ухудшения, иначе уровень поедет вслед за
 # ним и падение станет незаметным.
+#
+# НАЙДЕНО (аудит FPS-зависимости, диагностический коммит, НЕ исправлено
+# здесь): применяется как `ema += TRUST_EMA_ALPHA * (...)` БЕЗ alpha_for_dt
+# — то есть без нормировки на k (см. dt_ratio), в отличие от каждого
+# другого покадрового EMA-фильтра в файле (GYRO_DAMP_ALPHA, YAW_FILTER_
+# ALPHA, THROTTLE_OUT_ALPHA, PITCH_COMP_ALPHA и т.д. — все идут через
+# alpha_for_dt(ALPHA, k)). При 17/24/30 fps это де-факто три разных
+# фильтра по реальному времени, и особенно неприятно, что FPS падает
+# именно при росте рамки — то есть характер сглаживания trust меняется
+# вместе с нагрузкой. Исправление (alpha_for_dt(TRUST_EMA_ALPHA, k))
+# меняет ПОВЕДЕНИЕ контура — вне рамок этого диагностического коммита.
 TRUST_EMA_ALPHA = 0.05
 # До чего урезаем в худшем случае. Не до нуля: полностью глухой контур в
 # финале хуже, чем вялый — он перестанет реагировать вообще.
@@ -2135,13 +2146,28 @@ _FLIGHT_LOG_COLUMNS = (
     "tgt_vx,tgt_vy,stable_frames,in_closing,"
     "roll_p,roll_d,roll_i,roll_ff,roll_off,roll_sat,"
     "pitch_p,pitch_d,pitch_i,pitch_ff,pitch_off,pitch_sat,"
+    # ДИАГНОСТИКА ANTI-WINDUP (диагностический коммит, anti-windup не
+    # менялся). roll_off/pitch_off выше — "requested" (то, что видит
+    # внутренний anti-windup при проверке насыщения). after_trust/
+    # before_slew/after_slew — снимки ДАЛЬШЕ по цепочке (trust_k,
+    # демпфирование по гироскопу, launch/cruise, финальный кламп
+    # 1000-2000, CMD_SLEW), которые PID не видит вовсе. Вместе с roll_i/
+    # pitch_i (выше) на одном прогоне видно, копится ли I, хотя финальная
+    # команда уже сильно урезана позже по цепочке.
+    "roll_after_trust,roll_before_slew,roll_after_slew,"
+    "pitch_after_trust,pitch_before_slew,pitch_after_slew,"
     "launch_pwm,cruise_pwm,rate_damp,roll_damp,pitch_comb,"
     "yaw_filt,yaw_weight,yaw_pd,yaw_ff,yaw_i,yaw_off,yaw_sat,"
     "los_rate,los_aim_px,az_rate,los_aim_x_px,tau_ubyv,rost_ot_zahvata,final_hold,doverie,base_thr,thr_adjust,thr_i,rc_fresh,"
     "cmd_roll,cmd_pitch,cmd_yaw,cmd_thr,"
     "sent_r,sent_p,sent_t,sent_y,"
     "fc_roll,fc_pitch,fc_yaw,att_age_ms,"
-    "m1,m2,m3,m4,rc_r,rc_p,rc_y,rc_t,dt_ms,cb_ms,ms_potok,ms_sovpadenie,ms_primerka,armed,"
+    "m1,m2,m3,m4,rc_r,rc_p,rc_y,rc_t,dt_ms,cb_ms,ms_potok,ms_sovpadenie,ms_primerka,"
+    # STAGE TIMING (диагностический коммит): control/upravlenie — время
+    # update_control_from_target(); diagnostika — MEAN/TOPMEAN (теперь раз
+    # в секунду, см. _diag_1hz_tick); overlay — draw_overlay_on_frame(),
+    # САМ overlay не менялся, только замер вокруг него.
+    "ms_upravlenie,ms_diagnostika,ms_overlay,armed,"
     "launch_target_deg,launch_reached,k,match_psr,match_second,search_margin,"
     "match_flow_gap,size_est,size_skip,size_why,size_R,size_scale,motion_sep,motion_on,"
     "color_on,color_pen,color_best,chroma_sat,"
@@ -3563,9 +3589,66 @@ DEBUG_PRINT = True
 # =========================================================
 # 6. MSP
 # =========================================================
+#
+# --- ДИАГНОСТИКА MSP-ТРАНСПОРТА (диагностический коммит, поведение не
+# меняет) ---
+#
+# msp_request() блокирующий, serial timeout=0.05 с — то есть один неудачный
+# запрос способен съесть 50 мс, а весь цикл fc_io_loop запланирован каждые
+# MSP_RC_PERIOD=0.04 с. Низкоприоритетная диагностика (STATUS/GPS/MOTOR)
+# потенциально способна задержать то, что важнее по времени (MSP_RC,
+# отправку MSP_SET_RAW_RC) — раньше это было только предположением, без
+# измерения. Меряем длительность КАЖДОГО msp_request() по типу команды и
+# интервал между УСПЕШНЫМИ отправками MSP_SET_RAW_RC, копим скользящее окно
+# и раз в MSP_TIMING_REPORT_PERIOD_S печатаем p50/p90/p99 одной строкой в
+# flight_log.event() — этого достаточно, чтобы увидеть, гуляет ли
+# транспорт, не считая процентили на каждом кадре.
+_MSP_CMD_NAMES = {
+    105: "rc", 108: "att", 102: "imu", 109: "alt", 104: "motor",
+    106: "gps", 101: "status", 36: "feature", 119: "boxids",
+}
+MSP_TIMING_WINDOW = 300
+_msp_timing_ms = {imya: collections.deque(maxlen=MSP_TIMING_WINDOW)
+                  for imya in _MSP_CMD_NAMES.values()}
+_msp_send_interval_ms = collections.deque(maxlen=MSP_TIMING_WINDOW)
+_msp_send_interval_prev_ts = None
+MSP_TIMING_REPORT_PERIOD_S = 5.0
+_msp_timing_report_t = 0.0
+
+
+def _percentile(sorted_vals, p):
+    """p-й процентиль (0..1) уже ОТСОРТИРОВАННОГО списка. None на пустом."""
+    if not sorted_vals:
+        return None
+    idx = min(len(sorted_vals) - 1, int(round(p * (len(sorted_vals) - 1))))
+    return sorted_vals[idx]
+
+
+def _msp_timing_report():
+    """Одна строка в журнал: p50/p90/p99 по каждому типу MSP-запроса и по
+    интервалу между успешными MSP_SET_RAW_RC. Не трогает поведение —
+    только читает уже накопленные буферы."""
+    parts = []
+    for imya, buf in _msp_timing_ms.items():
+        if not buf:
+            continue
+        vals = sorted(buf)
+        parts.append("%s p50=%.0f p90=%.0f p99=%.0f n=%d" % (
+            imya, _percentile(vals, 0.5), _percentile(vals, 0.9),
+            _percentile(vals, 0.99), len(vals)))
+    if _msp_send_interval_ms:
+        vals = sorted(_msp_send_interval_ms)
+        parts.append("send_interval_ms p50=%.0f p90=%.0f p99=%.0f n=%d" % (
+            _percentile(vals, 0.5), _percentile(vals, 0.9),
+            _percentile(vals, 0.99), len(vals)))
+    if parts:
+        flight_log.event("MSP TRANSPORT: " + "; ".join(parts))
+
+
 def msp_request(cmd):
     if fc is None:
         return None
+    _msp_t0 = time.monotonic()
     try:
         # Чистим вход. ACK от SET_RAW_RC иначе копятся и парсер ловит их
         # как ответ на MSP_RC (cmd=200 vs ожидаемые 105/108).
@@ -3609,6 +3692,13 @@ def msp_request(cmd):
         # них не трогаем; переоткрываем только на настоящем сбое ввода-вывода.
         _fc_reconnect()
         return None
+    finally:
+        # finally — а не запись перед каждым return — чтобы засечь ВСЕ пути
+        # выхода (успех, любой из ранних `return None`, ветку except)
+        # одним местом, не трогая саму протокольную логику выше.
+        _imya = _MSP_CMD_NAMES.get(cmd)
+        if _imya is not None:
+            _msp_timing_ms[_imya].append((time.monotonic() - _msp_t0) * 1000.0)
 
 
 _fc_reconnect_ts = 0.0
@@ -3754,6 +3844,7 @@ def fc_io_loop():
        channels[0]=Roll, [1]=Pitch, [2]=Throttle, [3]=Yaw.
     """
     global aux4_state
+    global _msp_timing_report_t
     next_t = time.monotonic()
     next_motor_t = 0.0
     next_status_t = 0.0
@@ -3837,6 +3928,10 @@ def fc_io_loop():
                     app_state["fc_yaw_deg"] = float(heading_t)
 
             now = time.monotonic()
+
+            if now >= _msp_timing_report_t:
+                _msp_timing_report_t = now + MSP_TIMING_REPORT_PERIOD_S
+                _msp_timing_report()
 
             # Один раз узнаём, в каких битах живут нужные нам режимы.
             # Включена ли на полётнике функция GPS. Это единственный честный
@@ -4075,6 +4170,17 @@ def fc_io_loop():
                 # порте лог показывал ушедшую команду, которой не было.
                 sent_ok = send_msp_set_raw_rc(channels)
                 now_send = time.monotonic()
+                # ИНТЕРВАЛ МЕЖДУ УСПЕШНЫМИ ОТПРАВКАМИ — диагностика. Betaflight
+                # с msp_override_channels_mask ждёт непрерывный поток; если
+                # низкоприоритетные запросы (STATUS/GPS/MOTOR) выше в этом же
+                # цикле задерживают дошедшие до этой строки кадры, здесь это
+                # будет видно как рост p90/p99 при номинале ~MSP_RC_PERIOD*1000.
+                global _msp_send_interval_prev_ts
+                if sent_ok:
+                    if _msp_send_interval_prev_ts is not None:
+                        _msp_send_interval_ms.append(
+                            (now_send - _msp_send_interval_prev_ts) * 1000.0)
+                    _msp_send_interval_prev_ts = now_send
                 with state_lock:
                     # last_sent_channels — то, что РЕАЛЬНО ушло. При сбое не
                     # трогаем: пусть держит последнее честно отправленное.
@@ -5536,6 +5642,17 @@ def estimate_ground_speed(gray, now_mono):
         # «скорости нет», и закон на неё не обопрётся.
         global _gs_speed_t
         if speed is not None and 0.0 <= speed < 120.0:
+            # НАЙДЕНО (аудит FPS-зависимости, диагностический коммит, НЕ
+            # исправлено здесь): alpha_for_dt(GROUND_SPEED_ALPHA, 1.0) —
+            # k захардкожен в 1.0, хотя estimate_ground_speed() вызывается
+            # из camera_callback раз в кадр (см. вызов ниже по файлу), с
+            # тем же гуляющим интервалом, что и весь остальной контур. Сама
+            # speed (ang_rate) уже честно делится на реальный dt — не
+            # нормировано только сглаживание EMA. Тот же класс бага, что
+            # TRUST_EMA_ALPHA выше: при разном FPS EMA de-facto другой
+            # фильтр. Исправление (alpha_for_dt(GROUND_SPEED_ALPHA, k) с
+            # k, приведённым к этой функции) меняет ПОВЕДЕНИЕ — вне рамок
+            # этого диагностического коммита.
             a = alpha_for_dt(GROUND_SPEED_ALPHA, 1.0)
             if ground_speed_mps is None:
                 ground_speed_mps = speed
@@ -6048,7 +6165,15 @@ def _pid_axis_step(error, prev_error, integral, ff_value,
     if dbg_key is not None:
         # Раздельно P, D, I и FF: по сумме не понять, кто именно увёл ось —
         # а это первый вопрос, когда наведение промахивается.
-        _pid_dbg[dbg_key] = (err_f * p_gain, d_err * d_gain, integral,
+        #
+        # D ЗДЕСЬ ДОЛЖЕН БЫТЬ (d_err / k) * d_gain — ТО ЖЕ САМОЕ выражение,
+        # что и в pd_part выше. Раньше здесь стояло d_err * d_gain без
+        # деления на k: контур считал верно (D в pd_part был правильным),
+        # но колонка roll_d/pitch_d в CSV показывала D в k раз больше
+        # реального при любом k != 1 (то есть почти всегда, см. dt_ratio) —
+        # разбор лога мог указать на «слишком резкий D», которого в
+        # реальной команде не было.
+        _pid_dbg[dbg_key] = (err_f * p_gain, (d_err / k) * d_gain, integral,
                              ff_part, out, saturated)
 
     return out, err_f, integral
@@ -6549,6 +6674,16 @@ def _reset_geometry_history(reason):
 
 
 def update_control_from_target():
+    """Тонкая обёртка вокруг _update_control_from_target_impl() — измеряет
+    время этапа "управление" (_etap_ms["upravlenie"]), сам контур не
+    трогает. Внешние вызовы (process_locked_tracker, тесты) идут сюда же,
+    как и раньше — имя и сигнатура не изменились."""
+    _t0 = time.monotonic()
+    _update_control_from_target_impl()
+    _etap("upravlenie", _t0)
+
+
+def _update_control_from_target_impl():
     """Roll/Pitch/Yaw — P+D+I через _pid_axis_step с anti-windup.
        Прицельная точка по pitch учитывает текущий тангаж квада (MSP_ATTITUDE).
        Throttle:
@@ -7284,6 +7419,14 @@ def update_control_from_target():
         ROLL_INTEGRAL_MAX, ROLL_INTEGRAL_DECAY,
         ROLL_SIGN, MAX_ROLL_DEFLECT, dbg_key="roll", k=k,
     )
+    # ДИАГНОСТИКА ANTI-WINDUP. "requested" (сырой выход _pid_axis_step,
+    # уже в _pid_dbg["roll"][4]) считает насыщение по MAX_ROLL_DEFLECT —
+    # но НЕ видит ни trust_k, ни демпфирование по гироскопу, ни slew ниже.
+    # I может продолжать копиться, хотя реальная команда после них уже
+    # сильно урезана. Снимок ЗДЕСЬ — до какого-либо изменения контура: то
+    # же значение trust_k * roll_offset, что участвует в строке ниже,
+    # просто прочитано для лога до присвоения.
+    _pid_dbg["roll_after_trust"] = roll_offset * trust_k
     # Демпфирование по гироскопу для крена — то же, что у тангажа. Крен
     # раскачивался сильнее и при этом не имел его вовсе.
     roll_damp_pwm = 0.0
@@ -7312,6 +7455,7 @@ def update_control_from_target():
     else:
         roll_offset *= trust_k
     target_roll = max(1000, min(2000, 1500 + roll_offset))
+    _pid_dbg["roll_before_slew"] = target_roll
 
     # --- PITCH: P+D+I+FF через хелпер с anti-windup ---
     pitch_offset, prev_ady_ctrl, pitch_integral = _pid_axis_step(
@@ -7375,9 +7519,13 @@ def update_control_from_target():
             elif rate_damp_pwm < -PITCH_RATE_DAMP_MAX:
                 rate_damp_pwm = -PITCH_RATE_DAMP_MAX
 
+    # ДИАГНОСТИКА ANTI-WINDUP (см. пояснение у крена выше) — тот же
+    # снимок pitch_offset * trust_k, что входит в combined_pitch ниже.
+    _pid_dbg["pitch_after_trust"] = pitch_offset * trust_k
     combined_pitch = (pitch_offset * trust_k + launch_pitch_pwm
                       + cruise_pitch_pwm + rate_damp_pwm)
     target_pitch = max(1000, min(2000, 1500 + combined_pitch))
+    _pid_dbg["pitch_before_slew"] = target_pitch
 
     # --- YAW: фильтр + ослабление при больших adx + I + FF с anti-windup ---
     # Yaw не использует хелпер потому что error — это filtered_dx_yaw × yaw_weight,
@@ -7496,6 +7644,12 @@ def update_control_from_target():
         target_roll = int(round(_slew_roll))
         target_pitch = int(round(_slew_pitch))
         target_yaw = int(round(_slew_yaw))
+
+    # ДИАГНОСТИКА ANTI-WINDUP: значение ПОСЛЕ slew (безусловно — если
+    # CMD_SLEW_ENABLED=False, slew не менял target_roll/target_pitch, и
+    # after_slew совпадёт с before_slew, что и есть честный ответ).
+    _pid_dbg["roll_after_slew"] = target_roll
+    _pid_dbg["pitch_after_slew"] = target_pitch
 
     # --- THROTTLE ---
     thr_adjust = 0.0
@@ -7874,6 +8028,21 @@ def update_control_from_target():
         "roll_off": r_off, "roll_sat": r_sat,
         "pitch_p": p_p, "pitch_d": p_d, "pitch_i": p_i, "pitch_ff": p_ff,
         "pitch_off": p_off, "pitch_sat": p_sat,
+        # ДИАГНОСТИКА ANTI-WINDUP (не меняет сам anti-windup). "requested"
+        # — это roll_off/pitch_off выше (сырой выход _pid_axis_step, то же,
+        # что видит внутренний anti-windup при проверке насыщения).
+        # after_trust/before_slew/after_slew — снимки ДАЛЬШЕ по цепочке,
+        # которые _pid_axis_step не видит вовсе: trust_k, демпфирование по
+        # гироскопу, launch/cruise, финальный кламп 1000-2000, CMD_SLEW.
+        # Раздельно roll_i/pitch_i (выше) уже пишут I — вместе с этими
+        # четырьмя точками на одном прогоне видно, копится ли I, хотя
+        # финальная команда уже сильно урезана позже по цепочке.
+        "roll_after_trust": _pid_dbg.get("roll_after_trust"),
+        "roll_before_slew": _pid_dbg.get("roll_before_slew"),
+        "roll_after_slew": _pid_dbg.get("roll_after_slew"),
+        "pitch_after_trust": _pid_dbg.get("pitch_after_trust"),
+        "pitch_before_slew": _pid_dbg.get("pitch_before_slew"),
+        "pitch_after_slew": _pid_dbg.get("pitch_after_slew"),
         "launch_pwm": launch_pitch_pwm, "cruise_pwm": cruise_pitch_pwm,
         # Отдельной колонкой: без неё вклад демпфирования не отличить от
         # прицельного, а именно его размер и надо проверять по логу.
@@ -9617,6 +9786,8 @@ def _capture_flight_row(cb_t0):
             g("roll_off"), g("roll_sat"),
             g("pitch_p"), g("pitch_d"), g("pitch_i"), g("pitch_ff"),
             g("pitch_off"), g("pitch_sat"),
+            g("roll_after_trust"), g("roll_before_slew"), g("roll_after_slew"),
+            g("pitch_after_trust"), g("pitch_before_slew"), g("pitch_after_slew"),
             g("launch_pwm"), g("cruise_pwm"), g("rate_damp"), g("roll_damp"),
             g("pitch_comb"),
             g("yaw_filt"), g("yaw_weight"), g("yaw_pd"), g("yaw_ff"),
@@ -9637,6 +9808,8 @@ def _capture_flight_row(cb_t0):
             # именно этап съедает время — нет. Дважды чинил не то место.
             _etap_ms.get("potok"), _etap_ms.get("sovpadenie"),
             _etap_ms.get("primerka"),
+            _etap_ms.get("upravlenie"), _etap_ms.get("diagnostika"),
+            _etap_ms.get("overlay"),
             armed,
             g("launch_target_deg"), g("launch_reached"), g("k"),
             _match_dbg.get("psr"), _match_dbg.get("second"),
@@ -9979,6 +10152,13 @@ def camera_callback(request):
         _cam_exp_us, _cam_gain, _cam_colour_gain_r, _cam_colour_gain_b = (
             _read_cam_exposure_metadata(request))
         _cma_read_t = _cb_t0
+    # Тот же самый тик 1 Гц — и для MEAN/TOPMEAN (см. ниже, у MappedArray).
+    # Раньше mm.array[:, :, 1].mean() (307200 пикселей) и _mean_top_strip()
+    # гонялись КАЖДЫЙ кадр (24 раза в секунду) ради числа, которое читается
+    # раз в секунду (консольный дебаг, CSV — той же кадансу, что CMA/CPU).
+    # _cma_read_t только что выставлен РОВНО в _cb_t0 на тикующем кадре —
+    # сравнение диагностирует тик без отдельного таймера.
+    _diag_1hz_tick = (_cma_read_t == _cb_t0)
     try:
         with state_lock:
             aux_snapshot = aux4_state
@@ -9998,12 +10178,20 @@ def camera_callback(request):
                 # много нарисовали». Берём G-канал: он ближе всего к
                 # человеческому восприятию яркости и присутствует в любом
                 # формате main (BGR/RGB — во всех второй канал зелёный).
-                try:
-                    _last_main_mean = float(mm.array[:, :, 1].mean())
-                except Exception:
-                    _last_main_mean = None
-                _last_main_top_mean = _mean_top_strip(mm.array)
+                # Только на тике 1 Гц (см. _diag_1hz_tick выше) — между
+                # тиками MEAN/TOPMEAN просто держат последнее значение,
+                # как уже делают CMA/CPU/экспозиция.
+                if _diag_1hz_tick:
+                    _t_diag = time.monotonic()
+                    try:
+                        _last_main_mean = float(mm.array[:, :, 1].mean())
+                    except Exception:
+                        _last_main_mean = None
+                    _last_main_top_mean = _mean_top_strip(mm.array)
+                    _etap("diagnostika", _t_diag)
+                _t_ovl = time.monotonic()
                 draw_overlay_on_frame(mm.array)
+                _etap("overlay", _t_ovl)
             _capture_flight_row(_cb_t0)
             return
 
@@ -10064,13 +10252,18 @@ def camera_callback(request):
 
         with MappedArray(request, "main") as mm:
             # Средняя яркость главного кадра ДО оверлея — см. пояснение
-            # у той же операции в idle-ветке.
-            try:
-                _last_main_mean = float(mm.array[:, :, 1].mean())
-            except Exception:
-                _last_main_mean = None
-            _last_main_top_mean = _mean_top_strip(mm.array)
+            # у той же операции в idle-ветке. Тоже только на тике 1 Гц.
+            if _diag_1hz_tick:
+                _t_diag = time.monotonic()
+                try:
+                    _last_main_mean = float(mm.array[:, :, 1].mean())
+                except Exception:
+                    _last_main_mean = None
+                _last_main_top_mean = _mean_top_strip(mm.array)
+                _etap("diagnostika", _t_diag)
+            _t_ovl = time.monotonic()
             draw_overlay_on_frame(mm.array)
+            _etap("overlay", _t_ovl)
         _capture_flight_row(_cb_t0)
     except Exception:
         # ОШИБКА ЗДЕСЬ ОБЯЗАНА БЫТЬ ВИДНА.

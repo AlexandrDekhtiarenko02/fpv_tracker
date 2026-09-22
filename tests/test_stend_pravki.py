@@ -42,11 +42,19 @@ assert "return True" in telo and "return False" in telo, (
 assert "def _fc_reconnect(" in src, "нет переоткрытия порта после обрыва"
 assert "_fc_reconnect()" in telo, "send не пытается переоткрыть порт при сбое"
 # last_sent_channels помечается ТОЛЬКО на успешной отправке.
+#
+# Якоря по индексам, а не фиксированное окно символов: между send и
+# state_lock лежит диагностика интервала между отправками (см.
+# _msp_send_interval_ms) — окно фиксированной длины уже один раз ломалось
+# от вставки кода между двумя якорями, ищем следующее ближайшее
+# вхождение каждого маркера, а не режем произвольный кусок текста.
 j = src.index("sent_ok = send_msp_set_raw_rc(channels)")
-posle = src[j:j + 600]
-assert "if sent_ok:" in posle and 'app_state["last_sent_channels"]' in posle, (
-    "last_sent_channels пишется без проверки, что кадр реально ушёл")
-assert posle.index("if sent_ok:") < posle.index('app_state["last_sent_channels"]'), (
+j_if = src.index("if sent_ok:", j)
+j_lsc = src.index('app_state["last_sent_channels"]', j)
+assert j_if - j < 2000 and j_lsc - j < 2000, (
+    "if sent_ok:/last_sent_channels найдены неожиданно далеко от send — "
+    "возможно, это уже не та отправка, а следующая ниже по файлу")
+assert j_if < j_lsc, (
     "last_sent_channels пишется до проверки успеха отправки")
 print("    last_sent_channels только на успехе; порт переоткрывается")
 
