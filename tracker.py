@@ -2151,9 +2151,14 @@ _FLIGHT_LOG_COLUMNS = (
     # внутренний anti-windup при проверке насыщения). after_trust/
     # before_slew/after_slew — снимки ДАЛЬШЕ по цепочке (trust_k,
     # демпфирование по гироскопу, launch/cruise, финальный кламп
-    # 1000-2000, CMD_SLEW), которые PID не видит вовсе. Вместе с roll_i/
-    # pitch_i (выше) на одном прогоне видно, копится ли I, хотя финальная
-    # команда уже сильно урезана позже по цепочке.
+    # 1000-2000, CMD_SLEW), которые PID не видит вовсе. ВСЕ ЧЕТЫРЕ — В
+    # ОДНИХ ЕДИНИЦАХ (offset от 1500 PWM, НЕ абсолютный RC): before_slew/
+    # after_slew явно приведены вычитанием 1500, иначе цепочка requested
+    # (+80) -> after_trust (+45) -> before_slew (1545) -> after_slew
+    # (1528) выглядела бы как два разных масштаба и не читалась бы
+    # напрямую. Вместе с roll_i/pitch_i (выше) на одном прогоне видно,
+    # копится ли I, хотя финальная команда уже сильно урезана позже по
+    # цепочке.
     "roll_after_trust,roll_before_slew,roll_after_slew,"
     "pitch_after_trust,pitch_before_slew,pitch_after_slew,"
     "launch_pwm,cruise_pwm,rate_damp,roll_damp,pitch_comb,"
@@ -2545,6 +2550,10 @@ class FlightLogger:
 
     # ---------- фоновый поток ----------
     def _writer(self):
+        # _msp_timing_report_t — модуль-глобальный таймер, определён ниже
+        # по файлу (секция MSP), но к моменту вызова _writer() (фоновый
+        # поток, стартует уже после полной загрузки модуля) он существует.
+        global _msp_timing_report_t
         while not self._stop.is_set():
             self._stop.wait(FLIGHT_LOG_FLUSH_PERIOD)
             try:
@@ -2561,6 +2570,23 @@ class FlightLogger:
                               flush=True)
                     except Exception:
                         pass
+            # MSP-ТРАНСПОРТ: p50/p90/p99 раз в MSP_TIMING_REPORT_PERIOD_S.
+            #
+            # Намеренно ЗДЕСЬ, а не инлайном в fc_io_loop: подсчёт (sorted()
+            # по нескольким скользящим окнам + сборка строки) не бесплатен,
+            # а fc_io_loop — тот же цикл, что отправляет MSP_SET_RAW_RC и
+            # чей send_interval эта диагностика измеряет. Считать процентили
+            # прямо в измеряемом цикле значило бы самим измерением немного
+            # портить то, что меряешь. Здесь же — отдельный поток с уже
+            # существующей раз-в-секунду разбудкой, никак не завязанный на
+            # serial-транспорт.
+            _now_msp = time.monotonic()
+            if _now_msp >= _msp_timing_report_t:
+                _msp_timing_report_t = _now_msp + MSP_TIMING_REPORT_PERIOD_S
+                try:
+                    _msp_timing_report()
+                except Exception:
+                    pass
 
     def _drain(self):
         with self._lock:
@@ -3599,15 +3625,24 @@ DEBUG_PRINT = True
 # потенциально способна задержать то, что важнее по времени (MSP_RC,
 # отправку MSP_SET_RAW_RC) — раньше это было только предположением, без
 # измерения. Меряем длительность КАЖДОГО msp_request() по типу команды и
-# интервал между УСПЕШНЫМИ отправками MSP_SET_RAW_RC, копим скользящее окно
-# и раз в MSP_TIMING_REPORT_PERIOD_S печатаем p50/p90/p99 одной строкой в
-# flight_log.event() — этого достаточно, чтобы увидеть, гуляет ли
-# транспорт, не считая процентили на каждом кадре.
+# интервал между УСПЕШНЫМИ отправками MSP_SET_RAW_RC, копим скользящее окно.
+#
+# СБОР — в потоке fc_io_loop (append, O(1), микросекунды). СЧЁТ ПРОЦЕНТИЛЕЙ
+# — в фоновом потоке FlightLogger._writer() (уже существует, будит себя
+# раз в FLIGHT_LOG_FLUSH_PERIOD), а НЕ инлайном в fc_io_loop: сортировка
+# нескольких окон по MSP_TIMING_WINDOW значений и запись event — не
+# бесплатная операция, и раньше она выполнялась прямо в измеряемом цикле,
+# то есть диагностика раз в MSP_TIMING_REPORT_PERIOD_S сама немного
+# увеличивала как раз send_interval, который пытается измерить. Раз
+# запись (fc_io_loop) и чтение (writer) теперь в разных потоках —
+# _msp_timing_lock защищает append/снятие снимка (сам sorted()/format
+# идёт уже ВНЕ замка, по снятой копии).
 _MSP_CMD_NAMES = {
     105: "rc", 108: "att", 102: "imu", 109: "alt", 104: "motor",
     106: "gps", 101: "status", 36: "feature", 119: "boxids",
 }
 MSP_TIMING_WINDOW = 300
+_msp_timing_lock = threading.Lock()
 _msp_timing_ms = {imya: collections.deque(maxlen=MSP_TIMING_WINDOW)
                   for imya in _MSP_CMD_NAMES.values()}
 _msp_send_interval_ms = collections.deque(maxlen=MSP_TIMING_WINDOW)
@@ -3626,18 +3661,23 @@ def _percentile(sorted_vals, p):
 
 def _msp_timing_report():
     """Одна строка в журнал: p50/p90/p99 по каждому типу MSP-запроса и по
-    интервалу между успешными MSP_SET_RAW_RC. Не трогает поведение —
-    только читает уже накопленные буферы."""
+    интервалу между успешными MSP_SET_RAW_RC. Вызывается из фонового
+    потока FlightLogger — НЕ из fc_io_loop, который эти буферы наполняет
+    (см. пояснение выше). Замок держим только на копирование, sorted()/
+    форматирование строки — уже вне него."""
+    with _msp_timing_lock:
+        snapshot = {imya: list(buf) for imya, buf in _msp_timing_ms.items()}
+        interval_snapshot = list(_msp_send_interval_ms)
     parts = []
-    for imya, buf in _msp_timing_ms.items():
-        if not buf:
+    for imya, vals_raw in snapshot.items():
+        if not vals_raw:
             continue
-        vals = sorted(buf)
+        vals = sorted(vals_raw)
         parts.append("%s p50=%.0f p90=%.0f p99=%.0f n=%d" % (
             imya, _percentile(vals, 0.5), _percentile(vals, 0.9),
             _percentile(vals, 0.99), len(vals)))
-    if _msp_send_interval_ms:
-        vals = sorted(_msp_send_interval_ms)
+    if interval_snapshot:
+        vals = sorted(interval_snapshot)
         parts.append("send_interval_ms p50=%.0f p90=%.0f p99=%.0f n=%d" % (
             _percentile(vals, 0.5), _percentile(vals, 0.9),
             _percentile(vals, 0.99), len(vals)))
@@ -3698,7 +3738,9 @@ def msp_request(cmd):
         # одним местом, не трогая саму протокольную логику выше.
         _imya = _MSP_CMD_NAMES.get(cmd)
         if _imya is not None:
-            _msp_timing_ms[_imya].append((time.monotonic() - _msp_t0) * 1000.0)
+            with _msp_timing_lock:
+                _msp_timing_ms[_imya].append(
+                    (time.monotonic() - _msp_t0) * 1000.0)
 
 
 _fc_reconnect_ts = 0.0
@@ -3844,7 +3886,6 @@ def fc_io_loop():
        channels[0]=Roll, [1]=Pitch, [2]=Throttle, [3]=Yaw.
     """
     global aux4_state
-    global _msp_timing_report_t
     next_t = time.monotonic()
     next_motor_t = 0.0
     next_status_t = 0.0
@@ -3929,9 +3970,12 @@ def fc_io_loop():
 
             now = time.monotonic()
 
-            if now >= _msp_timing_report_t:
-                _msp_timing_report_t = now + MSP_TIMING_REPORT_PERIOD_S
-                _msp_timing_report()
+            # Периодический p50/p90/p99-отчёт по MSP-транспорту считается
+            # НЕ здесь, а в фоновом потоке FlightLogger._writer — см.
+            # пояснение у функции подсчёта отчёта: сама операция (sorted()
+            # по нескольким окнам + запись event) не бесплатна, и инлайновый
+            # вызов прямо в этом цикле сам немного искажал бы измеряемый
+            # send_interval.
 
             # Один раз узнаём, в каких битах живут нужные нам режимы.
             # Включена ли на полётнике функция GPS. Это единственный честный
@@ -4178,8 +4222,9 @@ def fc_io_loop():
                 global _msp_send_interval_prev_ts
                 if sent_ok:
                     if _msp_send_interval_prev_ts is not None:
-                        _msp_send_interval_ms.append(
-                            (now_send - _msp_send_interval_prev_ts) * 1000.0)
+                        with _msp_timing_lock:
+                            _msp_send_interval_ms.append(
+                                (now_send - _msp_send_interval_prev_ts) * 1000.0)
                     _msp_send_interval_prev_ts = now_send
                 with state_lock:
                     # last_sent_channels — то, что РЕАЛЬНО ушло. При сбое не
@@ -7455,7 +7500,12 @@ def _update_control_from_target_impl():
     else:
         roll_offset *= trust_k
     target_roll = max(1000, min(2000, 1500 + roll_offset))
-    _pid_dbg["roll_before_slew"] = target_roll
+    # ЕДИНИЦЫ — ОТКЛОНЕНИЕ ОТ ЦЕНТРА (PWM offset), А НЕ АБСОЛЮТНЫЙ RC.
+    # roll_off/roll_after_trust уже в offset — target_roll-1500 приводит
+    # before_slew к той же системе, иначе цепочка requested->after_trust->
+    # before_slew->after_slew не сравнима напрямую (offset, offset,
+    # абсолютный RC, абсолютный RC).
+    _pid_dbg["roll_before_slew"] = target_roll - 1500
 
     # --- PITCH: P+D+I+FF через хелпер с anti-windup ---
     pitch_offset, prev_ady_ctrl, pitch_integral = _pid_axis_step(
@@ -7525,7 +7575,8 @@ def _update_control_from_target_impl():
     combined_pitch = (pitch_offset * trust_k + launch_pitch_pwm
                       + cruise_pitch_pwm + rate_damp_pwm)
     target_pitch = max(1000, min(2000, 1500 + combined_pitch))
-    _pid_dbg["pitch_before_slew"] = target_pitch
+    # ЕДИНИЦЫ — offset, см. пояснение у крена выше.
+    _pid_dbg["pitch_before_slew"] = target_pitch - 1500
 
     # --- YAW: фильтр + ослабление при больших adx + I + FF с anti-windup ---
     # Yaw не использует хелпер потому что error — это filtered_dx_yaw × yaw_weight,
@@ -7647,9 +7698,12 @@ def _update_control_from_target_impl():
 
     # ДИАГНОСТИКА ANTI-WINDUP: значение ПОСЛЕ slew (безусловно — если
     # CMD_SLEW_ENABLED=False, slew не менял target_roll/target_pitch, и
-    # after_slew совпадёт с before_slew, что и есть честный ответ).
-    _pid_dbg["roll_after_slew"] = target_roll
-    _pid_dbg["pitch_after_slew"] = target_pitch
+    # after_slew совпадёт с before_slew, что и есть честный ответ). Единицы
+    # — offset от 1500, та же система, что requested/after_trust/
+    # before_slew: без этого цепочка "+80 -> +45 -> 1545 -> 1528" не
+    # читалась бы как одна и та же величина на разных стадиях.
+    _pid_dbg["roll_after_slew"] = target_roll - 1500
+    _pid_dbg["pitch_after_slew"] = target_pitch - 1500
 
     # --- THROTTLE ---
     thr_adjust = 0.0
@@ -8034,6 +8088,9 @@ def _update_control_from_target_impl():
         # after_trust/before_slew/after_slew — снимки ДАЛЬШЕ по цепочке,
         # которые _pid_axis_step не видит вовсе: trust_k, демпфирование по
         # гироскопу, launch/cruise, финальный кламп 1000-2000, CMD_SLEW.
+        # ВСЕ ЧЕТЫРЕ в offset от 1500 PWM (before_slew/after_slew — с
+        # вычтенным 1500, см. точку присвоения выше) — иначе сравнивать
+        # цепочку напрямую было бы нельзя (offset vs абсолютный RC).
         # Раздельно roll_i/pitch_i (выше) уже пишут I — вместе с этими
         # четырьмя точками на одном прогоне видно, копится ли I, хотя
         # финальная команда уже сильно урезана позже по цепочке.
@@ -10136,6 +10193,14 @@ def camera_callback(request):
     global _cpu_temp_c, _cpu_freq_mhz
     global _cam_exp_us, _cam_gain, _cam_colour_gain_r, _cam_colour_gain_b
     _cb_t0 = time.monotonic()
+    # _etap_ms должен отражать ТОЛЬКО этапы, реально выполненные В ЭТОМ
+    # кадре — без явной очистки словарь копил значения с прошлых вызовов
+    # (комментарий у объявления "заводится каждый кадр заново" не
+    # соответствовал коду). Особенно заметно для diagnostika (раз в
+    # секунду) и primerka (раз в SIZE_ADAPT_EVERY_FRAMES): без .clear()
+    # CSV мог показывать ms_diagnostika/ms_primerka в кадрах, где этап
+    # вообще не запускался — старое значение, а не None.
+    _etap_ms.clear()
     # CMA + CPU temp/freq + экспозиция раз в секунду: чтение /proc, /sys
     # дешевле, чем блокировать callback, но каждый кадр всё равно ни к
     # чему — экспозиция не меняется настолько быстро. Метаданные экспозиции

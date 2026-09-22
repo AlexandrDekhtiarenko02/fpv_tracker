@@ -9,12 +9,23 @@ msp_request() блокирующий, serial timeout=0.05 с — один неу
 диагностика (STATUS/GPS/MOTOR) задерживает то, что важнее по времени
 (MSP_RC, отправку MSP_SET_RAW_RC) — только предположение по чтению кода.
 
+ПОСЛЕ ОБЗОРА КОДА (замечание): первая версия считала p50/p90/p99 прямо
+внутри fc_io_loop раз в 5 с — то есть диагностика сама немного увеличивала
+send_interval, который пытается измерить (сортировка нескольких окон —
+не бесплатная операция, а происходила в измеряемом цикле). Теперь СБОР
+(append в deque) остаётся в fc_io_loop/msp_request, а СЧЁТ процентилей —
+в уже существующем фоновом потоке FlightLogger._writer(). Запись и чтение
+теперь в разных потоках — добавлен _msp_timing_lock, оба сайта append и
+сам _msp_timing_report() защищены им.
+
 msp_request() и _msp_timing_report()/_percentile() проверяются
 ФУНКЦИОНАЛЬНО: offline-харнесс подменяет serial.Serial так, что t.fc
 всегда None (реальный порт открыть нельзя) — здесь t.fc подменяется
 на фейковый объект, чтобы пройти протокольную логику до конца, включая
 finally-блок, который и пишет тайминг. Интервал между отправками (код
-внутри fc_io_loop, не отдельная функция) проверяется по исходному тексту.
+внутри fc_io_loop, не отдельная функция) и место периодического вызова
+отчёта (внутри FlightLogger._writer(), не fc_io_loop) проверяются по
+исходному тексту.
 """
 import io
 import os
@@ -124,12 +135,43 @@ assert "if sent_ok:" in mezhdu, (
 assert "_msp_send_interval_ms.append(" in mezhdu
 print("    интервал копится только при sent_ok, между send и state_lock")
 
-print("\n=== 8. Периодический вызов отчёта — раз в MSP_TIMING_REPORT_PERIOD_S "
-      "внутри fc_io_loop ===")
-assert "if now >= _msp_timing_report_t:" in src
-assert "_msp_timing_report_t = now + MSP_TIMING_REPORT_PERIOD_S" in src
-assert "_msp_timing_report()" in src
-print("    гейт по времени на месте, отчёт не печатается каждый кадр")
+print("\n=== 8. Периодический вызов отчёта — в FlightLogger._writer(), "
+      "НЕ в fc_io_loop ===")
+i_writer = src.index("def _writer(self):")
+i_writer_end = src.index("\n    def ", i_writer + 1)
+writer_body = src[i_writer:i_writer_end]
+assert "_msp_timing_report_t = _now_msp + MSP_TIMING_REPORT_PERIOD_S" in writer_body, (
+    "гейт периодического отчёта не найден внутри FlightLogger._writer()")
+assert "_msp_timing_report()" in writer_body, (
+    "_msp_timing_report() не вызывается из _writer()")
+i_fc_loop = src.index("def fc_io_loop():")
+i_fc_loop_end = src.index("\ndef ", i_fc_loop + 1)
+fc_loop_body = src[i_fc_loop:i_fc_loop_end]
+assert "_msp_timing_report()" not in fc_loop_body, (
+    "_msp_timing_report() всё ещё вызывается прямо в fc_io_loop — тот "
+    "самый цикл, чей send_interval эта диагностика измеряет; подсчёт "
+    "процентилей должен идти в фоновом потоке логгера, не здесь")
+print("    гейт и вызов — в FlightLogger._writer(), fc_io_loop его не "
+      "зовёт вовсе")
+
+print("\n=== 9. Оба append (msp_request/fc_io_loop) и сам "
+      "_msp_timing_report() защищены _msp_timing_lock ===")
+assert "_msp_timing_lock = threading.Lock()" in src
+i_report = src.index("def _msp_timing_report():")
+i_report_end = src.index("\ndef ", i_report + 1)
+report_body = src[i_report:i_report_end]
+assert "with _msp_timing_lock:" in report_body, (
+    "_msp_timing_report() не берёт замок при снятии снимка — читает "
+    "буферы, которые пишет другой поток, без защиты")
+i_finally = src.index("finally:", src.index("def msp_request(cmd):"))
+finally_body = src[i_finally:i_finally + 400]
+assert "with _msp_timing_lock:" in finally_body, (
+    "msp_request() пишет в _msp_timing_ms без замка — гонка с чтением "
+    "в фоновом потоке логгера")
+assert "with _msp_timing_lock:" in mezhdu, (
+    "интервал между отправками пишется без замка — та же гонка")
+print("    замок на месте у обоих append и у чтения в отчёте")
 
 print("\nOK: msp_request() таймингует все пути выхода через finally, "
-      "интервал между send'ами и периодический p50/p90/p99-отчёт на месте")
+      "интервал между send'ами копится в fc_io_loop, а p50/p90/p99-отчёт "
+      "считается в фоновом потоке логгера — не искажая измеряемый цикл")
