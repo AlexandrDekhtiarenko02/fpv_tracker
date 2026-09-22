@@ -19,6 +19,10 @@ for _im in ("FLOW_RASSH_MIN_R", "FLOW_RASSH_MIN", "FLOW_RASSH_MAX",
 ns["_flow_rasshirenie"] = None
 ns["_flow_rasshirenie_t"] = 0.0
 ns["_flow_dbg"] = {}
+# flow_predict теперь метит _flow_dbg["frame_index"] = frame_index (метка
+# свежести для shadow-диагностики, см. control-shadow-architecture) —
+# просто читает уже существующий счётчик кадров, значение тут неважно.
+ns["frame_index"] = 0
 # flow_predict теперь зовёт _flow_fit_translation_scale (совместная оценка
 # сдвига и масштаба, ТЗ §7) — извлекаем и её, иначе NameError внутри
 # flow_predict тихо ловится собственным except и тест видит «не сошлось»

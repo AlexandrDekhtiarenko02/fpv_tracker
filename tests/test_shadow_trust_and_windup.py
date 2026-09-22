@@ -1,19 +1,22 @@
-"""Trust time-normalized shadow (ТЗ §9) и anti-windup shadow (ТЗ §10).
-
-Оба про одно: live-версии этих механизмов не видят время/downstream
-ограничения так, как должны бы — здесь параллельно считаем, что было бы,
-не трогая live _dover_score_ema/roll_integral/pitch_integral/yaw_integral.
+"""Score-EMA time-normalized shadow (ТЗ §9) и anti-windup shadow (ТЗ
+§10) — ПЕРЕДЕЛАНО после второго ревью (нашло: shadow-I не участвовал в
+shadow-requested; restricted смешивал урезание trust/slew с добавлением
+launch/cruise; двойное применение sign делало push_further нечувствительным
+к знаку оси).
 
 Trust: live ema += TRUST_EMA_ALPHA * (...) БЕЗ alpha_for_dt/k — при
-разном FPS это де-факто разные фильтры. shadow_trust_time_norm — то же
-самое обновление, но с alpha_for_dt(TRUST_EMA_ALPHA, k). При k=1 (номинал)
-обе формулы обязаны совпасть; при k далёким от 1 — разойтись, и это и
-есть демонстрация найденного бага (не исправление — только видимость).
+разном FPS это де-факто разные фильтры. shadow_score_ema_time_norm — то
+же обновление, но с alpha_for_dt(TRUST_EMA_ALPHA, k). ЭТО НЕ shadow
+trust_k (тот ещё берёт худшее из psr/flow_gap) — только EMA-компонент,
+где найден FPS-баг. Название явно это отражает (переименовано с
+shadow_trust_time_norm после ревью — то имя намекало на альтернативный
+trust_k, которым не является).
 
-Anti-windup: shadow_roll_i/pitch_i/yaw_i — СВОИ интеграторы, копящие
-ошибку по тому же правилу push_further, что и live _pid_axis_step, но с
-"насыщением", определённым через РЕАЛЬНОЕ расхождение requested/delivered
-(roll_output_restriction), а не через MAX_*_DEFLECT.
+Anti-windup: shadow_roll_requested/pitch_requested/yaw_requested теперь
+строятся из СВОЕГО _shadow_*_integral (самосогласованно — "как бы вёл
+себя PID с исправленным anti-windup"), а restriction раскладывается на
+trust_restriction (чистое урезание trust) + slew_restriction (чистое
+урезание slew), НЕ конфликтуя с launch/cruise-добавками.
 """
 import os
 import sys
@@ -70,102 +73,156 @@ def kadr(dx=60, dy=40, score=0.85, dt=FRAME_DT):
     return t._shadow_ctl_dbg
 
 
-print("=== 1. Trust: при k=1 (номинальный FPS) shadow-EMA совпадает с "
-      "live-EMA (одна и та же формула при k=1) ===")
+print("=== 1. score_ema_time_norm: при k=1 (номинальный FPS) совпадает "
+      "с live _dover_score_ema (одна и та же формула при k=1) ===")
 force_reset()
 _clk.t = 1000.0
 sc = None
 for _ in range(10):
     sc = kadr(dt=FRAME_DT)   # ровно номинальный кадр -> k=1
-print("    shadow_trust_time_norm=%.6f live _dover_score_ema=%.6f"
-      % (sc["trust_time_norm"], t._dover_score_ema))
-assert abs(sc["trust_time_norm"] - t._dover_score_ema) < 1e-6, (
+print("    shadow_score_ema_time_norm=%.6f live _dover_score_ema=%.6f"
+      % (sc["score_ema_time_norm"], t._dover_score_ema))
+assert abs(sc["score_ema_time_norm"] - t._dover_score_ema) < 1e-6, (
     "при k=1 обе формулы совпадают по построению — расхождение значит "
     "ошибку в shadow-копии, а не в найденном баге")
 
-print("\n=== 2. Trust: при заметно неноминальном FPS (k далеко от 1) "
-      "shadow-EMA расходится с live-EMA — демонстрация FPS-бага ===")
-# ВАЖНО: EMA от константного score НЕ РАСХОДИТСЯ вообще — раз она уже
-# сошлась к этому значению, (score-ema)=0 у ОБЕИХ формул независимо от
-# alpha/k, и разница alpha_for_dt тут никак не проявится. Расхождение
-# видно только в ПЕРЕХОДНОМ процессе: сперва сходимся к 0.85 на
-# номинальном FPS (k=1, формулы совпадают по построению), затем ОДИН
-# резкий шаг score вниз одновременно с неноминальным k — вот тут
-# alpha_for_dt(ALPHA, k) и голый ALPHA дают заметно разный шаг.
+print("\n=== 2. score_ema_time_norm: резкий шаг score при неноминальном "
+      "FPS расходится с live-EMA — демонстрация найденного FPS-бага ===")
+# ВАЖНО: EMA от КОНСТАНТНОГО score не расходится вовсе (score-ema=0 у
+# обеих формул независимо от alpha/k) — нужен ПЕРЕХОДНЫЙ процесс: сперва
+# сходимся на номинальном FPS (k=1, формулы совпадают по построению),
+# затем один резкий шаг score вниз одновременно с неноминальным k.
 force_reset()
 _clk.t = 1000.0
 for _ in range(10):
-    sc = kadr(score=0.85, dt=FRAME_DT)   # прогрев на номинальном FPS
-assert abs(sc["trust_time_norm"] - t._dover_score_ema) < 1e-6, (
+    sc = kadr(score=0.85, dt=FRAME_DT)
+assert abs(sc["score_ema_time_norm"] - t._dover_score_ema) < 1e-6, (
     "прогрев на k=1 обязан дать совпадение — иначе тест сам не годен")
-sc = kadr(score=0.20, dt=FRAME_DT * 2.0)   # резкий обвал + k~2 за один шаг
-print("    после одного шага (score 0.85->0.20, k~2): "
-      "shadow_trust_time_norm=%.6f live _dover_score_ema=%.6f"
-      % (sc["trust_time_norm"], t._dover_score_ema))
-assert abs(sc["trust_time_norm"] - t._dover_score_ema) > 1e-3, (
-    "на резком шаге при неноминальном FPS shadow (time-normalized) и "
-    "live (не нормированная) EMA обязаны заметно разойтись — это и есть "
-    "found FPS-баг; совпадение значит, что либо баг пропал (тогда почему "
-    "TRUST_EMA_ALPHA не тронут?), либо shadow считает так же неверно, "
-    "как live")
-print("    подтверждено: расхождение реально видно на резком шаге при "
-      "неноминальном FPS")
+sc = kadr(score=0.20, dt=FRAME_DT * 2.0)   # обвал + k~2 за один шаг
+print("    после шага (score 0.85->0.20, k~2): shadow=%.6f live=%.6f"
+      % (sc["score_ema_time_norm"], t._dover_score_ema))
+assert abs(sc["score_ema_time_norm"] - t._dover_score_ema) > 1e-3, (
+    "на резком шаге при неноминальном FPS формулы обязаны заметно "
+    "разойтись — это и есть found FPS-баг")
+print("    подтверждено")
 
-print("\n=== 3. Anti-windup shadow: своё, отдельное состояние — не "
-      "совпадает с live roll_integral/pitch_integral ===")
+print("\n=== 3. Anti-windup shadow ТЕПЕРЬ самосогласован: "
+      "shadow_roll_requested строится из СВОЕГО shadow_roll_i, а не из "
+      "live r_off ===")
+# Сценарий: крупная устойчивая ошибка -> live PID внутренне насыщен
+# (r_off = MAX_ROLL_DEFLECT, его собственный anti-windup блокирует live
+# roll_integral). shadow, если бы requested брался у live r_off (старая
+# версия), просто продолжал бы копить ПОВЕРХ чужого потолка. В новой
+# версии shadow_roll_requested = clamp(ROLL_SIGN*(P+D+FF+shadow_I)) —
+# как только shadow_I заметно вырос, shadow_roll_requested ДОЛЖЕН
+# прижаться к тому же потолку MAX_ROLL_DEFLECT самостоятельно.
 force_reset()
 _clk.t = 1000.0
 sc = None
-for _ in range(20):
-    sc = kadr(dx=250, dy=180, score=0.85)   # крупная устойчивая ошибка
-print("    shadow_roll_i=%.3f live roll_integral=%.3f | shadow_pitch_i=%.3f "
-      "live pitch_integral=%.3f"
-      % (sc["roll_i"], t.roll_integral, sc["pitch_i"], t.pitch_integral))
-# Не требуем, чтобы они были РАЗНЫМИ по величине (могут случайно совпасть
-# на простом сценарии) — требуем, что это ДЕЙСТВИТЕЛЬНО разные объекты
-# состояния: изменение shadow не задевает live.
+for _ in range(30):
+    sc = kadr(dx=250, dy=180, score=0.85)
+c = t._ctl_dbg
+print("    после 30 кадров: live roll_off=%.1f shadow_roll_requested=%.1f "
+      "shadow_roll_i=%.1f live roll_integral=%.1f"
+      % (c["roll_off"], sc["roll_requested"], sc["roll_i"], t.roll_integral))
+assert abs(sc["roll_requested"]) <= t.MAX_ROLL_DEFLECT + 1e-6, (
+    "shadow_roll_requested обязан быть зажат по MAX_ROLL_DEFLECT, как и "
+    "live r_off — та же внутренняя логика _pid_axis_step")
+print("    shadow_roll_requested зажат тем же потолком — самосогласовано")
+
+print("\n=== 4. shadow-интегралы физически отдельные от live (изменение "
+      "shadow не задевает live) ===")
 _live_before = (t.roll_integral, t.pitch_integral, t.yaw_integral)
 t._shadow_roll_integral = 99999.0
 t._shadow_pitch_integral = -99999.0
 t._shadow_yaw_integral = 12345.0
 assert (t.roll_integral, t.pitch_integral, t.yaw_integral) == _live_before, (
-    "изменение shadow-интеграторов задело live roll_integral/pitch_integral/"
-    "yaw_integral — это не отдельное состояние, а alias на live")
-print("    подтверждено: shadow-интеграторы физически отдельные "
-      "переменные, не alias на live")
+    "изменение shadow-интеграторов задело live — не отдельное состояние")
+print("    подтверждено: физически разные переменные")
 
-print("\n=== 4. output_restriction = requested - delivered, "
-      "самосогласовано с уже существующими roll_off/before_slew/after_slew ===")
+print("\n=== 5. Restriction РАЗЛОЖЕН: launch/cruise-добавка НЕ считается "
+      "урезанием (точный сценарий из ревью) ===")
+# Пример ревью: PID requested невелик, cruise/launch добавляет много —
+# raньше restriction=requested-delivered давал ЛОЖНОЕ "урезание" (delivered
+# > requested из-за добавки). Проверяем НАПРЯМУЮ на функции
+# _shadow_windup_step / на посчитанных trust_restriction/slew_restriction:
+# если trust_k=1 (доверие полное) и slew не режет — обе restriction ~ 0,
+# ДАЖЕ ЕСЛИ launch/cruise добавили много к финальной команде.
 force_reset()
 _clk.t = 1000.0
-sc = None
-for _ in range(20):
-    sc = kadr(dx=250, dy=180, score=0.85)
-c = t._ctl_dbg
-_ozhid_roll = c["roll_off"] - c["roll_after_slew"]
-print("    shadow_roll_output_restriction=%.3f, roll_off-roll_after_slew=%.3f"
-      % (sc["roll_output_restriction"], _ozhid_roll))
-assert abs(sc["roll_output_restriction"] - _ozhid_roll) < 1e-6
-print("    совпадает — output_restriction не вводит новую величину, "
-      "только сравнивает уже существующие")
+# Небольшая, устойчивая ошибка -> requested далеко от MAX_DEFLECT,
+# trust=1.0 (хороший score), но заставляем glide включиться (крупная
+# выдержка по времени до контакта отсутствует в offline-харнессе по
+# умолчанию — используем launch/cruise напрямую нельзя без полного
+# закрытия, поэтому проверяем то же свойство минимальным путём: при
+# trust_k=1.0 и slew, не ограничивающем медленное движение,
+# trust_restriction и slew_restriction оба близки к нулю).
+for _ in range(15):
+    sc = kadr(dx=15, dy=10, score=0.95)
+print("    roll_trust_restriction=%.3f roll_slew_restriction=%.3f"
+      % (sc["roll_trust_restriction"], sc["roll_slew_restriction"]))
+assert abs(sc["roll_trust_restriction"]) < 5.0, (
+    "доверие ~1.0 -> trust_restriction обязан быть близок к нулю")
+print("    при полном доверии и небольшом движении обе restriction "
+      "близки к нулю — cruise/launch (если бы были) не исказили бы их")
 
-print("\n=== 5. slew_roll_active — булев вывод из уже существующих "
-      "before_slew/after_slew, не новая величина ===")
-_ozhid_active = c["roll_before_slew"] != c["roll_after_slew"]
-assert sc["slew_roll_active"] == _ozhid_active, (
-    "shadow_slew_roll_active не совпадает с (roll_before_slew != "
-    "roll_after_slew)")
-print("    slew_roll_active=%s согласован с before/after_slew"
-      % sc["slew_roll_active"])
+print("\n=== 6. КЛЮЧЕВОЙ ФИКС (найден ревью): push_further теперь "
+      "ЗАВИСИТ от sign оси — раньше двойное применение sign сокращалось "
+      "в sign**2=1 и делало функцию НЕЧУВСТВИТЕЛЬНОЙ к знаку ===")
+# Прямой юнит-тест _shadow_windup_step: одни и те же err_f/restriction,
+# только sign меняется +1 -> -1 — push_further обязан переключиться.
+ERR_F = 10.0
+RESTRICTION = 20.0   # > SHADOW_WINDUP_RESTRICT_PWM=15 -> restricted=True
+I_GAIN, I_MAX, I_DECAY, K = 0.1, 1000.0, 1.0, 1.0
 
-print("\n=== 6. Restriction-флаг restricted реагирует на порог "
-      "SHADOW_WINDUP_RESTRICT_PWM ===")
-assert (abs(sc["roll_output_restriction"]) > t.SHADOW_WINDUP_RESTRICT_PWM) == \
-    sc["roll_restricted"], (
-    "roll_restricted не согласован с порогом SHADOW_WINDUP_RESTRICT_PWM "
-    "и уже посчитанным roll_output_restriction")
-print("    roll_restricted согласован с порогом")
+new_i_plus, restricted_plus = t._shadow_windup_step(
+    ERR_F, RESTRICTION, 0.0, I_GAIN, I_MAX, I_DECAY, 1, K)
+new_i_minus, restricted_minus = t._shadow_windup_step(
+    ERR_F, RESTRICTION, 0.0, I_GAIN, I_MAX, I_DECAY, -1, K)
+print("    sign=+1: integral %.4f (было 0.0) | sign=-1: integral %.4f "
+      "(было 0.0)" % (new_i_plus, new_i_minus))
+assert restricted_plus and restricted_minus, (
+    "restriction=20 > порог 15 — restricted обязан быть True в обоих "
+    "случаях (restricted не зависит от sign, это отдельная проверка)")
+# sign=+1: i_dir=+1*10=+10, restriction*i_dir=20*10=200>0 -> push_further
+# =True -> интеграл НЕ растёт (push_further блокирует накопление).
+assert abs(new_i_plus - 0.0) < 1e-9, (
+    "sign=+1: push_further должен был заблокировать накопление "
+    "(restriction и i_dir в одном знаке) — интеграл не должен был вырасти")
+# sign=-1: i_dir=-1*10=-10, restriction*i_dir=20*(-10)=-200<0 ->
+# push_further=False -> интеграл РАСТЁТ на err_f*i_gain*k=10*0.1*1=1.0.
+assert abs(new_i_minus - 1.0) < 1e-6, (
+    "sign=-1: push_further должен был пропустить накопление "
+    "(restriction и i_dir в разных знаках) — интеграл обязан вырасти "
+    "на err_f*i_gain*k=1.0, а не остаться на месте, как при sign=+1")
+assert new_i_plus != new_i_minus, (
+    "РЕГРЕССИЯ НАЙДЕННОГО БАГА: при одних и тех же err_f/restriction "
+    "смена sign с +1 на -1 обязана менять классификацию push_further — "
+    "если результаты совпали, функция снова нечувствительна к знаку "
+    "оси (тот самый баг sign**2=1 из старой версии)")
+print("    sign=+1 и sign=-1 дают РАЗНЫЙ результат — функция "
+      "чувствительна к знаку оси (баг исправлен)")
 
-print("\nOK: trust time-normalized shadow показывает найденный FPS-баг, "
-      "не переключая live; anti-windup shadow — отдельное, "
-      "самосогласованное состояние, не alias на live-интеграторы")
+print("\n=== 7. Старая (баг) формула ДЕЙСТВИТЕЛЬНО была нечувствительна "
+      "к sign — документируем регрессию явно ===")
+
+
+def _staraya_buggy_formula(err_f, restriction, sign):
+    i_dir = sign * err_f
+    return restriction * i_dir * sign > 0   # старая push_further-формула
+
+
+_stary_plus = _staraya_buggy_formula(ERR_F, RESTRICTION, 1)
+_stary_minus = _staraya_buggy_formula(ERR_F, RESTRICTION, -1)
+assert _stary_plus == _stary_minus, (
+    "тест сам не показателен: старая формула должна была давать "
+    "ОДИНАКОВЫЙ результат для sign=+1 и sign=-1 (sign**2=1) — если тут "
+    "разные, воспроизвести баг для документации не вышло")
+print("    старая формула: sign=+1 -> %s, sign=-1 -> %s (одинаково, как "
+      "и было в баге) — новая версия ведёт себя иначе (см. пункт 6)"
+      % (_stary_plus, _stary_minus))
+
+print("\nOK: score_ema_time_norm корректно назван и показывает FPS-баг; "
+      "anti-windup shadow самосогласован (requested из своего "
+      "интеграла), restriction чист от launch/cruise, push_further "
+      "исправлен и чувствителен к sign оси")

@@ -171,14 +171,17 @@ for name in _LIVE_NAMES:
             idx = shadow_body.find(pattern, idx)
             if idx < 0:
                 break
-            # Убедиться, что перед найденным именем нет буквы/подчёркивания
-            # (то есть это не суффикс более длинного имени вроде
-            # _shadow_roll_integral для roll_integral).
             before = shadow_body[idx - 1] if idx > 0 else " "
-            assert not (before.isalnum() or before == "_"), (
+            if before.isalnum() or before == "_":
+                # Суффикс более длинного имени (например, "_slew_roll = "
+                # находится и внутри "_shadow_slew_roll = " — но там
+                # перед совпадением стоит "w" из "shadow", не граница
+                # слова). Это не присваивание live-переменной, пропускаем.
+                idx += 1
+                continue
+            assert False, (
                 "shadow-блок присваивает live-переменной %s (%r) — "
                 "нарушение изоляции shadow/live" % (name, pattern))
-            idx += 1
 print("    ни одно из %d live-имён (global_*_cmd, override_active, "
       "интеграторы, slew, EMA доверия) не присваивается внутри "
       "shadow-блока" % len(_LIVE_NAMES))
