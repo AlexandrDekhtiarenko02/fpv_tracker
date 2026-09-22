@@ -2284,6 +2284,13 @@ _FLIGHT_LOG_COLUMNS = (
     # булева поля не получило: производится напрямую из уже видимого
     # abs(shadow_roll_requested)>=MAX_ROLL_DEFLECT, заводить duplicate
     # столбец под это не стали.
+    #
+    # ПРЕДУПРЕЖДЕНИЕ ПРИ РАЗБОРЕ (4-е ревью): restricted = |trust_
+    # restriction + slew_restriction| > порог — они могут частично
+    # ПОГАСИТЬ друг друга (trust урезал +35, slew добавил -30, сумма +5 <
+    # 15 -> restricted=False), хотя оба механизма реально вмешивались.
+    # Смотреть roll_trust_restriction/roll_slew_restriction по отдельности,
+    # restricted — только сводный индикатор, не абсолютный ответ.
     "shadow_roll_restricted,shadow_pitch_restricted,shadow_yaw_restricted,"
     # trust_restriction/slew_restriction — РАЗДЕЛЬНО, а не одна общая
     # "output_restriction". Ревью нашло: requested-delivered смешивал
@@ -6867,6 +6874,8 @@ def _reset_geometry_history(reason):
     global stable_track_frames
     global _dover_score_ema, _dover_psr_ema
     global _shadow_trust_ema
+    global _shadow_roll_prev_restriction, _shadow_pitch_prev_restriction
+    global _shadow_yaw_prev_restriction
 
     geometry_epoch += 1
     _tau_ubyvanie = 0.0
@@ -6902,6 +6911,27 @@ def _reset_geometry_history(reason):
     # продолжала бы старую: сравнение live vs shadow после такого события
     # выглядело бы как FPS-эффект, а было бы просто разной историей.
     _shadow_trust_ema = None
+    # НАЙДЕНО (4-е ревью): _shadow_*_prev_restriction — restriction
+    # ПРЕДЫДУЩЕГО кадра, который anti-windup shadow намеренно использует
+    # с задержкой в один control-step (см. _shadow_windup_step). Но после
+    # разрыва (frame gap/re-anchor) "предыдущий кадр" в обычном смысле
+    # уже не существует — старое значение относится к старой, более не
+    # актуальной эпохе геометрии, и первая I-реакция shadow после разрыва
+    # могла бы быть ошибочно заблокирована данными из прошлой эпохи
+    # (особенно нелогично при reanchor_tracker_at_current_box(), которая
+    # сама явно объявляет старую temporal-геометрию невалидной). Сбрасываем
+    # в 0.0 — "restriction прошлого кадра неизвестна" читается как "не
+    # было restriction", то есть push_further по downstream не
+    # сработает вхолостую на первом кадре новой эпохи.
+    #
+    # _shadow_slew_roll/pitch/yaw СОЗНАТЕЛЬНО НЕ сбрасываются здесь — как
+    # и live _slew_roll/_slew_pitch/_slew_yaw, которые тоже переживают
+    # короткий разрыв геометрии без обнуления (сбрасываются только в
+    # полном not-controllable-сбросе). geometry_epoch — про temporal
+    # derivative-историю (tau/LOS-rate/EMA), не про command state.
+    _shadow_roll_prev_restriction = 0.0
+    _shadow_pitch_prev_restriction = 0.0
+    _shadow_yaw_prev_restriction = 0.0
     try:
         flight_log.event(
             "GEOMETRY_EPOCH %d: разрыв непрерывности (%s)"
@@ -8505,6 +8535,16 @@ def _update_control_from_target_impl():
         # в _shadow_windup_step (там — предыдущего кадра, для anti-windup
         # причинности, см. пояснение выше). Разные назначения, разные
         # источники — сознательно.
+        #
+        # ПРЕДУПРЕЖДЕНИЕ (4-е ревью) ПРИ РАЗБОРЕ ЛОГА: restricted — это
+        # |trust_restriction + slew_restriction| > порог, а не "любая из
+        # них активна". Они могут частично ПОГАСИТЬ друг друга (пример:
+        # trust урезал +35, slew из-за своей истории добавил -30, сумма
+        # +5 < 15 -> restricted=False), хотя оба механизма реально
+        # вмешивались в этом кадре. При разборе смотреть на roll_trust_
+        # restriction/roll_slew_restriction ПО ОТДЕЛЬНОСТИ, а не только на
+        # булев restricted — тот годится как сводный индикатор, не как
+        # абсолютный ответ "anti-windup нужен/не нужен в этом кадре".
         _roll_restricted = abs(_shadow_roll_prev_restriction) > SHADOW_WINDUP_RESTRICT_PWM
         _pitch_restricted = abs(_shadow_pitch_prev_restriction) > SHADOW_WINDUP_RESTRICT_PWM
         _yaw_restricted = abs(_shadow_yaw_prev_restriction) > SHADOW_WINDUP_RESTRICT_PWM

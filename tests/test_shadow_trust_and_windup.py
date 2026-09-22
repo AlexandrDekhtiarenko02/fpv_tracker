@@ -227,7 +227,66 @@ assert t._shadow_trust_ema is None, (
     "просто разной историей")
 print("    оба сброшены в None одним вызовом _reset_geometry_history()")
 
+print("\n=== 9. НАЙДЕНО 4-м ревью, ИСПРАВЛЕНО: _shadow_*_prev_restriction "
+      "тоже сбрасывается в _reset_geometry_history() — иначе первая "
+      "I-реакция после разрыва блокировалась бы restriction'ом из уже "
+      "неактуальной эпохи ===")
+# Прямое воспроизведение сценария из ревью: до разрыва — крупная
+# restriction. После _reset_geometry_history() "предыдущего кадра" в
+# обычном смысле больше нет — prev_restriction обязан читаться как
+# "неизвестно", не как старое число из прошлой эпохи.
+#
+# ДОВЕРИЕ УРЕЗАЕТСЯ ТОЛЬКО УХУДШЕНИЕМ (самокалибровка относительно
+# собственного недавнего уровня, см. TRUST_ENABLED) — КОНСТАНТНЫЙ низкий
+# score сходится сам с собой и даёт trust_k=1.0, restriction=0. Нужен
+# переходный процесс: прогрев на хорошем score, затем резкий обвал —
+# тот же приём, что уже в проверке 2 для score_ema.
+force_reset()
+_clk.t = 1000.0
+for _ in range(15):
+    kadr(dx=100, dy=70, score=0.90)   # прогрев: доверие сходится к 1.0
+for _ in range(3):
+    sc = kadr(dx=100, dy=70, score=0.05)   # резкий обвал -> trust_k << 1
+_do_razryva = sc["roll_trust_restriction"]
+print("    до разрыва: roll_trust_restriction=%.1f (_shadow_roll_prev_"
+      "restriction=%.1f)" % (_do_razryva, t._shadow_roll_prev_restriction))
+assert abs(t._shadow_roll_prev_restriction) > t.SHADOW_WINDUP_RESTRICT_PWM, (
+    "тест сам не годен: до разрыва должна была накопиться заметная "
+    "restriction, иначе сценарий ничего не проверяет")
+t._reset_geometry_history("тест: имитация frame gap/re-anchor")
+print("    после _reset_geometry_history(): _shadow_roll_prev_restriction=%.1f"
+      % t._shadow_roll_prev_restriction)
+assert t._shadow_roll_prev_restriction == 0.0, (
+    "_shadow_roll_prev_restriction не сбросился в _reset_geometry_history "
+    "— первая I-реакция shadow после разрыва (frame gap/re-anchor) была "
+    "бы ошибочно заблокирована restriction'ом из уже неактуальной эпохи "
+    "геометрии")
+assert t._shadow_pitch_prev_restriction == 0.0
+assert t._shadow_yaw_prev_restriction == 0.0
+print("    все три _shadow_*_prev_restriction сброшены в 0.0")
+
+print("\n=== 10. А _shadow_slew_* НЕ сбрасывается в "
+      "_reset_geometry_history() — сознательно, как и live _slew_* ===")
+# geometry_epoch — про temporal derivative-историю (tau/LOS-rate/EMA), не
+# про command state; live _slew_roll/_slew_pitch/_slew_yaw тоже
+# переживают короткий разрыв без обнуления. Проверяем, что это НЕ
+# случайно забытое — код должен явно НЕ трогать _shadow_slew_* здесь.
+force_reset()
+_clk.t = 1000.0
+for _ in range(10):
+    kadr(dx=100, dy=60, score=0.85)
+_slew_do = (t._shadow_slew_roll, t._shadow_slew_pitch, t._shadow_slew_yaw)
+t._reset_geometry_history("тест: короткий разрыв, не потеря лока")
+_slew_posle = (t._shadow_slew_roll, t._shadow_slew_pitch, t._shadow_slew_yaw)
+assert _slew_do == _slew_posle, (
+    "_shadow_slew_* изменился в _reset_geometry_history() — это не "
+    "должно происходить: slew-состояние (как и у live) переживает "
+    "короткий разрыв геометрии без обнуления, сбрасывается только в "
+    "полном not-controllable-сбросе")
+print("    _shadow_slew_roll/pitch/yaw не тронуты — как и задумано")
+
 print("\nOK: anti-windup shadow видит и внутреннее (MAX_*_DEFLECT), и "
       "downstream (trust/slew) насыщение; requested/i самосогласованы "
-      "внутри одной строки; score EMA живёт с той же границей эпохи, "
-      "что live")
+      "внутри одной строки; score EMA и prev_restriction живут с той же "
+      "границей эпохи, что live; slew-состояние границу эпохи "
+      "сознательно переживает")
