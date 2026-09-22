@@ -2246,13 +2246,74 @@ _FLIGHT_LOG_COLUMNS = (
     # mean_gray (вся яркость кадра, уже пишется рядом с чёрным экраном) —
     # если top_row заметно темнее общего, полоса внутри данных камеры;
     # если совпадает — полоса рождается только на физическом DRM-выводе.
-    "cam_top_row_mean"
+    "cam_top_row_mean,"
+    # SHADOW CONTROLLER (архитектурный аудит контура, диагностика-only —
+    # см. блок _shadow_ctl_dbg). Ничего из этого НЕ участвует в реальной
+    # команде: live-путь (global_roll_cmd и т.п.) собран и отправлен
+    # раньше, чем эти величины вообще посчитаны.
+    "shadow_ref_x,shadow_ref_y,"
+    "shadow_ref_static_x,shadow_ref_static_y,"
+    "shadow_ref_att_x,shadow_ref_att_y,"
+    "shadow_ref_lead_x,shadow_ref_lead_y,"
+    "shadow_ref_other_x,shadow_ref_other_y,"
+    "shadow_err_x,shadow_err_y,"
+    "shadow_sign_roll,shadow_sign_yaw,shadow_mag_roll,shadow_mag_yaw,"
+    "shadow_roll_yaw_both_active,"
+    "shadow_vel_box_x,shadow_vel_box_y,shadow_vel_flow_x,shadow_vel_flow_y,"
+    "shadow_vel_diff_x,shadow_vel_diff_y,"
+    "shadow_trust_time_norm,"
+    "shadow_roll_i,shadow_pitch_i,shadow_yaw_i,"
+    "shadow_roll_restricted,shadow_pitch_restricted,shadow_yaw_restricted,"
+    "shadow_roll_output_restriction,shadow_pitch_output_restriction,"
+    # slew_active — единственное из ТЗ §12, чего ещё не было: сам факт
+    # "slew ограничил именно в этом кадре" (roll_before_slew != roll_
+    # after_slew, оба уже есть в CSV). Не дублирует величины — только
+    # булев вывод из уже существующих.
+    "shadow_slew_roll_active,shadow_slew_pitch_active,"
+    "shadow_att_age_ms,shadow_gyro_age_ms,"
+    "shadow_time_us"
 )
 
 # Снимок внутренностей управления за текущий кадр. Заполняется в
 # update_control_from_target()/fast_idle_update(), читается один раз в
 # camera_callback. Обычный dict: ~3 мкс на кадр, на фоне 33 мс кадра — ничто.
 _ctl_dbg = {}
+
+# --- SHADOW CONTROLLER (архитектурный аудит контура, ветка
+# control-shadow-architecture от control-tuning) ---
+#
+# ПОВОД. Обзор кода нашёл не «неправильный коэффициент», а архитектурное
+# наложение: несколько регуляторов (tracking PID, lead, pitch attitude
+# compensation, LOS-поправка, glide/cruise, gyro damping) складывают свой
+# вклад в одну и ту же команду, каждый по своим данным и с разной
+# задержкой; roll и yaw оба реагируют на один dx; интегратор PID не знает,
+# что его выход дальше режут trust/slew; lead считается по движению
+# итоговой рамки, а рамку двигает и сам трекер (flow/matcher/scale).
+#
+# ЧТО ЭТО. Параллельный, чисто диагностический расчёт — НЕ управляет
+# аппаратом. Не имеет права писать global_roll_cmd/pitch/yaw/throttle_cmd,
+# override_active, target_controllable, track_state, трогать live PID-
+# интеграторы/slew/EMA доверия. Вызывается из
+# _update_control_from_target_impl() СТРОГО ПОСЛЕ commit'а live-команд в
+# state_lock, целиком обёрнут в try/except: исключение внутри shadow не
+# имеет права уронить или изменить то, что уже отправляется на FC.
+#
+# СОСТОЯНИЕ — отдельное от live, но того же вида (свои интеграторы, своя
+# EMA доверия), чтобы честно показать: накапливался бы I, если бы
+# anti-windup видел фактически доставленный (после trust/slew) выход, а
+# не только внутренний MAX_*_DEFLECT.
+_shadow_ctl_dbg = {"active": False}
+_shadow_roll_integral = 0.0
+_shadow_pitch_integral = 0.0
+_shadow_yaw_integral = 0.0
+_shadow_trust_ema = None
+# "Заметно активна" — доля от собственного предела оси, а не любое
+# ненулевое значение (иначе шум на обеих осях всегда считался бы
+# конкуренцией roll/yaw).
+SHADOW_CONTENTION_FRAC = 0.15
+# "Downstream заметно урезал" — порог в PWM (offset-единицы, та же
+# система, что roll_off/roll_after_trust/before_slew/after_slew).
+SHADOW_WINDUP_RESTRICT_PWM = 15.0
 # Диагностика «пропало видео вне лока». Обновляется в camera_callback раз в
 # кадр ДО отрисовки оверлея (иначе наши линии/лупа искажали бы среднюю
 # яркость). CMA-память читается раз в секунду: чтение /proc/meminfo — это
@@ -6224,6 +6285,42 @@ def _pid_axis_step(error, prev_error, integral, ff_value,
     return out, err_f, integral
 
 
+def _shadow_windup_step(err_f, requested, delivered, integral,
+                        i_gain, i_max, i_decay, sign, k):
+    """Копия anti-windup-условия из _pid_axis_step, но "насыщение" —
+    не внутренний MAX_*_DEFLECT (которого этот shadow-расчёт не видит и
+    видеть не должен), а РЕАЛЬНОЕ расхождение между тем, что попросил PID
+    (requested), и тем, что в итоге дошло до аппарата после trust/gyro
+    damping/launch-cruise/финального кламма/slew (delivered) — оба уже в
+    offset-единицах (той же системе, что roll_off/after_trust/before_slew/
+    after_slew).
+
+    ЧИСТО ДИАГНОСТИЧЕСКАЯ ФУНКЦИЯ: integral здесь — SHADOW-состояние
+    (_shadow_roll_integral и т.п.), отдельное от live roll_integral/
+    pitch_integral/yaw_integral. Не вызывается и не читается нигде в
+    live-пути управления.
+
+    Возвращает (новый_integral, restricted) — restricted=True означает
+    "downstream в этом кадре срезал заметно" (см. SHADOW_WINDUP_RESTRICT_PWM).
+    """
+    restriction = requested - delivered
+    restricted = abs(restriction) > SHADOW_WINDUP_RESTRICT_PWM
+    i_dir = sign * err_f
+    # "толкнуло бы дальше туда же, куда уже урезано": restriction и i_dir
+    # в одном направлении относительно sign — то есть I продолжал бы расти
+    # именно в ту сторону, где реальный выход и так уже не может расти.
+    push_further = restricted and (sign * restriction * i_dir > 0)
+    new_integral = integral
+    if err_f != 0.0 and not push_further:
+        new_integral += err_f * i_gain * k
+        if new_integral > i_max:
+            new_integral = i_max
+        elif new_integral < -i_max:
+            new_integral = -i_max
+    new_integral *= i_decay ** k
+    return new_integral, restricted
+
+
 _alt_hist = collections.deque(maxlen=ALT_NOISE_WINDOW)
 
 
@@ -6758,6 +6855,8 @@ def _update_control_from_target_impl():
     global prev_launch_pitch_deg, prev_box_size_px, box_growth_smoothed
     global _score_do_rosta, _tau_hold_val, _tau_hold_t, _size_R_boost
     global _tracked_since_t, _pid_last_lock_seq
+    global _shadow_roll_integral, _shadow_pitch_integral, _shadow_yaw_integral
+    global _shadow_trust_ema, _shadow_ctl_dbg
 
     with state_lock:
         box = target_box_main
@@ -6867,6 +6966,13 @@ def _update_control_from_target_impl():
         roll_integral = 0.0
         pitch_integral = 0.0
         yaw_integral = 0.0
+        # SHADOW-состояние — своё, отдельное от live-интеграторов выше, но
+        # сбрасывается по тому же событию (новый/потерянный захват): иначе
+        # диагностика windup тянула бы накопление прошлой цели в новую.
+        _shadow_roll_integral = 0.0
+        _shadow_pitch_integral = 0.0
+        _shadow_yaw_integral = 0.0
+        _shadow_trust_ema = None
         smoothed_pitch_deg = 0.0
         prev_control_mono = None
         prev_launch_pitch_deg = None
@@ -6892,6 +6998,7 @@ def _update_control_from_target_impl():
         # Кадр без управления — тоже данные: по ним видно, сколько времени
         # наведение простояло и в каком состоянии, вместо дыры в логе.
         _ctl_dbg = {"active": False, "base_thr": base_thr}
+        _shadow_ctl_dbg = {"active": False}
         return
 
     # Первый кадр после not-controllable — фиксируем «возраст захвата».
@@ -6953,6 +7060,12 @@ def _update_control_from_target_impl():
     # Применяется только после LEAD_MIN_STABLE_FRAMES — даём фильтру стабилизироваться.
     lead_x = 0.0
     lead_y = 0.0
+    # inst_vx/inst_vy — только инициализация имени (None, если ниже блок не
+    # выполнится на первом кадре после захвата). Значение НИГДЕ не меняет —
+    # нужно исключительно shadow-диагностике ниже (box-derived velocity),
+    # чтобы не падать NameError на первом кадре.
+    inst_vx = None
+    inst_vy = None
     if prev_box_cx is not None and prev_box_cy is not None:
         inst_vx = box_cx - prev_box_cx
         inst_vy = box_cy - prev_box_cy
@@ -8065,6 +8178,143 @@ def _update_control_from_target_impl():
     # видны все промежуточные величины сразу; снаружи их уже не восстановить.
     r_p, r_d, r_i, r_ff, r_off, r_sat = _pid_dbg.get("roll", (0.0,) * 5 + (False,))
     p_p, p_d, p_i, p_ff, p_off, p_sat = _pid_dbg.get("pitch", (0.0,) * 5 + (False,))
+
+    # ================= SHADOW CONTROLLER =================
+    # См. пояснение у объявления _shadow_ctl_dbg. СТРОГО ПОСЛЕ commit'а
+    # live-команд выше (state_lock уже закрыт) — исключение здесь не может
+    # изменить то, что уже ушло в global_*_cmd. Читает уже посчитанные в
+    # этом кадре величины (box_cx/cy, adx/ady, lead_x/y, pitch_comp_px,
+    # los_aim_*, r_off/p_off, yaw_pd/yaw_ff, target_roll/pitch/yaw, k,
+    # trust_k, _flow_dbg) — ни одного нового CV-прохода, ни одного нового
+    # MSP-запроса. Timing — сам за себя (shadow_time_us).
+    try:
+        _shadow_t0 = time.monotonic()
+
+        # --- AimReference (ТЗ §4): та же математика dx_aim/dy_aim, явно
+        # разложенная по вкладам. box_cx - ref_x всегда равно dx_aim (и то
+        # же по Y) — это тождество, не новый расчёт; проверяется тестом.
+        _ref_static_x = AIM_OFFSET_X
+        _ref_att_x = 0.0  # компенсация тангажа в этом законе не влияет на X
+        _ref_lead_x = lead_x
+        _ref_other_x = los_aim_x_px
+        _shadow_ref_x = (CENTER_X - _ref_static_x - _ref_att_x
+                         - _ref_lead_x - _ref_other_x)
+        _shadow_err_x = box_cx - _shadow_ref_x
+
+        _ref_static_y = AIM_OFFSET_Y
+        _ref_att_y = pitch_comp_px
+        _ref_lead_y = lead_y
+        _ref_other_y = los_aim_px
+        _shadow_ref_y = (CENTER_Y - _ref_static_y - _ref_att_y
+                         - _ref_lead_y - _ref_other_y)
+        _shadow_err_y = box_cy - _shadow_ref_y
+
+        # --- Roll/Yaw contention (ТЗ §7): оба реагируют на один dx? ---
+        _sign_roll = 0 if abs(r_off) < 1e-6 else (1 if r_off > 0 else -1)
+        _sign_yaw = 0 if abs(yaw_pd) < 1e-6 else (1 if yaw_pd > 0 else -1)
+        _roll_active = abs(r_off) >= (SHADOW_CONTENTION_FRAC * MAX_ROLL_DEFLECT)
+        _yaw_active = abs(yaw_pd) >= (SHADOW_CONTENTION_FRAC * MAX_YAW_DEFLECT)
+        _roll_yaw_both_active = bool(
+            _roll_active and _yaw_active and _sign_roll != 0
+            and _sign_roll == _sign_yaw)
+
+        # --- Lead: box-derived vs flow-derived velocity (ТЗ §8) ---
+        # inst_vx/inst_vy — уже посчитанная (выше по функции) межкадровая
+        # скорость ИТОГОВОЙ рамки, ДО фильтра target_vx/vy_smoothed.
+        # _flow_dbg["translation_x/y"] — уже посчитанный (в flow_predict,
+        # раньше этого кадра) сдвиг по optical flow, НЕЗАВИСИМО от box/
+        # matcher/scale. Оба — то, что уже есть, ничего заново не считаем.
+        _vel_box_x = None if inst_vx is None else inst_vx / k
+        _vel_box_y = None if inst_vy is None else inst_vy / k
+        _flow_tx = _flow_dbg.get("translation_x")
+        _flow_ty = _flow_dbg.get("translation_y")
+        _vel_flow_x = None if _flow_tx is None else _flow_tx / k
+        _vel_flow_y = None if _flow_ty is None else _flow_ty / k
+        _vel_diff_x = (None if _vel_box_x is None or _vel_flow_x is None
+                       else _vel_box_x - _vel_flow_x)
+        _vel_diff_y = (None if _vel_box_y is None or _vel_flow_y is None
+                       else _vel_box_y - _vel_flow_y)
+
+        # --- Trust: time-normalized EMA рядом с live (ТЗ §9) ---
+        # Live doverie использует TRUST_EMA_ALPHA БЕЗ alpha_for_dt/k (см.
+        # комментарий у TRUST_EMA_ALPHA) — здесь тот же вход, но нормировано
+        # по k, в СВОЕЙ EMA (_shadow_trust_ema), live _dover_score_ema не
+        # трогаем и не читаем для записи.
+        if last_match_score is not None and last_match_score > 0.0:
+            if _shadow_trust_ema is None:
+                _shadow_trust_ema = float(last_match_score)
+            else:
+                _shadow_trust_ema += alpha_for_dt(TRUST_EMA_ALPHA, k) * (
+                    float(last_match_score) - _shadow_trust_ema)
+
+        # --- Anti-windup shadow (ТЗ §10): видит ФАКТИЧЕСКИ доставленный
+        # выход (после trust/damp/launch-cruise/кламма/slew), а не только
+        # локальный MAX_*_DEFLECT, который видит live _pid_axis_step. ---
+        _yaw_requested = YAW_SIGN * (yaw_pd + yaw_ff + yaw_integral)
+        _shadow_roll_integral, _roll_restricted = _shadow_windup_step(
+            adx, r_off, target_roll - 1500.0, _shadow_roll_integral,
+            i_roll_eff, ROLL_INTEGRAL_MAX, ROLL_INTEGRAL_DECAY, ROLL_SIGN, k)
+        _shadow_pitch_integral, _pitch_restricted = _shadow_windup_step(
+            ady, p_off, target_pitch - 1500.0, _shadow_pitch_integral,
+            i_pitch_eff, PITCH_INTEGRAL_MAX, PITCH_INTEGRAL_DECAY,
+            PITCH_SIGN, k)
+        _shadow_yaw_integral, _yaw_restricted = _shadow_windup_step(
+            yaw_error_weighted, _yaw_requested, target_yaw - 1500.0,
+            _shadow_yaw_integral, I_GAIN_YAW, YAW_INTEGRAL_MAX,
+            YAW_INTEGRAL_DECAY, YAW_SIGN, k)
+
+        # --- Возраст ATT/gyro на момент этого кадра (ТЗ §2/3) — свежее
+        # чтение app_state, ОТДЕЛЬНОЕ от того, что уже прочитал live-путь
+        # выше (никакой новый MSP-запрос не добавляется, только чтение уже
+        # обновляемого фоновым потоком состояния). ---
+        with state_lock:
+            _att_ts = app_state.get("fc_pitch_ts", 0.0)
+            _gyro_ts = app_state.get("imu_ts", 0.0)
+        _att_age_ms = (None if _att_ts <= 0.0
+                       else (now_mono - _att_ts) * 1000.0)
+        _gyro_age_ms = (None if _gyro_ts <= 0.0
+                        else (now_mono - _gyro_ts) * 1000.0)
+
+        _shadow_ctl_dbg = {
+            "active": True,
+            "ref_x": _shadow_ref_x, "ref_y": _shadow_ref_y,
+            "ref_static_x": _ref_static_x, "ref_static_y": _ref_static_y,
+            "ref_att_x": _ref_att_x, "ref_att_y": _ref_att_y,
+            "ref_lead_x": _ref_lead_x, "ref_lead_y": _ref_lead_y,
+            "ref_other_x": _ref_other_x, "ref_other_y": _ref_other_y,
+            "err_x": _shadow_err_x, "err_y": _shadow_err_y,
+            "sign_roll": _sign_roll, "sign_yaw": _sign_yaw,
+            "mag_roll": abs(r_off), "mag_yaw": abs(yaw_pd),
+            "roll_yaw_both_active": _roll_yaw_both_active,
+            "vel_box_x": _vel_box_x, "vel_box_y": _vel_box_y,
+            "vel_flow_x": _vel_flow_x, "vel_flow_y": _vel_flow_y,
+            "vel_diff_x": _vel_diff_x, "vel_diff_y": _vel_diff_y,
+            "trust_time_norm": _shadow_trust_ema,
+            "roll_i": _shadow_roll_integral,
+            "pitch_i": _shadow_pitch_integral,
+            "yaw_i": _shadow_yaw_integral,
+            "roll_restricted": _roll_restricted,
+            "pitch_restricted": _pitch_restricted,
+            "yaw_restricted": _yaw_restricted,
+            "roll_output_restriction": r_off - (target_roll - 1500.0),
+            "pitch_output_restriction": p_off - (target_pitch - 1500.0),
+            # slew_active — сам факт, что slew в ЭТОМ кадре изменил
+            # значение (roll_before_slew != roll_after_slew, обе величины
+            # уже в CSV, здесь не дублируются, только сравниваются).
+            "slew_roll_active": (_pid_dbg.get("roll_before_slew")
+                                 != _pid_dbg.get("roll_after_slew")),
+            "slew_pitch_active": (_pid_dbg.get("pitch_before_slew")
+                                  != _pid_dbg.get("pitch_after_slew")),
+            "att_age_ms": _att_age_ms, "gyro_age_ms": _gyro_age_ms,
+            "time_us": (time.monotonic() - _shadow_t0) * 1e6,
+        }
+    except Exception:
+        # Shadow НЕ ИМЕЕТ ПРАВА уронить или испортить live-путь. Он уже
+        # выполнился к этому моменту (state_lock выше закрыт), поэтому
+        # исключение здесь — потеря ТОЛЬКО диагностики этого кадра.
+        _shadow_ctl_dbg = {"active": False}
+    # ================ /SHADOW CONTROLLER ================
+
     _ctl_dbg = {
         "active": True,
         "box_cx": box_cx, "box_cy": box_cy,
@@ -9685,7 +9935,7 @@ def print_debug_once_per_second():
 def fast_idle_update():
     global prev_aux_on, track_state, override_active
     global global_roll_cmd, global_pitch_cmd, global_yaw_cmd, global_throttle_cmd
-    global _ctl_dbg
+    global _ctl_dbg, _shadow_ctl_dbg
 
     with state_lock:
         live_thr = app_state.get("rc_throttle", 1500)
@@ -9698,6 +9948,7 @@ def fast_idle_update():
         app_state["dyn_throttle"] = live_thr
         override_active = False
         _ctl_dbg = {"active": False, "base_thr": live_thr}
+        _shadow_ctl_dbg = {"active": False}
         global_roll_cmd = 1500.0
         global_pitch_cmd = 1500.0
         global_yaw_cmd = 1500.0
@@ -9723,6 +9974,8 @@ def _capture_flight_row(cb_t0):
 
         c = _ctl_dbg
         active = c.get("active", False)
+        sc = _shadow_ctl_dbg
+        shadow_active = sc.get("active", False)
 
         with state_lock:
             st = track_state
@@ -9829,6 +10082,9 @@ def _capture_flight_row(cb_t0):
         def g(k, d=None):
             return c.get(k, d) if active else None
 
+        def sg(k, d=None):
+            return sc.get(k, d) if shadow_active else None
+
         _row_values = (
             now - flight_log._t0, frame_index, fps_current, st, ctrl, aux, ov,
             fc_ovr_row,
@@ -9918,6 +10174,23 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("nudge_rc_fresh"),
             _cam_exp_us, _cam_gain, _cam_colour_gain_r, _cam_colour_gain_b,
             _last_main_top_mean,
+            sg("ref_x"), sg("ref_y"),
+            sg("ref_static_x"), sg("ref_static_y"),
+            sg("ref_att_x"), sg("ref_att_y"),
+            sg("ref_lead_x"), sg("ref_lead_y"),
+            sg("ref_other_x"), sg("ref_other_y"),
+            sg("err_x"), sg("err_y"),
+            sg("sign_roll"), sg("sign_yaw"), sg("mag_roll"), sg("mag_yaw"),
+            sg("roll_yaw_both_active"),
+            sg("vel_box_x"), sg("vel_box_y"), sg("vel_flow_x"), sg("vel_flow_y"),
+            sg("vel_diff_x"), sg("vel_diff_y"),
+            sg("trust_time_norm"),
+            sg("roll_i"), sg("pitch_i"), sg("yaw_i"),
+            sg("roll_restricted"), sg("pitch_restricted"), sg("yaw_restricted"),
+            sg("roll_output_restriction"), sg("pitch_output_restriction"),
+            sg("slew_roll_active"), sg("slew_pitch_active"),
+            sg("att_age_ms"), sg("gyro_age_ms"),
+            sg("time_us"),
         )
         flight_log.row(_row_values)
         # Та же строка — в папку этого захвата. Форматируем один раз здесь, а
