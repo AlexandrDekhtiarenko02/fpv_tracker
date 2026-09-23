@@ -2307,17 +2307,38 @@ _FLIGHT_LOG_COLUMNS = (
     # команды", НЕ как чистый windup-сигнал одного PID.
     "shadow_roll_trust_restriction,shadow_roll_slew_restriction,"
     "shadow_pitch_trust_restriction,shadow_pitch_slew_restriction,"
-    # FINAL-HOLD DELIVERED GAP (найдено разбором 14 заходов 22.09, не по
-    # коду): пока live final_hold=1, реально уходящая на FC команда
-    # заморожена, а shadow_*_after_slew (как и весь live PID->trust->slew)
-    # продолжает считаться как обычно — в zahvat07 разошлись на 70 PWM.
-    # *_delivered — СВОЯ shadow-заморозка after_slew на момент включения
-    # hold (не копия живой _final_komandy — та усредняет по своему окну).
-    # Вне hold delivered==after_slew, gap=0. *_hold_restriction=after_slew-
-    # delivered — третья "чистая" restriction-компонента, отдельная от
-    # trust_restriction/slew_restriction. ДИАГНОСТИКА-ONLY: пока не входит
-    # в _shadow_windup_step/push_further, поведение shadow не меняет.
-    "shadow_roll_delivered,shadow_pitch_delivered,shadow_yaw_delivered,"
+    # FINAL-HOLD DELIVERED-MODEL GAP (найдено разбором 14 заходов 22.09, не
+    # по коду; уточнено ревью по d2e63f4 — см. переименование ниже).
+    #
+    # ТРИ РАЗНЫХ УРОВНЯ, которые легко перепутать при разборе — держать их
+    # разделёнными всегда:
+    #   1. live computed (ДО hold)      = pitch_after_slew  (БЕЗ префикса
+    #      shadow_ — уже есть в CSV, это то, что вычислил бы live-контур,
+    #      если бы final_hold не сработал)
+    #   2. live actually commanded      = cmd_pitch / sent_p  (тоже без
+    #      префикса — РЕАЛЬНО ушедшее на FC, единственный источник правды
+    #      про то, что live физически сделал во время hold)
+    #   3. shadow hypothetical          = shadow_pitch_after_slew (СВОЙ
+    #      расчёт, продолжающий жить во время hold) и
+    #      shadow_pitch_delivered_model (см. ниже)
+    #
+    # *_delivered_model — НЕ уровень 2 и не попытка его угадать. Это СВОЯ
+    # shadow-заморозка shadow_*_after_slew на момент включения hold (не
+    # копия живой _final_komandy — та усредняет по своему окну _final_okno,
+    # у shadow такого окна нет). Суффикс _model — намеренно, чтобы это
+    # нельзя было принять за уровень 2: shadow_pitch_delivered_model — это
+    # "что доставил бы ГИПОТЕТИЧЕСКИЙ hold shadow-контура", не то, что
+    # реально ушло на FC (для этого читать cmd_pitch/sent_p). Вне hold
+    # delivered_model==after_slew, gap=0. *_hold_restriction=after_slew-
+    # delivered_model — третья "чистая" restriction-компонента, отдельная
+    # от trust_restriction/slew_restriction, но тоже ЦЕЛИКОМ внутри
+    # shadow-мира (не измеряет реальный live-эффект final_hold — тот
+    # эффект = pitch_after_slew - cmd_pitch, считается напрямую по уже
+    # существующим live-колонкам, без всякого shadow). ДИАГНОСТИКА-ONLY:
+    # пока не входит в _shadow_windup_step/push_further, поведение shadow
+    # не меняет.
+    "shadow_roll_delivered_model,shadow_pitch_delivered_model,"
+    "shadow_yaw_delivered_model,"
     "shadow_roll_hold_restriction,shadow_pitch_hold_restriction,"
     "shadow_yaw_hold_restriction,"
     # slew_active — факт, что SHADOW-slew (свой, см. shadow_roll_after_
@@ -8578,43 +8599,50 @@ def _update_control_from_target_impl():
         _pitch_restricted = abs(_shadow_pitch_prev_restriction) > SHADOW_WINDUP_RESTRICT_PWM
         _yaw_restricted = abs(_shadow_yaw_prev_restriction) > SHADOW_WINDUP_RESTRICT_PWM
 
-        # --- Final-hold delivered gap: нашли по 14 заходам 22.09 (zahvat07/
-        # 09), не по коду. _final_zamorozhen — уже существующий live-флаг
-        # (просто читаем, ничего его собственного не трогаем): пока он
-        # True, реально уходящая на FC команда заморожена (взвешенное
-        # среднее по live _final_okno, см. блок заморозки выше по функции),
-        # а весь PID->trust->slew расчёт (в т.ч. shadow-версия) продолжает
-        # как ни в чём не бывало считаться и писаться в диагностику. В
-        # zahvat07 pitch_after_slew ушёл 15->85 PWM за время hold, пока
-        # cmd_pitch стоял на 1514 — расхождение 70 PWM, никак раньше не
-        # видное в Shadow: тот утверждал, что моделирует downstream, но
-        # ступень hold пропускал целиком.
-        #
-        # СВОЯ заморозка, не копия live: замораживаем СВОЙ after_slew этого
-        # кадра на момент False->True перехода (взять их взвешенное среднее
-        # по своему окну не пытаемся — у shadow такого окна нет, а
-        # копировать live _final_komandy означало бы тянуть в shadow
-        # чужую, не самосогласованную величину). Диагностика-only: этот
-        # gap пока НИКАК не участвует в _shadow_windup_step/push_further —
-        # поведение shadow (не говоря о live) не меняется, только видимость.
+        # --- Final-hold delivered-MODEL gap: нашли по 14 заходам 22.09
+        # (zahvat07/09), не по коду. ПЕРЕИМЕНОВАНО после ревью по d2e63f4:
+        # "*_delivered" читалось как "реально доставленная live-команда" —
+        # НЕПРАВДА. _final_zamorozhen — уже существующий live-флаг (просто
+        # читаем, ничего его собственного не трогаем): пока он True, РЕАЛЬНО
+        # уходящая на FC команда — это _final_komandy (взвешенное среднее по
+        # live _final_okno, см. блок заморозки выше по функции; в CSV она
+        # видна как cmd_pitch/sent_p, БЕЗ префикса shadow_). Shadow этого
+        # окна не имеет и не пытается его копировать — вместо этого строит
+        # СВОЙ, самосогласованный, но ГИПОТЕТИЧЕСКИЙ hold: замораживает
+        # СВОЙ after_slew этого кадра на момент False->True перехода. Три
+        # разных уровня, которые нельзя путать при разборе (см. коммент у
+        # заголовка колонок в _FLIGHT_LOG_COLUMNS):
+        #   1. live computed (до hold)  = pitch_after_slew
+        #   2. live actually commanded  = cmd_pitch / sent_p
+        #   3. shadow hypothetical      = shadow_pitch_after_slew /
+        #                                 shadow_pitch_delivered_model
+        # В zahvat07 РЕАЛЬНЫЙ (уровень 1 vs 2) разрыв — pitch_after_slew
+        # ушёл 15->85 PWM, пока cmd_pitch стоял на 1514 (70 PWM) — это и
+        # была исходная находка, целиком из уже существующих live-колонок,
+        # без всякого shadow. shadow_pitch_delivered_model этот разрыв не
+        # измеряет и не пытается — он свой, для другого вопроса ("что
+        # делал бы anti-windup, если бы shadow-путь тоже кто-то морозил").
+        # Диагностика-only: gap пока НИКАК не участвует в
+        # _shadow_windup_step/push_further — поведение shadow (не говоря о
+        # live) не меняется, только видимость.
         if _final_zamorozhen:
             if _shadow_pitch_hold_value is None:
                 _shadow_roll_hold_value = _shadow_roll_after_slew
                 _shadow_pitch_hold_value = _shadow_pitch_after_slew
                 _shadow_yaw_hold_value = _shadow_yaw_after_slew
-            _shadow_roll_delivered = _shadow_roll_hold_value
-            _shadow_pitch_delivered = _shadow_pitch_hold_value
-            _shadow_yaw_delivered = _shadow_yaw_hold_value
+            _shadow_roll_delivered_model = _shadow_roll_hold_value
+            _shadow_pitch_delivered_model = _shadow_pitch_hold_value
+            _shadow_yaw_delivered_model = _shadow_yaw_hold_value
         else:
             _shadow_roll_hold_value = None
             _shadow_pitch_hold_value = None
             _shadow_yaw_hold_value = None
-            _shadow_roll_delivered = _shadow_roll_after_slew
-            _shadow_pitch_delivered = _shadow_pitch_after_slew
-            _shadow_yaw_delivered = _shadow_yaw_after_slew
-        _roll_hold_restr = _shadow_roll_after_slew - _shadow_roll_delivered
-        _pitch_hold_restr = _shadow_pitch_after_slew - _shadow_pitch_delivered
-        _yaw_hold_restr = _shadow_yaw_after_slew - _shadow_yaw_delivered
+            _shadow_roll_delivered_model = _shadow_roll_after_slew
+            _shadow_pitch_delivered_model = _shadow_pitch_after_slew
+            _shadow_yaw_delivered_model = _shadow_yaw_after_slew
+        _roll_hold_restr = _shadow_roll_after_slew - _shadow_roll_delivered_model
+        _pitch_hold_restr = _shadow_pitch_after_slew - _shadow_pitch_delivered_model
+        _yaw_hold_restr = _shadow_yaw_after_slew - _shadow_yaw_delivered_model
 
         # --- Единый снимок ATT/gyro (ТЗ §2/3/6) — ИСПРАВЛЕНО после
         # ревью: раньше возраст считался от now_mono, взятого В НАЧАЛЕ
@@ -8664,13 +8692,15 @@ def _update_control_from_target_impl():
             "roll_slew_restriction": _roll_slew_restr,
             "pitch_trust_restriction": _pitch_trust_restr,
             "pitch_slew_restriction": _pitch_slew_restr,
-            # delivered/hold_restriction — см. блок "Final-hold delivered
-            # gap" выше: roll/yaw добавлены для полноты (_final_komandy
-            # замораживает все три оси разом), хотя обзор по 14 заходам
-            # искал эффект именно на pitch.
-            "roll_delivered": _shadow_roll_delivered,
-            "pitch_delivered": _shadow_pitch_delivered,
-            "yaw_delivered": _shadow_yaw_delivered,
+            # delivered_model/hold_restriction — см. блок "Final-hold
+            # delivered-MODEL gap" выше: НЕ реально доставленная live-
+            # команда (та — cmd_roll/pitch/yaw, без префикса shadow_), а
+            # свой гипотетический hold shadow-пути. roll/yaw добавлены для
+            # полноты (_final_komandy замораживает все три оси разом), хотя
+            # обзор по 14 заходам искал эффект именно на pitch.
+            "roll_delivered_model": _shadow_roll_delivered_model,
+            "pitch_delivered_model": _shadow_pitch_delivered_model,
+            "yaw_delivered_model": _shadow_yaw_delivered_model,
             "roll_hold_restriction": _roll_hold_restr,
             "pitch_hold_restriction": _pitch_hold_restr,
             "yaw_hold_restriction": _yaw_hold_restr,
@@ -10572,7 +10602,8 @@ def _capture_flight_row(cb_t0):
             sg("roll_restricted"), sg("pitch_restricted"), sg("yaw_restricted"),
             sg("roll_trust_restriction"), sg("roll_slew_restriction"),
             sg("pitch_trust_restriction"), sg("pitch_slew_restriction"),
-            sg("roll_delivered"), sg("pitch_delivered"), sg("yaw_delivered"),
+            sg("roll_delivered_model"), sg("pitch_delivered_model"),
+            sg("yaw_delivered_model"),
             sg("roll_hold_restriction"), sg("pitch_hold_restriction"),
             sg("yaw_hold_restriction"),
             sg("slew_roll_active"), sg("slew_pitch_active"),
