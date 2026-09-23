@@ -2307,6 +2307,19 @@ _FLIGHT_LOG_COLUMNS = (
     # команды", НЕ как чистый windup-сигнал одного PID.
     "shadow_roll_trust_restriction,shadow_roll_slew_restriction,"
     "shadow_pitch_trust_restriction,shadow_pitch_slew_restriction,"
+    # FINAL-HOLD DELIVERED GAP (найдено разбором 14 заходов 22.09, не по
+    # коду): пока live final_hold=1, реально уходящая на FC команда
+    # заморожена, а shadow_*_after_slew (как и весь live PID->trust->slew)
+    # продолжает считаться как обычно — в zahvat07 разошлись на 70 PWM.
+    # *_delivered — СВОЯ shadow-заморозка after_slew на момент включения
+    # hold (не копия живой _final_komandy — та усредняет по своему окну).
+    # Вне hold delivered==after_slew, gap=0. *_hold_restriction=after_slew-
+    # delivered — третья "чистая" restriction-компонента, отдельная от
+    # trust_restriction/slew_restriction. ДИАГНОСТИКА-ONLY: пока не входит
+    # в _shadow_windup_step/push_further, поведение shadow не меняет.
+    "shadow_roll_delivered,shadow_pitch_delivered,shadow_yaw_delivered,"
+    "shadow_roll_hold_restriction,shadow_pitch_hold_restriction,"
+    "shadow_yaw_hold_restriction,"
     # slew_active — факт, что SHADOW-slew (свой, см. shadow_roll_after_
     # slew) ограничил именно в этом кадре. НЕ live: та версия видна в
     # CSV напрямую как roll_before_slew/roll_after_slew, без префикса
@@ -2369,6 +2382,18 @@ _shadow_roll_prev_restriction = 0.0
 _shadow_pitch_prev_restriction = 0.0
 _shadow_yaw_prev_restriction = 0.0
 _shadow_trust_ema = None
+# Final-hold "доставленная" команда (разбор по 14 заходам 22.09, zahvat07/
+# 09: pitch_after_slew уходил 15->85 PWM, пока cmd_pitch реально стоял
+# замороженным на 1514 — Shadow называл себя анализом downstream, но
+# ступень final_hold не видел вовсе). _final_zamorozhen (live) замораживает
+# то, что реально уходит на FC (взвешенное среднее по live _final_okno);
+# shadow-версия — СВОЯ, отдельная заморозка (см. блок SHADOW CONTROLLER):
+# держит СВОЙ after_slew на момент включения hold, а не копирует
+# live-заморозку (та усредняет по своему окну, здесь такого окна нет).
+# None = hold сейчас не активен, shadow_*_delivered == shadow_*_after_slew.
+_shadow_roll_hold_value = None
+_shadow_pitch_hold_value = None
+_shadow_yaw_hold_value = None
 # "Заметно активна" — доля от собственного предела оси, а не любое
 # ненулевое значение (иначе шум на обеих осях всегда считался бы
 # конкуренцией roll/yaw).
@@ -6985,6 +7010,7 @@ def _update_control_from_target_impl():
     global _shadow_roll_prev_restriction, _shadow_pitch_prev_restriction
     global _shadow_yaw_prev_restriction
     global _shadow_trust_ema, _shadow_ctl_dbg
+    global _shadow_roll_hold_value, _shadow_pitch_hold_value, _shadow_yaw_hold_value
 
     with state_lock:
         box = target_box_main
@@ -7107,6 +7133,9 @@ def _update_control_from_target_impl():
         _shadow_pitch_prev_restriction = 0.0
         _shadow_yaw_prev_restriction = 0.0
         _shadow_trust_ema = None
+        _shadow_roll_hold_value = None
+        _shadow_pitch_hold_value = None
+        _shadow_yaw_hold_value = None
         smoothed_pitch_deg = 0.0
         prev_control_mono = None
         prev_launch_pitch_deg = None
@@ -8549,6 +8578,44 @@ def _update_control_from_target_impl():
         _pitch_restricted = abs(_shadow_pitch_prev_restriction) > SHADOW_WINDUP_RESTRICT_PWM
         _yaw_restricted = abs(_shadow_yaw_prev_restriction) > SHADOW_WINDUP_RESTRICT_PWM
 
+        # --- Final-hold delivered gap: нашли по 14 заходам 22.09 (zahvat07/
+        # 09), не по коду. _final_zamorozhen — уже существующий live-флаг
+        # (просто читаем, ничего его собственного не трогаем): пока он
+        # True, реально уходящая на FC команда заморожена (взвешенное
+        # среднее по live _final_okno, см. блок заморозки выше по функции),
+        # а весь PID->trust->slew расчёт (в т.ч. shadow-версия) продолжает
+        # как ни в чём не бывало считаться и писаться в диагностику. В
+        # zahvat07 pitch_after_slew ушёл 15->85 PWM за время hold, пока
+        # cmd_pitch стоял на 1514 — расхождение 70 PWM, никак раньше не
+        # видное в Shadow: тот утверждал, что моделирует downstream, но
+        # ступень hold пропускал целиком.
+        #
+        # СВОЯ заморозка, не копия live: замораживаем СВОЙ after_slew этого
+        # кадра на момент False->True перехода (взять их взвешенное среднее
+        # по своему окну не пытаемся — у shadow такого окна нет, а
+        # копировать live _final_komandy означало бы тянуть в shadow
+        # чужую, не самосогласованную величину). Диагностика-only: этот
+        # gap пока НИКАК не участвует в _shadow_windup_step/push_further —
+        # поведение shadow (не говоря о live) не меняется, только видимость.
+        if _final_zamorozhen:
+            if _shadow_pitch_hold_value is None:
+                _shadow_roll_hold_value = _shadow_roll_after_slew
+                _shadow_pitch_hold_value = _shadow_pitch_after_slew
+                _shadow_yaw_hold_value = _shadow_yaw_after_slew
+            _shadow_roll_delivered = _shadow_roll_hold_value
+            _shadow_pitch_delivered = _shadow_pitch_hold_value
+            _shadow_yaw_delivered = _shadow_yaw_hold_value
+        else:
+            _shadow_roll_hold_value = None
+            _shadow_pitch_hold_value = None
+            _shadow_yaw_hold_value = None
+            _shadow_roll_delivered = _shadow_roll_after_slew
+            _shadow_pitch_delivered = _shadow_pitch_after_slew
+            _shadow_yaw_delivered = _shadow_yaw_after_slew
+        _roll_hold_restr = _shadow_roll_after_slew - _shadow_roll_delivered
+        _pitch_hold_restr = _shadow_pitch_after_slew - _shadow_pitch_delivered
+        _yaw_hold_restr = _shadow_yaw_after_slew - _shadow_yaw_delivered
+
         # --- Единый снимок ATT/gyro (ТЗ §2/3/6) — ИСПРАВЛЕНО после
         # ревью: раньше возраст считался от now_mono, взятого В НАЧАЛЕ
         # функции, а timestamps читались ЗДЕСЬ, много вычислений спустя —
@@ -8597,6 +8664,16 @@ def _update_control_from_target_impl():
             "roll_slew_restriction": _roll_slew_restr,
             "pitch_trust_restriction": _pitch_trust_restr,
             "pitch_slew_restriction": _pitch_slew_restr,
+            # delivered/hold_restriction — см. блок "Final-hold delivered
+            # gap" выше: roll/yaw добавлены для полноты (_final_komandy
+            # замораживает все три оси разом), хотя обзор по 14 заходам
+            # искал эффект именно на pitch.
+            "roll_delivered": _shadow_roll_delivered,
+            "pitch_delivered": _shadow_pitch_delivered,
+            "yaw_delivered": _shadow_yaw_delivered,
+            "roll_hold_restriction": _roll_hold_restr,
+            "pitch_hold_restriction": _pitch_hold_restr,
+            "yaw_hold_restriction": _yaw_hold_restr,
             # slew_active — сам факт, что SHADOW-slew в ЭТОМ кадре изменил
             # значение (shadow_roll_before_slew != shadow_roll_after_slew).
             # ИСПРАВЛЕНО после 3-го ревью: раньше здесь сравнивались LIVE
@@ -10495,6 +10572,9 @@ def _capture_flight_row(cb_t0):
             sg("roll_restricted"), sg("pitch_restricted"), sg("yaw_restricted"),
             sg("roll_trust_restriction"), sg("roll_slew_restriction"),
             sg("pitch_trust_restriction"), sg("pitch_slew_restriction"),
+            sg("roll_delivered"), sg("pitch_delivered"), sg("yaw_delivered"),
+            sg("roll_hold_restriction"), sg("pitch_hold_restriction"),
+            sg("yaw_hold_restriction"),
             sg("slew_roll_active"), sg("slew_pitch_active"),
             sg("att_age_ms"), sg("gyro_age_ms"),
             sg("time_us"),
