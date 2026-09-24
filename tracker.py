@@ -2387,7 +2387,30 @@ _FLIGHT_LOG_COLUMNS = (
     # снимком. На 5 проверенных заходах только #13 (промах) пересекает
     # 12 м/с — у остальных максимум 5.9-11.4 м/с. None = vario нет/протухла.
     "shadow_vertical_sink_mps,shadow_vertical_sink_limit,"
-    "shadow_time_us"
+    "shadow_time_us,"
+    # TRACKING SHADOW: TEMPLATE IDENTITY (первый срез Tracking Shadow,
+    # разбор качества трекинга по 14 заходам 24.09.2026, см. блок
+    # process_locked_tracker / _shadow_track_dbg). Три диагностических
+    # представления ОДНОЙ И ТОЙ ЖЕ текущей позиции (lock_cx/lock_cy):
+    #   A. live  — уже посчитано этим же кадром, НЕ дублируется здесь:
+    #      смотреть match_score/match_psr/match_second/match_flow_gap.
+    #   B. fresh — template заново снят из ТЕКУЩЕГО кадра на текущей
+    #      позиции/масштабе (та же формула, что build_template()).
+    #   C. base  — template_base (эталон с захвата), приведён к тому же
+    #      размеру, что B (тот самый resize, что уже есть в live-коде под
+    #      TEMPLATE_RESCALE_ON_SIZE_CHANGE, но та ветка сейчас выключена).
+    # target_w/h — размер, к которому приведены И B, И C (сравнимы между
+    # собой и с template_w/box_w). *_flow_gap — расстояние найденного пика
+    # до flow-предсказания (тот же ориентир, что и у live match_flow_gap).
+    # НЕ включает color/motion guard (см. коммент у _shadow_match_against_
+    # template) — по разбору оба реально влияли в 0.00%/0.76% TRACKED-
+    # кадров, дублировать 2x/кадр не оправдано. None = kадр не TRACKED,
+    # template_base отсутствует, либо вырожденный случай матча.
+    "shadow_track_target_w,shadow_track_target_h,"
+    "shadow_track_fresh_score,shadow_track_fresh_psr,shadow_track_fresh_second,"
+    "shadow_track_fresh_flow_gap,"
+    "shadow_track_base_score,shadow_track_base_psr,shadow_track_base_second,"
+    "shadow_track_base_flow_gap"
 )
 
 # Снимок внутренностей управления за текущий кадр. Заполняется в
@@ -2612,6 +2635,26 @@ _pid_dbg = {}
 # Внутренности сопоставления шаблона за текущий кадр. Нужны, чтобы понять
 # ПОЧЕМУ матч встал именно сюда, а не просто насколько он уверенный.
 _match_dbg = {}
+# --- TRACKING SHADOW: TEMPLATE IDENTITY (первый срез Tracking Shadow,
+# разбор качества трекинга по 14 заходам 24.09.2026) ---
+#
+# ПОВОД. Разбор нашёл: до ручного reanchor template часто устаревшего
+# масштаба (TEMPLATE_RESCALE_ON_SIZE_CHANGE=False), score/PSR соответственно
+# плохие (median PSR по 12 длинным заходам 2.9, PSR<3 в 52% кадров), а
+# manual reanchor (свежий template в текущем масштабе) почти мгновенно чинит
+# score/PSR — в 4 независимых заходах разрыв воспроизведён кадр-в-кадр:
+# #13 score 0.290->0.974 (PSR 0.76->6.9), #10 дважды (0.79->0.95,
+# 0.48->0.97), #14 (0.50->0.96) — ровно на следующем кадре после reanchor.
+#
+# ЧТО ЭТО. Параллельный, чисто диагностический расчёт внутри
+# process_locked_tracker — НЕ управляет трекером. Не пишет template_gray,
+# tmpl_w/tmpl_h, template_std, lock_cx/lock_cy/lock_w/lock_h,
+# template_base, _match_dbg. Главный вопрос: когда live-template уже плох,
+# существует ли УЖЕ В ЭТОМ ЖЕ КАДРЕ альтернативный template (снятый заново
+# на текущей позиции, или исходный template_base, приведённый к текущему
+# размеру), который отождествляет объект существенно лучше — то есть было
+# бы видно ДО того, как оператор вручную это исправит?
+_shadow_track_dbg = {"active": False}
 # Внутренности оптического потока за текущий кадр (ТЗ п.5, flow_points /
 # flow_inliers): сколько точек было заведено и сколько дожило после
 # фильтра по статусу LK и по err. Разница между ними — как раз то, что
@@ -5977,6 +6020,128 @@ def build_template(gray, cx, cy, box_w, box_h):
     return tmpl
 
 
+def _shadow_build_fresh_template(gray, cx, cy, box_w, box_h):
+    """TRACKING SHADOW: побитово та же формула размера/кропа, что
+    build_template() (TEMPLATE_SCALE/MIN/MAX + crop_center), но возвращает
+    значения, а НЕ пишет tmpl_w/tmpl_h/template_std. Эти три глобала читает
+    live template_match_locked() на СЛЕДУЮЩЕМ кадре ДО их собственного
+    пересчёта (тот происходит только при acquisition/reanchor/adaptation,
+    не каждый кадр) — если бы shadow писал их каждый TRACKED-кадр, live-матч
+    следующего кадра молча работал бы с чужими значениями. Возвращает
+    (tmpl, tw, th, tstd)."""
+    tw = clamp(max(box_w * TEMPLATE_SCALE, TEMPLATE_MIN), TEMPLATE_MIN, TEMPLATE_MAX)
+    th = clamp(max(box_h * TEMPLATE_SCALE, TEMPLATE_MIN), TEMPLATE_MIN, TEMPLATE_MAX)
+    tmpl, _rect = crop_center(gray, cx, cy, tw, th)
+    tstd = float(np.std(tmpl)) if tmpl.size else 0.0
+    return tmpl, tmpl.shape[1], tmpl.shape[0], tstd
+
+
+def _shadow_match_against_template(gray, tmpl, tmpl_w, tmpl_h, tmpl_std,
+                                   pred_cx, pred_cy, flow_motion):
+    """TRACKING SHADOW: ядро template_match_locked() (адаптивный margin,
+    сужение окна для крупного эталона, canonical-масштаб, TM_CCOEFF/SQDIFF
+    по std, distance penalty, PSR/second по тому же radius-exclusion,
+    субпиксельное уточнение) — переиспользуется побитово той же
+    арифметикой и теми же константами (SEARCH_MARGIN*, MATCH_BIG_TMPL_PX,
+    MATCH_CANONICAL_PX, DIST_PENALTY), но ЧИСТАЯ ФУНКЦИЯ: принимает
+    template явным параметром вместо чтения template_gray/tmpl_w/tmpl_h/
+    template_std, ничего не пишет в _match_dbg. Можно звать 2 раза за кадр,
+    не портя ни live-путь, ни его диагностику.
+
+    НАМЕРЕННО ПРОПУЩЕНЫ color_penalty_map/motion_penalty_map: по разбору
+    14 заходов TRACK_ON_COLOR-защита реально включалась в 0.00% TRACKED-
+    кадров, motion guard — в 0.76%. Дублировать оба 2x/кадр ради
+    околонулевого реального эффекта — плохой размен CPU на Pi Zero 2W.
+    Это значит: сравнение здесь честное по ШАБЛОНУ (то, что и нужно для
+    вопроса "чинит ли reanchor template identity"), но НЕ идентично тому,
+    что увидел бы live matcher с color/motion guard включёнными.
+
+    Возвращает (ok, score, psr, second, mx, my). ok=False на любом
+    вырожденном случае (тот же смысл, что False-возвраты в
+    template_match_locked)."""
+    if tmpl is None or tmpl_w is None or tmpl_h is None or tmpl_w <= 0 or tmpl_h <= 0:
+        return False, 0.0, 0.0, 0.0, pred_cx, pred_cy
+    if ADAPTIVE_SEARCH_MARGIN:
+        vel_norm = min(1.0, flow_motion / SEARCH_MARGIN_VEL_REF)
+        margin = int(round(SEARCH_MARGIN_MIN
+                           + (SEARCH_MARGIN_MAX - SEARCH_MARGIN_MIN) * vel_norm))
+    else:
+        margin = SEARCH_MARGIN
+    if ((tmpl_w >= MATCH_BIG_TMPL_PX or tmpl_h >= MATCH_BIG_TMPL_PX)
+            and flow_motion <= SEARCH_MARGIN_MIN - MATCH_BIG_ZAPAS_PX):
+        if margin > SEARCH_MARGIN_MIN:
+            margin = int(SEARCH_MARGIN_MIN)
+    sw = int(tmpl_w + margin * 2)
+    sh = int(tmpl_h + margin * 2)
+    search, (sx1, sy1, sx2, sy2) = crop_center(gray, pred_cx, pred_cy, sw, sh)
+    if search.shape[0] < tmpl_h or search.shape[1] < tmpl_w:
+        return False, 0.0, 0.0, 0.0, pred_cx, pred_cy
+
+    scale = 1.0
+    if max(tmpl_w, tmpl_h) > MATCH_CANONICAL_PX:
+        scale = MATCH_CANONICAL_PX / float(max(tmpl_w, tmpl_h))
+    if scale < 1.0:
+        match_search = cv2.resize(
+            search, (max(1, int(round(search.shape[1] * scale))),
+                     max(1, int(round(search.shape[0] * scale)))),
+            interpolation=cv2.INTER_AREA)
+        match_tmpl = cv2.resize(
+            tmpl, (max(1, int(round(tmpl_w * scale))),
+                  max(1, int(round(tmpl_h * scale)))),
+            interpolation=cv2.INTER_AREA)
+        if (match_search.shape[0] < match_tmpl.shape[0]
+                or match_search.shape[1] < match_tmpl.shape[1]):
+            return False, 0.0, 0.0, 0.0, pred_cx, pred_cy
+    else:
+        match_search = search
+        match_tmpl = tmpl
+
+    try:
+        if tmpl_std < 3.0:
+            res = cv2.matchTemplate(match_search, match_tmpl, cv2.TM_SQDIFF_NORMED)
+            score_map = 1.0 - res
+        else:
+            score_map = cv2.matchTemplate(match_search, match_tmpl, cv2.TM_CCOEFF_NORMED)
+    except Exception:
+        return False, 0.0, 0.0, 0.0, pred_cx, pred_cy
+    if score_map.size == 0:
+        return False, 0.0, 0.0, 0.0, pred_cx, pred_cy
+
+    rh, rw = score_map.shape[:2]
+    yy, xx = np.mgrid[0:rh, 0:rw]
+    centers_x = sx1 + xx / scale + tmpl_w / 2.0
+    centers_y = sy1 + yy / scale + tmpl_h / 2.0
+    dist = np.sqrt((centers_x - pred_cx) ** 2 + (centers_y - pred_cy) ** 2)
+    norm = max(margin, 1)
+    penalized = score_map - DIST_PENALTY * (dist / norm) ** 2
+
+    _, _max_val, _, max_loc = cv2.minMaxLoc(penalized.astype(np.float32))
+    mx, my = max_loc
+    raw_score = float(score_map[my, mx])
+
+    try:
+        sm = score_map.astype(np.float32)
+        mask = np.ones(sm.shape, dtype=bool)
+        r = max(2, int(min(sm.shape) * 0.15))
+        y0, y1 = max(0, my - r), min(sm.shape[0], my + r + 1)
+        x0, x1 = max(0, mx - r), min(sm.shape[1], mx + r + 1)
+        mask[y0:y1, x0:x1] = False
+        side = sm[mask]
+        if side.size > 8:
+            sd = float(side.std())
+            psr = (raw_score - float(side.mean())) / sd if sd > 1e-6 else 0.0
+            second = float(side.max())
+        else:
+            psr, second = 0.0, 0.0
+    except Exception:
+        psr, second = 0.0, 0.0
+
+    sub_dx, sub_dy = subpixel_peak(score_map, mx, my)
+    new_cx = sx1 + (mx + sub_dx) / scale + tmpl_w / 2.0
+    new_cy = sy1 + (my + sub_dy) / scale + tmpl_h / 2.0
+    return True, raw_score, psr, second, float(new_cx), float(new_cy)
+
+
 def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0,
                           tgt_dx=0.0, tgt_dy=0.0):
     """Темплейт-матч с distance-penalty + субпиксельная интерполяция пика.
@@ -6285,6 +6450,7 @@ def reset_tracking(to_acq=False):
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
     global _nudge_was_active, _nudge_prev_t, _adapt_frozen_posle_reanchor
+    global _shadow_track_dbg
 
     track_state = TRACK_STATE_ACQ if to_acq else TRACK_STATE_IDLE
     target_visible = False
@@ -6305,6 +6471,7 @@ def reset_tracking(to_acq=False):
     template_base = None
     target_uv = None
     color_active = False
+    _shadow_track_dbg = {"active": False}
     color_separation = 0.0
     template_std = 0.0
     prev_gray = None
@@ -9708,6 +9875,7 @@ def process_locked_tracker(gray, cb_t0=None):
     global template_scale_acc, color_axis
     global lock_w0, lock_h0
     global _nudge_was_active, _nudge_prev_t
+    global _shadow_track_dbg
 
     frame_index += 1
 
@@ -10141,6 +10309,63 @@ def process_locked_tracker(gray, cb_t0=None):
             prev_pts = refresh_flow_points(gray, lock_cx, lock_cy, lock_w, lock_h)
         prev_gray = gray.copy()
 
+        # ============= TRACKING SHADOW: TEMPLATE IDENTITY =============
+        # СТРОГО ДО блока адаптации ниже, который МОЖЕТ переписать
+        # template_gray: "live" ниже (уже посчитано, не пересчитывается —
+        # это last_match_score/_match_dbg["psr"/"second"/"flow_gap"] этого
+        # же кадра, уже в CSV как match_score/match_psr/match_second/
+        # match_flow_gap) обязан остаться ТЕМ ЖЕ template_gray, которым
+        # только что реально матчился этот кадр, а не тем, во что он
+        # превратится после адаптации несколькими строками ниже.
+        #
+        # "fresh"/"base" ищутся вокруг ТОЙ ЖЕ pred_cx/pred_cy, что и live
+        # match (вызов template_match_locked выше по функции) — иначе
+        # разница score объяснялась бы разным местом поиска, а не разным
+        # template. Целиком try/except: исключение здесь — потеря только
+        # диагностики этого кадра, lock_cx/lock_cy/template_gray уже
+        # закоммичены строками выше и не откатываются.
+        try:
+            if template_gray is not None and lock_w > 0 and lock_h > 0:
+                _fresh_tmpl, _tw, _th, _fresh_std = _shadow_build_fresh_template(
+                    gray, lock_cx, lock_cy, lock_w, lock_h)
+                (_fresh_ok, _fresh_score, _fresh_psr, _fresh_second,
+                 _fmx, _fmy) = _shadow_match_against_template(
+                    gray, _fresh_tmpl, _tw, _th, _fresh_std,
+                    pred_cx, pred_cy, flow_motion)
+                _fresh_gap = (math.hypot(_fmx - pred_cx, _fmy - pred_cy)
+                             if _fresh_ok else None)
+
+                _base_ok = False
+                _base_score = _base_psr = _base_second = _base_gap = None
+                if template_base is not None and template_base.size > 0:
+                    _base_tmpl = cv2.resize(
+                        template_base, (_tw, _th), interpolation=cv2.INTER_LINEAR)
+                    _base_std = float(np.std(_base_tmpl)) if _base_tmpl.size else 0.0
+                    (_base_ok, _base_score, _base_psr, _base_second,
+                     _bmx, _bmy) = _shadow_match_against_template(
+                        gray, _base_tmpl, _tw, _th, _base_std,
+                        pred_cx, pred_cy, flow_motion)
+                    _base_gap = (math.hypot(_bmx - pred_cx, _bmy - pred_cy)
+                                if _base_ok else None)
+
+                _shadow_track_dbg = {
+                    "active": True,
+                    "target_w": _tw, "target_h": _th,
+                    "fresh_score": _fresh_score if _fresh_ok else None,
+                    "fresh_psr": _fresh_psr if _fresh_ok else None,
+                    "fresh_second": _fresh_second if _fresh_ok else None,
+                    "fresh_flow_gap": _fresh_gap,
+                    "base_score": _base_score if _base_ok else None,
+                    "base_psr": _base_psr if _base_ok else None,
+                    "base_second": _base_second if _base_ok else None,
+                    "base_flow_gap": _base_gap,
+                }
+            else:
+                _shadow_track_dbg = {"active": False}
+        except Exception:
+            _shadow_track_dbg = {"active": False}
+        # ============ /TRACKING SHADOW: TEMPLATE IDENTITY ============
+
         if not FREEZE_TEMPLATE and match_ok and score >= 0.60:
             cur_tmpl = build_template(gray, lock_cx, lock_cy, lock_w, lock_h)
             # ЗАПРЕТ АДАПТАЦИИ НА СОМНИТЕЛЬНЫХ КАДРАХ (ТЗ §9). match_ok и
@@ -10390,6 +10615,10 @@ def process_locked_tracker(gray, cb_t0=None):
         update_control_from_target()
     else:
         lost_frames += 1
+        # Не оставляем диагностику прошлого TRACKED-кадра висеть на кадре,
+        # где Tracking Shadow вообще не считался (та же болезнь, что чинили
+        # для _shadow_ctl_dbg в control-shadow-architecture).
+        _shadow_track_dbg = {"active": False}
         prev_gray = gray.copy()
         if lost_frames <= HOLD_FRAMES:
             box = lores_box_to_main(lock_cx, lock_cy, lock_w, lock_h)
@@ -10559,6 +10788,8 @@ def _capture_flight_row(cb_t0):
         active = c.get("active", False)
         sc = _shadow_ctl_dbg
         shadow_active = sc.get("active", False)
+        st_ = _shadow_track_dbg
+        shadow_track_active = st_.get("active", False)
 
         with state_lock:
             st = track_state
@@ -10667,6 +10898,9 @@ def _capture_flight_row(cb_t0):
 
         def sg(k, d=None):
             return sc.get(k, d) if shadow_active else None
+
+        def sgt(k, d=None):
+            return st_.get(k, d) if shadow_track_active else None
 
         _row_values = (
             now - flight_log._t0, frame_index, fps_current, st, ctrl, aux, ov,
@@ -10784,6 +11018,11 @@ def _capture_flight_row(cb_t0):
             sg("att_age_ms"), sg("gyro_age_ms"),
             sg("vertical_sink_mps"), sg("vertical_sink_limit"),
             sg("time_us"),
+            sgt("target_w"), sgt("target_h"),
+            sgt("fresh_score"), sgt("fresh_psr"), sgt("fresh_second"),
+            sgt("fresh_flow_gap"),
+            sgt("base_score"), sgt("base_psr"), sgt("base_second"),
+            sgt("base_flow_gap"),
         )
         flight_log.row(_row_values)
         # Та же строка — в папку этого захвата. Форматируем один раз здесь, а
