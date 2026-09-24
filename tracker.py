@@ -10796,7 +10796,13 @@ def process_locked_tracker(gray, cb_t0=None):
 
                         # Захват НОВОГО candidate — КАЖДЫЙ активный слот
                         # (и fresh-, и base-очередь), для оценки на БУДУЩЕМ
-                        # слоте (через ~2 слота, раз variant чередуется).
+                        # слоте. Т.к. candidate перезаписывается КАЖДЫЙ
+                        # активный слот, fresh всегда оценивает candidate
+                        # с НЕПОСРЕДСТВЕННО предыдущего активного слота —
+                        # через 1 shadow-slot = TRACKING_SHADOW_EVERY_N_
+                        # FRAMES кадров (не 2, несмотря на чередование
+                        # variant — сам тест это ожидает через N*FRAME_DT,
+                        # см. секцию 11 test_tracking_shadow_identity.py).
                         # Дёшево: один crop_center, БЕЗ matchTemplate —
                         # "дорогой" вызов на слот остаётся ровно один.
                         # НАМЕРЕННО lock_w/lock_h (текущие), а НЕ _shadow_
