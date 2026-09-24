@@ -2410,7 +2410,13 @@ _FLIGHT_LOG_COLUMNS = (
     "shadow_track_fresh_score,shadow_track_fresh_psr,shadow_track_fresh_second,"
     "shadow_track_fresh_flow_gap,"
     "shadow_track_base_score,shadow_track_base_psr,shadow_track_base_second,"
-    "shadow_track_base_flow_gap"
+    "shadow_track_base_flow_gap,"
+    # Собственная стоимость Tracking Shadow за кадр (мс) — для A/B на
+    # стенде перед деплоем: TRACKING_SHADOW_ENABLED/TRACKING_SHADOW_
+    # INCLUDE_BASE переключают OFF/FRESH/BOTH без правки остального кода.
+    # В отличие от control-shadow (~130мкс) это НЕ округление погрешности:
+    # 1-2 живых cv2.matchTemplate() за кадр.
+    "shadow_track_time_ms"
 )
 
 # Снимок внутренностей управления за текущий кадр. Заполняется в
@@ -2654,6 +2660,15 @@ _match_dbg = {}
 # на текущей позиции, или исходный template_base, приведённый к текущему
 # размеру), который отождествляет объект существенно лучше — то есть было
 # бы видно ДО того, как оператор вручную это исправит?
+#
+# СТОИМОСТЬ — В ОТЛИЧИЕ ОТ CONTROL-SHADOW (~130мкс, округление погрешности)
+# — НЕ бесплатна: fresh/base — это 1-2 живых cv2.matchTemplate() за кадр,
+# та же операция, что на Pi Zero 2W уже стоит ~8-9мс на live-матче (самый
+# дорогой этап кадра). Перед деплоем на реальный борт — два переключателя
+# для A/B на стенде, без правки остального кода:
+TRACKING_SHADOW_ENABLED = True
+# False = считаем только fresh (1 matchTemplate); True = fresh+base (2).
+TRACKING_SHADOW_INCLUDE_BASE = True
 _shadow_track_dbg = {"active": False}
 # Внутренности оптического потока за текущий кадр (ТЗ п.5, flow_points /
 # flow_inliers): сколько точек было заведено и сколько дожило после
@@ -10324,45 +10339,59 @@ def process_locked_tracker(gray, cb_t0=None):
         # template. Целиком try/except: исключение здесь — потеря только
         # диагностики этого кадра, lock_cx/lock_cy/template_gray уже
         # закоммичены строками выше и не откатываются.
-        try:
-            if template_gray is not None and lock_w > 0 and lock_h > 0:
-                _fresh_tmpl, _tw, _th, _fresh_std = _shadow_build_fresh_template(
-                    gray, lock_cx, lock_cy, lock_w, lock_h)
-                (_fresh_ok, _fresh_score, _fresh_psr, _fresh_second,
-                 _fmx, _fmy) = _shadow_match_against_template(
-                    gray, _fresh_tmpl, _tw, _th, _fresh_std,
-                    pred_cx, pred_cy, flow_motion)
-                _fresh_gap = (math.hypot(_fmx - pred_cx, _fmy - pred_cy)
-                             if _fresh_ok else None)
-
-                _base_ok = False
-                _base_score = _base_psr = _base_second = _base_gap = None
-                if template_base is not None and template_base.size > 0:
-                    _base_tmpl = cv2.resize(
-                        template_base, (_tw, _th), interpolation=cv2.INTER_LINEAR)
-                    _base_std = float(np.std(_base_tmpl)) if _base_tmpl.size else 0.0
-                    (_base_ok, _base_score, _base_psr, _base_second,
-                     _bmx, _bmy) = _shadow_match_against_template(
-                        gray, _base_tmpl, _tw, _th, _base_std,
+        #
+        # TRACKING_SHADOW_ENABLED=False — весь блок стоит одну проверку
+        # bool, ни одного matchTemplate. TRACKING_SHADOW_INCLUDE_BASE=False
+        # — только fresh (1 вызов), не fresh+base (2). time_ms — по тому же
+        # шаблону, что control-shadow's shadow_time_us: считается внутри
+        # try, попадает в CSV только на успешном пути (на исключении/
+        # вырожденном кадре — active=False без time_ms, эта диагностика
+        # уже показывала себя надёжной на control-shadow).
+        if TRACKING_SHADOW_ENABLED:
+            try:
+                _track_shadow_t0 = time.monotonic()
+                if template_gray is not None and lock_w > 0 and lock_h > 0:
+                    _fresh_tmpl, _tw, _th, _fresh_std = _shadow_build_fresh_template(
+                        gray, lock_cx, lock_cy, lock_w, lock_h)
+                    (_fresh_ok, _fresh_score, _fresh_psr, _fresh_second,
+                     _fmx, _fmy) = _shadow_match_against_template(
+                        gray, _fresh_tmpl, _tw, _th, _fresh_std,
                         pred_cx, pred_cy, flow_motion)
-                    _base_gap = (math.hypot(_bmx - pred_cx, _bmy - pred_cy)
-                                if _base_ok else None)
+                    _fresh_gap = (math.hypot(_fmx - pred_cx, _fmy - pred_cy)
+                                 if _fresh_ok else None)
 
-                _shadow_track_dbg = {
-                    "active": True,
-                    "target_w": _tw, "target_h": _th,
-                    "fresh_score": _fresh_score if _fresh_ok else None,
-                    "fresh_psr": _fresh_psr if _fresh_ok else None,
-                    "fresh_second": _fresh_second if _fresh_ok else None,
-                    "fresh_flow_gap": _fresh_gap,
-                    "base_score": _base_score if _base_ok else None,
-                    "base_psr": _base_psr if _base_ok else None,
-                    "base_second": _base_second if _base_ok else None,
-                    "base_flow_gap": _base_gap,
-                }
-            else:
+                    _base_ok = False
+                    _base_score = _base_psr = _base_second = _base_gap = None
+                    if (TRACKING_SHADOW_INCLUDE_BASE and template_base is not None
+                            and template_base.size > 0):
+                        _base_tmpl = cv2.resize(
+                            template_base, (_tw, _th), interpolation=cv2.INTER_LINEAR)
+                        _base_std = float(np.std(_base_tmpl)) if _base_tmpl.size else 0.0
+                        (_base_ok, _base_score, _base_psr, _base_second,
+                         _bmx, _bmy) = _shadow_match_against_template(
+                            gray, _base_tmpl, _tw, _th, _base_std,
+                            pred_cx, pred_cy, flow_motion)
+                        _base_gap = (math.hypot(_bmx - pred_cx, _bmy - pred_cy)
+                                    if _base_ok else None)
+
+                    _shadow_track_dbg = {
+                        "active": True,
+                        "target_w": _tw, "target_h": _th,
+                        "fresh_score": _fresh_score if _fresh_ok else None,
+                        "fresh_psr": _fresh_psr if _fresh_ok else None,
+                        "fresh_second": _fresh_second if _fresh_ok else None,
+                        "fresh_flow_gap": _fresh_gap,
+                        "base_score": _base_score if _base_ok else None,
+                        "base_psr": _base_psr if _base_ok else None,
+                        "base_second": _base_second if _base_ok else None,
+                        "base_flow_gap": _base_gap,
+                        "time_ms": (time.monotonic() - _track_shadow_t0) * 1000.0,
+                    }
+                else:
+                    _shadow_track_dbg = {"active": False}
+            except Exception:
                 _shadow_track_dbg = {"active": False}
-        except Exception:
+        else:
             _shadow_track_dbg = {"active": False}
         # ============ /TRACKING SHADOW: TEMPLATE IDENTITY ============
 
@@ -11023,6 +11052,7 @@ def _capture_flight_row(cb_t0):
             sgt("fresh_flow_gap"),
             sgt("base_score"), sgt("base_psr"), sgt("base_second"),
             sgt("base_flow_gap"),
+            sgt("time_ms"),
         )
         flight_log.row(_row_values)
         # Та же строка — в папку этого захвата. Форматируем один раз здесь, а

@@ -229,7 +229,105 @@ for fn_name in ("_shadow_build_fresh_template", "_shadow_match_against_template"
 print("    _shadow_build_fresh_template/_shadow_match_against_template "
       "не объявляют global — чистые функции")
 
+print("\n=== 6. TRACKING_SHADOW_ENABLED=False: active=False, ноль "
+      "вызовов matchTemplate (блок не считает вообще — для A/B на "
+      "стенде, ревью после 33f9e16) ===")
+_orig_enabled = t.TRACKING_SHADOW_ENABLED
+_orig_include_base = t.TRACKING_SHADOW_INCLUDE_BASE
+t.TRACKING_SHADOW_ENABLED = False
+force_reset()
+with t.state_lock:
+    t.aux4_state = True
+t.acq_wait_left = 0
+t.prev_aux_on = True
+t.track_state = t.TRACK_STATE_ACQ
+with t.state_lock:
+    t.app_state["rc_channels"] = [1500] * 8
+    t.app_state["rc_link_ts"] = t.time.monotonic()
+_clk.tick(FRAME_DT)
+t.process_locked_tracker(make_scene(CX, CY, 30))
+assert t.track_state == t.TRACK_STATE_TRACKED, "захват не состоялся"
+
+
+def _tick_frame(offset):
+    with t.state_lock:
+        t.app_state["fc_pitch_deg"] = 10.0
+        t.app_state["fc_pitch_ts"] = t.time.monotonic()
+        t.app_state["gyro"] = (0, 0, 0)
+        t.app_state["imu_ts"] = t.time.monotonic()
+    _clk.tick(FRAME_DT)
+    t.process_locked_tracker(make_scene(CX, CY, 30, offset=offset))
+
+
+_call_count = [0]
+_orig_match_2 = t._shadow_match_against_template
+
+
+def _counting(*a, **k):
+    _call_count[0] += 1
+    return _orig_match_2(*a, **k)
+
+
+t._shadow_match_against_template = _counting
+_tick_frame(1)
+t._shadow_match_against_template = _orig_match_2
+assert t._shadow_track_dbg.get("active") is False
+assert _call_count[0] == 0, (
+    "TRACKING_SHADOW_ENABLED=False обязан пропустить весь блок — 0 "
+    "вызовов _shadow_match_against_template, было %d" % _call_count[0])
+print("    ENABLED=False: active=False, 0 вызовов matchTemplate")
+
+print("\n=== 7. TRACKING_SHADOW_INCLUDE_BASE=False: только fresh "
+      "(1 вызов), base_* все None (режим 'FRESH' для стендового A/B) ===")
+t.TRACKING_SHADOW_ENABLED = True
+t.TRACKING_SHADOW_INCLUDE_BASE = False
+_call_count[0] = 0
+t._shadow_match_against_template = _counting
+_tick_frame(2)
+t._shadow_match_against_template = _orig_match_2
+sc_fresh_only = t._shadow_track_dbg
+assert sc_fresh_only.get("active") is True
+assert _call_count[0] == 1, (
+    "INCLUDE_BASE=False обязан звать matchTemplate ровно 1 раз (только "
+    "fresh), было %d" % _call_count[0])
+assert sc_fresh_only.get("fresh_score") is not None
+assert sc_fresh_only.get("base_score") is None
+assert sc_fresh_only.get("base_psr") is None
+assert sc_fresh_only.get("base_flow_gap") is None
+print("    INCLUDE_BASE=False: 1 вызов matchTemplate, fresh заполнен, "
+      "base_* все None")
+
+print("\n=== 8. TRACKING_SHADOW_INCLUDE_BASE=True (режим 'BOTH'): 2 "
+      "вызова, shadow_track_time_ms записан и положителен ===")
+t.TRACKING_SHADOW_INCLUDE_BASE = True
+_call_count[0] = 0
+t._shadow_match_against_template = _counting
+_tick_frame(3)
+t._shadow_match_against_template = _orig_match_2
+sc_both = t._shadow_track_dbg
+assert sc_both.get("active") is True
+assert _call_count[0] == 2, (
+    "BOTH обязан звать matchTemplate ровно 2 раза (fresh+base), было %d"
+    % _call_count[0])
+assert sc_both.get("fresh_score") is not None
+assert sc_both.get("base_score") is not None
+assert sc_both.get("time_ms") is not None and sc_both["time_ms"] >= 0.0, (
+    "time_ms обязан хотя бы записываться на успешном кадре — именно его "
+    "будем читать на стенде как shadow_track_time_ms")
+# НЕ микробенчмарк: часы в оффлайн-тесте мокнуты (см. _Chasy) и не тикают
+# ВНУТРИ одного вызова process_locked_tracker(), поэтому time.monotonic()-
+# time.monotonic() тут всегда ровно 0.0 — реальную стоимость в мс так не
+# измерить (для этого и нужен стенд). Что проверено здесь: поле вообще
+# пишется (не падает раньше вычисления времени) и остаётся числом.
+print("    BOTH: 2 вызова matchTemplate, fresh и base заполнены, "
+      "time_ms=%.4f (мокнутые часы дают ровно 0.0, замер только на стенде)"
+      % sc_both["time_ms"])
+
+t.TRACKING_SHADOW_ENABLED = _orig_enabled
+t.TRACKING_SHADOW_INCLUDE_BASE = _orig_include_base
+
 print("\nOK: Tracking Shadow v1 (Template Identity) корректно измеряет "
       "разрыв fresh-vs-live на синтетике, не влияет на live-путь ни при "
-      "штатной работе, ни при внутреннем сбое, и не пишет в "
-      "live-переменные по исходному тексту")
+      "штатной работе, ни при внутреннем сбое, не пишет в live-переменные "
+      "по исходному тексту, и переключатели OFF/FRESH/BOTH работают "
+      "ровно так, как нужно для стендового A/B")
