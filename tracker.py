@@ -2257,6 +2257,16 @@ _FLIGHT_LOG_COLUMNS = (
     "shadow_ref_lead_x,shadow_ref_lead_y,"
     "shadow_ref_other_x,shadow_ref_other_y,"
     "shadow_err_x,shadow_err_y,"
+    # PITCH REFERENCE-CONFLICT SUSTAINED RUN (найдено разбором reference
+    # construction по 14 заходам 24.09.2026). pitch_ref_conflict — pitch_comp
+    # уже не просто перевернул знак dy_raw, а ПРЕВЫШАЕТ его по модулю
+    # (dominance, не просто sign-flip — тот сам по себе не разделяет
+    # заходы, см. коммент у SHADOW CONTROLLER). *_run_s — длительность
+    # текущей непрерывной такой серии: на 4 "чистых" заходах максимум
+    # монотонно рос по тяжести исхода (0.09с сошлось -> 1.25с промах) —
+    # признак, который реально отличает заходы, не мгновенный флаг. Только
+    # Pitch/Y, диагностика-only.
+    "shadow_pitch_ref_conflict,shadow_pitch_ref_conflict_run_s,"
     "shadow_sign_roll,shadow_sign_yaw,shadow_mag_roll,shadow_mag_yaw,"
     "shadow_roll_yaw_both_active,"
     "shadow_vel_box_x,shadow_vel_box_y,shadow_vel_flow_x,shadow_vel_flow_y,"
@@ -2415,6 +2425,18 @@ _shadow_trust_ema = None
 _shadow_roll_hold_value = None
 _shadow_pitch_hold_value = None
 _shadow_yaw_hold_value = None
+# Reference-conflict sustained run (найдено разбором reference construction
+# по 14 заходам 24.09.2026, не по коду): не сам sign-flip (dy_raw и dy_aim
+# разных знаков) разделяет исходы — он частый и в нормальных заходах тоже.
+# Разделяет ДЛИТЕЛЬНОСТЬ непрерывной серии, где pitch_comp уже не просто
+# перевернул знак, а ПРЕВЫШАЕТ dy_raw по модулю (доминирует). На 4 "чистых"
+# (nudge~0) заходах максимальная непрерывная серия росла строго по тяжести
+# исхода: #4 сошлось 0.09с -> #7 перелёт 0.31с -> #9 недолёт 0.75с -> #13
+# вертикальный промах 1.25с — при этом мгновенный dom% и общий flip% сами
+# по себе НЕ разделяли #7/#9/#13 (все 71-79% flip). Только Pitch/Y: вся
+# доказательная база — из dy_raw/dy_aim, X-аналог не проверялся, не вводим
+# по аналогии. None = сейчас не в серии.
+_shadow_pitch_conflict_since_t = None
 # "Заметно активна" — доля от собственного предела оси, а не любое
 # ненулевое значение (иначе шум на обеих осях всегда считался бы
 # конкуренцией roll/yaw).
@@ -7032,6 +7054,7 @@ def _update_control_from_target_impl():
     global _shadow_yaw_prev_restriction
     global _shadow_trust_ema, _shadow_ctl_dbg
     global _shadow_roll_hold_value, _shadow_pitch_hold_value, _shadow_yaw_hold_value
+    global _shadow_pitch_conflict_since_t
 
     with state_lock:
         box = target_box_main
@@ -7157,6 +7180,7 @@ def _update_control_from_target_impl():
         _shadow_roll_hold_value = None
         _shadow_pitch_hold_value = None
         _shadow_yaw_hold_value = None
+        _shadow_pitch_conflict_since_t = None
         smoothed_pitch_deg = 0.0
         prev_control_mono = None
         prev_launch_pitch_deg = None
@@ -8399,6 +8423,32 @@ def _update_control_from_target_impl():
                          - _ref_lead_y - _ref_other_y)
         _shadow_err_y = box_cy - _shadow_ref_y
 
+        # --- Reference conflict / sustained pitch-compensation dominance
+        # (найдено разбором reference construction по 14 заходам 24.09.2026,
+        # не по коду). Гипотеза "conflict% разделяет заходы" НЕ подтвердилась
+        # (#7 перелёт 78% flip-кадров, #13 вертикальный промах 79% — почти
+        # неотличимо). Разделяет ДЛИТЕЛЬНОСТЬ непрерывной серии, где
+        # pitch_comp (_ref_att_y) уже не просто перевернул знак dy_raw
+        # (=box_cy-CENTER_Y — та же формула, что в live _ctl_dbg["dy_raw"],
+        # box_cy уже читается строкой выше), а превышает его по модулю:
+        # #4 сошлось 0.09с -> #7 перелёт 0.31с -> #9 недолёт 0.75с -> #13
+        # промах 1.25с, монотонно по тяжести исхода. _shadow_err_y тут —
+        # уже посчитанный dy_aim (тождество проверено test_shadow_aim_
+        # reference.py), новый расчёт reference не нужен. Диагностика-only,
+        # только Pitch/Y (вся доказательная база оттуда, X не проверялся).
+        _dy_raw_y = box_cy - CENTER_Y
+        _pitch_ref_conflict = (
+            _dy_raw_y != 0.0 and _shadow_err_y != 0.0
+            and (_dy_raw_y > 0) != (_shadow_err_y > 0)
+            and abs(_ref_att_y) > abs(_dy_raw_y))
+        if _pitch_ref_conflict:
+            if _shadow_pitch_conflict_since_t is None:
+                _shadow_pitch_conflict_since_t = now_mono
+            _shadow_pitch_conflict_run_s = now_mono - _shadow_pitch_conflict_since_t
+        else:
+            _shadow_pitch_conflict_since_t = None
+            _shadow_pitch_conflict_run_s = 0.0
+
         # --- Roll/Yaw contention (ТЗ §7): оба реагируют на один dx? ---
         # ИСПРАВЛЕНО после ревью: mag_yaw раньше брал только yaw_pd (без
         # FF/I) — не тот же уровень, что r_off (полный P+D+I+FF, зажатый
@@ -8669,6 +8719,8 @@ def _update_control_from_target_impl():
             "ref_lead_x": _ref_lead_x, "ref_lead_y": _ref_lead_y,
             "ref_other_x": _ref_other_x, "ref_other_y": _ref_other_y,
             "err_x": _shadow_err_x, "err_y": _shadow_err_y,
+            "pitch_ref_conflict": _pitch_ref_conflict,
+            "pitch_ref_conflict_run_s": _shadow_pitch_conflict_run_s,
             "sign_roll": _sign_roll, "sign_yaw": _sign_yaw,
             "mag_roll": abs(r_off), "mag_yaw": abs(_live_yaw_pid_out),
             "roll_yaw_both_active": _roll_yaw_both_active,
@@ -10591,6 +10643,7 @@ def _capture_flight_row(cb_t0):
             sg("ref_lead_x"), sg("ref_lead_y"),
             sg("ref_other_x"), sg("ref_other_y"),
             sg("err_x"), sg("err_y"),
+            sg("pitch_ref_conflict"), sg("pitch_ref_conflict_run_s"),
             sg("sign_roll"), sg("sign_yaw"), sg("mag_roll"), sg("mag_yaw"),
             sg("roll_yaw_both_active"),
             sg("vel_box_x"), sg("vel_box_y"), sg("vel_flow_x"), sg("vel_flow_y"),
