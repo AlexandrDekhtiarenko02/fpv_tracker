@@ -2395,11 +2395,21 @@ _FLIGHT_LOG_COLUMNS = (
     # альтернативным template — сравнить с "live" (уже посчитано этим же
     # кадром, НЕ дублируется здесь: смотреть match_score/match_psr/
     # match_second/match_flow_gap):
-    #   variant="fresh" — template заново снят из ТЕКУЩЕГО кадра на
-    #      текущей позиции/масштабе (та же формула, что build_template()).
     #   variant="base"  — template_base (эталон с захвата), приведён к
-    #      тому же размеру (тот самый resize, что уже есть в live-коде под
-    #      TEMPLATE_RESCALE_ON_SIZE_CHANGE, но та ветка сейчас выключена).
+    #      текущему размеру (тот самый resize, что уже есть в live-коде
+    #      под TEMPLATE_RESCALE_ON_SIZE_CHANGE, но та ветка выключена).
+    #      Настоящий межкадровый тест с самого начала — template_base снят
+    #      на acquisition, задолго до текущего кадра.
+    #   variant="fresh" — TEMPORAL (ПЕРЕДЕЛАНО после ревью по 5cca02c,
+    #      нашли SELF-MATCH BIAS: старая версия резала template ИЗ
+    #      текущего кадра и ТУТ ЖЕ искала его В ТОМ ЖЕ кадре — на бенче
+    #      score был 0.986-1.000 у 99.9-100% кадров, не сигнал качества, а
+    #      гарантированный исход самой постановки опыта, те же пиксели
+    #      физически лежат в окне поиска). Теперь: candidate снимается на
+    #      ОДНОМ shadow-слоте и оценивается ТОЛЬКО на будущем слоте,
+    #      против кадра, которого при захвате candidate ещё не
+    #      существовало — реальная проверка "переживёт ли template время".
+    #      candidate_age_ms — сколько кадру candidate на момент оценки.
     #
     # ПЕРЕДЕЛАНО после бенча на Pi Zero 2W (24.09.2026): было "fresh И base
     # каждый TRACKED-кадр" — оказалось, что even на самом дешёвом размере
@@ -2408,10 +2418,23 @@ _FLIGHT_LOG_COLUMNS = (
     # Теперь: редкий слот (TRACKING_SHADOW_EVERY_N_FRAMES) уже ПОСЛЕ всей
     # live tracking-логики кадра, fresh/base ЧЕРЕДУЮТСЯ по слоту (никогда
     # оба в одном кадре) — variant показывает, какой именно в этой строке.
-    # skip_reason="budget" — слот был запланирован, но бюджет кадра уже
-    # исчерпан (та же семантика, что live skip_reason примерки).
+    # Каждый активный слот (и fresh-, и base-очередь) заодно снимает НОВЫЙ
+    # fresh-candidate для будущего слота — это дёшево (один crop, без
+    # matchTemplate), "дорогой" вызов на слот остаётся ровно один.
+    # skip_reason="budget" — слот запланирован, бюджет кадра уже исчерпан
+    # (та же семантика, что live skip_reason примерки). skip_reason=
+    # "no_candidate" — variant="fresh" на слоте, где ещё нет candidate
+    # (первый слот захода, либо candidate только что сброшен разрывом
+    # geometry_epoch/re-anchor — см. _reset_geometry_history).
     #
-    # target_w/h — размер, к которому приведён template этого варианта.
+    # geom_box_w/h — lock_w/lock_h, СНЯТЫЕ ДО блока примерки масштаба этого
+    # же кадра (ревью по 5cca02c, apples-to-apples): Shadow выполняется в
+    # конце кадра, примерка могла успеть поменять lock_w/h ПОСЛЕ того, как
+    # live match_score/match_psr этого кадра уже были посчитаны — снимаем
+    # размер РАНЬШЕ, чтобы shadow сравнивался с той же геометрией, что live.
+    # target_w/h — размер РЕАЛЬНО оценённого template (для fresh — размер
+    # candidate на момент ЕГО поимки, может отличаться от geom_box_w/h
+    # этой строки, если box успел вырасти/сжаться за время жизни candidate).
     # flow_gap — расстояние найденного пика до flow-предсказания (тот же
     # ориентир, что у live match_flow_gap). НЕ включает color/motion guard
     # (см. коммент у _shadow_match_against_template) — по разбору оба
@@ -2419,8 +2442,9 @@ _FLIGHT_LOG_COLUMNS = (
     # кадра, кадр не TRACKED, либо вырожденный случай матча.
     "shadow_track_variant,shadow_track_skip_reason,"
     "shadow_track_target_w,shadow_track_target_h,"
+    "shadow_track_geom_box_w,shadow_track_geom_box_h,"
     "shadow_track_score,shadow_track_psr,shadow_track_second,"
-    "shadow_track_flow_gap,"
+    "shadow_track_flow_gap,shadow_track_candidate_age_ms,"
     # Собственная стоимость Tracking Shadow за кадр (мс) — на 24px цели
     # (самый дешёвый размер из проверенных) один matchTemplate стоил
     # p50=3.74мс/p90=4.65мс/max=31.1мс на Pi Zero 2W (24.09.2026). В
@@ -2695,6 +2719,28 @@ TRACKING_SHADOW_ENABLED = True
 # каждые ~0.2с, достаточно для статистики за типичный заход (5-15с).
 TRACKING_SHADOW_EVERY_N_FRAMES = 5
 _shadow_track_dbg = {"active": False}
+# SELF-MATCH BIAS — найдено ревью по 5cca02c, подтверждено бенчем: старый
+# "fresh" резал template ИЗ текущего кадра и ТУТ ЖЕ искал его В ТОМ ЖЕ
+# кадре — почти self-match (в окне поиска физически лежат те же пиксели,
+# из которых template только что вырезан). На бенче fresh_score был
+# 0.986-1.000 у 99.9-100% кадров — не сигнал качества, а гарантированный
+# исход самой постановки опыта. base_score тем временем показывал реальную
+# дисперсию (p50=0.89, min=0.058) — как и должен настоящий межкадровый тест
+# (template_base снят на acquisition, задолго до текущего кадра).
+#
+# ИСПРАВЛЕНО: fresh стал TEMPORAL — candidate снимается на ОДНОМ slot'е, а
+# оценивается ТОЛЬКО на будущем slot'е, против кадра, которого при захвате
+# ещё не существовало. Реальная проверка "переживёт ли новый template
+# время", а не "совпадает ли кусок кадра сам с собой". Сбрасывается на
+# geometry_epoch discontinuity (см. _reset_geometry_history — та же точка,
+# что уже рвёт reanchor/frame-gap историю для остальных temporal-shadow
+# полей) и на полном сбросе (reset_tracking).
+_shadow_fresh_candidate = None
+_shadow_fresh_candidate_w = None
+_shadow_fresh_candidate_h = None
+_shadow_fresh_candidate_std = None
+_shadow_fresh_candidate_t = None
+_shadow_fresh_candidate_epoch = None
 # Внутренности оптического потока за текущий кадр (ТЗ п.5, flow_points /
 # flow_inliers): сколько точек было заведено и сколько дожило после
 # фильтра по статусу LK и по err. Разница между ними — как раз то, что
@@ -6510,6 +6556,8 @@ def reset_tracking(to_acq=False):
     global launch_phase, launch_counter, prev_controllable_for_launch
     global _nudge_was_active, _nudge_prev_t, _adapt_frozen_posle_reanchor
     global _shadow_track_dbg
+    global _shadow_fresh_candidate, _shadow_fresh_candidate_w, _shadow_fresh_candidate_h
+    global _shadow_fresh_candidate_std, _shadow_fresh_candidate_t, _shadow_fresh_candidate_epoch
 
     track_state = TRACK_STATE_ACQ if to_acq else TRACK_STATE_IDLE
     target_visible = False
@@ -6531,6 +6579,12 @@ def reset_tracking(to_acq=False):
     target_uv = None
     color_active = False
     _shadow_track_dbg = {"active": False}
+    _shadow_fresh_candidate = None
+    _shadow_fresh_candidate_w = None
+    _shadow_fresh_candidate_h = None
+    _shadow_fresh_candidate_std = None
+    _shadow_fresh_candidate_t = None
+    _shadow_fresh_candidate_epoch = None
     color_separation = 0.0
     template_std = 0.0
     prev_gray = None
@@ -7226,6 +7280,8 @@ def _reset_geometry_history(reason):
     global _shadow_roll_prev_restriction, _shadow_pitch_prev_restriction
     global _shadow_yaw_prev_restriction
     global _shadow_pitch_conflict_since_t
+    global _shadow_fresh_candidate, _shadow_fresh_candidate_w, _shadow_fresh_candidate_h
+    global _shadow_fresh_candidate_std, _shadow_fresh_candidate_t, _shadow_fresh_candidate_epoch
 
     geometry_epoch += 1
     _tau_ubyvanie = 0.0
@@ -7292,6 +7348,19 @@ def _reset_geometry_history(reason):
     # до manual re-anchor/frame gap и конфликт после — из разных temporal
     # geometry epoch — склеивались бы в одну общую серию.
     _shadow_pitch_conflict_since_t = None
+    # НАЙДЕНО (ревью по 5cca02c): temporal "fresh" candidate — та же
+    # болезнь класса, что уже чинили выше: candidate снят на СТАРОЙ
+    # геометрии, оценивать его на новой (после re-anchor/frame gap) как
+    # "template пережил время" было бы нечестно — реально он просто
+    # относится к другому локу/эпохе. Сбрасываем весь candidate целиком,
+    # не только его epoch-метку: следующий shadow-слот честно начнёт
+    # заново с "no_candidate", а не подсунет чужую эпоху под видом текущей.
+    _shadow_fresh_candidate = None
+    _shadow_fresh_candidate_w = None
+    _shadow_fresh_candidate_h = None
+    _shadow_fresh_candidate_std = None
+    _shadow_fresh_candidate_t = None
+    _shadow_fresh_candidate_epoch = None
     try:
         flight_log.event(
             "GEOMETRY_EPOCH %d: разрыв непрерывности (%s)"
@@ -9935,6 +10004,8 @@ def process_locked_tracker(gray, cb_t0=None):
     global lock_w0, lock_h0
     global _nudge_was_active, _nudge_prev_t
     global _shadow_track_dbg
+    global _shadow_fresh_candidate, _shadow_fresh_candidate_w, _shadow_fresh_candidate_h
+    global _shadow_fresh_candidate_std, _shadow_fresh_candidate_t, _shadow_fresh_candidate_epoch
 
     frame_index += 1
 
@@ -10443,6 +10514,21 @@ def process_locked_tracker(gray, cb_t0=None):
                 and frame_index % TRACK_ON_COLOR_BG_EVERY == 0):
             refresh_color_axis(lock_cx, lock_cy, lock_w, lock_h)
 
+        # РАННИЙ СНИМОК ГЕОМЕТРИИ ДЛЯ TRACKING SHADOW (ревью по 5cca02c,
+        # п.2 "apples-to-apples"): Shadow теперь выполняется В КОНЦЕ кадра
+        # (после примерки масштаба, по CPU-бюджету — см. блок ниже), а
+        # live match_score/match_psr этого кадра уже зафиксированы ЗДЕСЬ,
+        # ДО примерки. Если примерка ниже реально поменяет lock_w/lock_h
+        # (не каждый кадр — только когда сработает), a shadow-блок в конце
+        # кадра построил бы fresh/base уже на НОВОМ размере — сравнение
+        # "живой score при 30px" против "shadow при уже 36px" в одной
+        # строке перестало бы быть apples-to-apples. Снимаем lock_w/h
+        # СЕЙЧАС (чистое копирование двух float, никакого CV) — shadow
+        # ниже использует именно эти значения, не перечитывает lock_w/h
+        # заново после примерки.
+        _shadow_geom_w = lock_w
+        _shadow_geom_h = lock_h
+
         # БЮДЖЕТ КАДРА (ТЗ §4). Ядро (поток+матч) уже отработало — приоритет
         # у него. Вторичный этап (примерка масштаба) запускается только если
         # он и без того запланирован ПО ЧАСТОТЕ И в кадре есть время: cb_t0
@@ -10651,37 +10737,99 @@ def process_locked_tracker(gray, cb_t0=None):
             else:
                 try:
                     _track_shadow_t0 = time.monotonic()
-                    if template_gray is not None and lock_w > 0 and lock_h > 0:
-                        _tw, _th = _shadow_template_target_size(lock_w, lock_h)
+                    if (template_gray is not None
+                            and _shadow_geom_w > 0 and _shadow_geom_h > 0):
                         # Слот-индекс (не frame_index напрямую) чередует
                         # variant — соседние активные слоты чередуются
                         # fresh/base, а не "все fresh, потом все base".
                         _slot = frame_index // TRACKING_SHADOW_EVERY_N_FRAMES
-                        _use_base = (_slot % 2 == 1 and template_base is not None
-                                    and template_base.size > 0)
-                        if _use_base:
-                            _variant = "base"
-                            _tmpl = cv2.resize(
+                        _want_base = (_slot % 2 == 1 and template_base is not None
+                                     and template_base.size > 0)
+                        _tw, _th = _shadow_template_target_size(
+                            _shadow_geom_w, _shadow_geom_h)
+                        _v_ok = False
+                        _variant = "base" if _want_base else "fresh"
+                        _v_score = _v_psr = _v_second = _v_gap = None
+                        _skip_reason = None
+                        _cand_age_ms = None
+
+                        if _want_base:
+                            _b_tmpl = cv2.resize(
                                 template_base, (_tw, _th),
                                 interpolation=cv2.INTER_LINEAR)
+                            _b_std = float(np.std(_b_tmpl)) if _b_tmpl.size else 0.0
+                            (_v_ok, _v_score, _v_psr, _v_second,
+                             _vmx, _vmy) = _shadow_match_against_template(
+                                gray, _b_tmpl, _tw, _th, _b_std,
+                                pred_cx, pred_cy, flow_motion)
+                            _v_gap = (math.hypot(_vmx - pred_cx, _vmy - pred_cy)
+                                     if _v_ok else None)
                         else:
-                            _variant = "fresh"
-                            _tmpl, _tw, _th, _v_std = _shadow_build_fresh_template(
-                                gray, lock_cx, lock_cy, lock_w, lock_h)
-                        _v_std = float(np.std(_tmpl)) if _tmpl.size else 0.0
-                        (_v_ok, _v_score, _v_psr, _v_second,
-                         _vmx, _vmy) = _shadow_match_against_template(
-                            gray, _tmpl, _tw, _th, _v_std,
-                            pred_cx, pred_cy, flow_motion)
-                        _v_gap = (math.hypot(_vmx - pred_cx, _vmy - pred_cy)
-                                 if _v_ok else None)
+                            # TEMPORAL fresh (ревью по 5cca02c — SELF-MATCH
+                            # BIAS, см. коммент у объявления _shadow_fresh_
+                            # candidate). Оцениваем candidate, снятый на
+                            # ПРОШЛОМ слоте — против ТЕКУЩЕГО кадра, которого
+                            # при захвате candidate ещё не существовало.
+                            # НЕ вырезаем новый template и не ищем его в этом
+                            # же кадре — это и был self-match.
+                            _cand_valid = (_shadow_fresh_candidate is not None
+                                          and _shadow_fresh_candidate_epoch == geometry_epoch)
+                            if _cand_valid:
+                                (_v_ok, _v_score, _v_psr, _v_second,
+                                 _vmx, _vmy) = _shadow_match_against_template(
+                                    gray, _shadow_fresh_candidate,
+                                    _shadow_fresh_candidate_w,
+                                    _shadow_fresh_candidate_h,
+                                    _shadow_fresh_candidate_std,
+                                    pred_cx, pred_cy, flow_motion)
+                                _v_gap = (math.hypot(_vmx - pred_cx, _vmy - pred_cy)
+                                         if _v_ok else None)
+                                _cand_age_ms = ((_track_shadow_t0
+                                                - _shadow_fresh_candidate_t) * 1000.0)
+                                # target_w/h этой строки — размер РЕАЛЬНО
+                                # оценённого candidate (мог быть снят на
+                                # другом размере box, чем текущий _tw/_th).
+                                _tw = _shadow_fresh_candidate_w
+                                _th = _shadow_fresh_candidate_h
+                            else:
+                                _skip_reason = "no_candidate"
+
+                        # Захват НОВОГО candidate — КАЖДЫЙ активный слот
+                        # (и fresh-, и base-очередь), для оценки на БУДУЩЕМ
+                        # слоте (через ~2 слота, раз variant чередуется).
+                        # Дёшево: один crop_center, БЕЗ matchTemplate —
+                        # "дорогой" вызов на слот остаётся ровно один.
+                        # НАМЕРЕННО lock_w/lock_h (текущие), а НЕ _shadow_
+                        # geom_w/h: примерка масштаба (если сработала в
+                        # этом же кадре) уже отработала ВЫШЕ и lock_w/h —
+                        # самая свежая оценка размера объекта на этот
+                        # момент. _shadow_geom_w/h нужен только для честного
+                        # сравнения С ЭТИМ КАДРОМ (geom_box_w/h, base-
+                        # вариант) — у candidate другая природа, это снимок
+                        # ВПРОК для будущего слота, ему нужна максимально
+                        # актуальная геометрия, а не геометрия момента live
+                        # match.
+                        (_new_cand, _ncw, _nch,
+                         _ncstd) = _shadow_build_fresh_template(
+                            gray, lock_cx, lock_cy, lock_w, lock_h)
+                        _shadow_fresh_candidate = _new_cand
+                        _shadow_fresh_candidate_w = _ncw
+                        _shadow_fresh_candidate_h = _nch
+                        _shadow_fresh_candidate_std = _ncstd
+                        _shadow_fresh_candidate_t = time.monotonic()
+                        _shadow_fresh_candidate_epoch = geometry_epoch
+
                         _shadow_track_dbg = {
-                            "active": True, "variant": _variant,
+                            "active": _v_ok, "variant": _variant,
+                            "skip_reason": _skip_reason,
                             "target_w": _tw, "target_h": _th,
                             "score": _v_score if _v_ok else None,
                             "psr": _v_psr if _v_ok else None,
                             "second": _v_second if _v_ok else None,
                             "flow_gap": _v_gap,
+                            "candidate_age_ms": _cand_age_ms,
+                            "geom_box_w": _shadow_geom_w,
+                            "geom_box_h": _shadow_geom_h,
                             "time_ms": (time.monotonic() - _track_shadow_t0) * 1000.0,
                         }
                     else:
@@ -10870,7 +11018,6 @@ def _capture_flight_row(cb_t0):
         sc = _shadow_ctl_dbg
         shadow_active = sc.get("active", False)
         st_ = _shadow_track_dbg
-        shadow_track_active = st_.get("active", False)
 
         with state_lock:
             st = track_state
@@ -10979,9 +11126,6 @@ def _capture_flight_row(cb_t0):
 
         def sg(k, d=None):
             return sc.get(k, d) if shadow_active else None
-
-        def sgt(k, d=None):
-            return st_.get(k, d) if shadow_track_active else None
 
         _row_values = (
             now - flight_log._t0, frame_index, fps_current, st, ctrl, aux, ov,
@@ -11099,14 +11243,18 @@ def _capture_flight_row(cb_t0):
             sg("att_age_ms"), sg("gyro_age_ms"),
             sg("vertical_sink_mps"), sg("vertical_sink_limit"),
             sg("time_us"),
-            # variant/skip_reason читаются НАПРЯМУЮ из st_ (не через sgt()):
-            # sgt() гасит всё в None, когда active=False — а skip_reason
-            # ИМЕННО тогда и осмыслен ("слот был, бюджета не хватило").
+            # ВСЁ читается напрямую из st_.get(), не через активность-
+            # гейт: _shadow_track_dbg — свежий dict КАЖДУЮ строку (никогда
+            # не переживает кадр молча), поэтому staleness тут физически
+            # невозможна — а skip_reason/target_w/geom_box_w осмыслены
+            # именно тогда, когда score/psr пусты ("слот был, но..."),
+            # прятать их за тем же гейтом, что и сами измерения, не нужно.
             st_.get("variant"), st_.get("skip_reason"),
-            sgt("target_w"), sgt("target_h"),
-            sgt("score"), sgt("psr"), sgt("second"),
-            sgt("flow_gap"),
-            sgt("time_ms"),
+            st_.get("target_w"), st_.get("target_h"),
+            st_.get("geom_box_w"), st_.get("geom_box_h"),
+            st_.get("score"), st_.get("psr"), st_.get("second"),
+            st_.get("flow_gap"), st_.get("candidate_age_ms"),
+            st_.get("time_ms"),
         )
         flight_log.row(_row_values)
         # Та же строка — в папку этого захвата. Форматируем один раз здесь, а

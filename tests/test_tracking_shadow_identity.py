@@ -1,31 +1,49 @@
-"""Tracking Shadow v1: Template Identity — первый срез Tracking Shadow
+"""Tracking Shadow: Template Identity — первый срез Tracking Shadow
 (разбор качества трекинга по 14 заходам crash-полёта, 24.09.2026).
+Переезд после live-этапов + rate-limit — ревью по 5cca02c. TEMPORAL
+fresh (эта версия) — ревью, нашедшее SELF-MATCH BIAS в 5cca02c.
 
-ПОВОД. Независимая проверка разбора (все числа сверены напрямую с
-tracker.py и CSV, не с чужих слов) подтвердила: median PSR по 12 длинным
-заходам 2.9, PSR<3 в 52% TRACKED-кадров, template/box mismatch>25% в 56%
-кадров коррелирует с сильно худшим PSR/score (3.71/0.831 при mismatch<=25%
-против 2.26/0.630 при >25%). А 4 независимых ручных reanchor (#13, #10 x2,
-#14) воспроизведены кадр-в-кадр: свежий template на той же позиции чинит
-score/PSR почти мгновенно (например #13: 0.290/0.76 -> 0.974/6.90 ровно на
-следующем кадре после reanchor). TEMPLATE_RESCALE_ON_SIZE_CHANGE=False —
-коробка растёт с целью, template остаётся старого масштаба.
+ПОВОД (исходный, всё ещё в силе). Median PSR по 12 длинным заходам 2.9,
+PSR<3 в 52% TRACKED-кадров, template/box mismatch>25% в 56% кадров
+коррелирует с сильно худшим PSR/score. 4 независимых ручных reanchor
+(#13, #10 x2, #14) воспроизведены кадр-в-кадр: свежий template на той же
+позиции чинит score/PSR почти мгновенно. TEMPLATE_RESCALE_ON_SIZE_
+CHANGE=False — коробка растёт с целью, template остаётся старого
+масштаба.
 
-ГЛАВНЫЙ ВОПРОС ПЕРВОГО СРЕЗА (сформулирован в разборе): когда live
-template уже плох, существует ли УЖЕ В ЭТОМ ЖЕ КАДРЕ альтернативный
-template (снятый заново на текущей позиции, либо template_base,
-приведённый к текущему размеру), который отождествляет объект существенно
-лучше — то есть было бы видно ДО того, как оператор вручную это исправит?
+SELF-MATCH BIAS (найдено ревью по 5cca02c, подтверждено бенчем на Pi Zero
+2W). Первая версия "fresh" резала template ИЗ текущего кадра и ТУТ ЖЕ
+искала его В ТОМ ЖЕ кадре — search-окно вокруг pred_cx/pred_cy физически
+содержит те же пиксели, из которых template секунду назад вырезан. На
+бенче fresh_score был 0.986-1.000 у 99.9-100% TRACKED-кадров — не сигнал
+качества template, а гарантированный исход самой постановки опыта.
+base_score тем временем показывал реальную дисперсию (p50=0.89,
+min=0.058) — настоящий межкадровый тест, template_base снят на
+acquisition, задолго до текущего кадра.
 
-ЧТО ЭТО. Диагностика-only внутри process_locked_tracker. Не пишет
-template_gray/tmpl_w/tmpl_h/template_std/lock_cx/lock_cy/lock_w/lock_h/
-template_base/_match_dbg. "live" не пересчитывается — уже посчитанные этим
-же кадром last_match_score/_match_dbg["psr"/"second"/"flow_gap"], уже в
-CSV как match_score/match_psr/match_second/match_flow_gap. "fresh"/"base"
-ищутся вокруг ТОЙ ЖЕ pred_cx/pred_cy, что и live match — иначе разница
-объяснялась бы разным местом поиска, а не разным template. Намеренно БЕЗ
-color/motion guard (см. коммент у _shadow_match_against_template) — по
-разбору оба реально влияли в 0.00%/0.76% TRACKED-кадров.
+ИСПРАВЛЕНО: fresh стал TEMPORAL. candidate снимается на ОДНОМ shadow-
+слоте (дёшево — один crop, БЕЗ matchTemplate) и оценивается ТОЛЬКО на
+БУДУЩЕМ слоте, против кадра, которого на момент захвата candidate ещё не
+существовало — реальная проверка "переживёт ли новый template время", а
+не "совпадает ли кусок кадра сам с собой". Candidate сбрасывается на
+geometry_epoch discontinuity (_reset_geometry_history — та же точка, что
+уже рвёт историю для остальных temporal-shadow полей) и на полном сбросе.
+
+APPLES-TO-APPLES (второй пункт того же ревью). Shadow теперь выполняется
+после блока примерки масштаба, которая МОЖЕТ поменять lock_w/lock_h в
+этом же кадре — уже ПОСЛЕ того, как live match_score/match_psr были
+посчитаны на СТАРОМ размере. shadow_track_geom_box_w/h снимает lock_w/h
+РАНЬШЕ (сразу после live match, до примерки), чтобы shadow сравнивался с
+той же геометрией, что видел live этого кадра.
+
+ЧТО ЭТО. Диагностика-only внутри process_locked_tracker, СТРОГО после
+update_control_from_target(). Не пишет template_gray/tmpl_w/tmpl_h/
+template_std/lock_cx/lock_cy/lock_w/lock_h/template_base/_match_dbg.
+"live" не пересчитывается — уже посчитанные этим же кадром
+last_match_score/_match_dbg["psr"/"second"/"flow_gap"], уже в CSV как
+match_score/match_psr/match_second/match_flow_gap. Намеренно БЕЗ color/
+motion guard (см. коммент у _shadow_match_against_template) — по разбору
+оба реально влияли в 0.00%/0.76% TRACKED-кадров.
 """
 import os
 import sys
@@ -91,10 +109,14 @@ _expected_tw = t.clamp(max(20.0 * t.TEMPLATE_SCALE, t.TEMPLATE_MIN), t.TEMPLATE_
 assert abs(tw - _expected_tw) < 1e-6, "размер должен совпасть с формулой build_template()"
 print("    tw=%.1f (formula=%.1f), live tmpl_w/tmpl_h/template_std не тронуты" % (tw, _expected_tw))
 
-print("\n=== 2. _shadow_match_against_template: ПРАВИЛЬНЫЙ (свежий, на "
-      "месте объекта) template даёт заметно лучший score/PSR, чем "
-      "template, снятый С ДРУГОГО (текстурного) места — синтетическая "
-      "версия того, что 4 реальных reanchor показали на бортовых логах ===")
+print("\n=== 2. _shadow_match_against_template: низкоуровневая проверка "
+      "самого matchTemplate-примитива — template НА объекте отождествляет "
+      "его лучше, чем template С ФОНА рядом. НЕ демонстрация механизма "
+      "'fresh' целиком (тот теперь TEMPORAL, см. секцию 11+) — это ниже "
+      "ровно тот self-match паттерн (крои и тут же ищи в том же кадре),\n"
+      "    который сам по себе и был найденной ревью проблемой; здесь он "
+      "оправдан — проверяем не 'фиксит ли fresh reanchor', а что "
+      "matchTemplate вообще умеет отличать объект от фона ===")
 OBJ_SIZE = 40
 scene = make_scene(CX, CY, OBJ_SIZE)
 good_tmpl, gw, gh, gstd = t._shadow_build_fresh_template(scene, CX, CY, OBJ_SIZE, OBJ_SIZE)
@@ -117,8 +139,9 @@ if ok_bad:
     assert score_good > score_bad and psr_good > psr_bad, (
         "template объекта обязан отождествлять объект лучше, чем template "
         "с фона — иначе сравнение само по себе не имеет смысла")
-print("    fresh-на-объекте однозначно лучше template-с-фона — тот же "
-      "эффект, что reanchor показал на #13/#10/#14")
+print("    matchTemplate-примитив корректно отличает объект от фона — "
+      "необходимое, но не достаточное условие для temporal fresh (см. "
+      "секцию 11+, где это же используется ПРАВИЛЬНО — между слотами)")
 
 print("\n=== 3. Изоляция: сломанный _shadow_match_against_template не "
       "меняет live-путь (template_gray/tmpl_w/tmpl_h/template_std/"
@@ -368,8 +391,130 @@ print("    Tracking Shadow физически после update_control_from_tar
 t.TRACKING_SHADOW_ENABLED = _orig_enabled
 t.TRACKING_SHADOW_EVERY_N_FRAMES = _orig_every_n
 
-print("\nOK: Tracking Shadow v2 (после бенча 24.09.2026) — редкий "
-      "budget-gated слот СТРОГО ПОСЛЕ всей live tracking-логики, fresh/"
-      "base чередуются (не оба в одном кадре), не влияет на live-путь ни "
-      "при штатной работе, ни при внутреннем сбое, и не пишет в "
-      "live-переменные по исходному тексту")
+print("\n=== 11. TEMPORAL fresh: candidate, оценённый на fresh-слоте, "
+      "был захвачен на РАННЕМ слоте — candidate_age_ms доказывает "
+      "реальный временной разрыв, не тот же кадр (это и был self-match "
+      "bias в 5cca02c: crop и match в одном вызове дают age=0 всегда) ===")
+force_reset()
+with t.state_lock:
+    t.aux4_state = True
+t.acq_wait_left = 0
+t.prev_aux_on = True
+t.track_state = t.TRACK_STATE_ACQ
+with t.state_lock:
+    t.app_state["rc_channels"] = [1500] * 8
+    t.app_state["rc_link_ts"] = t.time.monotonic()
+_clk.tick(FRAME_DT)
+t.process_locked_tracker(make_scene(CX, CY, 30))
+assert t.track_state == t.TRACK_STATE_TRACKED
+
+t.TRACKING_SHADOW_ENABLED = True
+t.TRACKING_SHADOW_EVERY_N_FRAMES = 4
+# frame_index — сквозной модульный счётчик, не сбрасывается ни force_reset,
+# ни reset_tracking — к этой точке он уже унаследовал чётность от секций
+# 1-10. Поэтому НЕ предполагаем, какой слот "первый" и какой у него
+# variant — активно ждём нужный, благо variant строго чередуется между
+# соседними активными слотами (_slot = frame_index // N, variant = slot%2).
+_off = [0]
+
+
+def _next_active_slot(max_frames=64):
+    for _ in range(max_frames):
+        _off[0] = (_off[0] % 20) + 1
+        _tick_frame(_off[0])
+        v = t._shadow_track_dbg.get("variant")
+        if v is not None:
+            return v
+    raise AssertionError("не дождались активного слота за %d кадров" % max_frames)
+
+
+def _next_active_slot_with_variant(want, max_attempts=8):
+    # По строгому чередованию нужный variant выпадает не позже 2-й
+    # попытки; запас до 8 — просто щедрая подстраховка.
+    for _ in range(max_attempts):
+        v = _next_active_slot()
+        if v == want:
+            return v
+    raise AssertionError("не дождались variant=%r за %d активных слотов" % (want, max_attempts))
+
+
+v1 = _next_active_slot_with_variant("base")
+assert t._shadow_fresh_candidate is not None, (
+    "base-слот тоже обязан захватить fresh-candidate для будущего "
+    "fresh-слота (см. докстринг: 'каждый активный слот' захватывает)")
+
+# По строгому чередованию следующий активный слот ГАРАНТИРОВАННО "fresh"
+# — ровно через TRACKING_SHADOW_EVERY_N_FRAMES кадров от только что
+# виденного base.
+v2 = _next_active_slot()
+assert v2 == "fresh", (
+    "чередование нарушено: сразу после 'base' ожидали 'fresh', получили %r" % v2)
+sc_slot2 = t._shadow_track_dbg
+assert sc_slot2.get("active") is True, (
+    "candidate от только что виденного base-слота обязан быть валиден — "
+    "active=True, не 'no_candidate'")
+_age = sc_slot2.get("candidate_age_ms")
+_expected_age = t.TRACKING_SHADOW_EVERY_N_FRAMES * FRAME_DT * 1000.0
+assert _age is not None and _age > 0.0, (
+    "candidate_age_ms обязан быть положительным — доказательство, что "
+    "candidate снят РАНЬШЕ, не в этом же вызове (self-match всегда дал "
+    "бы age=0, потому что crop и match происходили бы в одной функции)")
+assert abs(_age - _expected_age) < FRAME_DT * 1000.0 * 1.5, (
+    "candidate_age_ms=%.1f ожидали около %.1fмс (%d кадров * %.1fмс) — "
+    "слишком далеко от ожидаемого временного разрыва"
+    % (_age, _expected_age, t.TRACKING_SHADOW_EVERY_N_FRAMES, FRAME_DT * 1000.0))
+print("    base-слот (захватил candidate) -> fresh-слот active=True "
+      "candidate_age_ms=%.1f (~%.1f ожидали) — candidate реально пережил "
+      "%d кадров между захватом и оценкой, это не self-match"
+      % (_age, _expected_age, t.TRACKING_SHADOW_EVERY_N_FRAMES))
+
+print("\n=== 12. Candidate инвалидируется на geometry_epoch discontinuity: "
+      "fresh-слот сразу после _reset_geometry_history() обязан дать "
+      "skip_reason='no_candidate', а не тихо оценить candidate из ДРУГОЙ "
+      "(уже недействительной) эпохи ===")
+# Снова дождаться "base" (он гарантированно свежо захватит candidate),
+# затем СРАЗУ разорвать эпоху — по чередованию следующий слот будет
+# "fresh" и обязан НЕ увидеть только что уничтоженный candidate.
+_next_active_slot_with_variant("base")
+assert t._shadow_fresh_candidate is not None
+t._reset_geometry_history("test_epoch_break")
+assert t._shadow_fresh_candidate is None, (
+    "_reset_geometry_history() обязан сбросить _shadow_fresh_candidate "
+    "целиком — не только epoch-метку")
+
+v3 = _next_active_slot()
+assert v3 == "fresh", (
+    "чередование нарушено: сразу после 'base' ожидали 'fresh', получили %r" % v3)
+sc_slot3 = t._shadow_track_dbg
+assert sc_slot3.get("active") is False
+assert sc_slot3.get("skip_reason") == "no_candidate", (
+    "candidate из старой эпохи не должен был просочиться в оценку — "
+    "ожидали skip_reason='no_candidate', получили %r" % sc_slot3.get("skip_reason"))
+print("    base (candidate захвачен) -> epoch break -> fresh: active=False "
+      "skip_reason='no_candidate' — candidate старой эпохи не использован")
+
+print("\n=== 13. geom_box_w/h снимается ДО блока примерки масштаба "
+      "(apples-to-apples, ревью по 5cca02c п.2) — по расположению в "
+      "исходном тексте, не только по докстрингу ===")
+src3 = io.open(os.path.join(_ROOT, "tracker.py"), encoding="utf-8").read()
+i_geom_snap = src3.index("_shadow_geom_w = lock_w")
+i_primerka2 = src3.index(
+    'elif SIZE_ADAPT_ENABLED and _primerka_pora and _budget_ok:')
+assert i_geom_snap < i_primerka2, (
+    "снимок _shadow_geom_w/h обязан идти ДО блока примерки масштаба — "
+    "иначе он снимет уже изменённый этим же кадром lock_w/h, а не тот, "
+    "с которым был посчитан live match_score этого кадра")
+print("    _shadow_geom_w/h снимается до блока примерки — apples-to-apples "
+      "с live match_score/match_psr этой же строки")
+
+t.TRACKING_SHADOW_ENABLED = _orig_enabled
+t.TRACKING_SHADOW_EVERY_N_FRAMES = _orig_every_n
+
+print("\nOK: Tracking Shadow (после бенча 24.09.2026 + ревью self-match "
+      "bias) — редкий budget-gated слот СТРОГО ПОСЛЕ всей live "
+      "tracking-логики, fresh стал TEMPORAL (candidate переживает реальное "
+      "время между слотами, не self-match), candidate корректно "
+      "инвалидируется на geometry_epoch discontinuity, geom_box_w/h "
+      "снимается до примерки для честного сравнения с live — не влияет "
+      "на live-путь ни при штатной работе, ни при внутреннем сбое, и не "
+      "пишет в live-переменные по исходному тексту")
