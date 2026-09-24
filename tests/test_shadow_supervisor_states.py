@@ -14,6 +14,13 @@ HIGH_NOSE_DOWN — ПЕРЕИМЕНОВАНО и ИСПРАВЛЕНО после
       состояние. Теперь сравнение знаковое (pitch > порог), имя поля —
       high_nose_down.
 
+Ревью по 1de3fad нашло ЕЩЁ баг: убрав svezhiy_tangazh(), заодно потеряли
+его freshness-проверку — app_state["fc_pitch_deg"] не обнуляется сам,
+если MSP_ATTITUDE перестал приходить, и голое ">40" продолжило бы писать
+True по протухшему значению сколь угодно долго. Добавлен freshness-gate
+по FC_PITCH_TIMEOUT (переиспользует уже посчитанный _att_age_ms, не новый
+state_lock).
+
 VERTICAL_SINK_LIMIT — БЕЗ ИЗМЕНЕНИЙ (ревью по fad59c8 явно одобрило: "мне
 нравится... не придумал ещё один magic threshold"). sink_mps >
 VARIO_MAX_SINK_MPS — ноль новых порогов, та же константа (и
@@ -131,7 +138,41 @@ assert sc_raw["pitch_high_nose_down"] is False, (
 print("    fc_pitch=35 (raw, <40) + быстрое вращение gyro_y=90°/с -> "
       "всё равно False (state не использует gyro-экстраполяцию)")
 
-print("\n=== 5. HIGH_NOSE_DOWN: None при отсутствующей ATT (не путать с "
+print("\n=== 5. HIGH_NOSE_DOWN: None при ПРОТУХШЕЙ ATT — реальный баг, "
+      "найден ревью по 1de3fad. app_state['fc_pitch_deg'] НЕ обнуляется "
+      "сам, если MSP_ATTITUDE перестал приходить: без freshness-gate "
+      "старое '52°, протухло 800мс назад' продолжило бы читаться как "
+      "живой sign nose-down ===")
+force_reset()
+_clk.t = 1000.0
+kadr(fc_pitch=50.0)  # свежий кадр — заводим fc_pitch_ts в app_state
+_clk.tick(t.FC_PITCH_TIMEOUT + 0.5)  # состариваем ts, не трогая значение
+with t.state_lock:
+    t.target_box_main = (CX - 20, CY - 20, CX + 20, CY + 20)
+    t.target_controllable = True
+    t.target_visible = True
+t.last_match_score = 0.85
+t._match_dbg = {"psr": 6.0}
+t.lock_w0 = t.lock_h0 = 30.0
+with t.state_lock:
+    t.app_state["rc_throttle"] = 1450
+    t.app_state["rc_throttle_ts"] = t.time.monotonic()
+    # fc_pitch_deg/fc_pitch_ts НЕ трогаем — тот самый "последний известный
+    # 50°", который MSP просто перестал обновлять.
+    t.app_state["gyro"] = (0, 0, 0)
+    t.app_state["imu_ts"] = t.time.monotonic()
+t.update_control_from_target()
+sc_stale = t._shadow_ctl_dbg
+assert sc_stale.get("active"), "shadow должен остаться активным на этом кадре"
+assert sc_stale["pitch_high_nose_down"] is None, (
+    "протухший raw fc_pitch_deg=50 (>40) без freshness-gate дал бы "
+    "pitch_high_nose_down=True по данным старше FC_PITCH_TIMEOUT=%.2fс — "
+    "обязано быть None, не True и не False" % t.FC_PITCH_TIMEOUT)
+print("    fc_pitch=50° (>40), ts старше FC_PITCH_TIMEOUT=%.2fс -> "
+      "pitch_high_nose_down=None (не True по протухшему значению)"
+      % t.FC_PITCH_TIMEOUT)
+
+print("\n=== 6. HIGH_NOSE_DOWN: None при отсутствующей ATT (не путать с "
       "False) ===")
 force_reset()
 _clk.t = 1000.0
@@ -162,7 +203,7 @@ else:
           "проверка None уже покрыта тестом test_shadow_isolation.py "
           "для аналогичных полей)")
 
-print("\n=== 6. VERTICAL_SINK_LIMIT: False при малом снижении, True за "
+print("\n=== 7. VERTICAL_SINK_LIMIT: False при малом снижении, True за "
       "VARIO_MAX_SINK_MPS (без изменений с прошлого ревью) ===")
 force_reset()
 _clk.t = 1000.0
@@ -175,14 +216,14 @@ assert abs(sc_fast["vertical_sink_mps"] - 19.8) < 1e-6
 print("    sink=5.0 м/с -> False, sink=19.8 м/с (как в реальном #13) -> "
       "True (порог %.1f)" % t.VARIO_MAX_SINK_MPS)
 
-print("\n=== 7. VERTICAL_SINK_LIMIT: набор подъёма (climb, vario>0) — не "
+print("\n=== 8. VERTICAL_SINK_LIMIT: набор подъёма (climb, vario>0) — не "
       "путать с сильным снижением ===")
 sc_climb = kadr(fc_pitch=10.0, vario_cms=2000.0)  # набираем высоту
 assert sc_climb["vertical_sink_limit"] is False
 assert sc_climb["vertical_sink_mps"] < 0, "набор высоты должен дать sink<0"
 print("    набор высоты (vario=+2000 см/с) -> sink_mps<0, limit=False")
 
-print("\n=== 8. VERTICAL_SINK_LIMIT: ни одного нового порога — по "
+print("\n=== 9. VERTICAL_SINK_LIMIT: ни одного нового порога — по "
       "исходному тексту читает именно VARIO_MAX_SINK_MPS/VARIO_FRESH_S ===")
 import io  # noqa: E402
 src = io.open(os.path.join(_ROOT, "tracker.py"), encoding="utf-8").read()
