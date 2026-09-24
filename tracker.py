@@ -2390,32 +2390,41 @@ _FLIGHT_LOG_COLUMNS = (
     "shadow_time_us,"
     # TRACKING SHADOW: TEMPLATE IDENTITY (первый срез Tracking Shadow,
     # разбор качества трекинга по 14 заходам 24.09.2026, см. блок
-    # process_locked_tracker / _shadow_track_dbg). Три диагностических
-    # представления ОДНОЙ И ТОЙ ЖЕ текущей позиции (lock_cx/lock_cy):
-    #   A. live  — уже посчитано этим же кадром, НЕ дублируется здесь:
-    #      смотреть match_score/match_psr/match_second/match_flow_gap.
-    #   B. fresh — template заново снят из ТЕКУЩЕГО кадра на текущей
-    #      позиции/масштабе (та же формула, что build_template()).
-    #   C. base  — template_base (эталон с захвата), приведён к тому же
-    #      размеру, что B (тот самый resize, что уже есть в live-коде под
+    # process_locked_tracker / _shadow_track_dbg). Диагностическое
+    # представление ОДНОЙ И ТОЙ ЖЕ текущей позиции (lock_cx/lock_cy)
+    # альтернативным template — сравнить с "live" (уже посчитано этим же
+    # кадром, НЕ дублируется здесь: смотреть match_score/match_psr/
+    # match_second/match_flow_gap):
+    #   variant="fresh" — template заново снят из ТЕКУЩЕГО кадра на
+    #      текущей позиции/масштабе (та же формула, что build_template()).
+    #   variant="base"  — template_base (эталон с захвата), приведён к
+    #      тому же размеру (тот самый resize, что уже есть в live-коде под
     #      TEMPLATE_RESCALE_ON_SIZE_CHANGE, но та ветка сейчас выключена).
-    # target_w/h — размер, к которому приведены И B, И C (сравнимы между
-    # собой и с template_w/box_w). *_flow_gap — расстояние найденного пика
-    # до flow-предсказания (тот же ориентир, что и у live match_flow_gap).
-    # НЕ включает color/motion guard (см. коммент у _shadow_match_against_
-    # template) — по разбору оба реально влияли в 0.00%/0.76% TRACKED-
-    # кадров, дублировать 2x/кадр не оправдано. None = kадр не TRACKED,
-    # template_base отсутствует, либо вырожденный случай матча.
+    #
+    # ПЕРЕДЕЛАНО после бенча на Pi Zero 2W (24.09.2026): было "fresh И base
+    # каждый TRACKED-кадр" — оказалось, что even на самом дешёвом размере
+    # цели (24px) every-frame BOTH вытеснял бюджетом live-этап примерки
+    # масштаба (ms_primerka: 44 замера за сессию на OFF -> 0 на BOTH).
+    # Теперь: редкий слот (TRACKING_SHADOW_EVERY_N_FRAMES) уже ПОСЛЕ всей
+    # live tracking-логики кадра, fresh/base ЧЕРЕДУЮТСЯ по слоту (никогда
+    # оба в одном кадре) — variant показывает, какой именно в этой строке.
+    # skip_reason="budget" — слот был запланирован, но бюджет кадра уже
+    # исчерпан (та же семантика, что live skip_reason примерки).
+    #
+    # target_w/h — размер, к которому приведён template этого варианта.
+    # flow_gap — расстояние найденного пика до flow-предсказания (тот же
+    # ориентир, что у live match_flow_gap). НЕ включает color/motion guard
+    # (см. коммент у _shadow_match_against_template) — по разбору оба
+    # реально влияли в 0.00%/0.76% TRACKED-кадров. None = не слот этого
+    # кадра, кадр не TRACKED, либо вырожденный случай матча.
+    "shadow_track_variant,shadow_track_skip_reason,"
     "shadow_track_target_w,shadow_track_target_h,"
-    "shadow_track_fresh_score,shadow_track_fresh_psr,shadow_track_fresh_second,"
-    "shadow_track_fresh_flow_gap,"
-    "shadow_track_base_score,shadow_track_base_psr,shadow_track_base_second,"
-    "shadow_track_base_flow_gap,"
-    # Собственная стоимость Tracking Shadow за кадр (мс) — для A/B на
-    # стенде перед деплоем: TRACKING_SHADOW_ENABLED/TRACKING_SHADOW_
-    # INCLUDE_BASE переключают OFF/FRESH/BOTH без правки остального кода.
-    # В отличие от control-shadow (~130мкс) это НЕ округление погрешности:
-    # 1-2 живых cv2.matchTemplate() за кадр.
+    "shadow_track_score,shadow_track_psr,shadow_track_second,"
+    "shadow_track_flow_gap,"
+    # Собственная стоимость Tracking Shadow за кадр (мс) — на 24px цели
+    # (самый дешёвый размер из проверенных) один matchTemplate стоил
+    # p50=3.74мс/p90=4.65мс/max=31.1мс на Pi Zero 2W (24.09.2026). В
+    # отличие от control-shadow (~130мкс) это НЕ округление погрешности.
     "shadow_track_time_ms"
 )
 
@@ -2662,13 +2671,29 @@ _match_dbg = {}
 # бы видно ДО того, как оператор вручную это исправит?
 #
 # СТОИМОСТЬ — В ОТЛИЧИЕ ОТ CONTROL-SHADOW (~130мкс, округление погрешности)
-# — НЕ бесплатна: fresh/base — это 1-2 живых cv2.matchTemplate() за кадр,
-# та же операция, что на Pi Zero 2W уже стоит ~8-9мс на live-матче (самый
-# дорогой этап кадра). Перед деплоем на реальный борт — два переключателя
-# для A/B на стенде, без правки остального кода:
+# — НЕ бесплатна, и бенч на Pi Zero 2W (24.09.2026, 24px цель — самый
+# дешёвый размер из возможных) это подтвердил численно:
+#   OFF:   ms_primerka считался 44 раза за сессию, FPS p50=19.3
+#   FRESH (1 matchTemplate/кадр, every-frame): shadow_track_time_ms
+#          p50=3.74мс, ms_primerka посчитан 1 раз, FPS p50=18.7
+#   BOTH  (2/кадр, every-frame): time_ms p50=7.46мс, ms_primerka —
+#          0 РАЗ ЗА ВСЮ СЕССИЮ, FPS p50=17.6
+# every-frame BOTH до блока адаптации/примерки САМ ПОРТИЛ ОБЪЕКТ
+# ИЗМЕРЕНИЯ — вытеснял именно тот этап (примерка масштаба), из-за
+# отсутствия которого изначально искали Template Identity. Поэтому:
+#   (1) Shadow теперь стоит ПОСЛЕ всей live tracking-логики (flow, match,
+#       scale adaptation, update_control_from_target) — никогда не может
+#       вытеснить их бюджетом, только использует то, что осталось;
+#   (2) не every-frame — редкий слот, с собственным budget-gate;
+#   (3) fresh/base ЧЕРЕДУЮТСЯ (по слоту), а не считаются оба в одном
+#       кадре — вдвое дешевле активного слота.
+# Намеренно НЕ добавлен режим "включать чаще при признаках деградации":
+# это добавило бы максимальную нагрузку именно в проблемной фазе и само
+# ухудшило бы то же самое качество трекинга, которое пытаемся измерить.
 TRACKING_SHADOW_ENABLED = True
-# False = считаем только fresh (1 matchTemplate); True = fresh+base (2).
-TRACKING_SHADOW_INCLUDE_BASE = True
+# Редкий фиксированный слот — не every-frame. На 24 FPS это ~1 замер
+# каждые ~0.2с, достаточно для статистики за типичный заход (5-15с).
+TRACKING_SHADOW_EVERY_N_FRAMES = 5
 _shadow_track_dbg = {"active": False}
 # Внутренности оптического потока за текущий кадр (ТЗ п.5, flow_points /
 # flow_inliers): сколько точек было заведено и сколько дожило после
@@ -6035,6 +6060,26 @@ def build_template(gray, cx, cy, box_w, box_h):
     return tmpl
 
 
+def _shadow_template_target_size(box_w, box_h):
+    """TRACKING SHADOW: чистая арифметика (без изображения) — побитово та
+    же формула размера, что build_template() (TEMPLATE_SCALE/MIN/MAX).
+    Вынесена отдельно от _shadow_build_fresh_template, чтобы "base"-слот
+    (см. ниже — fresh/base теперь ЧЕРЕДУЮТСЯ, не считаются оба в одном
+    кадре) мог узнать целевой размер под cv2.resize(template_base, ...),
+    не строя при этом ненужный fresh-кроп.
+
+    НАЙДЕНО (при написании теста на альтернацию): build_template()/
+    _shadow_build_fresh_template() всегда отдавали tw/th через
+    tmpl.shape (numpy — уже int), эта формула сама по себе — float
+    (TEMPLATE_SCALE=2.0). crop_center() float внутри терпит (округляет
+    сам), а вот cv2.resize(..., dsize=(tw, th)) — НЕТ: "base"-слот без
+    предварительного fresh уже падал на Bad argument/dsize. round()+int
+    здесь, а не в вызывающем коде — все потребители получают целые."""
+    tw = clamp(max(box_w * TEMPLATE_SCALE, TEMPLATE_MIN), TEMPLATE_MIN, TEMPLATE_MAX)
+    th = clamp(max(box_h * TEMPLATE_SCALE, TEMPLATE_MIN), TEMPLATE_MIN, TEMPLATE_MAX)
+    return int(round(tw)), int(round(th))
+
+
 def _shadow_build_fresh_template(gray, cx, cy, box_w, box_h):
     """TRACKING SHADOW: побитово та же формула размера/кропа, что
     build_template() (TEMPLATE_SCALE/MIN/MAX + crop_center), но возвращает
@@ -6044,8 +6089,7 @@ def _shadow_build_fresh_template(gray, cx, cy, box_w, box_h):
     не каждый кадр) — если бы shadow писал их каждый TRACKED-кадр, live-матч
     следующего кадра молча работал бы с чужими значениями. Возвращает
     (tmpl, tw, th, tstd)."""
-    tw = clamp(max(box_w * TEMPLATE_SCALE, TEMPLATE_MIN), TEMPLATE_MIN, TEMPLATE_MAX)
-    th = clamp(max(box_h * TEMPLATE_SCALE, TEMPLATE_MIN), TEMPLATE_MIN, TEMPLATE_MAX)
+    tw, th = _shadow_template_target_size(box_w, box_h)
     tmpl, _rect = crop_center(gray, cx, cy, tw, th)
     tstd = float(np.std(tmpl)) if tmpl.size else 0.0
     return tmpl, tmpl.shape[1], tmpl.shape[0], tstd
@@ -10324,77 +10368,6 @@ def process_locked_tracker(gray, cb_t0=None):
             prev_pts = refresh_flow_points(gray, lock_cx, lock_cy, lock_w, lock_h)
         prev_gray = gray.copy()
 
-        # ============= TRACKING SHADOW: TEMPLATE IDENTITY =============
-        # СТРОГО ДО блока адаптации ниже, который МОЖЕТ переписать
-        # template_gray: "live" ниже (уже посчитано, не пересчитывается —
-        # это last_match_score/_match_dbg["psr"/"second"/"flow_gap"] этого
-        # же кадра, уже в CSV как match_score/match_psr/match_second/
-        # match_flow_gap) обязан остаться ТЕМ ЖЕ template_gray, которым
-        # только что реально матчился этот кадр, а не тем, во что он
-        # превратится после адаптации несколькими строками ниже.
-        #
-        # "fresh"/"base" ищутся вокруг ТОЙ ЖЕ pred_cx/pred_cy, что и live
-        # match (вызов template_match_locked выше по функции) — иначе
-        # разница score объяснялась бы разным местом поиска, а не разным
-        # template. Целиком try/except: исключение здесь — потеря только
-        # диагностики этого кадра, lock_cx/lock_cy/template_gray уже
-        # закоммичены строками выше и не откатываются.
-        #
-        # TRACKING_SHADOW_ENABLED=False — весь блок стоит одну проверку
-        # bool, ни одного matchTemplate. TRACKING_SHADOW_INCLUDE_BASE=False
-        # — только fresh (1 вызов), не fresh+base (2). time_ms — по тому же
-        # шаблону, что control-shadow's shadow_time_us: считается внутри
-        # try, попадает в CSV только на успешном пути (на исключении/
-        # вырожденном кадре — active=False без time_ms, эта диагностика
-        # уже показывала себя надёжной на control-shadow).
-        if TRACKING_SHADOW_ENABLED:
-            try:
-                _track_shadow_t0 = time.monotonic()
-                if template_gray is not None and lock_w > 0 and lock_h > 0:
-                    _fresh_tmpl, _tw, _th, _fresh_std = _shadow_build_fresh_template(
-                        gray, lock_cx, lock_cy, lock_w, lock_h)
-                    (_fresh_ok, _fresh_score, _fresh_psr, _fresh_second,
-                     _fmx, _fmy) = _shadow_match_against_template(
-                        gray, _fresh_tmpl, _tw, _th, _fresh_std,
-                        pred_cx, pred_cy, flow_motion)
-                    _fresh_gap = (math.hypot(_fmx - pred_cx, _fmy - pred_cy)
-                                 if _fresh_ok else None)
-
-                    _base_ok = False
-                    _base_score = _base_psr = _base_second = _base_gap = None
-                    if (TRACKING_SHADOW_INCLUDE_BASE and template_base is not None
-                            and template_base.size > 0):
-                        _base_tmpl = cv2.resize(
-                            template_base, (_tw, _th), interpolation=cv2.INTER_LINEAR)
-                        _base_std = float(np.std(_base_tmpl)) if _base_tmpl.size else 0.0
-                        (_base_ok, _base_score, _base_psr, _base_second,
-                         _bmx, _bmy) = _shadow_match_against_template(
-                            gray, _base_tmpl, _tw, _th, _base_std,
-                            pred_cx, pred_cy, flow_motion)
-                        _base_gap = (math.hypot(_bmx - pred_cx, _bmy - pred_cy)
-                                    if _base_ok else None)
-
-                    _shadow_track_dbg = {
-                        "active": True,
-                        "target_w": _tw, "target_h": _th,
-                        "fresh_score": _fresh_score if _fresh_ok else None,
-                        "fresh_psr": _fresh_psr if _fresh_ok else None,
-                        "fresh_second": _fresh_second if _fresh_ok else None,
-                        "fresh_flow_gap": _fresh_gap,
-                        "base_score": _base_score if _base_ok else None,
-                        "base_psr": _base_psr if _base_ok else None,
-                        "base_second": _base_second if _base_ok else None,
-                        "base_flow_gap": _base_gap,
-                        "time_ms": (time.monotonic() - _track_shadow_t0) * 1000.0,
-                    }
-                else:
-                    _shadow_track_dbg = {"active": False}
-            except Exception:
-                _shadow_track_dbg = {"active": False}
-        else:
-            _shadow_track_dbg = {"active": False}
-        # ============ /TRACKING SHADOW: TEMPLATE IDENTITY ============
-
         if not FREEZE_TEMPLATE and match_ok and score >= 0.60:
             cur_tmpl = build_template(gray, lock_cx, lock_cy, lock_w, lock_h)
             # ЗАПРЕТ АДАПТАЦИИ НА СОМНИТЕЛЬНЫХ КАДРАХ (ТЗ §9). match_ok и
@@ -10642,6 +10615,85 @@ def process_locked_tracker(gray, cb_t0=None):
             overlay_text = "TRACKED"
             overlay_color = COLOR_RED
         update_control_from_target()
+
+        # ============= TRACKING SHADOW: TEMPLATE IDENTITY =============
+        # ПЕРЕМЕЩЕНО после ревью бенч-цифр (24.09.2026): раньше стоял ДО
+        # блока адаптации/примерки масштаба и every-frame BOTH сам вытеснял
+        # именно эту live-стадию бюджетом (ms_primerka: 44 замера за сессию
+        # на OFF -> 1 на FRESH -> 0 на BOTH, измерено на Pi Zero 2W). Теперь
+        # — строго ПОСЛЕ ВСЕЙ live tracking-логики этого кадра (flow, match,
+        # scale adaptation, ДАЖЕ update_control_from_target() уже отработал)
+        # — диагностика не имеет права вытеснять ни один live-этап, только
+        # донашивает то, что осталось от бюджета кадра. "live" ниже
+        # по-прежнему не пересчитывается — last_match_score/_match_dbg
+        # ["psr"/"second"/"flow_gap"] этого кадра давно зафиксированы
+        # (template_match_locked отработал в начале функции), их точное
+        # место в файле относительно адаптации теперь не имеет значения.
+        #
+        # РЕДКИЙ СЛОТ, не every-frame: TRACKING_SHADOW_EVERY_N_FRAMES.
+        # НА СЛОТЕ fresh/base ЧЕРЕДУЮТСЯ (никогда оба в одном кадре — вдвое
+        # дешевле активного слота, чем в первой версии). СВОЙ budget-gate
+        # (та же схема, что уже проверила примерка выше по функции, но
+        # СВЕЖИЙ замер — после update_control_from_target() утекло ещё
+        # время): если бюджет уже исчерпан — просто не считаем и честно
+        # пишем shadow_track_skip_reason="budget" (тот же принцип, что
+        # skip_reason примерки), не более. Никакой "считать чаще, если
+        # tracker выглядит плохо" — именно в проблемной фазе это добавило
+        # бы максимальную нагрузку и само ухудшило бы то, что измеряем.
+        if (TRACKING_SHADOW_ENABLED
+                and frame_index % TRACKING_SHADOW_EVERY_N_FRAMES == 0):
+            _track_budget_ok = (cb_t0 is None or
+                                (time.monotonic() - cb_t0) * 1000.0
+                                <= FRAME_BUDGET_MS)
+            if not _track_budget_ok:
+                _shadow_track_dbg = {
+                    "active": False, "skip_reason": "budget"}
+            else:
+                try:
+                    _track_shadow_t0 = time.monotonic()
+                    if template_gray is not None and lock_w > 0 and lock_h > 0:
+                        _tw, _th = _shadow_template_target_size(lock_w, lock_h)
+                        # Слот-индекс (не frame_index напрямую) чередует
+                        # variant — соседние активные слоты чередуются
+                        # fresh/base, а не "все fresh, потом все base".
+                        _slot = frame_index // TRACKING_SHADOW_EVERY_N_FRAMES
+                        _use_base = (_slot % 2 == 1 and template_base is not None
+                                    and template_base.size > 0)
+                        if _use_base:
+                            _variant = "base"
+                            _tmpl = cv2.resize(
+                                template_base, (_tw, _th),
+                                interpolation=cv2.INTER_LINEAR)
+                        else:
+                            _variant = "fresh"
+                            _tmpl, _tw, _th, _v_std = _shadow_build_fresh_template(
+                                gray, lock_cx, lock_cy, lock_w, lock_h)
+                        _v_std = float(np.std(_tmpl)) if _tmpl.size else 0.0
+                        (_v_ok, _v_score, _v_psr, _v_second,
+                         _vmx, _vmy) = _shadow_match_against_template(
+                            gray, _tmpl, _tw, _th, _v_std,
+                            pred_cx, pred_cy, flow_motion)
+                        _v_gap = (math.hypot(_vmx - pred_cx, _vmy - pred_cy)
+                                 if _v_ok else None)
+                        _shadow_track_dbg = {
+                            "active": True, "variant": _variant,
+                            "target_w": _tw, "target_h": _th,
+                            "score": _v_score if _v_ok else None,
+                            "psr": _v_psr if _v_ok else None,
+                            "second": _v_second if _v_ok else None,
+                            "flow_gap": _v_gap,
+                            "time_ms": (time.monotonic() - _track_shadow_t0) * 1000.0,
+                        }
+                    else:
+                        _shadow_track_dbg = {"active": False}
+                except Exception:
+                    _shadow_track_dbg = {"active": False}
+        else:
+            # Не слот этого кадра (либо Shadow выключен целиком) — явный
+            # сброс, не "оставить значение прошлого слота висеть": та же
+            # болезнь, что чинили для _shadow_ctl_dbg в более раннем ревью.
+            _shadow_track_dbg = {"active": False}
+        # ============ /TRACKING SHADOW: TEMPLATE IDENTITY ============
     else:
         lost_frames += 1
         # Не оставляем диагностику прошлого TRACKED-кадра висеть на кадре,
@@ -11047,11 +11099,13 @@ def _capture_flight_row(cb_t0):
             sg("att_age_ms"), sg("gyro_age_ms"),
             sg("vertical_sink_mps"), sg("vertical_sink_limit"),
             sg("time_us"),
+            # variant/skip_reason читаются НАПРЯМУЮ из st_ (не через sgt()):
+            # sgt() гасит всё в None, когда active=False — а skip_reason
+            # ИМЕННО тогда и осмыслен ("слот был, бюджета не хватило").
+            st_.get("variant"), st_.get("skip_reason"),
             sgt("target_w"), sgt("target_h"),
-            sgt("fresh_score"), sgt("fresh_psr"), sgt("fresh_second"),
-            sgt("fresh_flow_gap"),
-            sgt("base_score"), sgt("base_psr"), sgt("base_second"),
-            sgt("base_flow_gap"),
+            sgt("score"), sgt("psr"), sgt("second"),
+            sgt("flow_gap"),
             sgt("time_ms"),
         )
         flight_log.row(_row_values)

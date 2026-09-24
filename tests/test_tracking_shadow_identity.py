@@ -230,10 +230,9 @@ print("    _shadow_build_fresh_template/_shadow_match_against_template "
       "не объявляют global — чистые функции")
 
 print("\n=== 6. TRACKING_SHADOW_ENABLED=False: active=False, ноль "
-      "вызовов matchTemplate (блок не считает вообще — для A/B на "
-      "стенде, ревью после 33f9e16) ===")
+      "вызовов matchTemplate (блок не считает вообще) ===")
 _orig_enabled = t.TRACKING_SHADOW_ENABLED
-_orig_include_base = t.TRACKING_SHADOW_INCLUDE_BASE
+_orig_every_n = t.TRACKING_SHADOW_EVERY_N_FRAMES
 t.TRACKING_SHADOW_ENABLED = False
 force_reset()
 with t.state_lock:
@@ -249,14 +248,14 @@ t.process_locked_tracker(make_scene(CX, CY, 30))
 assert t.track_state == t.TRACK_STATE_TRACKED, "захват не состоялся"
 
 
-def _tick_frame(offset):
+def _tick_frame(offset, cb_t0=None):
     with t.state_lock:
         t.app_state["fc_pitch_deg"] = 10.0
         t.app_state["fc_pitch_ts"] = t.time.monotonic()
         t.app_state["gyro"] = (0, 0, 0)
         t.app_state["imu_ts"] = t.time.monotonic()
     _clk.tick(FRAME_DT)
-    t.process_locked_tracker(make_scene(CX, CY, 30, offset=offset))
+    t.process_locked_tracker(make_scene(CX, CY, 30, offset=offset), cb_t0=cb_t0)
 
 
 _call_count = [0]
@@ -277,57 +276,100 @@ assert _call_count[0] == 0, (
     "вызовов _shadow_match_against_template, было %d" % _call_count[0])
 print("    ENABLED=False: active=False, 0 вызовов matchTemplate")
 
-print("\n=== 7. TRACKING_SHADOW_INCLUDE_BASE=False: только fresh "
-      "(1 вызов), base_* все None (режим 'FRESH' для стендового A/B) ===")
+print("\n=== 7. Редкий слот: TRACKING_SHADOW_EVERY_N_FRAMES=3 — активен "
+      "только на frame_index%3==0, остальные кадры active=False БЕЗ "
+      "единого вызова matchTemplate (не every-frame — нашли ревью бенча: "
+      "even на 24px every-frame BOTH вытеснял ms_primerka с 44 замеров "
+      "до 0) ===")
 t.TRACKING_SHADOW_ENABLED = True
-t.TRACKING_SHADOW_INCLUDE_BASE = False
-_call_count[0] = 0
-t._shadow_match_against_template = _counting
-_tick_frame(2)
-t._shadow_match_against_template = _orig_match_2
-sc_fresh_only = t._shadow_track_dbg
-assert sc_fresh_only.get("active") is True
-assert _call_count[0] == 1, (
-    "INCLUDE_BASE=False обязан звать matchTemplate ровно 1 раз (только "
-    "fresh), было %d" % _call_count[0])
-assert sc_fresh_only.get("fresh_score") is not None
-assert sc_fresh_only.get("base_score") is None
-assert sc_fresh_only.get("base_psr") is None
-assert sc_fresh_only.get("base_flow_gap") is None
-print("    INCLUDE_BASE=False: 1 вызов matchTemplate, fresh заполнен, "
-      "base_* все None")
+t.TRACKING_SHADOW_EVERY_N_FRAMES = 3
+_slot_results = []
+for i in range(9):
+    _call_count[0] = 0
+    t._shadow_match_against_template = _counting
+    _tick_frame(10 + i)
+    t._shadow_match_against_template = _orig_match_2
+    is_slot = (t.frame_index % t.TRACKING_SHADOW_EVERY_N_FRAMES == 0)
+    _slot_results.append((t.frame_index, is_slot, t._shadow_track_dbg.get("active"), _call_count[0]))
+for fi, is_slot, active, calls in _slot_results:
+    if is_slot:
+        assert calls >= 1, "frame_index=%d — слот, но 0 вызовов matchTemplate" % fi
+    else:
+        assert calls == 0, (
+            "frame_index=%d — НЕ слот (не кратен %d), но был вызов "
+            "matchTemplate — рано, диагностика должна молчать вне своего "
+            "слота" % (fi, t.TRACKING_SHADOW_EVERY_N_FRAMES))
+        assert active is False, "не-слот кадр обязан быть active=False"
+n_slots = sum(1 for _, s, _, _ in _slot_results if s)
+n_active = sum(1 for _, _, a, _ in _slot_results if a)
+print("    9 кадров, %d слотов (every %d-й), %d активных — вне слота "
+      "вызовов matchTemplate не было ни разу" % (n_slots, t.TRACKING_SHADOW_EVERY_N_FRAMES, n_active))
 
-print("\n=== 8. TRACKING_SHADOW_INCLUDE_BASE=True (режим 'BOTH'): 2 "
-      "вызова, shadow_track_time_ms записан и положителен ===")
-t.TRACKING_SHADOW_INCLUDE_BASE = True
+print("\n=== 8. Чередование fresh/base по слотам — никогда оба в одном "
+      "кадре (вдвое дешевле активного слота, чем в первой версии) ===")
+_variants = []
+for i in range(9, 15):
+    _tick_frame(20 + i)
+    if t._shadow_track_dbg.get("active"):
+        _variants.append(t._shadow_track_dbg.get("variant"))
+assert len(_variants) >= 2, "нужно хотя бы 2 активных слота для проверки чередования"
+assert set(_variants) <= {"fresh", "base"}
+# Чередование: соседние активные слоты не должны быть одним и тем же
+# variant подряд ВСЕ разы (иначе это не чередование, а константа).
+assert len(set(_variants)) > 1 or len(_variants) < 2, (
+    "ожидали чередование fresh/base по слотам, а не один и тот же "
+    "variant всё время: %s" % _variants)
+print("    variant по активным слотам: %s (чередуется, не одна константа)"
+      % _variants)
+
+print("\n=== 9. Budget-gate: если время кадра уже вышло за FRAME_BUDGET_MS "
+      "к моменту слота — active=False, skip_reason='budget', НИ ОДНОГО "
+      "вызова matchTemplate (проверка бюджета ДО, не ПОСЛЕ вычисления) ===")
+# Найти следующий slot-кадр и подать туда заведомо просроченный cb_t0.
+_next_slot_offset = 1
+while (t.frame_index + _next_slot_offset) % t.TRACKING_SHADOW_EVERY_N_FRAMES != 0:
+    _next_slot_offset += 1
+for _ in range(_next_slot_offset - 1):
+    _tick_frame(40)
 _call_count[0] = 0
 t._shadow_match_against_template = _counting
-_tick_frame(3)
+_late_cb_t0 = _clk.t - (t.FRAME_BUDGET_MS / 1000.0 + 0.5)  # "начался" давно
+_tick_frame(41, cb_t0=_late_cb_t0)
 t._shadow_match_against_template = _orig_match_2
-sc_both = t._shadow_track_dbg
-assert sc_both.get("active") is True
-assert _call_count[0] == 2, (
-    "BOTH обязан звать matchTemplate ровно 2 раза (fresh+base), было %d"
-    % _call_count[0])
-assert sc_both.get("fresh_score") is not None
-assert sc_both.get("base_score") is not None
-assert sc_both.get("time_ms") is not None and sc_both["time_ms"] >= 0.0, (
-    "time_ms обязан хотя бы записываться на успешном кадре — именно его "
-    "будем читать на стенде как shadow_track_time_ms")
-# НЕ микробенчмарк: часы в оффлайн-тесте мокнуты (см. _Chasy) и не тикают
-# ВНУТРИ одного вызова process_locked_tracker(), поэтому time.monotonic()-
-# time.monotonic() тут всегда ровно 0.0 — реальную стоимость в мс так не
-# измерить (для этого и нужен стенд). Что проверено здесь: поле вообще
-# пишется (не падает раньше вычисления времени) и остаётся числом.
-print("    BOTH: 2 вызова matchTemplate, fresh и base заполнены, "
-      "time_ms=%.4f (мокнутые часы дают ровно 0.0, замер только на стенде)"
-      % sc_both["time_ms"])
+assert t.frame_index % t.TRACKING_SHADOW_EVERY_N_FRAMES == 0, "тест обязан был попасть ровно в слот"
+sc_budget = t._shadow_track_dbg
+assert sc_budget.get("active") is False
+assert sc_budget.get("skip_reason") == "budget", (
+    "слот был, бюджет исчерпан — обязан быть skip_reason='budget', "
+    "получили %r" % sc_budget.get("skip_reason"))
+assert _call_count[0] == 0, (
+    "budget-gate обязан проверяться ДО вычисления — 0 вызовов "
+    "matchTemplate на просроченном кадре, было %d" % _call_count[0])
+print("    просроченный cb_t0 на слот-кадре -> active=False, "
+      "skip_reason='budget', 0 вызовов matchTemplate")
+
+print("\n=== 10. Расположение: Tracking Shadow стоит ПОСЛЕ update_control_"
+      "from_target(), а НЕ до блока адаптации/примерки — не может "
+      "вытеснить бюджетом ни один live-этап ===")
+src2 = io.open(os.path.join(_ROOT, "tracker.py"), encoding="utf-8").read()
+i_utft = src2.rindex("update_control_from_target()",
+                     0, src2.index("# ============= TRACKING SHADOW: TEMPLATE IDENTITY ============="))
+i_shadow2 = src2.index("# ============= TRACKING SHADOW: TEMPLATE IDENTITY =============")
+i_primerka = src2.index('elif SIZE_ADAPT_ENABLED and _primerka_pora and _budget_ok:')
+assert i_utft < i_shadow2, (
+    "Tracking Shadow обязан идти ПОСЛЕ update_control_from_target()")
+assert i_primerka < i_shadow2, (
+    "Tracking Shadow обязан идти ПОСЛЕ блока примерки масштаба (scale "
+    "adaptation), не до него — иначе он снова вытесняет её бюджетом, "
+    "именно эта регрессия и была найдена бенчем на Pi Zero 2W")
+print("    Tracking Shadow физически после update_control_from_target() "
+      "и после блока примерки масштаба — не может их вытеснить")
 
 t.TRACKING_SHADOW_ENABLED = _orig_enabled
-t.TRACKING_SHADOW_INCLUDE_BASE = _orig_include_base
+t.TRACKING_SHADOW_EVERY_N_FRAMES = _orig_every_n
 
-print("\nOK: Tracking Shadow v1 (Template Identity) корректно измеряет "
-      "разрыв fresh-vs-live на синтетике, не влияет на live-путь ни при "
-      "штатной работе, ни при внутреннем сбое, не пишет в live-переменные "
-      "по исходному тексту, и переключатели OFF/FRESH/BOTH работают "
-      "ровно так, как нужно для стендового A/B")
+print("\nOK: Tracking Shadow v2 (после бенча 24.09.2026) — редкий "
+      "budget-gated слот СТРОГО ПОСЛЕ всей live tracking-логики, fresh/"
+      "base чередуются (не оба в одном кадре), не влияет на live-путь ни "
+      "при штатной работе, ни при внутреннем сбое, и не пишет в "
+      "live-переменные по исходному тексту")
