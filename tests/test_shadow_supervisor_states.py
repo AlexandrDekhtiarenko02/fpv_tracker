@@ -1,27 +1,32 @@
 """Первый срез supervisor-состояний Shadow v2 (ТЗ/разбор 24.09.2026):
-HIGH_ATTITUDE и VERTICAL_SINK_LIMIT.
+HIGH_NOSE_DOWN и VERTICAL_SINK_LIMIT.
 
-По следам ответа "давай" на предложение сделать threshold-sweep. Третье
-предложенное состояние, CLOSURE_GEOMETRY_DISAGREE (tau vs los_rate), в
-эту сессию НЕ вошло: наивная формула "tau_s < TAU_THROTTLE_LO_S и
-|los_rate| > LOS_RATE_DEADBAND_DPS" (оба порога уже live-константы, не
-придуманы) на проверке дала #4 (здоровый эталон, "сошлось") САМЫЙ
-высокий disagree-rate — 39.7%, выше, чем у #9 (36.0%), ради которого
-условие и строилось. Значит формула не разделяет, а не значит "фичи нет"
-— нужен нормальный дизайн, не десятиминутный sweep. Не реализовано.
+HIGH_NOSE_DOWN — ПЕРЕИМЕНОВАНО и ИСПРАВЛЕНО после ревью по fad59c8, две
+находки:
+  (1) threshold-sweep (40°) считался по СЫРОМУ fc_pitch_deg из CSV, а
+      первая версия применяла порог к svezhiy_tangazh() (raw + gyro-
+      экстраполяция до ±12°) — доказательная база и фактический вход были
+      РАЗНЫМИ сигналами. Теперь читает raw fc_pitch_deg напрямую.
+  (2) сравнение было abs(pitch)>40 — вся доказательная база (sign-
+      conflict, pitch_comp dominance, VARIO sink) про ОДИН конкретный
+      сценарий: nose-down dive (positive fc_pitch = nose down). -50°
+      nose-up физически другая ситуация, но abs() схлопывал их в одно
+      состояние. Теперь сравнение знаковое (pitch > порог), имя поля —
+      high_nose_down.
 
-HIGH_ATTITUDE: fc_pitch > SHADOW_HIGH_ATTITUDE_DEG=40.0. Порог — из
-threshold-sweep по #4/7/9/13/14: dominance-rate по 5-градусным бакетам
-держится <15% (с провалом до ~0% на 25-40°), затем резко прыгает на
-45-50° (62%), 50-55° (91%). fc_pitch — тот же сигнал, что уже участвует в
-pitch_comp_px (svezhiy_tangazh), новое измерение не нужно; МОЖЕТ быть
-None при протухшей/отсутствующей ATT.
+VERTICAL_SINK_LIMIT — БЕЗ ИЗМЕНЕНИЙ (ревью по fad59c8 явно одобрило: "мне
+нравится... не придумал ещё один magic threshold"). sink_mps >
+VARIO_MAX_SINK_MPS — ноль новых порогов, та же константа (и
+VARIO_FRESH_S), что уже использует живой "ПРЕДЕЛ СКОРОСТИ СНИЖЕНИЯ" в
+throttle law.
 
-VERTICAL_SINK_LIMIT: sink_mps > VARIO_MAX_SINK_MPS — ноль новых порогов,
-буквально та же константа (и VARIO_FRESH_S), что уже использует живой
-"ПРЕДЕЛ СКОРОСТИ СНИЖЕНИЯ" в throttle law. На 5 проверенных заходах
-только #13 (вертикальный промах) пересекает 12 м/с (up to 19.8 м/с) —
-у остальных максимум 5.9-11.4 м/с.
+Третье предложенное состояние, CLOSURE_GEOMETRY_DISAGREE (tau vs
+los_rate), по-прежнему НЕ реализовано: наивная формула "tau_s <
+TAU_THROTTLE_LO_S и |los_rate| > LOS_RATE_DEADBAND_DPS" на проверке дала
+#4 (здоровый эталон) САМЫЙ высокий disagree-rate — 39.7%, выше, чем у #9
+(36.0%), ради которого условие строилось. Формула не разделяет — нужен
+нормальный time-based дизайн (по аналогии с pitch_ref_conflict_run_s), не
+мгновенный boolean.
 """
 import os
 import sys
@@ -57,7 +62,8 @@ def force_reset():
     t.update_control_from_target()
 
 
-def kadr(dx=60, dy=40, fc_pitch=15.0, vario_cms=0.0, score=0.85, dt=FRAME_DT):
+def kadr(dx=60, dy=40, fc_pitch=15.0, vario_cms=0.0, gyro=(0, 0, 0),
+         score=0.85, dt=FRAME_DT):
     with t.state_lock:
         t.target_box_main = (CX - 20 + dx, CY - 20 + dy,
                              CX + 20 + dx, CY + 20 + dy)
@@ -72,7 +78,7 @@ def kadr(dx=60, dy=40, fc_pitch=15.0, vario_cms=0.0, score=0.85, dt=FRAME_DT):
         t.app_state["rc_throttle_ts"] = now
         t.app_state["fc_pitch_deg"] = fc_pitch
         t.app_state["fc_pitch_ts"] = now
-        t.app_state["gyro"] = (0, 0, 0)
+        t.app_state["gyro"] = gyro
         t.app_state["imu_ts"] = now
         t.app_state["vario_cms"] = vario_cms
         t.app_state["alt_ts"] = now
@@ -81,24 +87,51 @@ def kadr(dx=60, dy=40, fc_pitch=15.0, vario_cms=0.0, score=0.85, dt=FRAME_DT):
     return t._shadow_ctl_dbg
 
 
-print("=== 1. HIGH_ATTITUDE: False при малом pitch, True за порогом ===")
+print("=== 1. HIGH_NOSE_DOWN: False при малом pitch, True за порогом ===")
 force_reset()
 _clk.t = 1000.0
 sc_low = kadr(fc_pitch=20.0)
-assert sc_low["pitch_high_attitude"] is False
+assert sc_low["pitch_high_nose_down"] is False
 sc_high = kadr(fc_pitch=45.0)
-assert sc_high["pitch_high_attitude"] is True
+assert sc_high["pitch_high_nose_down"] is True
 print("    fc_pitch=20 -> False, fc_pitch=45 -> True (порог %.0f)"
-      % t.SHADOW_HIGH_ATTITUDE_DEG)
+      % t.SHADOW_HIGH_NOSE_DOWN_DEG)
 
-print("\n=== 2. HIGH_ATTITUDE: граница ровно на пороге (не >=, строго >) ===")
-sc_edge = kadr(fc_pitch=t.SHADOW_HIGH_ATTITUDE_DEG)
-assert sc_edge["pitch_high_attitude"] is False, (
+print("\n=== 2. HIGH_NOSE_DOWN: граница ровно на пороге (не >=, строго >) ===")
+sc_edge = kadr(fc_pitch=t.SHADOW_HIGH_NOSE_DOWN_DEG)
+assert sc_edge["pitch_high_nose_down"] is False, (
     "ровно на пороге обязано быть False (строго >, не >=) — иначе "
     "константа сама себе противоречит с комментарием 'больше X'")
 print("    fc_pitch==порог -> False (строго >, граница не включена)")
 
-print("\n=== 3. HIGH_ATTITUDE: None при отсутствующей ATT (не путать с "
+print("\n=== 3. HIGH_NOSE_DOWN: знаковое сравнение — большой NOSE-UP (-50°) "
+      "НЕ считается конфликтом. Главный вывод ревью: abs() смешивал два "
+      "физически разных состояния в одно ===")
+sc_nose_up = kadr(fc_pitch=-50.0)
+assert sc_nose_up["pitch_high_nose_down"] is False, (
+    "-50° это nose-up (аппарат задирает нос), физически другая ситуация, "
+    "не тот dive-сценарий, на котором доказан порог 40° — abs(pitch)>40 "
+    "здесь дал бы True, что и было главной находкой ревью")
+print("    fc_pitch=-50 (nose-up) -> False, хотя abs(-50)=50 > 40 — знак "
+      "учитывается, не только модуль")
+
+print("\n=== 4. HIGH_NOSE_DOWN: читает СЫРОЙ fc_pitch_deg, не "
+      "gyro-экстраполированный svezhiy_tangazh() — тот сигнал, на котором "
+      "реально делался threshold-sweep ===")
+force_reset()
+_clk.t = 1000.0
+# fc_pitch=35 (< порога 40 по raw), но БЫСТРОЕ вращение по gyro_y — если бы
+# state читал svezhiy_tangazh() (экстраполяция до ±12°), 35+12=47 > 40 дало
+# бы True. Порог доказан на raw, поэтому обязано остаться False.
+sc_raw = kadr(fc_pitch=35.0, gyro=(0, 90.0, 0))
+assert sc_raw["pitch_high_nose_down"] is False, (
+    "raw fc_pitch=35 < 40, но если бы state читал экстраполированный "
+    "svezhiy_tangazh() (35+gyro-поправка до +12° = до 47°), получили бы "
+    "True — а sweep доказан именно на raw-сигнале, не на экстраполяции")
+print("    fc_pitch=35 (raw, <40) + быстрое вращение gyro_y=90°/с -> "
+      "всё равно False (state не использует gyro-экстраполяцию)")
+
+print("\n=== 5. HIGH_NOSE_DOWN: None при отсутствующей ATT (не путать с "
       "False) ===")
 force_reset()
 _clk.t = 1000.0
@@ -120,17 +153,17 @@ _clk.tick(FRAME_DT)
 t.update_control_from_target()
 sc_none = t._shadow_ctl_dbg
 if sc_none.get("active"):
-    assert sc_none["pitch_high_attitude"] is None, (
-        "без ATT pitch_high_attitude обязан быть None, не False — иначе "
+    assert sc_none["pitch_high_nose_down"] is None, (
+        "без ATT pitch_high_nose_down обязан быть None, не False — иначе "
         "'нет данных' и 'проверили, pitch маленький' неразличимы")
-    print("    ATT отсутствует -> pitch_high_attitude=None (не False)")
+    print("    ATT отсутствует -> pitch_high_nose_down=None (не False)")
 else:
     print("    (shadow неактивен на этом синтетическом кадре — пропуск, "
           "проверка None уже покрыта тестом test_shadow_isolation.py "
           "для аналогичных полей)")
 
-print("\n=== 4. VERTICAL_SINK_LIMIT: False при малом снижении, True за "
-      "VARIO_MAX_SINK_MPS ===")
+print("\n=== 6. VERTICAL_SINK_LIMIT: False при малом снижении, True за "
+      "VARIO_MAX_SINK_MPS (без изменений с прошлого ревью) ===")
 force_reset()
 _clk.t = 1000.0
 sc_slow = kadr(fc_pitch=10.0, vario_cms=-500.0)  # 5 м/с
@@ -142,14 +175,14 @@ assert abs(sc_fast["vertical_sink_mps"] - 19.8) < 1e-6
 print("    sink=5.0 м/с -> False, sink=19.8 м/с (как в реальном #13) -> "
       "True (порог %.1f)" % t.VARIO_MAX_SINK_MPS)
 
-print("\n=== 5. VERTICAL_SINK_LIMIT: набор подъёма (climb, vario>0) — не "
+print("\n=== 7. VERTICAL_SINK_LIMIT: набор подъёма (climb, vario>0) — не "
       "путать с сильным снижением ===")
 sc_climb = kadr(fc_pitch=10.0, vario_cms=2000.0)  # набираем высоту
 assert sc_climb["vertical_sink_limit"] is False
 assert sc_climb["vertical_sink_mps"] < 0, "набор высоты должен дать sink<0"
 print("    набор высоты (vario=+2000 см/с) -> sink_mps<0, limit=False")
 
-print("\n=== 6. VERTICAL_SINK_LIMIT: ни одного нового порога — по "
+print("\n=== 8. VERTICAL_SINK_LIMIT: ни одного нового порога — по "
       "исходному тексту читает именно VARIO_MAX_SINK_MPS/VARIO_FRESH_S ===")
 import io  # noqa: E402
 src = io.open(os.path.join(_ROOT, "tracker.py"), encoding="utf-8").read()
@@ -163,6 +196,7 @@ assert "SHADOW_VARIO" not in shadow_body, (
 print("    в shadow-блоке нет отдельной SHADOW_VARIO_* константы — читает "
       "живой VARIO_MAX_SINK_MPS напрямую")
 
-print("\nOK: shadow_pitch_high_attitude (новый порог 40°, обоснован "
-      "sweep'ом) и shadow_vertical_sink_limit (ноль новых порогов, живая "
+print("\nOK: shadow_pitch_high_nose_down (знаковый, читает raw fc_pitch_deg "
+      "— тот сигнал, на котором доказан порог 40°) и "
+      "shadow_vertical_sink_limit (ноль новых порогов, живая "
       "VARIO_MAX_SINK_MPS) работают как задумано, диагностика-only")

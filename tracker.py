@@ -2258,22 +2258,28 @@ _FLIGHT_LOG_COLUMNS = (
     "shadow_ref_other_x,shadow_ref_other_y,"
     "shadow_err_x,shadow_err_y,"
     # PITCH REFERENCE-CONFLICT SUSTAINED RUN (найдено разбором reference
-    # construction по 14 заходам 24.09.2026). pitch_ref_conflict — pitch_comp
-    # уже не просто перевернул знак dy_raw, а ПРЕВЫШАЕТ его по модулю
-    # (dominance, не просто sign-flip — тот сам по себе не разделяет
-    # заходы, см. коммент у SHADOW CONTROLLER). *_run_s — длительность
+    # construction по 14 заходам 24.09.2026, формула причинности исправлена
+    # ревью по bb7d206). pitch_ref_conflict — ИМЕННО добавление pitch_comp
+    # меняет знак уже сформированной (static+lead+other) reference-ошибки
+    # (контрфактическое сравнение err_without_att vs err_with_att, не голый
+    # dy_raw vs итоговый dy_aim — та версия могла ложно приписать pitch_comp
+    # флип, сделанный на самом деле lead/LOS). *_run_s — длительность
     # текущей непрерывной такой серии: на 4 "чистых" заходах максимум
     # монотонно рос по тяжести исхода (0.09с сошлось -> 1.25с промах) —
     # признак, который реально отличает заходы, не мгновенный флаг. Только
     # Pitch/Y, диагностика-only.
     "shadow_pitch_ref_conflict,shadow_pitch_ref_conflict_run_s,"
-    # HIGH_ATTITUDE (первый срез supervisor-состояний Shadow v2,
-    # threshold-sweep по #4/7/9/13/14 24.09.2026, см. SHADOW_HIGH_ATTITUDE_DEG):
-    # fc_pitch > 40° — граница перед резким прыжком dominance-rate
-    # (25-40°: 0-1%, 45-50°: 62%, 50-60°: 89-91%). Не новое измерение,
-    # тот же fc_pitch, что уже даёт pitch_comp_px. None, если ATT
-    # протухла/отсутствует (svezhiy_tangazh вернул None) — не путать с False.
-    "shadow_pitch_high_attitude,"
+    # HIGH_NOSE_DOWN (первый срез supervisor-состояний Shadow v2,
+    # threshold-sweep по #4/7/9/13/14 24.09.2026, см. SHADOW_HIGH_NOSE_DOWN_DEG;
+    # переименовано из high_attitude и исправлено ревью по fad59c8: раньше
+    # сравнивался abs(pitch) от ЭКСТРАПОЛИРОВАННОГО svezhiy_tangazh(), а
+    # sweep был по СЫРОМУ fc_pitch_deg из CSV — разные сигналы). fc_pitch_deg
+    # (сырой, без gyro-экстраполяции) > 40° — граница перед резким прыжком
+    # dominance-rate (25-40°: 0-1%, 45-50°: 62%, 50-60°: 89-91%). Знаковое
+    # сравнение, не abs(): вся доказательная база про nose-down dive
+    # (positive fc_pitch = nose down), не про большой наклон вообще. None,
+    # если ATT отсутствует — не путать с False.
+    "shadow_pitch_high_nose_down,"
     "shadow_sign_roll,shadow_sign_yaw,shadow_mag_roll,shadow_mag_yaw,"
     "shadow_roll_yaw_both_active,"
     "shadow_vel_box_x,shadow_vel_box_y,shadow_vel_flow_x,shadow_vel_flow_y,"
@@ -2459,15 +2465,28 @@ SHADOW_CONTENTION_FRAC = 0.15
 # система, что roll_off/roll_after_trust/before_slew/after_slew).
 SHADOW_WINDUP_RESTRICT_PWM = 15.0
 # Первый срез supervisor-состояний Shadow v2 (threshold-sweep по 5
-# "чистым" заходам #4/7/9/13/14, 24.09.2026). HIGH_ATTITUDE: dominance-rate
-# (pitch_ref_conflict) по 5-градусным бакетам fc_pitch держится <15% (с
-# шумным провалом до ~0% на 25-40°) и резко прыгает на 45-50° (62%),
-# 50-55° (91%), 55-60° (89%) — во всех бакетах, где набралось n>=30 кадров.
-# 40° — консервативная граница перед этим прыжком, не среднее по кривой.
-# НЕ покрывает отдельно замеченный ранний подъём на 20-25° у #13/#14
-# (58-62%, но у #4/#9 там же 7-11%) — с 5 заходами это слишком тонкий
-# сигнал для отдельного порога, оставлен как открытое наблюдение.
-SHADOW_HIGH_ATTITUDE_DEG = 40.0
+# "чистым" заходам #4/7/9/13/14, 24.09.2026). Sweep дал: dominance-rate
+# (pitch_ref_conflict) по 5-градусным бакетам держится <15% (с шумным
+# провалом до ~0% на 25-40°) и резко прыгает на 45-50° (62%), 50-55°
+# (91%), 55-60° (89%) — во всех бакетах, где набралось n>=30 кадров. 40° —
+# консервативная граница перед этим прыжком, не среднее по кривой. НЕ
+# покрывает отдельно замеченный ранний подъём на 20-25° у #13/#14 (58-62%,
+# но у #4/#9 там же 7-11%) — с 5 заходами это слишком тонкий сигнал для
+# отдельного порога, оставлен как открытое наблюдение.
+#
+# ПЕРЕИМЕНОВАНО/ИСПРАВЛЕНО после ревью по fad59c8, две находки:
+# (1) sweep считался по СЫРОМУ fc_pitch_deg из CSV, а первая версия кода
+# применяла порог к svezhiy_tangazh() (raw + gyro-экстраполяция до ±12°)
+# — доказательная база и фактический вход были РАЗНЫМИ сигналами. Теперь
+# читаем raw fc_pitch_deg напрямую (тот сигнал, на котором и был sweep),
+# без экстраполяции.
+# (2) сравнение было abs(pitch)>40 — вся доказательная база (sign-conflict,
+# pitch_comp dominance, VARIO sink) про ОДИН конкретный сценарий: nose-
+# down dive (positive fc_pitch = nose down, см. комментарий в коде камеры/
+# att). -50° nose-up физически другая ситуация, но abs() схлопывал их в
+# одно состояние. Теперь сравнение знаковое (pitch > порог), имя поля —
+# high_nose_down, не high_attitude.
+SHADOW_HIGH_NOSE_DOWN_DEG = 40.0
 # Диагностика «пропало видео вне лока». Обновляется в camera_callback раз в
 # кадр ДО отрисовки оверлея (иначе наши линии/лупа искажали бы среднюю
 # яркость). CMA-память читается раз в секунду: чтение /proc/meminfo — это
@@ -6968,6 +6987,7 @@ def _reset_geometry_history(reason):
     global _shadow_trust_ema
     global _shadow_roll_prev_restriction, _shadow_pitch_prev_restriction
     global _shadow_yaw_prev_restriction
+    global _shadow_pitch_conflict_since_t
 
     geometry_epoch += 1
     _tau_ubyvanie = 0.0
@@ -7024,6 +7044,16 @@ def _reset_geometry_history(reason):
     _shadow_roll_prev_restriction = 0.0
     _shadow_pitch_prev_restriction = 0.0
     _shadow_yaw_prev_restriction = 0.0
+    # НАЙДЕНО (ревью по bb7d206/fad59c8): та же болезнь, что чинили выше
+    # для _shadow_*_prev_restriction, но забытая для нового temporal-
+    # признака. _shadow_pitch_conflict_since_t считает ДЛИТЕЛЬНОСТЬ
+    # непрерывной серии reference-конфликта — то есть тоже "накапливается
+    # ПО ВРЕМЕНИ и корректно лишь при непрерывном наблюдении ОДНОГО И ТОГО
+    # ЖЕ лока" (см. докстринг функции), но сбрасывался раньше только в
+    # полном not-controllable-сбросе, не здесь. Без этой строки конфликт
+    # до manual re-anchor/frame gap и конфликт после — из разных temporal
+    # geometry epoch — склеивались бы в одну общую серию.
+    _shadow_pitch_conflict_since_t = None
     try:
         flight_log.event(
             "GEOMETRY_EPOCH %d: разрыв непрерывности (%s)"
@@ -8451,20 +8481,32 @@ def _update_control_from_target_impl():
         # (найдено разбором reference construction по 14 заходам 24.09.2026,
         # не по коду). Гипотеза "conflict% разделяет заходы" НЕ подтвердилась
         # (#7 перелёт 78% flip-кадров, #13 вертикальный промах 79% — почти
-        # неотличимо). Разделяет ДЛИТЕЛЬНОСТЬ непрерывной серии, где
-        # pitch_comp (_ref_att_y) уже не просто перевернул знак dy_raw
-        # (=box_cy-CENTER_Y — та же формула, что в live _ctl_dbg["dy_raw"],
-        # box_cy уже читается строкой выше), а превышает его по модулю:
-        # #4 сошлось 0.09с -> #7 перелёт 0.31с -> #9 недолёт 0.75с -> #13
-        # промах 1.25с, монотонно по тяжести исхода. _shadow_err_y тут —
-        # уже посчитанный dy_aim (тождество проверено test_shadow_aim_
-        # reference.py), новый расчёт reference не нужен. Диагностика-only,
-        # только Pitch/Y (вся доказательная база оттуда, X не проверялся).
+        # неотличимо). Разделяет ДЛИТЕЛЬНОСТЬ непрерывной серии — см. ниже.
+        #
+        # ПЕРЕДЕЛАНО после ревью по bb7d206: старая формула сравнивала
+        # dy_raw (=box_cy-CENTER_Y, БЕЗ static/lead/other) против
+        # окончательного dy_aim (СО ВСЕМИ компонентами) и проверяла
+        # abs(att)>abs(dy_raw) — это доказывало только "одновременно
+        # присутствуют большая pitch_comp и итоговый sign-conflict", не
+        # то, что flip сделал именно pitch_comp. Пример бага: dy_raw=-20,
+        # pitch_comp=+25, lead+LOS=+30 -> итог +35 — старая формула
+        # объявила бы "pitch_comp конфликт", хотя большую часть переворота
+        # сделали lead/LOS. ТЕПЕРЬ — честная контрфактическая причинность:
+        # reference-error БЕЗ pitch_comp (err_without_att = dy_raw+static+
+        # lead+other, т.е. _shadow_err_y минус ровно вклад _ref_att_y) vs
+        # error С pitch_comp (_shadow_err_y, уже посчитанный dy_aim —
+        # тождество проверено test_shadow_aim_reference.py). Конфликт —
+        # если ИМЕННО добавление att поменяло знак уже сформированной
+        # (static+lead+other) ошибки. Математически это то же самое, что
+        # abs(att)>abs(err_without_att) с противоположным знаком — но
+        # теперь err_without_att, а не голый dy_raw, так что lead/LOS
+        # больше не могут задним числом попасть в "вину" pitch_comp.
+        # Диагностика-only, только Pitch/Y (вся доказательная база оттуда).
         _dy_raw_y = box_cy - CENTER_Y
+        _err_without_att_y = _dy_raw_y + _ref_static_y + _ref_lead_y + _ref_other_y
         _pitch_ref_conflict = (
-            _dy_raw_y != 0.0 and _shadow_err_y != 0.0
-            and (_dy_raw_y > 0) != (_shadow_err_y > 0)
-            and abs(_ref_att_y) > abs(_dy_raw_y))
+            _err_without_att_y != 0.0 and _shadow_err_y != 0.0
+            and (_err_without_att_y > 0) != (_shadow_err_y > 0))
         if _pitch_ref_conflict:
             if _shadow_pitch_conflict_since_t is None:
                 _shadow_pitch_conflict_since_t = now_mono
@@ -8472,22 +8514,6 @@ def _update_control_from_target_impl():
         else:
             _shadow_pitch_conflict_since_t = None
             _shadow_pitch_conflict_run_s = 0.0
-
-        # --- HIGH_ATTITUDE (первый срез supervisor-состояний Shadow v2,
-        # ТЗ/разбор 24.09.2026). fc_pitch НЕ живёт как переменная в этой
-        # функции (pitch_comp_px считает его внутри своего отдельного
-        # вызова _compute_pitch_attitude_comp_px) — зовём svezhiy_tangazh()
-        # заново, тот же чистый, дешёвый (state_lock + арифметика) хелпер,
-        # никакого нового измерения/MSP-запроса. МОЖЕТ БЫТЬ None
-        # (svezhiy_tangazh честно возвращает None при отсутствии/
-        # протухании ATT, а live продолжает работать с comp=0 в этом
-        # случае) — не считать это False молча. Порог —
-        # SHADOW_HIGH_ATTITUDE_DEG, см. обоснование threshold-sweep у
-        # объявления константы.
-        _shadow_fc_pitch, _ = svezhiy_tangazh(now_mono)
-        _pitch_high_attitude = (
-            None if _shadow_fc_pitch is None
-            else abs(_shadow_fc_pitch) > SHADOW_HIGH_ATTITUDE_DEG)
 
         # --- Roll/Yaw contention (ТЗ §7): оба реагируют на один dx? ---
         # ИСПРАВЛЕНО после ревью: mag_yaw раньше брал только yaw_pd (без
@@ -8748,10 +8774,23 @@ def _update_control_from_target_impl():
             _gyro_ts = app_state.get("imu_ts", 0.0)
             _var_raw = app_state.get("vario_cms")
             _var_ts = app_state.get("alt_ts", 0.0)
+            _raw_fc_pitch_deg = app_state.get("fc_pitch_deg")
         _att_age_ms = (None if _att_ts <= 0.0
                        else (_snap_now - _att_ts) * 1000.0)
         _gyro_age_ms = (None if _gyro_ts <= 0.0
                         else (_snap_now - _gyro_ts) * 1000.0)
+
+        # --- HIGH_NOSE_DOWN (первый срез supervisor-состояний Shadow v2,
+        # ТЗ/разбор 24.09.2026, переименовано и исправлено после ревью по
+        # fad59c8 — см. два пункта у объявления SHADOW_HIGH_NOSE_DOWN_DEG).
+        # СЫРОЙ fc_pitch_deg (без gyro-экстраполяции svezhiy_tangazh) — тот
+        # же сигнал, на котором делался threshold-sweep; читаем его тем же
+        # снимком, что и ATT/gyro age строкой выше, отдельный state_lock не
+        # добавлен. Знаковое сравнение (не abs()): доказательная база вся
+        # про nose-down dive, positive fc_pitch = nose down.
+        _pitch_high_nose_down = (
+            None if _raw_fc_pitch_deg is None
+            else _raw_fc_pitch_deg > SHADOW_HIGH_NOSE_DOWN_DEG)
 
         # --- VERTICAL_SINK_LIMIT (второй срез supervisor-состояний Shadow
         # v2, ТЗ/разбор 24.09.2026). Ни одного нового порога: буквально те
@@ -8778,7 +8817,7 @@ def _update_control_from_target_impl():
             "err_x": _shadow_err_x, "err_y": _shadow_err_y,
             "pitch_ref_conflict": _pitch_ref_conflict,
             "pitch_ref_conflict_run_s": _shadow_pitch_conflict_run_s,
-            "pitch_high_attitude": _pitch_high_attitude,
+            "pitch_high_nose_down": _pitch_high_nose_down,
             "sign_roll": _sign_roll, "sign_yaw": _sign_yaw,
             "mag_roll": abs(r_off), "mag_yaw": abs(_live_yaw_pid_out),
             "roll_yaw_both_active": _roll_yaw_both_active,
@@ -10704,7 +10743,7 @@ def _capture_flight_row(cb_t0):
             sg("ref_other_x"), sg("ref_other_y"),
             sg("err_x"), sg("err_y"),
             sg("pitch_ref_conflict"), sg("pitch_ref_conflict_run_s"),
-            sg("pitch_high_attitude"),
+            sg("pitch_high_nose_down"),
             sg("sign_roll"), sg("sign_yaw"), sg("mag_roll"), sg("mag_yaw"),
             sg("roll_yaw_both_active"),
             sg("vel_box_x"), sg("vel_box_y"), sg("vel_flow_x"), sg("vel_flow_y"),
