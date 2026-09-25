@@ -873,6 +873,56 @@ TEMPLATE_BASE_ALPHA = 0.15
 # проверен. Включать только для замера, сравнивая score с текущим.
 TEMPLATE_RESCALE_ON_SIZE_CHANGE = False
 
+# --- AUTO TEMPLATE REFRESH (первый live-эффект поверх Tracking Shadow
+# Template Identity — до этого вся линия была чистой диагностикой,
+# ревью 24.09.2026: "хватит делать только диагностику"). ---
+#
+# ОСНОВАНИЕ. Четыре независимых ручных reanchor (#13, #10 x2, #14) в
+# разборе 14 заходов воспроизведены кадр-в-кадр: свежий template на той же
+# позиции чинит score/PSR почти мгновенно (см. докстрока Tracking Shadow
+# выше). Temporal fresh (после фикса self-match bias в 3c47c58) умеет
+# проверять ровно это — "переживёт ли новый template время" — НЕ на самом
+# себе, а на будущем кадре. Раньше это было только числом в CSV; теперь
+# то же измерение управляет живым template_gray.
+#
+# СТРОГО ТОЛЬКО ШАБЛОН. Не двигает lock_cx/lock_cy/lock_w/lock_h, не рвёт
+# geometry_epoch (положение цели не менялось — рвать эпоху означало бы
+# утверждать geometry discontinuity, которого не было, и без нужды сбросило
+# бы LOS-rate/tau/EMA историю), не трогает prev_pts/prev_gray (та же
+# причина — flow не имеет отношения к тому, ЧЕМ мы опознаём цель) и не
+# трогает template_base (независимый long-term reference для Shadow и для
+# measure_scale_change; менять все якоря разом — не понять потом, что
+# именно помогло).
+AUTO_TEMPLATE_REFRESH_ENABLED = True
+# Короткая серия подтверждений, не один случайный кадр. Считаются подряд
+# идущие FRESH-ОЦЕНКИ (не кадры — fresh выпадает через слот от base, см.
+# чередование в Tracking Shadow), каждая обязана голосовать "да": fresh
+# кандидат устойчиво отождествляет цель лучше live template по PSR
+# (уникальность пика — то, что отличает "держит цель" от "уверенно
+# держит фон", см. докстрока _template_adaptation_gate) И укладывается в
+# то же расхождение с потоком, что live-путь уже допускает при выборе
+# позиции (переиспользуем MAX_LOCK_STEP, а не изобретаем новый порог).
+AUTO_TEMPLATE_REFRESH_CONFIRM_N = 3
+# Абсолютный, не относительный запас: PSR у части кадров лежит около нуля,
+# где относительный прирост ничего не значит. Первая оценка, НЕ
+# откалиброванная бенчем величина (в отличие от MAX_LOCK_STEP) — уточнить
+# после стендового A/B.
+AUTO_TEMPLATE_REFRESH_PSR_MARGIN = 1.0
+# Не переснимать чаще, чем раз в столько секунд — иначе на границе, где
+# fresh и live колеблются около равенства, template дёргался бы туда-сюда
+# на каждой новой набранной серии подтверждений.
+AUTO_TEMPLATE_REFRESH_COOLDOWN_S = 4.0
+# Сколько секунд держать "TREF" на оверлее после срабатывания — чтобы на
+# стенде момент автообновления было видно глазами, а не только в логе.
+AUTO_TEMPLATE_REFRESH_OVERLAY_S = 0.6
+_auto_tref_confirm_streak = 0
+_auto_tref_last_t = None
+_auto_tref_overlay_until_t = None
+# Накопительный счётчик за весь процесс (как frame_index) — НЕ сбрасывается
+# ни reset_tracking, ни geometry break: это метрика для бенч-анализа
+# ("сколько раз за полёт"), а не temporal-shadow состояние.
+_auto_tref_total_count = 0
+
 # =========================================================
 # 3. УПРАВЛЕНИЕ
 # =========================================================
@@ -2225,6 +2275,14 @@ _FLIGHT_LOG_COLUMNS = (
     # кадре: match_scale (примерка масштаба), segment (связная компонента)
     # или none (в этом кадре не мерили вовсе).
     "geometry_epoch,scale_source,"
+    # AUTO TEMPLATE REFRESH (первый live-эффект Tracking Shadow, ревью
+    # 24.09.2026): накопительный счётчик за весь процесс (как frame_index,
+    # не сбрасывается reset_tracking/geometry break) — сколько раз к этому
+    # кадру live template_gray был автоматически переснят по temporal-
+    # fresh проверке. Момент конкретного срабатывания — событие
+    # AUTO_TEMPLATE_REFRESH в события.log (old_psr/fresh_psr/old_size/
+    # new_size), не отдельная колонка — считать по росту этого счётчика.
+    "auto_template_refresh_count,"
     # РУЧНАЯ КОРРЕКЦИЯ РАМКИ (п.11/п.13): активна ли она в этом кадре и
     # какой сдвиг применён — отдельно от geometry_epoch/template_
     # adaptation_allowed, которые эта коррекция запускает.
@@ -6558,6 +6616,7 @@ def reset_tracking(to_acq=False):
     global _shadow_track_dbg
     global _shadow_fresh_candidate, _shadow_fresh_candidate_w, _shadow_fresh_candidate_h
     global _shadow_fresh_candidate_std, _shadow_fresh_candidate_t, _shadow_fresh_candidate_epoch
+    global _auto_tref_confirm_streak, _auto_tref_last_t, _auto_tref_overlay_until_t
 
     track_state = TRACK_STATE_ACQ if to_acq else TRACK_STATE_IDLE
     target_visible = False
@@ -6585,6 +6644,13 @@ def reset_tracking(to_acq=False):
     _shadow_fresh_candidate_std = None
     _shadow_fresh_candidate_t = None
     _shadow_fresh_candidate_epoch = None
+    # AUTO TEMPLATE REFRESH: полный сброс лока — серия подтверждений,
+    # cooldown-таймер и текущее окно оверлея все относятся к УЖЕ
+    # потерянному локу. _auto_tref_total_count НЕ трогаем — это
+    # накопитель за весь процесс, как frame_index.
+    _auto_tref_confirm_streak = 0
+    _auto_tref_last_t = None
+    _auto_tref_overlay_until_t = None
     color_separation = 0.0
     template_std = 0.0
     prev_gray = None
@@ -7282,6 +7348,7 @@ def _reset_geometry_history(reason):
     global _shadow_pitch_conflict_since_t
     global _shadow_fresh_candidate, _shadow_fresh_candidate_w, _shadow_fresh_candidate_h
     global _shadow_fresh_candidate_std, _shadow_fresh_candidate_t, _shadow_fresh_candidate_epoch
+    global _auto_tref_confirm_streak
 
     geometry_epoch += 1
     _tau_ubyvanie = 0.0
@@ -7361,6 +7428,11 @@ def _reset_geometry_history(reason):
     _shadow_fresh_candidate_std = None
     _shadow_fresh_candidate_t = None
     _shadow_fresh_candidate_epoch = None
+    # AUTO TEMPLATE REFRESH: серия подтверждений построена на fresh-
+    # кандидатах СТАРОЙ геометрии (см. сброс candidate чуть выше) — после
+    # разрыва не должна засчитываться. Cooldown-таймер НЕ трогаем: это
+    # ограничение по реальному времени, а не по geometry epoch.
+    _auto_tref_confirm_streak = 0
     try:
         flight_log.event(
             "GEOMETRY_EPOCH %d: разрыв непрерывности (%s)"
@@ -10006,6 +10078,9 @@ def process_locked_tracker(gray, cb_t0=None):
     global _shadow_track_dbg
     global _shadow_fresh_candidate, _shadow_fresh_candidate_w, _shadow_fresh_candidate_h
     global _shadow_fresh_candidate_std, _shadow_fresh_candidate_t, _shadow_fresh_candidate_epoch
+    global _adapt_frozen_posle_reanchor
+    global _auto_tref_confirm_streak, _auto_tref_last_t, _auto_tref_overlay_until_t
+    global _auto_tref_total_count
 
     frame_index += 1
 
@@ -10700,6 +10775,15 @@ def process_locked_tracker(gray, cb_t0=None):
             target_box_main = box
             overlay_text = "TRACKED"
             overlay_color = COLOR_RED
+            # AUTO TEMPLATE REFRESH: держим "TREF" AUTO_TEMPLATE_REFRESH_
+            # OVERLAY_S секунд после срабатывания. Проверяется здесь же,
+            # где "TRACKED" и так пишется каждый TRACKED-кадр — сам
+            # триггер живёт в Tracking Shadow ниже, который активен не
+            # каждый кадр (слот), а окно должно быть видно на ВСЕХ кадрах
+            # флэша, не только на кадре срабатывания.
+            if (_auto_tref_overlay_until_t is not None
+                    and time.monotonic() < _auto_tref_overlay_until_t):
+                overlay_text = "TREF"
         update_control_from_target()
 
         # ============= TRACKING SHADOW: TEMPLATE IDENTITY =============
@@ -10791,6 +10875,77 @@ def process_locked_tracker(gray, cb_t0=None):
                                 # другом размере box, чем текущий _tw/_th).
                                 _tw = _shadow_fresh_candidate_w
                                 _th = _shadow_fresh_candidate_h
+
+                                # ===== AUTO TEMPLATE REFRESH ===== (голос
+                                # этого fresh-слота; константы и
+                                # обоснование — у объявления
+                                # AUTO_TEMPLATE_REFRESH_ENABLED выше по
+                                # файлу). _match_dbg["psr"] этого кадра уже
+                                # посчитан live template_match_locked() в
+                                # начале функции — не пересчёт. ЕДИНСТВЕННЫЙ
+                                # под-блок Tracking Shadow, которому
+                                # разрешено писать в live template_gray/
+                                # overlay_text/_adapt_frozen_posle_reanchor
+                                # (см. test_tracking_shadow_identity.py §5
+                                # и test_auto_template_refresh.py).
+                                if AUTO_TEMPLATE_REFRESH_ENABLED:
+                                    _live_psr = _match_dbg.get("psr")
+                                    _tref_vote = (
+                                        _v_ok and _live_psr is not None
+                                        and _v_psr is not None
+                                        and _v_psr >= (_live_psr
+                                                       + AUTO_TEMPLATE_REFRESH_PSR_MARGIN)
+                                        and _v_gap is not None
+                                        and _v_gap <= MAX_LOCK_STEP)
+                                    if _tref_vote:
+                                        _auto_tref_confirm_streak += 1
+                                    else:
+                                        _auto_tref_confirm_streak = 0
+                                    _tref_cooldown_ok = (
+                                        _auto_tref_last_t is None
+                                        or (time.monotonic() - _auto_tref_last_t)
+                                           >= AUTO_TEMPLATE_REFRESH_COOLDOWN_S)
+                                    if (_auto_tref_confirm_streak
+                                            >= AUTO_TEMPLATE_REFRESH_CONFIRM_N
+                                            and _tref_cooldown_ok):
+                                        _old_tref_psr = _live_psr
+                                        _old_tref_tw, _old_tref_th = tmpl_w, tmpl_h
+                                        # ТОЛЬКО шаблон — тот же самый live
+                                        # build_template(), что и
+                                        # reanchor_tracker_at_current_box(),
+                                        # на ТЕКУЩИХ lock_cx/cy/w/h. Box не
+                                        # двигаем, geometry_epoch не рвём —
+                                        # положение цели не менялось,
+                                        # изменилось только то, чем мы её
+                                        # опознаём.
+                                        template_gray = build_template(
+                                            gray, lock_cx, lock_cy, lock_w, lock_h)
+                                        # Свежесобранный template ещё не
+                                        # подтверждён повторным измерением —
+                                        # та же заморозка addWeighted-
+                                        # адаптации, что и после полного
+                                        # reanchor, и по той же причине (см.
+                                        # docstring _template_adaptation_gate).
+                                        _adapt_frozen_posle_reanchor = True
+                                        _auto_tref_confirm_streak = 0
+                                        _auto_tref_last_t = time.monotonic()
+                                        _auto_tref_overlay_until_t = (
+                                            time.monotonic()
+                                            + AUTO_TEMPLATE_REFRESH_OVERLAY_S)
+                                        _auto_tref_total_count += 1
+                                        with state_lock:
+                                            overlay_text = "TREF"
+                                        try:
+                                            flight_log.event(
+                                                "AUTO_TEMPLATE_REFRESH old_psr=%.2f "
+                                                "fresh_psr=%.2f old_size=%dx%d "
+                                                "new_size=%dx%d"
+                                                % (_old_tref_psr, _v_psr,
+                                                   _old_tref_tw, _old_tref_th,
+                                                   tmpl_w, tmpl_h))
+                                        except Exception:
+                                            pass
+                                # ===== /AUTO TEMPLATE REFRESH =====
                             else:
                                 _skip_reason = "no_candidate"
 
@@ -11216,6 +11371,7 @@ def _capture_flight_row(cb_t0):
             _flow_dbg.get("translation_x"), _flow_dbg.get("translation_y"),
             _flow_dbg.get("scale"), _flow_dbg.get("scale_confidence"),
             geometry_epoch, _match_dbg.get("scale_source"),
+            _auto_tref_total_count,
             _match_dbg.get("manual_nudge"), _match_dbg.get("manual_nudge_dx"),
             _match_dbg.get("manual_nudge_dy"),
             _match_dbg.get("aux2_raw"), _match_dbg.get("aux3_raw"),

@@ -72,6 +72,17 @@ _clk = _Chasy()
 t.time.monotonic = _clk.monotonic
 FRAME_DT = 1.0 / t.CAM_FPS
 
+# Этот файл проверяет ТОЛЬКО диагностику Tracking Shadow — AUTO TEMPLATE
+# REFRESH (живой, НАМЕРЕННО template_gray-пишущий под-блок, добавленный
+# поверх той же fresh-оценки) имеет свой отдельный тест
+# (test_auto_template_refresh.py) с точным списком разрешённых
+# live-имён. Выключаем здесь, чтобы секции этого файла (особенно §3 —
+# байт-в-байт изоляция live-состояния) проверяли изоляцию ЧИСТОЙ
+# диагностики, не полагаясь на то, что confirm-серия случайно не успела
+# набраться за несколько кадров теста.
+_orig_auto_tref_enabled = t.AUTO_TEMPLATE_REFRESH_ENABLED
+t.AUTO_TEMPLATE_REFRESH_ENABLED = False
+
 
 def make_scene(cx, cy, size, offset=0, seed=7):
     """Текстурная сцена: один объект size x size px с реальной фактурой
@@ -214,13 +225,25 @@ assert t._shadow_track_dbg.get("active") is False, (
     "reset_tracking() обязан сбросить _shadow_track_dbg")
 print("    после reset_tracking(): active=False")
 
-print("\n=== 5. По исходному тексту: Tracking Shadow не пишет ни в одну "
-      "live-переменную ===")
+print("\n=== 5. По исходному тексту: Tracking Shadow (сама диагностика, "
+      "БЕЗ под-блока AUTO TEMPLATE REFRESH) не пишет ни в одну live-"
+      "переменную ===")
 import io  # noqa: E402
 src = io.open(os.path.join(_ROOT, "tracker.py"), encoding="utf-8").read()
 i_start = src.index("# ============= TRACKING SHADOW: TEMPLATE IDENTITY =============")
 i_end = src.index("# ============ /TRACKING SHADOW: TEMPLATE IDENTITY ============")
-shadow_body = src[i_start:i_end]
+shadow_body_full = src[i_start:i_end]
+# AUTO TEMPLATE REFRESH — единственный НАМЕРЕННО live-пишущий под-блок
+# внутри Tracking Shadow (ревью "хватит только диагностики", 24.09.2026);
+# у него свой собственный тест (test_auto_template_refresh.py) с точным
+# списком РАЗРЕШЁННЫХ live-имён. Вырезаем его отсюда, чтобы эта секция
+# по-прежнему проверяла именно то, что было её смыслом изначально — что
+# САМА диагностика (candidate capture/evaluate, дебаг-словарь) ничего
+# live не трогает.
+_tref_i0 = shadow_body_full.index("# ===== AUTO TEMPLATE REFRESH =====")
+_tref_i1 = shadow_body_full.index("# ===== /AUTO TEMPLATE REFRESH =====") + len(
+    "# ===== /AUTO TEMPLATE REFRESH =====")
+shadow_body = shadow_body_full[:_tref_i0] + shadow_body_full[_tref_i1:]
 _LIVE_NAMES = ("template_gray", "tmpl_w", "tmpl_h", "template_std",
               "lock_cx", "lock_cy", "lock_w", "lock_h", "template_base",
               "track_state", "last_match_score")
@@ -518,3 +541,5 @@ print("\nOK: Tracking Shadow (после бенча 24.09.2026 + ревью self
       "снимается до примерки для честного сравнения с live — не влияет "
       "на live-путь ни при штатной работе, ни при внутреннем сбое, и не "
       "пишет в live-переменные по исходному тексту")
+
+t.AUTO_TEMPLATE_REFRESH_ENABLED = _orig_auto_tref_enabled
