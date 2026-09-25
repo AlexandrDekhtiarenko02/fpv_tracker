@@ -1,26 +1,32 @@
 """Задержка control на время ручной коррекции рамки (прямая просьба
 оператора: "мало отвожу стик - рамка не реагирует, сильно отвожу - резко
 перелетает", нужна пауза, пока рамка ещё двигается, чтобы было удобно
-целиться).
+целиться) — ВТОРАЯ версия, после ревью по c6fb464.
 
-ПОДТВЕРЖДЕНО ЯВНО (не угадано): пока рамка активно двигается стиком — и
-ещё MANUAL_NUDGE_CONTROL_SETTLE_S секунд после отпускания — control
-продолжает лететь по СТАРОЙ (до-nudge) позиции цели, как будто оператор
-её не трогал. target_box_main (и, значит, оверлей на экране) при этом
-двигается ЖИВО вместе со стиком — без этого оператору нечем целиться.
-Как только окно устоя истекло без нового движения стика — control одним
-шагом переходит на финальную (уже поправленную) позицию.
+ПЕРВАЯ ВЕРСИЯ держала заморозку ЕЩЁ 1с ПОСЛЕ отпускания стика (окно
+устоя). Ревью нашло это архитектурно неверным: к моменту отпускания
+reanchor_tracker_at_current_box() уже отработал — новая geometry_epoch,
+template пересобран, flow/match снова считаются по новой позиции, а
+control ещё секунду продолжал бы читать СТАРЫЙ box. Смесь двух временных
+состояний, а "резкий скачок reference" не устранялся, а просто
+переносился на секунду позже.
 
-Проверяется: заморозка включается на первом же активном кадре nudge и
-держится всю правку; target_box_main живой всё это время; отпускание
-стика НЕ снимает заморозку сразу, запускает окно устоя; по истечении
-окна — переход на финальную позицию одним шагом; повторный nudge ВНУТРИ
-окна устоя не сбрасывает снимок на промежуточную позицию (снимок — от
-самого начала серии правок, не от последнего micro-отпускания);
-ENABLED=False — поведение как до этой правки (заморозки никогда нет);
-reset_tracking()/смена lock_sequence снимают заморозку (не переживают
-чужой лок); существующая ветка "not controllable" остаётся последней
-линией защиты независимо от того, какой box выбран.
+ЭТА ВЕРСИЯ. Заморозка живёт СТРОГО пока стик реально отклонён — снимается
+В ТОТ ЖЕ МОМЕНТ, что и сам reanchor, без отдельного таймера. Переход на
+новую позицию доверен уже существующему, уже проверенному механизму
+reanchor_tracker_at_current_box() -> _reset_geometry_history(): тот
+обнуляет tau/LOS-rate/prev_box_cx,cy/target_vx,vy_smoothed — то есть
+ровно то, что не даёт скачку позиции превратиться в ложную скорость.
+_slew_roll/pitch/yaw НЕ сбрасываются и сглаживают сам шаг команды.
+
+ВТОРОЙ ФИКС ЭТОГО РЕВЬЮ (безопасность): "стик в дедбенде" и "AUX/RC-
+сигнал пропал ПОСРЕДИ активной правки" раньше вели к одному и тому же
+коду — оба подтверждались reanchor'ом как "оператор закончил". Устаревший
+RC теперь — авария (MANUAL_NUDGE abort), не подтверждение: без reanchor,
+без заморозки, просто падение в обычную live-логику этого же кадра.
+
+ТРЕТИЙ ФИКС: nudge_control_frozen в CSV пишется ПОСЛЕ проверки смены
+lock_sequence, не до — иначе кадр самой смены мог соврать в логе.
 """
 import io
 import os
@@ -96,7 +102,6 @@ def tick():
 
 ROLL_US = 300.0   # заметно за пределами MANUAL_NUDGE_DEADBAND_US=60
 t.MANUAL_NUDGE_CONTROL_DELAY_ENABLED = True
-t.MANUAL_NUDGE_CONTROL_SETTLE_S = 1.0
 
 print("=== 1. Покой: заморозки нет ===")
 capture()
@@ -131,89 +136,107 @@ for _ in range(5):
         _boxes_seen.append(t.target_box_main)
 assert len(set(_boxes_seen)) > 1, (
     "target_box_main не менялся ВО ВРЕМЯ nudge — оператору нечем "
-    "целиться на экране, живая визуальная обратная связь потеряна"
-)
+    "целиться на экране, живая визуальная обратная связь потеряна")
 assert _boxes_seen[-1] != _frozen_snapshot, (
-    "target_box_main (живой) совпал с замороженным control-box — "
-    "разделение между visual и control не работает")
-print("    заморозка держится %d кадров, target_box_main реально уехал "
-      "от замороженного control-box (живая визуальная обратная связь есть)"
-      % 5)
+    "target_box_main (живой) совпал с замороженным control-box")
+print("    заморозка держится %d кадров без изменения снимка, "
+      "target_box_main реально уехал от него (визуальная обратная связь "
+      "есть)" % 5)
 
-print("\n=== 4. Отпускание стика: заморозка НЕ снимается сразу — "
-      "запускается окно устоя ===")
+print("\n=== 4. НАЙДЕНО ревью (п.1): отпускание стика снимает заморозку "
+      "В ТОТ ЖЕ КАДР, что и reanchor — не секундой позже. control сразу "
+      "использует НОВЫЙ (только что переустановленный) target_box_main ===")
+_epoch_before_release = t.geometry_epoch
 set_stick(0)
 tick()
 assert t._match_dbg.get("manual_nudge") == 0, "nudge не снялся при отпускании"
-assert t._nudge_frozen_box is not None, (
-    "заморозка снялась СРАЗУ на отпускании — окно устоя не запустилось")
-assert t._match_dbg.get("nudge_control_frozen") == 1, (
-    "control обязан оставаться замороженным сразу после отпускания — "
-    "окно устоя ещё не прошло")
-_remaining0 = t._match_dbg.get("nudge_settle_remaining_ms")
-assert _remaining0 is not None and _remaining0 > 0, (
-    "nudge_settle_remaining_ms обязан быть положительным сразу после "
-    "отпускания, получили %r" % _remaining0)
-print("    сразу после отпускания: nudge_control_frozen=1, "
-      "nudge_settle_remaining_ms=%.0f (~%.0f ожидали)"
-      % (_remaining0, t.MANUAL_NUDGE_CONTROL_SETTLE_S * 1000.0))
+assert t.geometry_epoch == _epoch_before_release + 1, (
+    "reanchor не сработал на кадре отпускания")
+assert t._nudge_frozen_box is None, (
+    "заморозка пережила reanchor — control ещё кадр читал бы старый box "
+    "одновременно с уже новой geometry/template/flow (ровно то, что "
+    "нашло ревью)")
+assert t._match_dbg.get("nudge_control_frozen") == 0, (
+    "nudge_control_frozen обязан стать 0 РОВНО на кадре reanchor, не позже")
+print("    geometry_epoch %d -> %d (reanchor) И nudge_control_frozen=0 "
+      "ОДНИМ И ТЕМ ЖЕ кадром — заморозка не переживает reanchor ни на "
+      "кадр" % (_epoch_before_release, t.geometry_epoch))
 
-print("\n=== 5. Окно устоя отсчитывает время (не кадры) — по кадру "
-      "остаётся меньше, чем на прошлом ===")
+print("\n=== 5. target_vx/vy_smoothed реально 0.0 сразу после reanchor — "
+      "скачок box НЕ прочитан регулятором как мгновенная скорость (та "
+      "самая защита от 'ложной скорости', на которую опирается фикс "
+      "п.1). prev_box_cx/cy НЕ проверяем на None: _update_control_from_"
+      "target_impl() в ЭТОМ ЖЕ кадре законно переустанавливает их под "
+      "НОВЫЙ box — это база для СЛЕДУЮЩЕГО сравнения, не утечка старого ===")
+assert t.target_vx_smoothed == 0.0 and t.target_vy_smoothed == 0.0, (
+    "target_vx/vy_smoothed не обнулены после reanchor — скачок box мог "
+    "быть прочитан как реальная скорость цели")
+print("    target_vx/vy_smoothed=0.0 сразу после reanchor — "
+      "_reset_geometry_history() внутри reanchor реально это делает, а "
+      "не только по комментарию")
+
+print("\n=== 6. НАЙДЕНО ревью (п.3, SAFETY): устаревший RC ПОСРЕДИ "
+      "активной правки — авария, НЕ подтверждение. Без reanchor, без "
+      "заморозки, падение в обычную live-логику этого же кадра ===")
+with t.state_lock:
+    _box_before_6 = t.target_box_main
+set_stick(ROLL_US)
 tick()
-_remaining1 = t._match_dbg.get("nudge_settle_remaining_ms")
-assert _remaining1 is not None and _remaining1 < _remaining0, (
-    "nudge_settle_remaining_ms не уменьшился между кадрами (%.0f -> %.0f)"
-    % (_remaining0, _remaining1))
-print("    remaining_ms: %.0f -> %.0f" % (_remaining0, _remaining1))
-
-print("\n=== 6. По истечении окна устоя — переход на финальную позицию "
-      "одним шагом, control_frozen=0 ===")
-with t.state_lock:
-    _final_box = t.target_box_main
-while t._match_dbg.get("nudge_control_frozen") == 1:
-    tick()
-assert t._nudge_frozen_box is None
-assert t._match_dbg.get("nudge_settle_remaining_ms") is None
-with t.state_lock:
-    _box_now = t.target_box_main
-assert _box_now == _final_box, (
-    "target_box_main продолжил меняться уже ПОСЛЕ отпускания стика — не "
-    "должен, коррекция закончилась на re-anchor")
-print("    окно устоя истекло: nudge_control_frozen=0, "
-      "_nudge_frozen_box=None, control перешёл на финальную позицию")
-
-print("\n=== 7. Повторный nudge ВНУТРИ окна устоя: снимок НЕ сбрасывается "
-      "на промежуточную позицию — остаётся от начала НОВОЙ серии правок, "
-      "а таймер устоя отменяется ===")
-with t.state_lock:
-    _box_a = t.target_box_main
-set_stick(ROLL_US)
-tick()   # начало новой серии
-assert t._nudge_frozen_box == _box_a
-for _ in range(3):
-    tick()
+assert t._match_dbg.get("manual_nudge") == 1, "тест сам по себе негоден"
+assert t._nudge_frozen_box is not None, "тест сам по себе негоден"
+_epoch_before_stale = t.geometry_epoch
+_events = []
+t.flight_log.event = _events.append
+# RC не обновляется — rc_link_ts стареет естественно с мокнутыми часами.
+# МЕЛКИМИ шагами (FRAME_DT каждый), не одним прыжком: один большой прыжок
+# сам пересёк бы НЕСВЯЗАННЫЙ порог frame_gap (FLOW_RASSH_SVEZH_S=0.20с в
+# _update_control_from_target_impl) и вызвал бы _reset_geometry_history
+# по СОВСЕМ ДРУГОЙ причине — тест бы путал два разных источника bump'а
+# geometry_epoch (тот же класс аккуратности, что уже потребовался для
+# cam_jump_dt_ms в Camera Jump Shadow).
+_elapsed = 0.0
+while _elapsed <= t.MANUAL_NUDGE_RC_FRESH_S:
+    _clk.tick(FRAME_DT)
+    _elapsed += FRAME_DT
+    t.process_locked_tracker(scene)
+assert t._match_dbg.get("manual_nudge") == 0
+assert t.geometry_epoch == _epoch_before_stale, (
+    "geometry_epoch вырос на кадре stale-RC — значит reanchor всё-таки "
+    "сработал, подтвердив промежуточную (возможно случайную) позицию, "
+    "именно то, что ревью просило НЕ делать")
+assert t._nudge_frozen_box is None, (
+    "заморозка не снялась на stale-RC abort")
+_abort_events = [e for e in _events if e.startswith("MANUAL_NUDGE abort")]
+assert len(_abort_events) == 1, (
+    "ожидали ровно 1 событие MANUAL_NUDGE abort, получили %d: %s"
+    % (len(_abort_events), _abort_events))
+_reanchor_events = [e for e in _events if e.startswith("REANCHOR")]
+assert not _reanchor_events, (
+    "REANCHOR всё-таки случился на stale-RC кадре: %s" % _reanchor_events)
+print("    событие: %s; geometry_epoch не изменился (%d), заморозка "
+      "снята, REANCHOR не вызывался" % (_abort_events[0], t.geometry_epoch))
 set_stick(0)
-tick()   # отпустили -> окно устоя пошло
-_mid_frozen = t._nudge_frozen_box
-assert t._match_dbg.get("nudge_settle_remaining_ms") is not None
-tick()   # ещё один кадр внутри окна устоя (не отпустили полностью долго)
+tick()   # вернуть RC в норму для дальнейших секций
+
+print("\n=== 7. НАЙДЕНО ревью (п.4): nudge_control_frozen в CSV не "
+      "врёт на кадре смены lock_sequence — пишется ПОСЛЕ safety-сброса ===")
 set_stick(ROLL_US)
-tick()   # повторный nudge ДО истечения окна устоя
-assert t._match_dbg.get("manual_nudge") == 1
-assert t._nudge_frozen_box == _mid_frozen, (
-    "повторный nudge внутри окна устоя обязан сохранить ИСХОДНЫЙ снимок "
-    "серии правок, а не взять текущую (промежуточную) позицию — иначе "
-    "control частично 'утекает' за каждым micro-отпусканием"
-)
-assert t._match_dbg.get("nudge_settle_remaining_ms") is None, (
-    "окно устоя обязано отмениться при возобновлении nudge"
-)
-print("    снимок серии правок не сбросился на промежуточную позицию, "
-      "окно устоя корректно отменилось")
+tick()
+assert t._nudge_frozen_box is not None, "тест сам по себе негоден"
+t.lock_sequence += 1   # имитация быстрого reacq
+t.update_control_from_target()
+assert t._nudge_frozen_box is None, (
+    "смена lock_sequence не сбросила заморозку")
+assert t._match_dbg.get("nudge_control_frozen") == 0, (
+    "nudge_control_frozen соврал '1' на кадре, где заморозка уже снята "
+    "сменой lock_sequence — диагностика писалась ДО safety-сброса")
+print("    nudge_control_frozen=0 корректно на кадре смены lock_sequence "
+      "(диагностика пишется после safety-сброса)")
 set_stick(0)
-while t._match_dbg.get("nudge_control_frozen") == 1:
-    tick()
+with t.state_lock:
+    t.track_state = t.TRACK_STATE_TRACKED
+    t.target_controllable = True
+tick()
 
 print("\n=== 8. MANUAL_NUDGE_CONTROL_DELAY_ENABLED=False: заморозки нет "
       "никогда, поведение как до этой правки ===")
@@ -233,60 +256,41 @@ print("\n=== 9. reset_tracking() снимает заморозку — след�
       "наследует чужой box ===")
 set_stick(ROLL_US)
 tick()
-assert t._nudge_frozen_box is not None, "тест сам по себе негоден: заморозка не включилась"
+assert t._nudge_frozen_box is not None, "тест сам по себе негоден"
 t.reset_tracking(to_acq=False)
 assert t._nudge_frozen_box is None, (
-    "_nudge_frozen_box пережил reset_tracking() — следующий лок мог бы "
-    "унаследовать box совсем другого захода")
-assert t._nudge_settle_until_t is None
+    "_nudge_frozen_box пережил reset_tracking()")
 set_stick(0)
 capture()
-print("    reset_tracking() очищает _nudge_frozen_box/_nudge_settle_until_t")
+print("    reset_tracking() очищает _nudge_frozen_box")
 
-print("\n=== 10. Смена lock_sequence снимает заморозку внутри "
-      "_update_control_from_target_impl (защита от чужого лока без "
-      "полного reset_tracking) ===")
-set_stick(ROLL_US)
-tick()
-assert t._nudge_frozen_box is not None, "тест сам по себе негоден"
-t.lock_sequence += 1   # имитация быстрого reacq без полного reset
-t.update_control_from_target()
-assert t._nudge_frozen_box is None, (
-    "смена lock_sequence не сбросила заморозку — control мог бы лететь "
-    "по box уже потерянного лока")
-set_stick(0)
-with t.state_lock:
-    t.track_state = t.TRACK_STATE_TRACKED
-    t.target_controllable = True
-tick()
-
-print("\n=== 11. По исходному тексту: заморозка читается ДО ветки "
+print("\n=== 10. По исходному тексту: заморозка читается ДО ветки "
       "'not controllable or box is None' — существующая защита не "
       "обходится ===")
 src = io.open(os.path.join(_ROOT, "tracker.py"), encoding="utf-8").read()
 i_fn = src.index("def _update_control_from_target_impl():")
-i_freeze = src.index("if _nudge_frozen_box is not None:", i_fn)
+i_freeze = src.index(
+    "box = _nudge_frozen_box if _nudge_frozen_box is not None else _live_box",
+    i_fn)
 i_safety = src.index("if not controllable or box is None:", i_fn)
-assert i_freeze < i_safety, (
-    "чтение заморозки должно идти ДО проверки 'not controllable or box "
-    "is None' — иначе порядок исполнения неочевиден из кода")
+assert i_freeze < i_safety
 print("    заморозка читается раньше safety-ветки 'not controllable'")
 
-print("\n=== 12. CSV: nudge_control_frozen/nudge_settle_remaining_ms на "
-      "месте ===")
-assert "nudge_control_frozen,nudge_settle_remaining_ms," in src
+print("\n=== 11. CSV: nudge_control_frozen на месте (nudge_settle_"
+      "remaining_ms убран вместе с окном устоя) ===")
+assert "nudge_control_frozen," in src
+assert "nudge_settle_remaining_ms" not in src, (
+    "убранное окно устоя оставило след в CSV/коде — nudge_settle_"
+    "remaining_ms всё ещё где-то упоминается")
 i_row = src.index("def _capture_flight_row")
 i_row_end = src.index("\ndef ", i_row + 1)
 row_body = src[i_row:i_row_end]
 assert '_match_dbg.get("nudge_control_frozen")' in row_body
-assert '_match_dbg.get("nudge_settle_remaining_ms")' in row_body
-print("    колонки на месте и читаются в _capture_flight_row")
+print("    колонка на месте, окно устоя нигде не осталось")
 
-print("\nOK: пока рамка активно двигается стиком (и ещё "
-      "MANUAL_NUDGE_CONTROL_SETTLE_S=%.1fс после отпускания) control "
-      "продолжает лететь по СТАРОЙ позиции цели, рамка на экране едет "
-      "живо; повторный nudge внутри окна устоя не 'утекает' на "
-      "промежуточную позицию; ENABLED=False возвращает поведение к "
-      "прежнему; reset_tracking/смена лока снимают заморозку; "
-      "существующая защита 'not controllable' не обойдена"
-      % t.MANUAL_NUDGE_CONTROL_SETTLE_S)
+print("\nOK: заморозка control на время ручной коррекции живёт строго "
+      "пока стик отклонён, снимается ОДНИМ кадром с reanchor (не смешивая "
+      "старый box с уже новой geometry-историей), переход сглажен уже "
+      "существующим _reset_geometry_history()+slew; устаревший RC "
+      "посреди правки — авария (без reanchor/заморозки), не "
+      "подтверждение; диагностика в CSV не врёт на кадре смены лока")

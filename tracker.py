@@ -2291,13 +2291,15 @@ _FLIGHT_LOG_COLUMNS = (
     "manual_nudge,manual_nudge_dx,manual_nudge_dy,"
     # ЗАДЕРЖКА УПРАВЛЕНИЯ НА ВРЕМЯ РУЧНОЙ КОРРЕКЦИИ (прямая просьба
     # оператора: "мало отвожу - не реагирует, сильно - резко перелетает",
-    # нужна пауза, пока рамка ещё двигается). nudge_control_frozen=1 —
-    # control ЭТОГО кадра считался по box ДО начала правки (см.
-    # MANUAL_NUDGE_CONTROL_DELAY_ENABLED), не по живому target_box_main.
-    # nudge_settle_remaining_ms — сколько ещё мс до перехода на финальную
-    # (поправленную) позицию; None — стик ещё активен (отсчёт не идёт)
-    # либо заморозки нет вовсе.
-    "nudge_control_frozen,nudge_settle_remaining_ms,"
+    # нужна пауза, пока рамка ещё двигается — см. MANUAL_NUDGE_CONTROL_
+    # DELAY_ENABLED). nudge_control_frozen=1 — control ЭТОГО кадра
+    # считался по box ДО начала правки, не по живому target_box_main.
+    # Заморозка живёт СТРОГО пока стик реально отклонён — снимается в
+    # тот же момент, что и сам nudge (отпускание или stale-RC abort), без
+    # отдельного таймера после (ревью по c6fb464 нашло, что искусственное
+    # окно устоя после reanchor смешивало старый box с уже новой
+    # geometry-историей — убрано).
+    "nudge_control_frozen,"
     # ДИАГНОСТИКА ВХОДА. Сырые значения AUX2/AUX3 (копии правого стика,
     # заведённые в обход маски MSP-оверрайда) и свежесть MSP_RC — чтобы на
     # бортовом логе сразу было видно, что копии стика реально приходят и
@@ -6795,7 +6797,7 @@ def reset_tracking(to_acq=False):
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
     global _nudge_was_active, _nudge_prev_t, _adapt_frozen_posle_reanchor
-    global _nudge_frozen_box, _nudge_settle_until_t
+    global _nudge_frozen_box
     global _shadow_track_dbg
     global _shadow_fresh_candidate, _shadow_fresh_candidate_w, _shadow_fresh_candidate_h
     global _shadow_fresh_candidate_std, _shadow_fresh_candidate_t, _shadow_fresh_candidate_epoch
@@ -6839,7 +6841,6 @@ def reset_tracking(to_acq=False):
     # через полный сброс значило бы на СЛЕДУЮЩЕМ локе control мог бы
     # улететь к box совсем другого захвата.
     _nudge_frozen_box = None
-    _nudge_settle_until_t = None
     color_separation = 0.0
     template_std = 0.0
     prev_gray = None
@@ -7677,7 +7678,7 @@ def _update_control_from_target_impl():
     global _shadow_trust_ema, _shadow_ctl_dbg
     global _shadow_roll_hold_value, _shadow_pitch_hold_value, _shadow_yaw_hold_value
     global _shadow_pitch_conflict_since_t
-    global _nudge_frozen_box, _nudge_settle_until_t
+    global _nudge_frozen_box
 
     with state_lock:
         _live_box = target_box_main
@@ -7688,29 +7689,13 @@ def _update_control_from_target_impl():
 
     # ЗАДЕРЖКА УПРАВЛЕНИЯ НА ВРЕМЯ РУЧНОЙ КОРРЕКЦИИ (см. константы и
     # обоснование у MANUAL_NUDGE_CONTROL_DELAY_ENABLED). _nudge_frozen_box
-    # не None — либо стик ещё активен, либо идёт окно устоя после
-    # отпускания; box для СЧЁТА управления остаётся тем, что было ДО
-    # начала правки, пока target_box_main (см. draw_overlay_on_frame)
-    # живо едет за стиком — оператору есть чем целиться на экране, а
-    # дрон никуда раньше времени не летит.
-    box = _live_box
-    if _nudge_frozen_box is not None:
-        if (_nudge_settle_until_t is not None
-                and time.monotonic() >= _nudge_settle_until_t):
-            # Окно устоя истекло без нового движения стика — правка
-            # завершена, одним шагом переходим на финальную позицию.
-            _nudge_frozen_box = None
-            _nudge_settle_until_t = None
-        else:
-            box = _nudge_frozen_box
-    # Видимость в CSV (тот же _match_dbg, что уже несёт manual_nudge/
-    # manual_nudge_dx/dy) — чтобы на разборе можно было убедиться, что
-    # задержка реально держит control на старой цели, а не поверить на
-    # слово комментарию.
-    _match_dbg["nudge_control_frozen"] = 1 if box is not _live_box else 0
-    _match_dbg["nudge_settle_remaining_ms"] = (
-        None if _nudge_settle_until_t is None
-        else max(0.0, (_nudge_settle_until_t - time.monotonic()) * 1000.0))
+    # не None РОВНО пока стик реально отклонён — box для СЧЁТА управления
+    # остаётся тем, что было ДО начала правки, пока target_box_main (см.
+    # draw_overlay_on_frame) живо едет за стиком — оператору есть чем
+    # целиться на экране, а дрон никуда раньше времени не летит. Никакого
+    # таймера здесь больше нет — снятие заморозки решает process_locked_
+    # tracker, в тот же момент, что и сам nudge (см. константы выше).
+    box = _nudge_frozen_box if _nudge_frozen_box is not None else _live_box
 
     # ЗАХВАТ СМЕНИЛСЯ — обнуляем состояние прошлой цели, которое не имеет
     # смысла на новой. Ветка not-controllable ниже делает то же самое, но
@@ -7728,8 +7713,13 @@ def _update_control_from_target_impl():
         # относится к ПРОШЛОМУ локу, новый лок обязан лететь по своему
         # живому target_box_main, а не по чужому замороженному box.
         _nudge_frozen_box = None
-        _nudge_settle_until_t = None
         box = _live_box
+
+    # НАЙДЕНО (ревью по c6fb464, п.4): раньше это писалось ДО проверки
+    # смены lock_sequence — на кадре самой смены CSV мог показать
+    # nudge_control_frozen=1, хотя код уже выбрал live box несколькими
+    # строками выше. Пишем ПОСЛЕ, когда box уже окончательно решён.
+    _match_dbg["nudge_control_frozen"] = 1 if box is not _live_box else 0
 
     now_mono = time.monotonic()
     # СЫРОЙ интервал — до dt_ratio(), который его ЗАЖИМАЕТ до DT_MAX (см.
@@ -10234,20 +10224,43 @@ _adapt_frozen_posle_reanchor = False
 # ПРОБЛЕМА ДО ЭТОЙ ПРАВКИ. update_control_from_target() вызывался КАЖДЫЙ
 # кадр прямо во время активного nudge (см. ветку if _nudge_active: ниже)
 # и читал ЖИВОЙ target_box_main — то есть дрон гонялся за рамкой в
-# реальном времени, ПОКА оператор её ещё двигает стиком. Вместе с тем,
-# что маленькое отклонение стика почти не двигает рамку, а большое
-# двигает её быстро (MANUAL_NUDGE_MAX_PX_S), это ощущалось как "дрон
-# дёргается вслед за каждым моим движением стика", а не как спокойная
-# правка прицела.
+# реальном времени, ПОКА оператор её ещё двигает стиком.
 #
-# РЕШЕНИЕ (подтверждено оператором явно, не угадано): пока рамка активно
-# двигается стиком — И ЕЩЁ MANUAL_NUDGE_CONTROL_SETTLE_S секунд после
-# отпускания — control loop продолжает лететь по СТАРОЙ (до-nudge)
-# позиции цели, как будто ничего не менялось. Рамка на экране (overlay,
-# target_box_main) при этом двигается ЖИВО — оператору нужна визуальная
-# обратная связь, иначе нечем прицеливаться. Как только окно устоя
-# истекло без нового движения стика — control одним шагом переходит на
-# ФИНАЛЬНУЮ (уже поправленную) позицию и дальше летит по ней как обычно.
+# ПЕРВАЯ ВЕРСИЯ ЭТОЙ ПРАВКИ (ревью по c6fb464) держала заморозку ЕЩЁ
+# MANUAL_NUDGE_CONTROL_SETTLE_S=1с ПОСЛЕ отпускания стика — и это была
+# ошибка: к моменту отпускания reanchor_tracker_at_current_box() УЖЕ
+# отработал (новая geometry_epoch, template пересобран, flow/match снова
+# считаются по новой позиции), а control ещё секунду продолжал бы читать
+# СТАРЫЙ box — смесь двух временных состояний (старая цель для control,
+# новая — для всего остального трекинга), и "резкий скачок reference"
+# просто переносился на секунду позже, а не устранялся.
+#
+# ТЕКУЩАЯ ВЕРСИЯ. Заморозка живёт СТРОГО пока стик реально отклонён (и
+# ни одним кадром дольше) — снимается В ТОТ ЖЕ МОМЕНТ, что и сам
+# reanchor, в process_locked_tracker, а не по таймеру внутри
+# _update_control_from_target_impl. Никакого искусственного окна устоя
+# после отпускания больше нет: переход на новую позицию доверен УЖЕ
+# СУЩЕСТВУЮЩЕМУ и уже проверенному механизму reanchor_tracker_at_
+# current_box() -> _reset_geometry_history() (тот и обнуляет tau/LOS-
+# rate/prev_box_cx,cy/target_vx,vy_smoothed — то есть ровно то, что не
+# даёт скачку позиции превратиться в ложную скорость) — этим же путём
+# уже безопасно обрабатывается ЛЮБОЙ другой geometry discontinuity
+# (frame gap, обычный manual reanchor), выдумывать вторую, отдельную
+# схему специально для nudge не нужно и, как показало ревью, вредно.
+# _slew_roll/pitch/yaw при этом НЕ сбрасываются (см. _reset_geometry_
+# history) — они и сглаживают сам шаг команды, если целевая точка после
+# reanchor заметно отличается от прежней.
+#
+# STALE RC — АВАРИЯ, НЕ ПОДТВЕРЖДЕНИЕ (ревью по c6fb464, п.3). Раньше
+# "стик в дедбенде" и "AUX/RC-сигнал пропал ПОСРЕДИ активной правки" вели
+# к одному и тому же коду — elif _nudge_was_active: трактовал оба случая
+# как «оператор сознательно закончил», подтверждая reanchor'ом ту
+# промежуточную позицию, на которой прервалась связь. Теперь эти случаи
+# различены (_nudge_rc_stale_abort ниже): устаревший RC ПОСРЕДИ правки
+# — НЕ вызывает reanchor и не запускает заморозку, просто снимает
+# nudge-состояние и падает в обычную live-логику этого же кадра, отдавая
+# решение "годится ли текущая позиция" flow/match, а не собственному
+# предположению.
 #
 # БЕЗОПАСНОСТЬ. _update_control_from_target_impl() читает box ТОЛЬКО из
 # _nudge_frozen_box/target_box_main — оба всегда валидный, недавно
@@ -10256,14 +10269,11 @@ _adapt_frozen_posle_reanchor = False
 # этим не затронута и остаётся последней линией защиты независимо от
 # того, какой из двух box сейчас выбран.
 MANUAL_NUDGE_CONTROL_DELAY_ENABLED = True
-MANUAL_NUDGE_CONTROL_SETTLE_S = 1.0
 # None — control читает живой target_box_main как раньше (нет активной
-# коррекции или задержка выключена). Не-None — control летит по ЭТОМУ
-# box, пока не истечёт _nudge_settle_until_t.
+# коррекции или задержка выключена). Не-None — control летит по этому
+# box; снимается СТРОГО в момент, когда снимается сам nudge (активный
+# стик кончился или сработал stale-RC abort) — никакого таймера.
 _nudge_frozen_box = None
-# None, пока стик ещё активен (устой не начинал отсчёт) ИЛИ заморозки нет
-# вовсе. Выставляется в момент отпускания стика (nudge end).
-_nudge_settle_until_t = None
 
 
 def reanchor_tracker_at_current_box(gray, reason):
@@ -10337,7 +10347,7 @@ def process_locked_tracker(gray, cb_t0=None):
     global template_scale_acc, color_axis
     global lock_w0, lock_h0
     global _nudge_was_active, _nudge_prev_t
-    global _nudge_frozen_box, _nudge_settle_until_t
+    global _nudge_frozen_box
     global _shadow_track_dbg
     global _shadow_fresh_candidate, _shadow_fresh_candidate_w, _shadow_fresh_candidate_h
     global _shadow_fresh_candidate_std, _shadow_fresh_candidate_t, _shadow_fresh_candidate_epoch
@@ -10561,6 +10571,7 @@ def process_locked_tracker(gray, cb_t0=None):
     _nudge_dx = _nudge_dy = 0.0
     _aux2_raw = _aux3_raw = None
     _nudge_rc_fresh = False
+    _have_aux = False
     _nudge_eligible = MANUAL_NUDGE_ENABLED and track_state == TRACK_STATE_TRACKED
 
     if _nudge_eligible:
@@ -10618,6 +10629,20 @@ def process_locked_tracker(gray, cb_t0=None):
                 _nudge_dy = (MANUAL_NUDGE_PITCH_SIGN * _pitch_norm
                             * MANUAL_NUDGE_MAX_PX_S * _nudge_dt)
 
+    # НАЙДЕНО (ревью по c6fb464, п.3 — SAFETY): "стик в дедбенде" и
+    # "AUX/RC-сигнал пропал ПОСРЕДИ активной правки" раньше вели к
+    # ОДНОМУ И ТОМУ ЖЕ коду ниже (elif _nudge_was_active:), который
+    # трактует оба случая как «оператор сознательно закончил» и
+    # подтверждает reanchor'ом текущую позицию. Для стика в дедбенде это
+    # верно. Для пропавшего RC — нет: это авария связи, а не решение
+    # оператора, и подтверждать НЕЗАКОНЧЕННУЮ коррекцию reanchor'ом
+    # опасно. Различаем: если nudge был активен, всё ещё разрешён по
+    # track_state, но валидных свежих AUX-данных в ЭТОМ кадре нет — это
+    # авария, не согласие.
+    _nudge_rc_stale_abort = (
+        _nudge_was_active and _nudge_eligible
+        and not (_have_aux and _nudge_rc_fresh))
+
     if not _nudge_active:
         # Стик в мёртвой зоне, RC несвежий или nudge недопустим в этом
         # состоянии — часы сдвига сбрасываем, чтобы следующая АКТИВАЦИЯ
@@ -10647,9 +10672,6 @@ def process_locked_tracker(gray, cb_t0=None):
                 with state_lock:
                     _nudge_frozen_box = target_box_main
         _nudge_was_active = True
-        # Стик снова активен — отменяем уже идущий отсчёт устоя (если шёл
-        # после предыдущего micro-отпускания внутри этой же серии правок).
-        _nudge_settle_until_t = None
         lock_cx = float(clamp(lock_cx + _nudge_dx, 0, LORES_W - 1))
         lock_cy = float(clamp(lock_cy + _nudge_dy, 0, LORES_H - 1))
         lost_frames = 0
@@ -10663,6 +10685,18 @@ def process_locked_tracker(gray, cb_t0=None):
             overlay_color = COLOR_GREEN
         update_control_from_target()
         return
+    elif _nudge_rc_stale_abort:
+        # АВАРИЙНЫЙ ВЫХОД (ревью по c6fb464, п.3 — SAFETY). RC/AUX пропал
+        # ПОСРЕДИ активной правки — это НЕ решение оператора закончить, а
+        # обрыв связи. НЕ вызываем reanchor (не подтверждаем промежуточную,
+        # возможно случайную позицию), НЕ ставим заморозку control — просто
+        # снимаем nudge-состояние и падаем дальше, в обычную live-логику
+        # ЭТОГО ЖЕ кадра (flow_predict/template_match_locked ниже), как на
+        # любом обычном TRACKED-кадре. Решение "годится ли текущая позиция"
+        # отдаётся flow/match, не берётся на веру автоматически.
+        _nudge_was_active = False
+        _nudge_frozen_box = None
+        flight_log.event("MANUAL_NUDGE abort (RC/AUX stale)")
     elif _nudge_was_active:
         # Стик вернулся в мёртвую зону — оператор закончил правку. Мягкая
         # перепривязка ВНУТРИ TRACKED: новые flow-точки на новом месте,
@@ -10680,12 +10714,18 @@ def process_locked_tracker(gray, cb_t0=None):
         _nudge_was_active = False
         flight_log.event("MANUAL_NUDGE end")
         reanchor_tracker_at_current_box(gray, "manual_reanchor")
-        if MANUAL_NUDGE_CONTROL_DELAY_ENABLED and _nudge_frozen_box is not None:
-            # Отпустили стик — начинаем отсчёт устоя. Заморозку (_nudge_
-            # frozen_box) НЕ снимаем здесь: control продолжает лететь по
-            # старой цели ещё MANUAL_NUDGE_CONTROL_SETTLE_S секунд, снимется
-            # она в _update_control_from_target_impl() по истечении окна.
-            _nudge_settle_until_t = time.monotonic() + MANUAL_NUDGE_CONTROL_SETTLE_S
+        # Заморозку снимаем СРАЗУ, тем же кадром, что и сам reanchor — не
+        # секундой позже (ревью по c6fb464, п.1: держать её дольше значило
+        # бы кормить control СТАРЫМ box, пока geometry_epoch/template/flow
+        # уже полностью перешли на НОВУЮ позицию — смесь двух временных
+        # состояний. update_control_from_target() ниже сразу использует
+        # живой, только что переустановленный target_box_main; переход
+        # сглаживает уже существующий и проверенный механизм — _reset_
+        # geometry_history() внутри reanchor обнуляет tau/LOS-rate/prev_
+        # box_cx,cy/target_vx,vy_smoothed (не даёт скачку позиции стать
+        # ложной скоростью), а _slew_roll/pitch/yaw (не сбрасываются)
+        # сглаживают сам шаг команды.
+        _nudge_frozen_box = None
         lost_frames = 0
         box = lores_box_to_main(lock_cx, lock_cy, lock_w, lock_h)
         with state_lock:
@@ -11723,7 +11763,6 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("manual_nudge"), _match_dbg.get("manual_nudge_dx"),
             _match_dbg.get("manual_nudge_dy"),
             _match_dbg.get("nudge_control_frozen"),
-            _match_dbg.get("nudge_settle_remaining_ms"),
             _match_dbg.get("aux2_raw"), _match_dbg.get("aux3_raw"),
             _match_dbg.get("nudge_rc_fresh"),
             _cam_exp_us, _cam_gain, _cam_colour_gain_r, _cam_colour_gain_b,
