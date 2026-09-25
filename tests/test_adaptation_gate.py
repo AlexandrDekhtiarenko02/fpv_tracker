@@ -107,5 +107,45 @@ assert changed2, (
     "разрешённой адаптации — либо шум кадра недостаточен, либо addWeighted "
     "не вызывается вовсе")
 
-print("\nOK: адаптация блокируется на неоднозначном (полосатом) кадре и "
-      "работает как прежде на однозначном")
+print("\n=== C. НАЙДЕНО (ревью по 9da5f65): build_template() пишет "
+      "tmpl_w/tmpl_h/template_std КАК ПОБОЧНЫЙ ЭФФЕКТ безусловно — даже "
+      "когда cur_tmpl ниже выброшен гейтом. tmpl_w/tmpl_h/template_std "
+      "обязаны всё это время описывать РЕАЛЬНЫЙ template_gray, не "
+      "выброшенный cur_tmpl ===")
+t.reset_tracking(to_acq=True)
+with t.state_lock:
+    t.aux4_state = True
+t.acq_wait_left = 0
+t.prev_aux_on = True
+t.track_state = t.TRACK_STATE_ACQ
+scene0 = make_scene(0, periodic=True)
+t.process_locked_tracker(scene0)
+assert t.track_state == t.TRACK_STATE_TRACKED
+_mismatches = []
+for i in range(1, 16):
+    scene = make_scene(i, periodic=True)
+    t.process_locked_tracker(scene)
+    if t.track_state != t.TRACK_STATE_TRACKED:
+        continue
+    assert t._match_dbg.get("adapt_skip_reason") == "ambiguous_peak", (
+        "сценарий C предполагает тот же гейт-отказ каждый кадр, что и "
+        "секция A — иначе эта проверка ничего не показывает")
+    _real_w, _real_h = t.template_gray.shape[1], t.template_gray.shape[0]
+    _real_std = float(np.std(t.template_gray))
+    if (t.tmpl_w, t.tmpl_h) != (_real_w, _real_h):
+        _mismatches.append("frame %d: tmpl_w/h=(%s,%s) != реальный "
+                           "template_gray.shape=(%s,%s)"
+                           % (i, t.tmpl_w, t.tmpl_h, _real_w, _real_h))
+    if abs(t.template_std - _real_std) > 1e-6:
+        _mismatches.append("frame %d: template_std=%.4f != реальный "
+                           "np.std(template_gray)=%.4f"
+                           % (i, t.template_std, _real_std))
+assert not _mismatches, (
+    "tmpl_w/tmpl_h/template_std разошлись с реальным template_gray после "
+    "того, как cur_tmpl был отвергнут гейтом:\n  " + "\n  ".join(_mismatches))
+print("    %d кадров подряд с гейт-отказом — tmpl_w/tmpl_h/template_std "
+      "всё время совпадали с реальным template_gray" % 15)
+
+print("\nOK: адаптация блокируется на неоднозначном (полосатом) кадре, "
+      "работает как прежде на однозначном, и tmpl_w/tmpl_h/template_std "
+      "не расходятся с реальным template_gray, когда cur_tmpl выброшен")

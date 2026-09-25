@@ -900,8 +900,10 @@ AUTO_TEMPLATE_REFRESH_ENABLED = True
 # кандидат устойчиво отождествляет цель лучше live template по PSR
 # (уникальность пика — то, что отличает "держит цель" от "уверенно
 # держит фон", см. докстрока _template_adaptation_gate) И укладывается в
-# то же расхождение с потоком, что live-путь уже допускает при выборе
-# позиции (переиспользуем MAX_LOCK_STEP, а не изобретаем новый порог).
+# MATCH_GAP_SOFT по расхождению с потоком — ту же планку, ниже которой
+# live доверяет матчу БЕЗ скидки веса при слиянии match+flow (не
+# MAX_LOCK_STEP: тот лишь "не совсем невозможно физически", live с ним
+# ещё сомневается, а не полностью доверяет).
 AUTO_TEMPLATE_REFRESH_CONFIRM_N = 3
 # Абсолютный, не относительный запас: PSR у части кадров лежит около нуля,
 # где относительный прирост ничего не значит. Первая оценка, НЕ
@@ -10067,6 +10069,7 @@ def process_locked_tracker(gray, cb_t0=None):
     """
     global track_state, target_visible, target_controllable, overlay_text, overlay_color, target_box_main
     global lock_cx, lock_cy, lock_w, lock_h, template_gray, prev_gray, prev_pts
+    global tmpl_w, tmpl_h, template_std
     global template_base, target_uv, color_active, color_separation
     global lost_frames, frame_index, last_match_score, last_flow_ok
     global fps_t0, fps_frames, fps_current
@@ -10515,6 +10518,17 @@ def process_locked_tracker(gray, cb_t0=None):
         prev_gray = gray.copy()
 
         if not FREEZE_TEMPLATE and match_ok and score >= 0.60:
+            # НАЙДЕНО (ревью по 9da5f65): build_template() пишет tmpl_w/
+            # tmpl_h/template_std КАК ПОБОЧНЫЙ ЭФФЕКT — безусловно, даже
+            # если cur_tmpl ниже будет ВЫБРОШЕН (гейт не пропустил, или
+            # shape изменился при TEMPLATE_RESCALE_ON_SIZE_CHANGE=False —
+            # обе ветки ничего не делают с template_gray). До этой правки
+            # tmpl_w/h/template_std в таком кадре оставались от cur_tmpl,
+            # который так и не стал реальным template_gray — следующий
+            # template_match_locked() выбирал TM_SQDIFF_NORMED/CCOEFF_
+            # NORMED по std чужого, не использованного шаблона. Сохраняем
+            # и откатываем в обеих "выброшенных" ветках ниже.
+            _prev_tmpl_w, _prev_tmpl_h, _prev_tmpl_std = tmpl_w, tmpl_h, template_std
             cur_tmpl = build_template(gray, lock_cx, lock_cy, lock_w, lock_h)
             # ЗАПРЕТ АДАПТАЦИИ НА СОМНИТЕЛЬНЫХ КАДРАХ (ТЗ §9). match_ok и
             # score>=0.60 сами по себе не видят неоднозначность: высокий
@@ -10573,6 +10587,25 @@ def process_locked_tracker(gray, cb_t0=None):
                     template_gray = cv2.resize(
                         template_base, (cur_tmpl.shape[1], cur_tmpl.shape[0]),
                         interpolation=cv2.INTER_LINEAR)
+                    # template_std ЗДЕСЬ обязан описывать РЕАЛЬНЫЙ
+                    # template_gray (resize от template_base), а не
+                    # cur_tmpl (кроп ТЕКУЩЕГО кадра) — build_template()
+                    # выше посчитал std именно для cur_tmpl, это два
+                    # разных массива. tmpl_w/tmpl_h корректны и без
+                    # пересчёта: это ровно (cur_tmpl.shape[1], [0]),
+                    # тот же размер, в который сейчас отресайзили.
+                    template_std = float(np.std(template_gray))
+                else:
+                    # cur_tmpl выброшен целиком (shape изменился, а
+                    # TEMPLATE_RESCALE_ON_SIZE_CHANGE=False — дефолт):
+                    # template_gray не тронут этим кадром, откатываем и
+                    # tmpl_w/h/template_std к тому, что реально ему
+                    # соответствует.
+                    tmpl_w, tmpl_h, template_std = _prev_tmpl_w, _prev_tmpl_h, _prev_tmpl_std
+            else:
+                # Гейт не пропустил кадр — cur_tmpl построен и выброшен
+                # целиком, template_gray не тронут.
+                tmpl_w, tmpl_h, template_std = _prev_tmpl_w, _prev_tmpl_h, _prev_tmpl_std
 
         # Периодическая адаптация размера коробки. Раз в SIZE_ADAPT_EVERY_FRAMES
         # при уверенном матче запрашиваем заново связную компоненту под текущим
@@ -10896,7 +10929,19 @@ def process_locked_tracker(gray, cb_t0=None):
                                         and _v_psr >= (_live_psr
                                                        + AUTO_TEMPLATE_REFRESH_PSR_MARGIN)
                                         and _v_gap is not None
-                                        and _v_gap <= MAX_LOCK_STEP)
+                                        # НАЙДЕНО (ревью по 9da5f65): было
+                                        # MAX_LOCK_STEP (32px) — это грубый
+                                        # предел "не совсем невозможно за
+                                        # кадр", live с ним ещё СОМНЕВАЕТСЯ
+                                        # в матче (просто не отбрасывает
+                                        # целиком). MATCH_GAP_SOFT (4px) —
+                                        # порог, НИЖЕ которого live доверяет
+                                        # матчу ПОЛНОСТЬЮ без скидки веса
+                                        # (см. w_m/zatuh в блоке слияния
+                                        # match+flow выше) — комментарий
+                                        # утверждал "та же уверенность, что
+                                        # у live", а порог был другой.
+                                        and _v_gap <= MATCH_GAP_SOFT)
                                     if _tref_vote:
                                         _auto_tref_confirm_streak += 1
                                     else:
