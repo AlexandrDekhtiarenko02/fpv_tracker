@@ -2309,14 +2309,28 @@ _FLIGHT_LOG_COLUMNS = (
     "cam_top_row_mean,"
     # CAMERA JUMP SHADOW (диагностика-only, разбор 25.09.2026 — pitch<->
     # ExposureTime +0.867, pitch<->mean_gray +0.824, ~5x выдержки на
-    # 40-50° тангажа). cam_jump_exp_ratio/gray_delta — отношение/разница
-    # к ПРЕДЫДУЩЕМУ 1 Гц замеру (не к этому кадру — экспозиция и так
-    # меряется раз в секунду). cam_jump_top_saturated — верхняя строка
-    # main засвечена (mean>=250). cam_jump_detected — любое из трёх
-    # превысило порог (см. CAM_JUMP_*_THRESHOLD). Ничего из этого пока
+    # 40-50° тангажа; ревью по 66b7f4b добавило freshness/dt/edge-логику,
+    # см. комментарий у CAM_JUMP_SHADOW_ENABLED). cam_jump_exp_ratio/
+    # gray_delta — отношение/разница к ПРЕДЫДУЩЕМУ 1 Гц замеру.
+    # cam_jump_dt_ms — сколько РЕАЛЬНО времени было между этим и
+    # предыдущим замером (НЕ предполагается ровно 1000мс — сбой/пауза
+    # дали бы больший разрыв; дельты через cam_jump_dt_ms >
+    # CAM_JUMP_MAX_VALID_DT_S в jump не засчитываются). cam_jump_detected
+    # — ТОЛЬКО exp/gray скачок (переходный по построению). cam_top_
+    # saturated — ОТДЕЛЬНОЕ состояние (верхняя строка main засвечена,
+    # mean>=250), намеренно не часть jump — иначе многосекундный пересвет
+    # выглядел бы как серия скачков (см. ревью по 66b7f4b). cam_jump_
+    # sample_seq — монотонный номер 1 Гц замера; cam_jump_sample_age_ms —
+    # сколько мс НАЗАД (от текущей строки CSV) был взят этот замер, раз
+    # словарь пишется каждый кадр, а считается раз в секунду — без этого
+    # одна вспышка выглядела бы как десятки строк с jump=True. cam_jump_
+    # att_age_ms — свежесть fc_pitch_deg на момент замера (та же формула,
+    # что _att_age_ms в process_locked_tracker) — без неё pitch в событии
+    # мог быть заметно старше самого замера камеры. Ничего из этого пока
     # НЕ влияет на доверие трекингу/control — только измерение.
-    "cam_jump_exp_ratio,cam_jump_gray_delta,cam_jump_top_saturated,"
-    "cam_jump_detected,"
+    "cam_jump_exp_ratio,cam_jump_gray_delta,cam_jump_dt_ms,"
+    "cam_jump_detected,cam_top_saturated,"
+    "cam_jump_sample_seq,cam_jump_sample_age_ms,cam_jump_att_age_ms,"
     # SHADOW CONTROLLER (архитектурный аудит контура, диагностика-only —
     # см. блок _shadow_ctl_dbg). Ничего из этого НЕ участвует в реальной
     # команде: live-путь (global_roll_cmd и т.п.) собран и отправлен
@@ -2691,6 +2705,30 @@ def _mean_top_strip(main_array):
 # — см. camera_callback). Никаких новых чтений камеры и никакого CV
 # каждый кадр: сравнение с предыдущим 1 Гц замером — арифметика на уже
 # посчитанных числах.
+#
+# ЧЕТЫРЕ ПРАВКИ ПОСЛЕ РЕВЬЮ (по 66b7f4b, разбор его же первого прогона):
+# 1. _cam_shadow_dbg живёт ~1с в CSV (пишется КАЖДЫЙ кадр в
+#    _capture_flight_row, а считается раз в секунду) — без метки момента
+#    замера одна вспышка выглядела бы как "20 кадров подряд jump=True".
+#    cam_jump_sample_seq (монотонный счётчик замеров) + cam_jump_sample_
+#    age_ms (сколько РЕАЛЬНОГО времени прошло с этого замера НА ЭТОЙ
+#    строке) решают это — та же идея, что frame_index-метка у _flow_dbg.
+# 2. top_saturated — СОСТОЯНИЕ (может держаться секундами), не скачок.
+#    Раньше входил в общий "jump" и в условие лога — 5с пересвета давали
+#    5 отдельных событий CAM_JUMP. Теперь jump — строго exp/gray ДЕЛЬТА
+#    (по построению переходный: скачок, потом дельта следующего тика
+#    снова ~0), top_saturated — отдельное поле, событие в лог для него
+#    только на переднем фронте (переход False->True).
+# 3. Сравнение "текущий / предыдущий" не знало, сколько времени между
+#    ними прошло — плавный дрейф за 4с после сбоя/паузы выглядел бы как
+#    один резкий скачок. cam_jump_dt_ms + CAM_JUMP_MAX_VALID_DT_S: дельты
+#    старше порога не считаются jump (dt "протух" — та же freshness-
+#    логика, что везде в этом файле), но exp_ratio/gray_delta всё равно
+#    возвращаются (для разбора, не для решения).
+# 4. pitch в событии писался без возраста attitude (att_age_ms в прошлых
+#    логах доходил до сотен мс) — теперь рядом cam_jump_att_age_ms, той
+#    же формулой, что уже даёт _att_age_ms в process_locked_tracker
+#    (time.monotonic() - app_state["fc_pitch_ts"]).
 CAM_JUMP_SHADOW_ENABLED = True
 # Во сколько раз должна измениться выдержка между соседними 1 Гц замерами,
 # чтобы засчитать скачок (в любую сторону — рост ИЛИ резкое падение).
@@ -2704,17 +2742,28 @@ CAM_JUMP_GRAY_DELTA_THRESHOLD = 20.0
 # "Пересвет верхней строки" — тот же порог (mean>=250), которым в разборе
 # 25.09 меряли клиппинг (24% кадров при pitch 20-30°).
 CAM_JUMP_TOPROW_SATURATED_THRESHOLD = 250.0
+# Дольше этого между соседними 1 Гц замерами — сравнение не "скачок за
+# доли секунды", а неизвестно что (сбой callback, длинная пауза). Тот же
+# принцип, что FLOW_RASSH_SVEZH_S для потока: явный потолок, а не
+# молчаливое доверие произвольно старой паре точек.
+CAM_JUMP_MAX_VALID_DT_S = 2.0 * CMA_READ_PERIOD_S
 _cam_shadow_dbg = {}
 _cam_shadow_prev_exp_us = None
 _cam_shadow_prev_gray = None
+_cam_shadow_prev_sample_t = None
+_cam_shadow_prev_top_saturated = False
+_cam_shadow_sample_seq = 0
 
 
-def _camera_jump_check(exp_us, prev_exp_us, mean_gray, prev_gray, top_row_mean):
+def _camera_jump_check(exp_us, prev_exp_us, mean_gray, prev_gray,
+                       top_row_mean, dt_s):
     """Чистая функция (без чтения/записи globals) — сравнивает ТЕКУЩИЙ
-    1 Гц замер экспозиции/яркости с ПРЕДЫДУЩИМ. Возвращает dict с
-    exp_ratio/gray_delta/top_saturated/jump. None-поля — недостаточно
-    данных (нет предыдущего замера, метаданные недоступны и т.п.), не
-    "скачка не было"."""
+    1 Гц замер экспозиции/яркости с ПРЕДЫДУЩИМ, dt_s секунд назад.
+    Возвращает dict с exp_ratio/gray_delta/dt_valid/top_saturated/jump.
+    None-поля — недостаточно данных (нет предыдущего замера, метаданные
+    недоступны и т.п.), не "скачка не было". jump — ТОЛЬКО exp/gray
+    дельта (переходный по построению); top_saturated — состояние,
+    в jump сознательно не входит (см. правка 2 в комментарии выше)."""
     exp_ratio = None
     if exp_us is not None and prev_exp_us is not None and prev_exp_us > 0:
         exp_ratio = exp_us / float(prev_exp_us)
@@ -2723,16 +2772,19 @@ def _camera_jump_check(exp_us, prev_exp_us, mean_gray, prev_gray, top_row_mean):
         gray_delta = mean_gray - prev_gray
     top_saturated = (top_row_mean is not None
                      and top_row_mean >= CAM_JUMP_TOPROW_SATURATED_THRESHOLD)
-    exp_jump = (exp_ratio is not None
+    dt_valid = dt_s is not None and dt_s <= CAM_JUMP_MAX_VALID_DT_S
+    exp_jump = (dt_valid and exp_ratio is not None
                and (exp_ratio >= CAM_JUMP_EXP_RATIO_THRESHOLD
                     or exp_ratio <= 1.0 / CAM_JUMP_EXP_RATIO_THRESHOLD))
-    gray_jump = (gray_delta is not None
+    gray_jump = (dt_valid and gray_delta is not None
                 and abs(gray_delta) >= CAM_JUMP_GRAY_DELTA_THRESHOLD)
     return {
         "exp_ratio": exp_ratio,
         "gray_delta": gray_delta,
+        "dt_ms": None if dt_s is None else dt_s * 1000.0,
+        "dt_valid": dt_valid,
         "top_saturated": top_saturated,
-        "jump": bool(exp_jump or gray_jump or top_saturated),
+        "jump": bool(exp_jump or gray_jump),
     }
 
 
@@ -11460,6 +11512,15 @@ def _capture_flight_row(cb_t0):
         def sg(k, d=None):
             return sc.get(k, d) if shadow_active else None
 
+        # Ревью по 66b7f4b: _cam_shadow_dbg пишется раз в секунду, а эта
+        # строка — каждый кадр. sample_age_ms считается ЗАНОВО каждую
+        # строку (не берётся из словаря — тот момент заморожен) — честный
+        # "сколько реально мс назад был этот замер НА ЭТОЙ строке", не
+        # "0 всегда" и не то, что было на кадре самого замера.
+        _cam_sample_t = _cam_shadow_dbg.get("sample_t")
+        _cam_sample_age_ms = (None if _cam_sample_t is None
+                              else (time.monotonic() - _cam_sample_t) * 1000.0)
+
         _row_values = (
             now - flight_log._t0, frame_index, fps_current, st, ctrl, aux, ov,
             fc_ovr_row,
@@ -11551,7 +11612,10 @@ def _capture_flight_row(cb_t0):
             _cam_exp_us, _cam_gain, _cam_colour_gain_r, _cam_colour_gain_b,
             _last_main_top_mean,
             _cam_shadow_dbg.get("exp_ratio"), _cam_shadow_dbg.get("gray_delta"),
-            _cam_shadow_dbg.get("top_saturated"), _cam_shadow_dbg.get("jump"),
+            _cam_shadow_dbg.get("dt_ms"),
+            _cam_shadow_dbg.get("jump"), _cam_shadow_dbg.get("top_saturated"),
+            _cam_shadow_dbg.get("sample_seq"), _cam_sample_age_ms,
+            _cam_shadow_dbg.get("att_age_ms"),
             sg("ref_x"), sg("ref_y"),
             sg("ref_static_x"), sg("ref_static_y"),
             sg("ref_att_x"), sg("ref_att_y"),
@@ -11866,6 +11930,8 @@ def camera_callback(request):
     global _cpu_temp_c, _cpu_freq_mhz
     global _cam_exp_us, _cam_gain, _cam_colour_gain_r, _cam_colour_gain_b
     global _cam_shadow_dbg, _cam_shadow_prev_exp_us, _cam_shadow_prev_gray
+    global _cam_shadow_prev_sample_t, _cam_shadow_prev_top_saturated
+    global _cam_shadow_sample_seq
     _cb_t0 = time.monotonic()
     # _etap_ms должен отражать ТОЛЬКО этапы, реально выполненные В ЭТОМ
     # кадре — без явной очистки словарь копил значения с прошлых вызовов
@@ -11929,21 +11995,39 @@ def camera_callback(request):
                     _last_main_top_mean = _mean_top_strip(mm.array)
                     if CAM_JUMP_SHADOW_ENABLED:
                         try:
+                            _cam_dt_s = (None if _cam_shadow_prev_sample_t is None
+                                        else _t_diag - _cam_shadow_prev_sample_t)
                             _cjc = _camera_jump_check(
                                 _cam_exp_us, _cam_shadow_prev_exp_us,
                                 _last_main_mean, _cam_shadow_prev_gray,
-                                _last_main_top_mean)
+                                _last_main_top_mean, _cam_dt_s)
                             with state_lock:
+                                _fc_pitch_ts = app_state.get("fc_pitch_ts", 0.0)
                                 _cjc["pitch_deg"] = app_state.get("fc_pitch_deg")
+                            _cjc["att_age_ms"] = (
+                                None if _fc_pitch_ts <= 0.0
+                                else (time.monotonic() - _fc_pitch_ts) * 1000.0)
+                            _cam_shadow_sample_seq += 1
+                            _cjc["sample_seq"] = _cam_shadow_sample_seq
+                            _cjc["sample_t"] = _t_diag
                             if _cjc["jump"]:
                                 flight_log.event(
                                     "CAM_JUMP exp_ratio=%s gray_delta=%s "
-                                    "top_saturated=%s pitch=%s"
+                                    "dt_ms=%s pitch=%s att_age_ms=%s"
                                     % (_cjc["exp_ratio"], _cjc["gray_delta"],
-                                       _cjc["top_saturated"], _cjc["pitch_deg"]))
+                                       _cjc["dt_ms"], _cjc["pitch_deg"],
+                                       _cjc["att_age_ms"]))
+                            if _cjc["top_saturated"] and not _cam_shadow_prev_top_saturated:
+                                flight_log.event(
+                                    "CAM_TOP_SATURATED начало (mean>=%.0f) "
+                                    "pitch=%s att_age_ms=%s"
+                                    % (CAM_JUMP_TOPROW_SATURATED_THRESHOLD,
+                                       _cjc["pitch_deg"], _cjc["att_age_ms"]))
+                            _cam_shadow_prev_top_saturated = _cjc["top_saturated"]
                             _cam_shadow_dbg = _cjc
                             _cam_shadow_prev_exp_us = _cam_exp_us
                             _cam_shadow_prev_gray = _last_main_mean
+                            _cam_shadow_prev_sample_t = _t_diag
                         except Exception:
                             _cam_shadow_dbg = {}
                     _etap("diagnostika", _t_diag)
@@ -12020,21 +12104,39 @@ def camera_callback(request):
                 _last_main_top_mean = _mean_top_strip(mm.array)
                 if CAM_JUMP_SHADOW_ENABLED:
                     try:
+                        _cam_dt_s = (None if _cam_shadow_prev_sample_t is None
+                                    else _t_diag - _cam_shadow_prev_sample_t)
                         _cjc = _camera_jump_check(
                             _cam_exp_us, _cam_shadow_prev_exp_us,
                             _last_main_mean, _cam_shadow_prev_gray,
-                            _last_main_top_mean)
+                            _last_main_top_mean, _cam_dt_s)
                         with state_lock:
+                            _fc_pitch_ts = app_state.get("fc_pitch_ts", 0.0)
                             _cjc["pitch_deg"] = app_state.get("fc_pitch_deg")
+                        _cjc["att_age_ms"] = (
+                            None if _fc_pitch_ts <= 0.0
+                            else (time.monotonic() - _fc_pitch_ts) * 1000.0)
+                        _cam_shadow_sample_seq += 1
+                        _cjc["sample_seq"] = _cam_shadow_sample_seq
+                        _cjc["sample_t"] = _t_diag
                         if _cjc["jump"]:
                             flight_log.event(
                                 "CAM_JUMP exp_ratio=%s gray_delta=%s "
-                                "top_saturated=%s pitch=%s"
+                                "dt_ms=%s pitch=%s att_age_ms=%s"
                                 % (_cjc["exp_ratio"], _cjc["gray_delta"],
-                                   _cjc["top_saturated"], _cjc["pitch_deg"]))
+                                   _cjc["dt_ms"], _cjc["pitch_deg"],
+                                   _cjc["att_age_ms"]))
+                        if _cjc["top_saturated"] and not _cam_shadow_prev_top_saturated:
+                            flight_log.event(
+                                "CAM_TOP_SATURATED начало (mean>=%.0f) "
+                                "pitch=%s att_age_ms=%s"
+                                % (CAM_JUMP_TOPROW_SATURATED_THRESHOLD,
+                                   _cjc["pitch_deg"], _cjc["att_age_ms"]))
+                        _cam_shadow_prev_top_saturated = _cjc["top_saturated"]
                         _cam_shadow_dbg = _cjc
                         _cam_shadow_prev_exp_us = _cam_exp_us
                         _cam_shadow_prev_gray = _last_main_mean
+                        _cam_shadow_prev_sample_t = _t_diag
                     except Exception:
                         _cam_shadow_dbg = {}
                 _etap("diagnostika", _t_diag)
