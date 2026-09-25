@@ -2307,6 +2307,16 @@ _FLIGHT_LOG_COLUMNS = (
     # если top_row заметно темнее общего, полоса внутри данных камеры;
     # если совпадает — полоса рождается только на физическом DRM-выводе.
     "cam_top_row_mean,"
+    # CAMERA JUMP SHADOW (диагностика-only, разбор 25.09.2026 — pitch<->
+    # ExposureTime +0.867, pitch<->mean_gray +0.824, ~5x выдержки на
+    # 40-50° тангажа). cam_jump_exp_ratio/gray_delta — отношение/разница
+    # к ПРЕДЫДУЩЕМУ 1 Гц замеру (не к этому кадру — экспозиция и так
+    # меряется раз в секунду). cam_jump_top_saturated — верхняя строка
+    # main засвечена (mean>=250). cam_jump_detected — любое из трёх
+    # превысило порог (см. CAM_JUMP_*_THRESHOLD). Ничего из этого пока
+    # НЕ влияет на доверие трекингу/control — только измерение.
+    "cam_jump_exp_ratio,cam_jump_gray_delta,cam_jump_top_saturated,"
+    "cam_jump_detected,"
     # SHADOW CONTROLLER (архитектурный аудит контура, диагностика-only —
     # см. блок _shadow_ctl_dbg). Ничего из этого НЕ участвует в реальной
     # команде: live-путь (global_roll_cmd и т.п.) собран и отправлен
@@ -2649,6 +2659,81 @@ def _mean_top_strip(main_array):
         return float(main_array[:_MAIN_TOP_STRIP_ROWS, :, 1].mean())
     except Exception:
         return None
+
+
+# --- CAMERA JUMP SHADOW (диагностика-only, разбор 24 заходов 25.09.2026,
+# следом за Auto Template Refresh). ---
+#
+# НАХОДКА. AeEnable=True/AwbEnable=True (динамическая экспозиция/баланс
+# белого — намеренный выбор, см. main: без этого цель на солнце уходила
+# в пересвет, а смена освещения давала неверный баланс белого) СИЛЬНО
+# коррелирует с тангажом: pitch<->ExposureTime +0.867, pitch<->mean_gray
+# +0.824. При pitch 40-50° выдержка вырастает в ~5 раз против pitch<10°
+# (604 -> 3147 мкс), mean_gray 115 -> 177. Чистые эпизоды (заход #16:
+# 1691->2618 мкс, +36 mean_gray практически за один диагностический тик;
+# #17, #24 — тот же паттерн) показывают, что это не медленный дрейф, а
+# скачок за доли секунды при смене ракурса — то, что видно глазами как
+# "накренился -> картинка резко побелела".
+#
+# ЗАЧЕМ ДИАГНОСТИКА, А НЕ СРАЗУ ЖИВОЕ ОГРАНИЧЕНИЕ AE. Неизвестно заранее,
+# какой предел выдержки/скорости изменения безопасен для ЭТОЙ камеры без
+# стендового замера (тот же принцип, что и Tracking Shadow -> Auto
+# Template Refresh: сначала измерить, потом действовать). Здесь же
+# отдельная, более срочная польза: если "матчер уверен + flow согласен,
+# но это на самом деле резко поменявшаяся экспозиция/баланс" — то доверие
+# трекингу в такие моменты стоит снижать НЕЗАВИСИМО от PSR/flow_gap,
+# которые сами по себе этого не видят (ровно так же, как PSR/flow_gap не
+# видят identity мелкой цели на похожем фоне — родственная, но другая
+# причина той же "рамка едет, хотя метрики говорят, что всё хорошо").
+#
+# ИСТОЧНИК ДАННЫХ — уже читаемые раз в секунду _cam_exp_us/_last_main_
+# mean/_last_main_top_mean (тот же _diag_1hz_tick, что CMA/CPU/экспозиция
+# — см. camera_callback). Никаких новых чтений камеры и никакого CV
+# каждый кадр: сравнение с предыдущим 1 Гц замером — арифметика на уже
+# посчитанных числах.
+CAM_JUMP_SHADOW_ENABLED = True
+# Во сколько раз должна измениться выдержка между соседними 1 Гц замерами,
+# чтобы засчитать скачок (в любую сторону — рост ИЛИ резкое падение).
+# 1.4 — ниже самого маленького из "чистых" эпизодов разбора (1.47), но с
+# запасом от обычного плавного схождения AE. Первая оценка, не
+# откалиброванная стендом величина — уточнить по факту нового прогона.
+CAM_JUMP_EXP_RATIO_THRESHOLD = 1.4
+# Абсолютный скачок mean_gray между соседними 1 Гц замерами. Чистые
+# эпизоды разбора давали +30..+36 за такой скачок; порог взят с запасом.
+CAM_JUMP_GRAY_DELTA_THRESHOLD = 20.0
+# "Пересвет верхней строки" — тот же порог (mean>=250), которым в разборе
+# 25.09 меряли клиппинг (24% кадров при pitch 20-30°).
+CAM_JUMP_TOPROW_SATURATED_THRESHOLD = 250.0
+_cam_shadow_dbg = {}
+_cam_shadow_prev_exp_us = None
+_cam_shadow_prev_gray = None
+
+
+def _camera_jump_check(exp_us, prev_exp_us, mean_gray, prev_gray, top_row_mean):
+    """Чистая функция (без чтения/записи globals) — сравнивает ТЕКУЩИЙ
+    1 Гц замер экспозиции/яркости с ПРЕДЫДУЩИМ. Возвращает dict с
+    exp_ratio/gray_delta/top_saturated/jump. None-поля — недостаточно
+    данных (нет предыдущего замера, метаданные недоступны и т.п.), не
+    "скачка не было"."""
+    exp_ratio = None
+    if exp_us is not None and prev_exp_us is not None and prev_exp_us > 0:
+        exp_ratio = exp_us / float(prev_exp_us)
+    gray_delta = None
+    if mean_gray is not None and prev_gray is not None:
+        gray_delta = mean_gray - prev_gray
+    top_saturated = (top_row_mean is not None
+                     and top_row_mean >= CAM_JUMP_TOPROW_SATURATED_THRESHOLD)
+    exp_jump = (exp_ratio is not None
+               and (exp_ratio >= CAM_JUMP_EXP_RATIO_THRESHOLD
+                    or exp_ratio <= 1.0 / CAM_JUMP_EXP_RATIO_THRESHOLD))
+    gray_jump = (gray_delta is not None
+                and abs(gray_delta) >= CAM_JUMP_GRAY_DELTA_THRESHOLD)
+    return {
+        "exp_ratio": exp_ratio,
+        "gray_delta": gray_delta,
+        "top_saturated": top_saturated,
+        "jump": bool(exp_jump or gray_jump or top_saturated),
+    }
 
 
 def _read_cma_free_kb():
@@ -11465,6 +11550,8 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("nudge_rc_fresh"),
             _cam_exp_us, _cam_gain, _cam_colour_gain_r, _cam_colour_gain_b,
             _last_main_top_mean,
+            _cam_shadow_dbg.get("exp_ratio"), _cam_shadow_dbg.get("gray_delta"),
+            _cam_shadow_dbg.get("top_saturated"), _cam_shadow_dbg.get("jump"),
             sg("ref_x"), sg("ref_y"),
             sg("ref_static_x"), sg("ref_static_y"),
             sg("ref_att_x"), sg("ref_att_y"),
@@ -11778,6 +11865,7 @@ def camera_callback(request):
     global _last_main_mean, _last_main_top_mean, _cma_free_kb, _cma_read_t
     global _cpu_temp_c, _cpu_freq_mhz
     global _cam_exp_us, _cam_gain, _cam_colour_gain_r, _cam_colour_gain_b
+    global _cam_shadow_dbg, _cam_shadow_prev_exp_us, _cam_shadow_prev_gray
     _cb_t0 = time.monotonic()
     # _etap_ms должен отражать ТОЛЬКО этапы, реально выполненные В ЭТОМ
     # кадре — без явной очистки словарь копил значения с прошлых вызовов
@@ -11839,6 +11927,25 @@ def camera_callback(request):
                     except Exception:
                         _last_main_mean = None
                     _last_main_top_mean = _mean_top_strip(mm.array)
+                    if CAM_JUMP_SHADOW_ENABLED:
+                        try:
+                            _cjc = _camera_jump_check(
+                                _cam_exp_us, _cam_shadow_prev_exp_us,
+                                _last_main_mean, _cam_shadow_prev_gray,
+                                _last_main_top_mean)
+                            with state_lock:
+                                _cjc["pitch_deg"] = app_state.get("fc_pitch_deg")
+                            if _cjc["jump"]:
+                                flight_log.event(
+                                    "CAM_JUMP exp_ratio=%s gray_delta=%s "
+                                    "top_saturated=%s pitch=%s"
+                                    % (_cjc["exp_ratio"], _cjc["gray_delta"],
+                                       _cjc["top_saturated"], _cjc["pitch_deg"]))
+                            _cam_shadow_dbg = _cjc
+                            _cam_shadow_prev_exp_us = _cam_exp_us
+                            _cam_shadow_prev_gray = _last_main_mean
+                        except Exception:
+                            _cam_shadow_dbg = {}
                     _etap("diagnostika", _t_diag)
                 _t_ovl = time.monotonic()
                 draw_overlay_on_frame(mm.array)
@@ -11911,6 +12018,25 @@ def camera_callback(request):
                 except Exception:
                     _last_main_mean = None
                 _last_main_top_mean = _mean_top_strip(mm.array)
+                if CAM_JUMP_SHADOW_ENABLED:
+                    try:
+                        _cjc = _camera_jump_check(
+                            _cam_exp_us, _cam_shadow_prev_exp_us,
+                            _last_main_mean, _cam_shadow_prev_gray,
+                            _last_main_top_mean)
+                        with state_lock:
+                            _cjc["pitch_deg"] = app_state.get("fc_pitch_deg")
+                        if _cjc["jump"]:
+                            flight_log.event(
+                                "CAM_JUMP exp_ratio=%s gray_delta=%s "
+                                "top_saturated=%s pitch=%s"
+                                % (_cjc["exp_ratio"], _cjc["gray_delta"],
+                                   _cjc["top_saturated"], _cjc["pitch_deg"]))
+                        _cam_shadow_dbg = _cjc
+                        _cam_shadow_prev_exp_us = _cam_exp_us
+                        _cam_shadow_prev_gray = _last_main_mean
+                    except Exception:
+                        _cam_shadow_dbg = {}
                 _etap("diagnostika", _t_diag)
             _t_ovl = time.monotonic()
             draw_overlay_on_frame(mm.array)
