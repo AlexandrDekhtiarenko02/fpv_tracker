@@ -2326,11 +2326,20 @@ _FLIGHT_LOG_COLUMNS = (
     # одна вспышка выглядела бы как десятки строк с jump=True. cam_jump_
     # att_age_ms — свежесть fc_pitch_deg на момент замера (та же формула,
     # что _att_age_ms в process_locked_tracker) — без неё pitch в событии
-    # мог быть заметно старше самого замера камеры. Ничего из этого пока
-    # НЕ влияет на доверие трекингу/control — только измерение.
+    # мог быть заметно старше самого замера камеры. cam_jump_pitch_deg —
+    # НАЙДЕНО ревью по 3f977f2: pitch ЗАМОРОЖЕН на момент ТОГО ЖЕ 1 Гц
+    # замера, что и exp_ratio/gray_delta/jump — а обычный fc_pitch рядом
+    # в этой же строке пишется каждый кадр и УСПЕВАЕТ уйти далеко за то
+    # время, пока cam_jump_* всё ещё держат значения секундной давности.
+    # Без cam_jump_pitch_deg фильтр "cam_jump_detected=True -> смотрим
+    # соседний fc_pitch" сравнивал бы скачок камеры с ЧУЖИМ (более новым)
+    # тангажом — тот же класс ошибки, что уже чинили att_age_ms, только
+    # для самого значения pitch, а не его свежести. Ничего из cam_jump_*
+    # пока НЕ влияет на доверие трекингу/control — только измерение.
     "cam_jump_exp_ratio,cam_jump_gray_delta,cam_jump_dt_ms,"
     "cam_jump_detected,cam_top_saturated,"
     "cam_jump_sample_seq,cam_jump_sample_age_ms,cam_jump_att_age_ms,"
+    "cam_jump_pitch_deg,"
     # SHADOW CONTROLLER (архитектурный аудит контура, диагностика-only —
     # см. блок _shadow_ctl_dbg). Ничего из этого НЕ участвует в реальной
     # команде: live-путь (global_roll_cmd и т.п.) собран и отправлен
@@ -11615,7 +11624,7 @@ def _capture_flight_row(cb_t0):
             _cam_shadow_dbg.get("dt_ms"),
             _cam_shadow_dbg.get("jump"), _cam_shadow_dbg.get("top_saturated"),
             _cam_shadow_dbg.get("sample_seq"), _cam_sample_age_ms,
-            _cam_shadow_dbg.get("att_age_ms"),
+            _cam_shadow_dbg.get("att_age_ms"), _cam_shadow_dbg.get("pitch_deg"),
             sg("ref_x"), sg("ref_y"),
             sg("ref_static_x"), sg("ref_static_y"),
             sg("ref_att_x"), sg("ref_att_y"),

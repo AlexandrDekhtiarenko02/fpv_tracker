@@ -27,6 +27,16 @@ AwbEnable=True (динамическая экспозиция/баланс бе�
 4. pitch в событии писался без свежести attitude — теперь рядом
    att_age_ms той же формулой, что _att_age_ms в process_locked_tracker.
 
+ПРАВКА ПОСЛЕ РЕВЬЮ ВТОРОГО ПРОГОНА (3f977f2): att_age_ms попал в CSV, а
+сам pitch_deg, замороженный на МОМЕНТ ТОГО ЖЕ замера, — нет. Обычный
+fc_pitch в этой же строке пишется каждый кадр и успевает уйти далеко за
+то время, пока cam_jump_* держат значения секундной давности — фильтр
+"cam_jump_detected=True -> смотрим соседний fc_pitch" сравнивал бы
+скачок камеры с ЧУЖИМ, более новым тангажом. cam_jump_pitch_deg делает
+одну запись замера самодостаточной: sample_seq/sample_age_ms/exp_ratio/
+gray_delta/dt_ms/jump/top_saturated/pitch_deg/att_age_ms — всё с ОДНОГО
+и того же 1 Гц момента.
+
 Реальная камера недоступна в offline-прогоне — интеграция в
 camera_callback проверяется по исходному тексту (тот же подход, что
 test_dynamic_ae.py), арифметика — прямым вызовом чистой функции.
@@ -182,7 +192,7 @@ assert "time.monotonic() - _cam_sample_t" in row_body, (
     "строку, а не читаться готовым из словаря — иначе тот же баг "
     "'заморожено на момент замера', который эта правка и чинит")
 for field in ("exp_ratio", "gray_delta", "dt_ms", "jump", "top_saturated",
-             "sample_seq", "att_age_ms"):
+             "sample_seq", "att_age_ms", "pitch_deg"):
     assert ('_cam_shadow_dbg.get("%s")' % field) in row_body, (
         "_capture_flight_row не читает _cam_shadow_dbg.get(%r)" % field)
 print("    CSV-колонки на месте, sample_age_ms — живой пересчёт, не "
