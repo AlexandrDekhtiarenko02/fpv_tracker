@@ -27,6 +27,15 @@ import offline  # noqa: E402
 t = offline.load_tracker()
 t.MOTION_GUARD_ENABLED = False
 t.color_active = False
+# НАЙДЕНО (ревью по 3acbd77): секция D доказывает корректность std ПОСЛЕ
+# addWeighted конкретно, но Auto Template Refresh (по умолчанию ENABLED)
+# и примерка масштаба (SIZE_ADAPT_ENABLED) тоже умеют независимо
+# переписать template_gray за эти же 29 кадров — эвристика "adaptation_
+# allowed==1 + та же форма + содержимое изменилось" их не отличает от
+# настоящего addWeighted. Выключаем оба явно, чтобы секция D проверяла
+# ровно то, что заявлено, а не "какой-то из нескольких механизмов".
+t.AUTO_TEMPLATE_REFRESH_ENABLED = False
+t.SIZE_ADAPT_ENABLED = False
 
 CX, CY = t.LORES_W // 2, t.LORES_H // 2
 R = 40  # покрывает окно поиска при типичном margin
