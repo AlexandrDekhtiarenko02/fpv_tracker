@@ -271,11 +271,51 @@ assert len(_abort_6b) == 1, (
 print("    track_state=TRACKED->HOLD при живом стике и свежем RC -> "
       "abort (не reanchor), controllable=False — nudge не оживил "
       "слежение: %s" % _abort_6b[0])
-set_stick(0)
+assert t._nudge_abort_pending, "тест сам по себе негоден: флаг не выставлен"
+
+print("\n=== 6c. ГЛАВНАЯ НАХОДКА ЭТОГО РЕВЬЮ: после abort НИЧЕГО не "
+      "восстанавливаем руками — гоним ЕСТЕСТВЕННЫЕ следующие кадры (тем "
+      "же неизменным scene, где flow/match вполне может само найти "
+      "tracked_ok=True на промежуточной nudge-позиции) и проверяем, что "
+      "controllable НЕ включился обратно САМ. HOLD не ранний выход — до "
+      "этой правки именно тут automatic control мог вернуться после "
+      "ровно одного 'удачного' кадра, без единого явного действия "
+      "пилота ===")
+set_stick(0)   # стик отпущен по-настоящему — как сделал бы пилот
+_controllable_seen = []
+_track_states_seen = []
+for _ in range(15):
+    _clk.tick(FRAME_DT)
+    t.process_locked_tracker(scene)
+    with t.state_lock:
+        _controllable_seen.append(t.target_controllable)
+    _track_states_seen.append(t.track_state)
+    assert t._nudge_abort_pending, (
+        "_nudge_abort_pending снялся сам, без explicit pilot-действия "
+        "(reset_tracking) — флаг обязан быть персистентным")
+assert not any(_controllable_seen), (
+    "target_controllable стал True хотя бы на одном из %d естественных "
+    "кадров ПОСЛЕ abort без единого explicit pilot-действия — ровно та "
+    "дыра, которую нашло ревью: %s" % (len(_controllable_seen), _controllable_seen))
+print("    %d естественных кадров подряд (track_state по кадрам: %s) — "
+      "target_controllable НИ РАЗУ не стал True без явного действия "
+      "пилота" % (len(_controllable_seen), _track_states_seen))
+
+print("\n=== 6d. Явное действие пилота (reset_tracking — тот же AUX4-"
+      "toggle UX, что уже выводит из LOST/TOGGLE) снимает флаг и "
+      "возвращает нормальную жизнь трекера ===")
+t.reset_tracking(to_acq=False)
+assert not t._nudge_abort_pending, (
+    "reset_tracking() не снял _nudge_abort_pending")
+capture()
 with t.state_lock:
-    t.track_state = t.TRACK_STATE_TRACKED
-    t.target_controllable = True
-tick()
+    _controllable_after_reset = t.target_controllable
+assert _controllable_after_reset, (
+    "после explicit pilot-действия (reset + новый захват) controllable "
+    "обязан снова заработать нормально")
+print("    reset_tracking() снял _nudge_abort_pending; новый захват "
+      "controllable=True — нормальная жизнь восстановлена явным "
+      "действием, не сама по себе")
 
 print("\n=== 7. НАЙДЕНО ревью (п.4): nudge_control_frozen в CSV не "
       "врёт на кадре смены lock_sequence — пишется ПОСЛЕ safety-сброса ===")
@@ -338,6 +378,7 @@ print("    заморозка читается раньше safety-ветки 'n
 print("\n=== 11. CSV: nudge_control_frozen на месте (nudge_settle_"
       "remaining_ms убран вместе с окном устоя) ===")
 assert "nudge_control_frozen," in src
+assert "nudge_abort_pending," in src
 assert "nudge_settle_remaining_ms" not in src, (
     "убранное окно устоя оставило след в CSV/коде — nudge_settle_"
     "remaining_ms всё ещё где-то упоминается")
@@ -345,7 +386,8 @@ i_row = src.index("def _capture_flight_row")
 i_row_end = src.index("\ndef ", i_row + 1)
 row_body = src[i_row:i_row_end]
 assert '_match_dbg.get("nudge_control_frozen")' in row_body
-print("    колонка на месте, окно устоя нигде не осталось")
+assert '_match_dbg.get("nudge_abort_pending")' in row_body
+print("    обе колонки на месте, окно устоя нигде не осталось")
 
 print("\nOK: заморозка control на время ручной коррекции живёт строго "
       "пока стик отклонён, снимается ОДНИМ кадром с reanchor (не смешивая "

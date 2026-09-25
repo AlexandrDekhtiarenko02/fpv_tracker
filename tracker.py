@@ -2300,6 +2300,13 @@ _FLIGHT_LOG_COLUMNS = (
     # окно устоя после reanchor смешивало старый box с уже новой
     # geometry-историей — убрано).
     "nudge_control_frozen,"
+    # nudge_abort_pending=1 — nudge прервался НЕ настоящим отпусканием
+    # (track_state ушёл из TRACKED, RC/AUX устарел/пропал) и control
+    # принудительно держится controllable=False на ЛЮБОМ числе
+    # последующих кадров, пока пилот явно не сбросит флаг (reset_
+    # tracking — тот же AUX4-toggle UX, что и выход из LOST/TOGGLE).
+    # Персистентно, не одна кадровая метка (ревью по dfdde00).
+    "nudge_abort_pending,"
     # ДИАГНОСТИКА ВХОДА. Сырые значения AUX2/AUX3 (копии правого стика,
     # заведённые в обход маски MSP-оверрайда) и свежесть MSP_RC — чтобы на
     # бортовом логе сразу было видно, что копии стика реально приходят и
@@ -6797,7 +6804,7 @@ def reset_tracking(to_acq=False):
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
     global _nudge_was_active, _nudge_prev_t, _adapt_frozen_posle_reanchor
-    global _nudge_frozen_box
+    global _nudge_frozen_box, _nudge_abort_pending
     global _shadow_track_dbg
     global _shadow_fresh_candidate, _shadow_fresh_candidate_w, _shadow_fresh_candidate_h
     global _shadow_fresh_candidate_std, _shadow_fresh_candidate_t, _shadow_fresh_candidate_epoch
@@ -6841,6 +6848,12 @@ def reset_tracking(to_acq=False):
     # через полный сброс значило бы на СЛЕДУЮЩЕМ локе control мог бы
     # улететь к box совсем другого захвата.
     _nudge_frozen_box = None
+    # Явное действие пилота (AUX4 off, тот же путь, что reset_tracking
+    # уже вызывает на falling_aux) — единственное, что снимает abort-
+    # флаг (см. докстрока у объявления _nudge_abort_pending). Полный
+    # сброс лока значит "пилот сознательно вышел из текущего лока",
+    # ровно то explicit-действие, которого не хватало.
+    _nudge_abort_pending = False
     color_separation = 0.0
     template_std = 0.0
     prev_gray = None
@@ -7678,7 +7691,8 @@ def _update_control_from_target_impl():
     global _shadow_trust_ema, _shadow_ctl_dbg
     global _shadow_roll_hold_value, _shadow_pitch_hold_value, _shadow_yaw_hold_value
     global _shadow_pitch_conflict_since_t
-    global _nudge_frozen_box
+    global _nudge_frozen_box, _nudge_abort_pending
+    global target_controllable
 
     with state_lock:
         _live_box = target_box_main
@@ -7686,6 +7700,31 @@ def _update_control_from_target_impl():
         live_thr = app_state.get("rc_throttle", 1500)
         live_thr_ts = app_state.get("rc_throttle_ts", 0.0)
         _cur_lock_seq = lock_sequence
+
+    # НАЙДЕНО (ревью по dfdde00 — SAFETY): abort в process_locked_tracker
+    # ставит controllable=False только на СВОЁМ кадре — HOLD не ранний
+    # выход, и на следующем кадре обычный flow/match мог бы случайно дать
+    # tracked_ok=True на грязной смеси (lock уже промежуточный, prev_
+    # gray/points/template ещё до-nudge) и молча вернуть controllable=
+    # True без реального подтверждения пилотом. Централизуем здесь —
+    # той же точке, что уже перекрывает box заморозкой ниже — ЛЮБОЙ путь,
+    # который попытался бы включить controllable, натыкается на один и
+    # тот же принудительный отказ, пока пилот явно не сбросит флаг
+    # (см. докстрока у _nudge_abort_pending).
+    #
+    # НАЙДЕНО (тест поймал при первом прогоне этой самой правки):
+    # одной ЛОКАЛЬНОЙ переменной controllable здесь мало — она влияет
+    # только на СЧЁТ команды внутри этой функции, а process_locked_
+    # tracker уже успел выставить ГЛОБАЛЬНЫЙ target_controllable=True
+    # РАНЬШЕ, чем эта функция вообще вызвана (по обычному tracked_ok
+    # пути). Внешний потребитель global target_controllable (draw_
+    # overlay_on_frame, fc_io_loop и т.п.) увидел бы True, даже когда
+    # сама команда честно нейтральна — обманчиво. Пишем обратно в
+    # ГЛОБАЛЬНЫЙ флаг тоже, под тем же state_lock.
+    if _nudge_abort_pending and controllable:
+        controllable = False
+        with state_lock:
+            target_controllable = False
 
     # ЗАДЕРЖКА УПРАВЛЕНИЯ НА ВРЕМЯ РУЧНОЙ КОРРЕКЦИИ (см. константы и
     # обоснование у MANUAL_NUDGE_CONTROL_DELAY_ENABLED). _nudge_frozen_box
@@ -7720,6 +7759,7 @@ def _update_control_from_target_impl():
     # nudge_control_frozen=1, хотя код уже выбрал live box несколькими
     # строками выше. Пишем ПОСЛЕ, когда box уже окончательно решён.
     _match_dbg["nudge_control_frozen"] = 1 if box is not _live_box else 0
+    _match_dbg["nudge_abort_pending"] = 1 if _nudge_abort_pending else 0
 
     now_mono = time.monotonic()
     # СЫРОЙ интервал — до dt_ratio(), который его ЗАЖИМАЕТ до DT_MAX (см.
@@ -10289,8 +10329,30 @@ MANUAL_NUDGE_CONTROL_DELAY_ENABLED = True
 # None — control читает живой target_box_main как раньше (нет активной
 # коррекции или задержка выключена). Не-None — control летит по этому
 # box; снимается СТРОГО в момент, когда снимается сам nudge (активный
-# стик кончился или сработал stale-RC abort) — никакого таймера.
+# стик кончился или сработал abort) — никакого таймера.
 _nudge_frozen_box = None
+# НАЙДЕНО (ревью по dfdde00 — SAFETY, третья находка подряд на этом
+# участке). Abort ставит track_state=HOLD/target_controllable=False, но
+# HOLD НЕ является ранним выходом в process_locked_tracker (в отличие от
+# LOST+REQUIRE_AUX_TOGGLE_AFTER_LOST) — на СЛЕДУЮЩЕМ кадре код падает в
+# обычный flow_predict/template_match_locked с грязной смесью состояний
+# (lock_cx/cy — уже промежуточная nudge-позиция, prev_gray/prev_pts/
+# template_gray — ещё ДО начала правки, т.к. flow/match не запускались
+# ни разу за всё время активного nudge). Если ЭТОТ один кадр случайно
+# даст tracked_ok=True, код automatически возвращает track_state=TRACKED/
+# target_controllable=True — то есть "явная отдача управления" длилась
+# бы буквально один кадр, а не до реального подтверждения пилотом.
+#
+# _nudge_abort_pending — персистентный флаг (не одна кадровая метка):
+# ставится на abort, проверяется ЦЕНТРАЛЬНО в _update_control_from_
+# target_impl() (та же точка, что уже проверяет _nudge_frozen_box) и
+# ПРИНУДИТЕЛЬНО держит controllable=False, чем бы ни оказался tracked_ok
+# на любом последующем кадре — независимо от того, какой именно путь
+# кода попытался бы включить controllable обратно. Снимается ТОЛЬКО
+# explicit pilot-действием: reset_tracking() (см. там) — тот же путь,
+# что и AUX4 toggle для выхода из LOST/TOGGLE, то же самое пилот уже
+# знает по существующему UX восстановления после LOST.
+_nudge_abort_pending = False
 
 
 def reanchor_tracker_at_current_box(gray, reason):
@@ -10364,7 +10426,7 @@ def process_locked_tracker(gray, cb_t0=None):
     global template_scale_acc, color_axis
     global lock_w0, lock_h0
     global _nudge_was_active, _nudge_prev_t
-    global _nudge_frozen_box
+    global _nudge_frozen_box, _nudge_abort_pending
     global _shadow_track_dbg
     global _shadow_fresh_candidate, _shadow_fresh_candidate_w, _shadow_fresh_candidate_h
     global _shadow_fresh_candidate_std, _shadow_fresh_candidate_t, _shadow_fresh_candidate_epoch
@@ -10765,6 +10827,17 @@ def process_locked_tracker(gray, cb_t0=None):
         # состояние, переиспользуем существующее.
         _nudge_was_active = False
         _nudge_frozen_box = None
+        # НАЙДЕНО (ревью по dfdde00): HOLD ниже — НЕ ранний выход, на
+        # следующем кадре код падает в обычный flow_predict/match с
+        # грязной смесью (lock_cx/cy уже промежуточные, prev_gray/points/
+        # template ещё до-nudge) — если ОДИН такой кадр случайно даст
+        # tracked_ok=True, controllable вернулось бы в True само, без
+        # реального подтверждения пилотом. Персистентный флаг держит
+        # controllable=False ЦЕНТРАЛЬНО (см. _update_control_from_target_
+        # impl) на ЛЮБОМ числе последующих кадров, пока пилот явно не
+        # сбросит его (reset_tracking, тот же AUX4-toggle UX, что для
+        # выхода из LOST/TOGGLE).
+        _nudge_abort_pending = True
         flight_log.event(
             "MANUAL_NUDGE abort (track_state=%s enabled=%s have_aux=%s "
             "rc_fresh=%s)" % (track_state, MANUAL_NUDGE_ENABLED,
@@ -11806,6 +11879,7 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("manual_nudge"), _match_dbg.get("manual_nudge_dx"),
             _match_dbg.get("manual_nudge_dy"),
             _match_dbg.get("nudge_control_frozen"),
+            _match_dbg.get("nudge_abort_pending"),
             _match_dbg.get("aux2_raw"), _match_dbg.get("aux3_raw"),
             _match_dbg.get("nudge_rc_fresh"),
             _cam_exp_us, _cam_gain, _cam_colour_gain_r, _cam_colour_gain_b,
