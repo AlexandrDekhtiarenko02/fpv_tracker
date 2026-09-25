@@ -146,6 +146,53 @@ assert not _mismatches, (
 print("    %d кадров подряд с гейт-отказом — tmpl_w/tmpl_h/template_std "
       "всё время совпадали с реальным template_gray" % 15)
 
+print("\n=== D. НАЙДЕНО (ревью по b4234e6): секция C проверяла только "
+      "ОТВЕРГНУТЫЙ cur_tmpl. Отдельный, более коварный случай — "
+      "РАЗРЕШЁННАЯ same-size адаптация: build_template() пишет "
+      "template_std от cur_tmpl, а реальный template_gray после "
+      "addWeighted — уже СМЕСЬ старого template и cur_tmpl, другой "
+      "массив с другим std ===")
+t.reset_tracking(to_acq=True)
+with t.state_lock:
+    t.aux4_state = True
+t.acq_wait_left = 0
+t.prev_aux_on = True
+t.track_state = t.TRACK_STATE_ACQ
+scene0 = make_scene(0, periodic=False)
+t.process_locked_tracker(scene0)
+assert t.track_state == t.TRACK_STATE_TRACKED
+_checked_addweighted_frames = 0
+_mismatches_d = []
+_tg_prev = t.template_gray.copy()
+for i in range(1, 30):
+    scene = make_scene(i, periodic=False)
+    t.process_locked_tracker(scene)
+    if t.track_state != t.TRACK_STATE_TRACKED:
+        continue
+    _tg_now = t.template_gray
+    _was_blended = (t._match_dbg.get("template_adaptation_allowed") == 1
+                    and _tg_now.shape == _tg_prev.shape
+                    and not np.array_equal(_tg_now, _tg_prev))
+    if _was_blended:
+        _checked_addweighted_frames += 1
+        _real_std = float(np.std(_tg_now))
+        if abs(t.template_std - _real_std) > 1e-6:
+            _mismatches_d.append(
+                "frame %d: template_std=%.4f != реальный "
+                "np.std(template_gray)=%.4f (после РАЗРЕШЁННОГО "
+                "addWeighted)" % (i, t.template_std, _real_std))
+    _tg_prev = _tg_now.copy()
+assert _checked_addweighted_frames > 0, (
+    "сценарий D должен был застать хотя бы один реально смешанный "
+    "(addWeighted) кадр за 29 — иначе проверка ничего не показывает")
+assert not _mismatches_d, (
+    "template_std разошёлся с реальным template_gray после разрешённого "
+    "addWeighted:\n  " + "\n  ".join(_mismatches_d))
+print("    %d кадров с реальным addWeighted-смешиванием — template_std "
+      "каждый раз совпадал с np.std(смешанного template_gray)"
+      % _checked_addweighted_frames)
+
 print("\nOK: адаптация блокируется на неоднозначном (полосатом) кадре, "
       "работает как прежде на однозначном, и tmpl_w/tmpl_h/template_std "
-      "не расходятся с реальным template_gray, когда cur_tmpl выброшен")
+      "не расходятся с реальным template_gray — ни когда cur_tmpl "
+      "выброшен целиком (C), ни когда он смешан через addWeighted (D)")

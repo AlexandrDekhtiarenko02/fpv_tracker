@@ -6166,6 +6166,31 @@ def build_template(gray, cx, cy, box_w, box_h):
     return tmpl
 
 
+def sync_template_metadata():
+    """Синхронизирует tmpl_w/tmpl_h/template_std с РЕАЛЬНЫМ template_gray
+    (ревью по b4234e6). build_template() пишет их как побочный эффект,
+    но только для ТОГО массива, что сама построила и вернула — если
+    вызывающая сторона потом ТРАНСФОРМИРУЕТ результат (addWeighted-блend
+    старого template с cur_tmpl, resize от другого источника вроде
+    template_base) прежде чем присвоить его template_gray, метаданные
+    остаются от промежуточного массива, не от того, что реально стало
+    template_gray. template_match_locked() сам самолечит tmpl_w/tmpl_h из
+    template_gray.shape в начале каждого вызова (см. комментарий там же
+    про "рамка уезжает на край") — но НЕ template_std, тот ничем больше
+    не подстраховaн.
+
+    Вызывать сразу после КАЖДОГО места, где template_gray реально
+    присваивается новым содержимым (не после build_template(), если её
+    результат тут же выбрасывается — для этого случая свой фикс: сохранить
+    и откатить tmpl_w/tmpl_h/template_std до прежних значений, см.
+    process_locked_tracker)."""
+    global tmpl_w, tmpl_h, template_std
+    if template_gray is None or template_gray.size == 0:
+        return
+    tmpl_h, tmpl_w = template_gray.shape[:2]
+    template_std = float(np.std(template_gray))
+
+
 def _shadow_template_target_size(box_w, box_h):
     """TRACKING SHADOW: чистая арифметика (без изображения) — побитово та
     же формула размера, что build_template() (TEMPLATE_SCALE/MIN/MAX).
@@ -10044,6 +10069,7 @@ def reanchor_tracker_at_current_box(gray, reason):
     _reset_geometry_history(reason)
     _cur_tmpl = build_template(gray, lock_cx, lock_cy, lock_w, lock_h)
     template_gray = _cur_tmpl
+    sync_template_metadata()
     template_base = _cur_tmpl.copy()
     # Накопленный множитель масштаба — относительно template_base. Он
     # только что пересобран РОВНО под текущий lock_w/lock_h, поэтому
@@ -10229,6 +10255,7 @@ def process_locked_tracker(gray, cb_t0=None):
                     color_axis = None
             template_gray = build_template(track_img, lock_cx, lock_cy,
                                            lock_w, lock_h)
+            sync_template_metadata()
             template_base = template_gray.copy()
             template_scale_acc = 1.0
             # Один раз на захват решаем, помогает ли цвет. Если цель и её
@@ -10557,6 +10584,13 @@ def process_locked_tracker(gray, cb_t0=None):
                     template_gray = cv2.addWeighted(
                         template_gray, 1 - TEMPLATE_UPDATE_ALPHA,
                         cur_tmpl, TEMPLATE_UPDATE_ALPHA, 0)
+                    # НАЙДЕНО (ревью по b4234e6): template_std тут иначе
+                    # остаётся от cur_tmpl (построен build_template() выше),
+                    # а реальный template_gray — уже СМЕСЬ старого и
+                    # cur_tmpl. tmpl_w/h не страдают (форма не изменилась),
+                    # но следующий template_match_locked() выбирал бы
+                    # SQDIFF/CCOEFF по std чужого, не смешанного массива.
+                    sync_template_metadata()
                 elif TEMPLATE_RESCALE_ON_SIZE_CHANGE and template_base is not None:
                     # Размер изменился. Пересчитывать НАКОПЛЕННЫЙ шаблон нельзя:
                     # каждый cv2.resize — это интерполяция, то есть размытие, и
@@ -10591,10 +10625,8 @@ def process_locked_tracker(gray, cb_t0=None):
                     # template_gray (resize от template_base), а не
                     # cur_tmpl (кроп ТЕКУЩЕГО кадра) — build_template()
                     # выше посчитал std именно для cur_tmpl, это два
-                    # разных массива. tmpl_w/tmpl_h корректны и без
-                    # пересчёта: это ровно (cur_tmpl.shape[1], [0]),
-                    # тот же размер, в который сейчас отресайзили.
-                    template_std = float(np.std(template_gray))
+                    # разных массива.
+                    sync_template_metadata()
                 else:
                     # cur_tmpl выброшен целиком (shape изменился, а
                     # TEMPLATE_RESCALE_ON_SIZE_CHANGE=False — дефолт):
@@ -10747,6 +10779,15 @@ def process_locked_tracker(gray, cb_t0=None):
                             template_gray = cv2.resize(
                                 template_base, (nw, nh),
                                 interpolation=cv2.INTER_LINEAR)
+                            # НАЙДЕНО (ревью по b4234e6, системный проход по
+                            # всем местам присваивания template_gray): эта
+                            # ветка не зовёт build_template() вовсе — без
+                            # явного sync tmpl_w/h/template_std оставались
+                            # бы от предыдущего build_template()-вызова
+                            # (потенциально много кадров назад), не от
+                            # РЕАЛЬНОГО только что пересобранного
+                            # template_gray.
+                            sync_template_metadata()
                             # Пересчёт из исходного ОТБРАСЫВАЕТ накопленный вид
                             # цели: свет поменялся, ракурс поехал, а мы
                             # возвращаемся к тому, что было при захвате.
@@ -10965,6 +11006,7 @@ def process_locked_tracker(gray, cb_t0=None):
                                         # опознаём.
                                         template_gray = build_template(
                                             gray, lock_cx, lock_cy, lock_w, lock_h)
+                                        sync_template_metadata()
                                         # Свежесобранный template ещё не
                                         # подтверждён повторным измерением —
                                         # та же заморозка addWeighted-
