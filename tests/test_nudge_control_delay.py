@@ -175,37 +175,42 @@ print("    target_vx/vy_smoothed=0.0 сразу после reanchor — "
       "_reset_geometry_history() внутри reanchor реально это делает, а "
       "не только по комментарию")
 
-print("\n=== 6. НАЙДЕНО ревью (п.3, SAFETY): устаревший RC ПОСРЕДИ "
-      "активной правки — авария, НЕ подтверждение. Без reanchor, без "
-      "заморозки, падение в обычную live-логику этого же кадра ===")
-with t.state_lock:
-    _box_before_6 = t.target_box_main
+print("\n=== 6. НАЙДЕНО ревью (п.3 -> a2f5fe0, SAFETY): устаревший RC "
+      "ПОСРЕДИ активной правки — авария, НЕ подтверждение. Без reanchor, "
+      "БЕЗ попытки 'само разобраться' в live-логике — явная отдача "
+      "управления (controllable=False, HOLD), тот же путь, что уже "
+      "безопасно используется для любой другой потери уверенности ===")
 set_stick(ROLL_US)
 tick()
 assert t._match_dbg.get("manual_nudge") == 1, "тест сам по себе негоден"
 assert t._nudge_frozen_box is not None, "тест сам по себе негоден"
-_epoch_before_stale = t.geometry_epoch
 _events = []
 t.flight_log.event = _events.append
 # RC не обновляется — rc_link_ts стареет естественно с мокнутыми часами.
 # МЕЛКИМИ шагами (FRAME_DT каждый), не одним прыжком: один большой прыжок
 # сам пересёк бы НЕСВЯЗАННЫЙ порог frame_gap (FLOW_RASSH_SVEZH_S=0.20с в
 # _update_control_from_target_impl) и вызвал бы _reset_geometry_history
-# по СОВСЕМ ДРУГОЙ причине — тест бы путал два разных источника bump'а
-# geometry_epoch (тот же класс аккуратности, что уже потребовался для
-# cam_jump_dt_ms в Camera Jump Shadow).
+# по СОВСЕМ ДРУГОЙ причине (тот же класс аккуратности, что уже
+# потребовался для cam_jump_dt_ms в Camera Jump Shadow). Останавливаемся
+# РОВНО на кадре, где manual_nudge впервые падает до 0 — это и есть
+# кадр абортирования; дальше track_state уже HOLD, nudge неприменим
+# (_nudge_eligible требует TRACKED), и дальнейшие тики просто дали бы
+# обычную post-HOLD жизнь, не относящуюся к тому, что здесь проверяется.
 _elapsed = 0.0
-while _elapsed <= t.MANUAL_NUDGE_RC_FRESH_S:
+while t._match_dbg.get("manual_nudge") == 1:
     _clk.tick(FRAME_DT)
     _elapsed += FRAME_DT
     t.process_locked_tracker(scene)
-assert t._match_dbg.get("manual_nudge") == 0
-assert t.geometry_epoch == _epoch_before_stale, (
-    "geometry_epoch вырос на кадре stale-RC — значит reanchor всё-таки "
-    "сработал, подтвердив промежуточную (возможно случайную) позицию, "
-    "именно то, что ревью просило НЕ делать")
+    assert _elapsed < 2.0, "тест сам по себе негоден: abort не наступил за 2с"
 assert t._nudge_frozen_box is None, (
     "заморозка не снялась на stale-RC abort")
+with t.state_lock:
+    _controllable_after_abort = t.target_controllable
+assert not _controllable_after_abort, (
+    "target_controllable остался True после abort — управление не "
+    "отдано пилоту, именно то, что ревью просило исправить")
+assert t.track_state == t.TRACK_STATE_HOLD, (
+    "track_state=%r после abort, ожидали HOLD" % t.track_state)
 _abort_events = [e for e in _events if e.startswith("MANUAL_NUDGE abort")]
 assert len(_abort_events) == 1, (
     "ожидали ровно 1 событие MANUAL_NUDGE abort, получили %d: %s"
@@ -213,10 +218,64 @@ assert len(_abort_events) == 1, (
 _reanchor_events = [e for e in _events if e.startswith("REANCHOR")]
 assert not _reanchor_events, (
     "REANCHOR всё-таки случился на stale-RC кадре: %s" % _reanchor_events)
-print("    событие: %s; geometry_epoch не изменился (%d), заморозка "
-      "снята, REANCHOR не вызывался" % (_abort_events[0], t.geometry_epoch))
+print("    событие: %s; track_state=HOLD, target_controllable=False, "
+      "REANCHOR не вызывался" % _abort_events[0])
 set_stick(0)
-tick()   # вернуть RC в норму для дальнейших секций
+with t.state_lock:
+    t.track_state = t.TRACK_STATE_TRACKED
+    t.target_controllable = True
+tick()   # вернуть в TRACKED для дальнейших секций
+
+print("\n=== 6b. НАЙДЕНО ревью (та самая находка, ради которой сделан "
+      "_nudge_genuine_release): track_state сам ушёл из TRACKED ПОСРЕДИ "
+      "активной правки — RC при этом ИДЕАЛЬНО свежий, стик всё ещё "
+      "отклонён. Старая узкая _nudge_rc_stale_abort пропускала ЭТОТ "
+      "случай целиком (она проверяла только RC) — код падал в generic "
+      "'оператор закончил', reanchor'ил И САМ возвращал track_state="
+      "TRACKED/controllable=True, оживляя слежение, которое система "
+      "только что сама сочла ненадёжным ===")
+set_stick(ROLL_US)
+tick()
+assert t._match_dbg.get("manual_nudge") == 1, "тест сам по себе негоден"
+assert t._nudge_frozen_box is not None, "тест сам по себе негоден"
+# Стик ОСТАЁТСЯ отклонённым, set_stick() не трогаем — единственное, что
+# меняется, это track_state, имитируя трекер, который сам решил, что
+# больше не уверен (реальный путь для этого — отдельный вопрос, здесь
+# важно само условие "track_state != TRACKED при живом стике"). RC/AUX
+# в диагностике покажется False не потому, что связь пропала, а потому,
+# что _nudge_eligible падает РАНЬШЕ, чем код вообще их проверяет — это
+# ожидаемо: важно здесь именно то, что track_state сам по себе, без
+# какого-либо участия RC, уже обязан вести к abort, а не к reanchor.
+with t.state_lock:
+    t.track_state = t.TRACK_STATE_HOLD
+_events2 = []
+t.flight_log.event = _events2.append
+_clk.tick(FRAME_DT)
+t.process_locked_tracker(scene)
+assert t._nudge_frozen_box is None, (
+    "заморозка пережила потерю eligibility по track_state")
+with t.state_lock:
+    _controllable_6b = t.target_controllable
+assert not _controllable_6b, (
+    "target_controllable=True после потери eligibility — nudge оживил "
+    "слежение, которое трекер сам считал ненадёжным (ровно та ошибка, "
+    "которую нашло ревью)")
+_reanchor_6b = [e for e in _events2 if e.startswith("REANCHOR")]
+assert not _reanchor_6b, (
+    "REANCHOR вызван на кадре потери eligibility (не RC!) — старый "
+    "узкий фикс пропускал именно этот путь: %s" % _reanchor_6b)
+_abort_6b = [e for e in _events2 if e.startswith("MANUAL_NUDGE abort")]
+assert len(_abort_6b) == 1, (
+    "ожидали ровно 1 abort-событие на потерю eligibility, получили %d"
+    % len(_abort_6b))
+print("    track_state=TRACKED->HOLD при живом стике и свежем RC -> "
+      "abort (не reanchor), controllable=False — nudge не оживил "
+      "слежение: %s" % _abort_6b[0])
+set_stick(0)
+with t.state_lock:
+    t.track_state = t.TRACK_STATE_TRACKED
+    t.target_controllable = True
+tick()
 
 print("\n=== 7. НАЙДЕНО ревью (п.4): nudge_control_frozen в CSV не "
       "врёт на кадре смены lock_sequence — пишется ПОСЛЕ safety-сброса ===")

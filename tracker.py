@@ -10251,16 +10251,33 @@ _adapt_frozen_posle_reanchor = False
 # history) — они и сглаживают сам шаг команды, если целевая точка после
 # reanchor заметно отличается от прежней.
 #
-# STALE RC — АВАРИЯ, НЕ ПОДТВЕРЖДЕНИЕ (ревью по c6fb464, п.3). Раньше
-# "стик в дедбенде" и "AUX/RC-сигнал пропал ПОСРЕДИ активной правки" вели
-# к одному и тому же коду — elif _nudge_was_active: трактовал оба случая
-# как «оператор сознательно закончил», подтверждая reanchor'ом ту
-# промежуточную позицию, на которой прервалась связь. Теперь эти случаи
-# различены (_nudge_rc_stale_abort ниже): устаревший RC ПОСРЕДИ правки
-# — НЕ вызывает reanchor и не запускает заморозку, просто снимает
-# nudge-состояние и падает в обычную live-логику этого же кадра, отдавая
-# решение "годится ли текущая позиция" flow/match, а не собственному
-# предположению.
+# ПОТЕРЯ ELIGIBILITY ПОСРЕДИ ПРАВКИ — АВАРИЯ, НЕ ПОДТВЕРЖДЕНИЕ (ревью по
+# c6fb464/a2f5fe0, две находки подряд). Раньше "стик в дедбенде" и "AUX/
+# RC-сигнал пропал ПОСРЕДИ активной правки" вели к одному и тому же коду
+# — elif _nudge_was_active: трактовал оба случая как «оператор сознательно
+# закончил», подтверждая reanchor'ом ту промежуточную позицию, на которой
+# прервалась связь. Первый фикс (a2f5fe0) закрыл только stale-RC частный
+# случай — но _nudge_eligible САМА требует track_state==TRACKED, и если
+# он ушёл в HOLD/иное ПОСРЕДИ активной правки (по любой причине, не
+# только RC), _nudge_rc_stale_abort была False (требовала _nudge_
+# eligible=True), и код всё равно reanchor'ил, попутно САМ возвращая
+# track_state=TRACKED/target_controllable=True — то есть nudge мог
+# ОЖИВИТЬ слежение, которое система только что сама сочла ненадёжным,
+# прямо против принципа в комментарии выше.
+#
+# ТЕПЕРЬ (_nudge_genuine_release ниже): настоящим отпусканием считается
+# ТОЛЬКО track_state всё ещё TRACKED + свежие валидные AUX-данные,
+# подтверждающие именно дедбенд. Любая другая причина, по которой
+# _nudge_active стал False, — авария. На аварии: НЕ reanchor, НЕ
+# заморозка control, и (вторая находка того же ревью) НЕ попытка дать
+# обычной live-логике этого же кадра "самой решить" — lock_cx/lock_cy
+# всё ещё на последней ПРОМЕЖУТОЧНОЙ, не подтверждённой позиции, а
+# template/flow-history ещё от СТАРОЙ, до неё, so падение в flow/match
+# было бы попыткой понять смысл этой смеси. Вместо этого — явная и
+# осознанная отдача: target_controllable=False, track_state=HOLD, тот же
+# lost_frames/HOLD_FRAMES путь, что уже безопасно используется для ЛЮБОЙ
+# другой потери уверенности (см. конец process_locked_tracker) — не
+# изобретаем новое состояние, переиспользуем существующее.
 #
 # БЕЗОПАСНОСТЬ. _update_control_from_target_impl() читает box ТОЛЬКО из
 # _nudge_frozen_box/target_box_main — оба всегда валидный, недавно
@@ -10629,19 +10646,22 @@ def process_locked_tracker(gray, cb_t0=None):
                 _nudge_dy = (MANUAL_NUDGE_PITCH_SIGN * _pitch_norm
                             * MANUAL_NUDGE_MAX_PX_S * _nudge_dt)
 
-    # НАЙДЕНО (ревью по c6fb464, п.3 — SAFETY): "стик в дедбенде" и
-    # "AUX/RC-сигнал пропал ПОСРЕДИ активной правки" раньше вели к
-    # ОДНОМУ И ТОМУ ЖЕ коду ниже (elif _nudge_was_active:), который
-    # трактует оба случая как «оператор сознательно закончил» и
-    # подтверждает reanchor'ом текущую позицию. Для стика в дедбенде это
-    # верно. Для пропавшего RC — нет: это авария связи, а не решение
-    # оператора, и подтверждать НЕЗАКОНЧЕННУЮ коррекцию reanchor'ом
-    # опасно. Различаем: если nudge был активен, всё ещё разрешён по
-    # track_state, но валидных свежих AUX-данных в ЭТОМ кадре нет — это
-    # авария, не согласие.
-    _nudge_rc_stale_abort = (
-        _nudge_was_active and _nudge_eligible
-        and not (_have_aux and _nudge_rc_fresh))
+    # НАЙДЕНО (ревью по a2f5fe0 — SAFETY, обобщение фикса по c6fb464
+    # п.3). Настоящим отпусканием стика считается ТОЛЬКО track_state
+    # всё ещё TRACKED (_nudge_eligible) И валидные свежие AUX-данные в
+    # ЭТОМ кадре (_have_aux and _nudge_rc_fresh), подтверждающие именно
+    # дедбенд, а не отсутствие данных. Раньше эту роль играла узкая
+    # _nudge_rc_stale_abort (только RC), и она НИЧЕГО не говорила про
+    # track_state — если он менялся на НЕ-TRACKED ПОСРЕДИ активной
+    # правки по ЛЮБОЙ другой причине, _nudge_eligible сама становилась
+    # False, узкая проверка тоже давала False, и код всё равно падал в
+    # generic "оператор закончил" — то есть nudge мог САМ вернуть
+    # track_state=TRACKED/controllable=True вопреки тому, что система
+    # сама только что ушла из TRACKED. _nudge_genuine_release закрывает
+    # это целиком:
+    # НЕ проверяет узкий "RC устарел", а прямо требует ВСЕХ условий,
+    # при которых действительно можно доверять "стик в дедбенде".
+    _nudge_genuine_release = _nudge_eligible and _have_aux and _nudge_rc_fresh
 
     if not _nudge_active:
         # Стик в мёртвой зоне, RC несвежий или nudge недопустим в этом
@@ -10685,19 +10705,7 @@ def process_locked_tracker(gray, cb_t0=None):
             overlay_color = COLOR_GREEN
         update_control_from_target()
         return
-    elif _nudge_rc_stale_abort:
-        # АВАРИЙНЫЙ ВЫХОД (ревью по c6fb464, п.3 — SAFETY). RC/AUX пропал
-        # ПОСРЕДИ активной правки — это НЕ решение оператора закончить, а
-        # обрыв связи. НЕ вызываем reanchor (не подтверждаем промежуточную,
-        # возможно случайную позицию), НЕ ставим заморозку control — просто
-        # снимаем nudge-состояние и падаем дальше, в обычную live-логику
-        # ЭТОГО ЖЕ кадра (flow_predict/template_match_locked ниже), как на
-        # любом обычном TRACKED-кадре. Решение "годится ли текущая позиция"
-        # отдаётся flow/match, не берётся на веру автоматически.
-        _nudge_was_active = False
-        _nudge_frozen_box = None
-        flight_log.event("MANUAL_NUDGE abort (RC/AUX stale)")
-    elif _nudge_was_active:
+    elif _nudge_was_active and _nudge_genuine_release:
         # Стик вернулся в мёртвую зону — оператор закончил правку. Мягкая
         # перепривязка ВНУТРИ TRACKED: новые flow-точки на новом месте,
         # новая geometry_epoch, адаптация шаблона на паузе до первого
@@ -10735,6 +10743,41 @@ def process_locked_tracker(gray, cb_t0=None):
             target_box_main = box
             overlay_text = "TRACKED"
             overlay_color = COLOR_RED
+        update_control_from_target()
+        return
+    elif _nudge_was_active:
+        # АВАРИЙНЫЙ ВЫХОД (ревью по a2f5fe0 — SAFETY, обобщение фикса по
+        # c6fb464 п.3): nudge был активен, а _nudge_genuine_release=False
+        # — то есть это НЕ подтверждённое дедбендом отпускание (track_
+        # state ушёл из TRACKED, MANUAL_NUDGE выключили на лету, RC/AUX
+        # устарел или пропал — причина неважна, важно что мы НЕ можем
+        # честно сказать "оператор сознательно закончил"). НЕ reanchor
+        # (не подтверждаем промежуточную, возможно случайную позицию),
+        # НЕ заморозка control. И, ВАЖНО (вторая находка того же ревью):
+        # НЕ падение в обычную live-логику этого же кадра — lock_cx/
+        # lock_cy всё ещё на непроверенной промежуточной позиции, а
+        # template/flow-history ещё от СТАРОЙ, до неё; пытаться "само
+        # разобраться" на этой смеси не безопаснее, чем reanchor.
+        # Вместо этого — явная, осознанная отдача управления: тот же
+        # target_controllable=False / track_state=HOLD / lost_frames
+        # путь, что уже безопасно обрабатывает ЛЮБУЮ другую потерю
+        # уверенности (см. конец функции) — не изобретаем новое
+        # состояние, переиспользуем существующее.
+        _nudge_was_active = False
+        _nudge_frozen_box = None
+        flight_log.event(
+            "MANUAL_NUDGE abort (track_state=%s enabled=%s have_aux=%s "
+            "rc_fresh=%s)" % (track_state, MANUAL_NUDGE_ENABLED,
+                              _have_aux, _nudge_rc_fresh))
+        lost_frames += 1
+        box = lores_box_to_main(lock_cx, lock_cy, lock_w, lock_h)
+        with state_lock:
+            track_state = TRACK_STATE_HOLD
+            target_visible = True
+            target_controllable = False
+            target_box_main = box
+            overlay_text = "HOLD"
+            overlay_color = COLOR_YELLOW
         update_control_from_target()
         return
 
