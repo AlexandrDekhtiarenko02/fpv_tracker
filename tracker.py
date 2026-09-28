@@ -2307,6 +2307,16 @@ _FLIGHT_LOG_COLUMNS = (
     # tracking — тот же AUX4-toggle UX, что и выход из LOST/TOGGLE).
     # Персистентно, не одна кадровая метка (ревью по dfdde00).
     "nudge_abort_pending,"
+    # nudge_suspended=1 — Tier-1: серия правок ещё "в процессе" (track_
+    # state не терялся), но AUX/RC ЭТОГО кадра не подтверждают ни
+    # дедбенд, ни отклонение (обычно один пропущенный опрос MSP — см.
+    # MANUAL_NUDGE_SUSPEND_TIMEOUT_S). control приостановлен, но БЕЗ
+    # reanchor и без персистентного abort — разрешится само на первом же
+    # кадре со свежими данными, без explicit reset. Если тянется дольше
+    # таймаута — эскалирует в nudge_abort_pending (ревью по c73aa24,
+    # разбор борта: 59/63 сессий ложно доходили до abort из-за
+    # транспортного джиттера MSP).
+    "nudge_suspended,"
     # ДИАГНОСТИКА ВХОДА. Сырые значения AUX2/AUX3 (копии правого стика,
     # заведённые в обход маски MSP-оверрайда) и свежесть MSP_RC — чтобы на
     # бортовом логе сразу было видно, что копии стика реально приходят и
@@ -6804,7 +6814,7 @@ def reset_tracking(to_acq=False):
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
     global _nudge_was_active, _nudge_prev_t, _adapt_frozen_posle_reanchor
-    global _nudge_frozen_box, _nudge_abort_pending
+    global _nudge_frozen_box, _nudge_abort_pending, _nudge_suspended_since_t
     global _shadow_track_dbg
     global _shadow_fresh_candidate, _shadow_fresh_candidate_w, _shadow_fresh_candidate_h
     global _shadow_fresh_candidate_std, _shadow_fresh_candidate_t, _shadow_fresh_candidate_epoch
@@ -6897,6 +6907,11 @@ def reset_tracking(to_acq=False):
     # AUX off), поэтому здесь и чистим.
     _nudge_was_active = False
     _nudge_prev_t = None
+    # Tier-1 таймер "краткого transport gap" (см. MANUAL_NUDGE_SUSPEND_
+    # TIMEOUT_S) относится к ТЕКУЩЕЙ серии правок на ТЕКУЩЕМ локе — та же
+    # причина, что и для _nudge_was_active/_nudge_prev_t выше: новый заход
+    # не должен унаследовать чужой, уже бессмысленный отсчёт.
+    _nudge_suspended_since_t = None
     _adapt_frozen_posle_reanchor = False
 
 # =========================================================
@@ -7691,7 +7706,7 @@ def _update_control_from_target_impl():
     global _shadow_trust_ema, _shadow_ctl_dbg
     global _shadow_roll_hold_value, _shadow_pitch_hold_value, _shadow_yaw_hold_value
     global _shadow_pitch_conflict_since_t
-    global _nudge_frozen_box, _nudge_abort_pending
+    global _nudge_frozen_box, _nudge_abort_pending, _nudge_suspended_since_t
     global target_controllable
 
     with state_lock:
@@ -7760,6 +7775,7 @@ def _update_control_from_target_impl():
     # строками выше. Пишем ПОСЛЕ, когда box уже окончательно решён.
     _match_dbg["nudge_control_frozen"] = 1 if box is not _live_box else 0
     _match_dbg["nudge_abort_pending"] = 1 if _nudge_abort_pending else 0
+    _match_dbg["nudge_suspended"] = 1 if _nudge_suspended_since_t is not None else 0
 
     now_mono = time.monotonic()
     # СЫРОЙ интервал — до dt_ratio(), который его ЗАЖИМАЕТ до DT_MAX (см.
@@ -10354,6 +10370,48 @@ _nudge_frozen_box = None
 # знает по существующему UX восстановления после LOST.
 _nudge_abort_pending = False
 
+# --- КРАТКИЙ RC/AUX-РАЗРЫВ != ОТПУСКАНИЕ И != АВАРИЯ (ревью по c73aa24,
+# разбор 96 заходов 25.09.2026 на борту). ---
+#
+# НАХОДКА. На борту "MANUAL_NUDGE start=64, end=4, abort=59" — 59 из 63
+# сессий коррекции заканчивались ПЕРСИСТЕНТНЫМ abort вместо нормального
+# отпускания. Причина: MANUAL_NUDGE_RC_FRESH_S=0.35с (то же окно, что и
+# у основного приёмника) — ОДИН пропущенный опрос MSP (обычный transport
+# jitter, не обрыв связи) уже даёт rc_fresh=False; предыдущая версия
+# (dfdde00) трактовала это ТОЧНО так же, как реальную, устойчивую потерю
+# eligibility — сразу персистентный abort, требующий explicit reset.
+# Итог: почти любая ручная коррекция после dfdde00 технически "работала
+# безопасно", но practически была почти непригодна — пилот видел "подвинул
+# рамку -> отпустил -> control не вернулся" на подавляющем большинстве
+# попыток.
+#
+# ТРИ РАЗНЫХ СЛУЧАЯ, раньше слитые в один "не подтверждённое отпускание":
+#   1. Короткий transport gap (RC/AUX на секунду устарел, но стик и
+#      track_state в остальном в порядке) — САМ ПО СЕБЕ не решение
+#      пилота и не авария. Безопасно приостановить control (тот же
+#      принцип "не автоматика решает"), НЕ reanchor'ить, НЕ уходить в
+#      персистентный abort — просто ждать.
+#   2. Подтверждённое нейтральное положение стика (eligible + свежие
+#      данные + внутри дедбенда) — настоящее отпускание, как и раньше.
+#   3. Реальная, устойчивая потеря eligibility (track_state ушёл из
+#      TRACKED, MANUAL_NUDGE выключили) ИЛИ gap #1 не разрешился за
+#      MANUAL_NUDGE_SUSPEND_TIMEOUT_S — это авария, персистентный abort
+#      как раньше, explicit reset обязателен.
+#
+# _nudge_suspended_since_t — момент начала ТЕКУЩЕГО gap (случай 1), None
+# вне подозрительного периода. Пока не истёк MANUAL_NUDGE_SUSPEND_
+# TIMEOUT_S: control ПРИОСТАНОВЛЕН (controllable=False, как при abort),
+# но _nudge_frozen_box/_nudge_was_active НЕ трогаются — сессия остаётся
+# "в процессе", и как только придёт кадр с подтверждённым нейтральным
+# стиком (случай 2), это разрешится обычным reanchor'ом, БЕЗ explicit
+# reset. Если стик за это время снова окажется отклонён (данные
+# вернулись, стик всё ещё в руке) — просто продолжаем активный nudge как
+# ни в чём не бывало. REQUIRE_AUX_TOGGLE_AFTER_LOST для сравнения решает
+# ту же задачу класса "не путать временное с постоянным" на стороне
+# LOST — тот же принцип, другая часть кода.
+MANUAL_NUDGE_SUSPEND_TIMEOUT_S = 1.5
+_nudge_suspended_since_t = None
+
 
 def reanchor_tracker_at_current_box(gray, reason):
     """Мягкая перепривязка ВНУТРИ TRACKED, без LOST->ACQ (ТЗ §12).
@@ -10426,7 +10484,7 @@ def process_locked_tracker(gray, cb_t0=None):
     global template_scale_acc, color_axis
     global lock_w0, lock_h0
     global _nudge_was_active, _nudge_prev_t
-    global _nudge_frozen_box, _nudge_abort_pending
+    global _nudge_frozen_box, _nudge_abort_pending, _nudge_suspended_since_t
     global _shadow_track_dbg
     global _shadow_fresh_candidate, _shadow_fresh_candidate_w, _shadow_fresh_candidate_h
     global _shadow_fresh_candidate_std, _shadow_fresh_candidate_t, _shadow_fresh_candidate_epoch
@@ -10724,6 +10782,14 @@ def process_locked_tracker(gray, cb_t0=None):
     # НЕ проверяет узкий "RC устарел", а прямо требует ВСЕХ условий,
     # при которых действительно можно доверять "стик в дедбенде".
     _nudge_genuine_release = _nudge_eligible and _have_aux and _nudge_rc_fresh
+    # НАЙДЕНО (ревью по c73aa24): не всякая "не genuine_release" причина
+    # одинаково серьёзна. track_state ушёл из TRACKED (или сам nudge
+    # выключили) — решение САМОЙ системы, настоящая потеря eligibility,
+    # нет смысла ждать. А вот _nudge_eligible=True при недостающих/
+    # устаревших AUX-данных — обычно просто transport jitter (см.
+    # MANUAL_NUDGE_SUSPEND_TIMEOUT_S ниже) и заслуживает короткой отсрочки
+    # перед тем, как считаться аварией.
+    _nudge_track_ineligible = not _nudge_eligible
 
     if not _nudge_active:
         # Стик в мёртвой зоне, RC несвежий или nudge недопустим в этом
@@ -10754,6 +10820,11 @@ def process_locked_tracker(gray, cb_t0=None):
                 with state_lock:
                     _nudge_frozen_box = target_box_main
         _nudge_was_active = True
+        # Данные снова свежие и стик снова отклонён — если это было
+        # продолжение после краткого transport gap (Tier 1 ниже), гасим
+        # его отсчёт: пилот стик не отпускал, это была просто пауза в
+        # телеметрии, а не решение закончить правку.
+        _nudge_suspended_since_t = None
         lock_cx = float(clamp(lock_cx + _nudge_dx, 0, LORES_W - 1))
         lock_cy = float(clamp(lock_cy + _nudge_dy, 0, LORES_H - 1))
         lost_frames = 0
@@ -10771,7 +10842,11 @@ def process_locked_tracker(gray, cb_t0=None):
         # Стик вернулся в мёртвую зону — оператор закончил правку. Мягкая
         # перепривязка ВНУТРИ TRACKED: новые flow-точки на новом месте,
         # новая geometry_epoch, адаптация шаблона на паузе до первого
-        # свежего измерения (см. reanchor_tracker_at_current_box).
+        # свежего измерения (см. reanchor_tracker_at_current_box). Тот же
+        # путь и после краткого Tier-1 gap — genuine_release НЕ зависит
+        # от того, была ли перед этим приостановка: подтверждённый
+        # нейтральный стик закрывает серию правок чисто, без explicit
+        # reset (ревью по c73aa24, случай "короткий gap").
         #
         # ВОЗВРАТ ОБЯЗАТЕЛЕН ЗДЕСЬ, а не падение дальше в flow_predict.
         # reanchor только что поставил prev_gray = gray.copy() — сравнить
@@ -10782,6 +10857,7 @@ def process_locked_tracker(gray, cb_t0=None):
         # измерение появится ровно со СЛЕДУЮЩЕГО кадра, когда prev_gray
         # и gray разойдутся по-настоящему.
         _nudge_was_active = False
+        _nudge_suspended_since_t = None
         flight_log.event("MANUAL_NUDGE end")
         reanchor_tracker_at_current_box(gray, "manual_reanchor")
         # Заморозку снимаем СРАЗУ, тем же кадром, что и сам reanchor — не
@@ -10807,25 +10883,89 @@ def process_locked_tracker(gray, cb_t0=None):
             overlay_color = COLOR_RED
         update_control_from_target()
         return
-    elif _nudge_was_active:
-        # АВАРИЙНЫЙ ВЫХОД (ревью по a2f5fe0 — SAFETY, обобщение фикса по
-        # c6fb464 п.3): nudge был активен, а _nudge_genuine_release=False
-        # — то есть это НЕ подтверждённое дедбендом отпускание (track_
-        # state ушёл из TRACKED, MANUAL_NUDGE выключили на лету, RC/AUX
-        # устарел или пропал — причина неважна, важно что мы НЕ можем
-        # честно сказать "оператор сознательно закончил"). НЕ reanchor
-        # (не подтверждаем промежуточную, возможно случайную позицию),
-        # НЕ заморозка control. И, ВАЖНО (вторая находка того же ревью):
-        # НЕ падение в обычную live-логику этого же кадра — lock_cx/
-        # lock_cy всё ещё на непроверенной промежуточной позиции, а
-        # template/flow-history ещё от СТАРОЙ, до неё; пытаться "само
-        # разобраться" на этой смеси не безопаснее, чем reanchor.
-        # Вместо этого — явная, осознанная отдача управления: тот же
-        # target_controllable=False / track_state=HOLD / lost_frames
-        # путь, что уже безопасно обрабатывает ЛЮБУЮ другую потерю
-        # уверенности (см. конец функции) — не изобретаем новое
-        # состояние, переиспользуем существующее.
+    elif _nudge_was_active and not _nudge_track_ineligible:
+        # НАЙДЕНО (ревью по c73aa24, разбор борта: 59 из 63 сессий коррекции
+        # заканчивались персистентным abort вместо нормального отпускания).
+        # track_state всё ещё TRACKED (не _nudge_track_ineligible), но
+        # AUX-данные в ЭТОМ кадре не подтверждают ни дедбенд, ни отклонение
+        # (missing/stale) — обычно ОДИН пропущенный опрос MSP, transport
+        # jitter, а не решение пилота и не авария. Tier 1: приостанавливаем
+        # control (controllable=False — та же безопасная реакция, что и на
+        # аварии), но НЕ reanchor'им, НЕ трогаем _nudge_frozen_box/
+        # _nudge_was_active — серия правок остаётся "в процессе" и
+        # разрешится САМА, без explicit reset, как только придёт кадр с
+        # подтверждёнными данными (genuine_release выше, если стик
+        # действительно отпущен, либо активная ветка сверху, если пилот
+        # стик так и не отпускал). Эскалируем в персистентный abort
+        # (ветка ниже) только если это тянется дольше
+        # MANUAL_NUDGE_SUSPEND_TIMEOUT_S — тогда это уже не jitter.
+        if _nudge_suspended_since_t is None:
+            _nudge_suspended_since_t = time.monotonic()
+            flight_log.event(
+                "MANUAL_NUDGE suspend (track_state=%s have_aux=%s "
+                "rc_fresh=%s)" % (track_state, _have_aux, _nudge_rc_fresh))
+        if time.monotonic() - _nudge_suspended_since_t <= MANUAL_NUDGE_SUSPEND_TIMEOUT_S:
+            box = lores_box_to_main(lock_cx, lock_cy, lock_w, lock_h)
+            with state_lock:
+                target_visible = True
+                target_controllable = False
+                target_box_main = box
+                overlay_text = "NUDGE?"
+                overlay_color = COLOR_YELLOW
+            update_control_from_target()
+            return
+        # Иначе — gap затянулся дольше разумного transport jitter,
+        # падаем в ту же ветку персистентного abort ниже (не дублируем
+        # её тело: снимаем was_active здесь, а _nudge_track_ineligible
+        # заведомо False тут, поэтому явно помечаем причину эскалации).
+        # ДВА события, не одно: "suspend timeout" — специфичная причина
+        # эскалации именно ИЗ Tier 1 (сколько реально длился разрыв), а
+        # общий "MANUAL_NUDGE abort (...)" — тот же формат, что и у
+        # немедленного abort ниже, чтобы офлайн-разбор лога мог считать
+        # ВСЕ аборты одним grep'ом по префиксу, не заботясь о том, через
+        # какую ветку код до них дошёл.
+        flight_log.event(
+            "MANUAL_NUDGE suspend timeout (%.1fs) -> abort"
+            % (time.monotonic() - _nudge_suspended_since_t))
+        flight_log.event(
+            "MANUAL_NUDGE abort (track_state=%s enabled=%s have_aux=%s "
+            "rc_fresh=%s)" % (track_state, MANUAL_NUDGE_ENABLED,
+                              _have_aux, _nudge_rc_fresh))
         _nudge_was_active = False
+        _nudge_suspended_since_t = None
+        _nudge_frozen_box = None
+        _nudge_abort_pending = True
+        lost_frames += 1
+        box = lores_box_to_main(lock_cx, lock_cy, lock_w, lock_h)
+        with state_lock:
+            track_state = TRACK_STATE_HOLD
+            target_visible = True
+            target_controllable = False
+            target_box_main = box
+            overlay_text = "HOLD"
+            overlay_color = COLOR_YELLOW
+        update_control_from_target()
+        return
+    elif _nudge_was_active:
+        # АВАРИЙНЫЙ ВЫХОД, НЕМЕДЛЕННЫЙ (ревью по a2f5fe0 — SAFETY,
+        # обобщение фикса по c6fb464 п.3). Сюда попадаем ТОЛЬКО когда
+        # _nudge_track_ineligible=True — track_state сам ушёл из TRACKED
+        # или MANUAL_NUDGE выключили на лету. В отличие от Tier-1 ветки
+        # выше (краткий AUX/RC gap, см. c73aa24) это решение САМОЙ
+        # системы, не транспортный джиттер — ждать нечего, эскалируем
+        # сразу, без MANUAL_NUDGE_SUSPEND_TIMEOUT_S. НЕ reanchor (не
+        # подтверждаем промежуточную, возможно случайную позицию), НЕ
+        # заморозка control. И (вторая находка ревью по a2f5fe0): НЕ
+        # падение в обычную live-логику этого же кадра — lock_cx/lock_cy
+        # всё ещё на непроверенной промежуточной позиции, а template/
+        # flow-history ещё от СТАРОЙ, до неё; пытаться "само разобраться"
+        # на этой смеси не безопаснее, чем reanchor. Вместо этого —
+        # явная, осознанная отдача управления: тот же target_
+        # controllable=False / track_state=HOLD / lost_frames путь, что
+        # уже безопасно обрабатывает ЛЮБУЮ другую потерю уверенности (см.
+        # конец функции) — не изобретаем новое состояние.
+        _nudge_was_active = False
+        _nudge_suspended_since_t = None
         _nudge_frozen_box = None
         # НАЙДЕНО (ревью по dfdde00): HOLD ниже — НЕ ранний выход, на
         # следующем кадре код падает в обычный flow_predict/match с
@@ -11880,6 +12020,7 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("manual_nudge_dy"),
             _match_dbg.get("nudge_control_frozen"),
             _match_dbg.get("nudge_abort_pending"),
+            _match_dbg.get("nudge_suspended"),
             _match_dbg.get("aux2_raw"), _match_dbg.get("aux3_raw"),
             _match_dbg.get("nudge_rc_fresh"),
             _cam_exp_us, _cam_gain, _cam_colour_gain_r, _cam_colour_gain_b,

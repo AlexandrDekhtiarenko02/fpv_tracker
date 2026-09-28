@@ -1,32 +1,51 @@
 """Задержка control на время ручной коррекции рамки (прямая просьба
 оператора: "мало отвожу стик - рамка не реагирует, сильно отвожу - резко
 перелетает", нужна пауза, пока рамка ещё двигается, чтобы было удобно
-целиться) — ВТОРАЯ версия, после ревью по c6fb464.
+целиться) — ЧЕТВЁРТАЯ версия, после ревью по c73aa24 и разбора бортового
+лога 25.09 (5 CSV, ~110k строк, 96 заходов).
 
 ПЕРВАЯ ВЕРСИЯ держала заморозку ЕЩЁ 1с ПОСЛЕ отпускания стика (окно
-устоя). Ревью нашло это архитектурно неверным: к моменту отпускания
-reanchor_tracker_at_current_box() уже отработал — новая geometry_epoch,
-template пересобран, flow/match снова считаются по новой позиции, а
-control ещё секунду продолжал бы читать СТАРЫЙ box. Смесь двух временных
-состояний, а "резкий скачок reference" не устранялся, а просто
-переносился на секунду позже.
+устоя). Ревью нашло это архитектурно неверным — убрано (c6fb464).
 
-ЭТА ВЕРСИЯ. Заморозка живёт СТРОГО пока стик реально отклонён — снимается
-В ТОТ ЖЕ МОМЕНТ, что и сам reanchor, без отдельного таймера. Переход на
-новую позицию доверен уже существующему, уже проверенному механизму
-reanchor_tracker_at_current_box() -> _reset_geometry_history(): тот
-обнуляет tau/LOS-rate/prev_box_cx,cy/target_vx,vy_smoothed — то есть
-ровно то, что не даёт скачку позиции превратиться в ложную скорость.
-_slew_roll/pitch/yaw НЕ сбрасываются и сглаживают сам шаг команды.
+ВТОРАЯ/ТРЕТЬЯ ВЕРСИИ (a2f5fe0, dfdde00, c73aa24) свели ЛЮБОЕ прерывание
+активной правки, не подтверждённое дедбендом при свежих AUX/RC, к ОДНОМУ
+и тому же персистентному "MANUAL_NUDGE abort" (track_state=HOLD,
+controllable=False до explicit reset_tracking()) — устраняя дыру, при
+которой HOLD не был ранним выходом и controllable мог тихо вернуться
+сам. Бортовой лог 25.09 показал побочный эффект: сессия 14:53:56 дала
+MANUAL_NUDGE start=64, end=4, abort=59 — обычный transport jitter MSP
+(RC/AUX кратко устаревает на пару кадров) на борту читался тем же кодом,
+что и настоящая потеря eligibility, и почти ВСЕГДА эскалировал в
+персистентный abort, хотя пилот стик не отпускал. Оператор явно исключил
+"просто увеличить timeout" — нужна ГРАДАЦИЯ, не более длинный порог.
 
-ВТОРОЙ ФИКС ЭТОГО РЕВЬЮ (безопасность): "стик в дедбенде" и "AUX/RC-
-сигнал пропал ПОСРЕДИ активной правки" раньше вели к одному и тому же
-коду — оба подтверждались reanchor'ом как "оператор закончил". Устаревший
-RC теперь — авария (MANUAL_NUDGE abort), не подтверждение: без reanchor,
-без заморозки, просто падение в обычную live-логику этого же кадра.
+ЭТА ВЕРСИЯ (четвёртая) вводит Tier 1 между "активная правка" и
+"персистентный abort": короткий AUX/RC transport-разрыв ПРИ track_state
+всё ещё TRACKED приостанавливает control (тот же безопасный ответ, что
+и на аварию) БЕЗ reanchor и БЕЗ персистентного abort — серия правок
+остаётся "в процессе" (_nudge_frozen_box/_nudge_was_active не трогаются)
+и разрешается САМА на первом же кадре с подтверждёнными данными: либо
+чистым отпусканием (стик в дедбенде), либо возобновлением активной
+правки (стик всё ещё отклонён) — в обоих случаях без explicit reset,
+override не остаётся защёлкнутым. Настоящая потеря eligibility
+(track_state сам ушёл из TRACKED, или MANUAL_NUDGE выключили на лету)
+по-прежнему эскалирует НЕМЕДЛЕННО, минуя Tier 1 — это решение самой
+системы, ждать нечего. Tier-1 разрыв, который тянется дольше
+MANUAL_NUDGE_SUSPEND_TIMEOUT_S, эскалирует в тот же персистентный abort,
+что и раньше был единственным исходом.
 
-ТРЕТИЙ ФИКС: nudge_control_frozen в CSV пишется ПОСЛЕ проверки смены
-lock_sequence, не до — иначе кадр самой смены мог соврать в логе.
+Заморозка control (снимок ДО-nudge box) по-прежнему живёт СТРОГО пока
+стик реально отклонён ИЛИ идёт Tier-1 разрыв внутри той же серии правок —
+снимается В ТОТ ЖЕ МОМЕНТ, что и сам reanchor, без отдельного таймера.
+Переход на новую позицию доверен уже существующему, уже проверенному
+механизму reanchor_tracker_at_current_box() -> _reset_geometry_history():
+тот обнуляет tau/LOS-rate/prev_box_cx,cy/target_vx,vy_smoothed — то
+есть ровно то, что не даёт скачку позиции превратиться в ложную
+скорость. _slew_roll/pitch/yaw НЕ сбрасываются и сглаживают сам шаг
+команды.
+
+nudge_control_frozen в CSV пишется ПОСЛЕ проверки смены lock_sequence, не
+до — иначе кадр самой смены мог соврать в логе (ревью по c6fb464).
 """
 import io
 import os
@@ -175,15 +194,18 @@ print("    target_vx/vy_smoothed=0.0 сразу после reanchor — "
       "_reset_geometry_history() внутри reanchor реально это делает, а "
       "не только по комментарию")
 
-print("\n=== 6. НАЙДЕНО ревью (п.3 -> a2f5fe0, SAFETY): устаревший RC "
-      "ПОСРЕДИ активной правки — авария, НЕ подтверждение. Без reanchor, "
-      "БЕЗ попытки 'само разобраться' в live-логике — явная отдача "
-      "управления (controllable=False, HOLD), тот же путь, что уже "
-      "безопасно используется для любой другой потери уверенности ===")
+print("\n=== 6. НАЙДЕНО (борт 25.09, ревью по c73aa24): устаревший RC "
+      "ПОСРЕДИ активной правки — это Tier 1 (краткая приостановка), а "
+      "НЕ сразу авария. 59 из 63 бортовых сессий коррекции раньше ложно "
+      "доходили до персистентного abort из-за обычного transport jitter "
+      "MSP (RC/AUX устаревали на пару кадров), хотя пилот стик не "
+      "отпускал и track_state не терял TRACKED — MANUAL_NUDGE_RC_FRESH_S "
+      "просто короче типичного зазора опроса ===")
 set_stick(ROLL_US)
 tick()
 assert t._match_dbg.get("manual_nudge") == 1, "тест сам по себе негоден"
-assert t._nudge_frozen_box is not None, "тест сам по себе негоден"
+_frozen_before_gap = t._nudge_frozen_box
+assert _frozen_before_gap is not None, "тест сам по себе негоден"
 _events = []
 t.flight_log.event = _events.append
 # RC не обновляется — rc_link_ts стареет естественно с мокнутыми часами.
@@ -193,33 +215,83 @@ t.flight_log.event = _events.append
 # по СОВСЕМ ДРУГОЙ причине (тот же класс аккуратности, что уже
 # потребовался для cam_jump_dt_ms в Camera Jump Shadow). Останавливаемся
 # РОВНО на кадре, где manual_nudge впервые падает до 0 — это и есть
-# кадр абортирования; дальше track_state уже HOLD, nudge неприменим
-# (_nudge_eligible требует TRACKED), и дальнейшие тики просто дали бы
-# обычную post-HOLD жизнь, не относящуюся к тому, что здесь проверяется.
+# первый кадр, где данные не подтвердились.
 _elapsed = 0.0
 while t._match_dbg.get("manual_nudge") == 1:
     _clk.tick(FRAME_DT)
     _elapsed += FRAME_DT
     t.process_locked_tracker(scene)
-    assert _elapsed < 2.0, "тест сам по себе негоден: abort не наступил за 2с"
+    assert _elapsed < 2.0, "тест сам по себе негоден: RC не устарел за 2с"
+print("    RC устарел на кадре t+%.3fs — manual_nudge упал до 0" % _elapsed)
+
+print("\n=== 6.1 Первый неподтверждённый кадр: Tier 1 — control "
+      "приостановлен, но БЕЗ reanchor, БЕЗ персистентного abort, "
+      "track_state остаётся TRACKED, замороженный box НЕ сброшен (серия "
+      "правок жива и может разрешиться сама, без explicit reset) ===")
+assert t._nudge_suspended_since_t is not None, (
+    "Tier-1 таймер не запустился на первом же неподтверждённом кадре")
+assert t._nudge_frozen_box == _frozen_before_gap, (
+    "Tier 1 не обязан трогать замороженный box — правка ещё не завершена")
+assert not t._nudge_abort_pending, (
+    "персистентный abort выставился СРАЗУ на первом неподтверждённом "
+    "кадре — Tier 1 обязан дать короткую отсрочку прежде чем считать "
+    "это аварией (нельзя просто увеличить timeout — нужна отсрочка)")
+assert t.track_state == t.TRACK_STATE_TRACKED, (
+    "track_state ушёл из TRACKED на Tier-1 кадре — Tier 1 не авария")
+with t.state_lock:
+    _controllable_tier1 = t.target_controllable
+assert not _controllable_tier1, (
+    "control не приостановлен на Tier-1 кадре — тот же безопасный ответ, "
+    "что и на аварию, обязан сработать и здесь")
+assert t._match_dbg.get("nudge_suspended") == 1
+_suspend_events = [e for e in _events
+                   if e.startswith("MANUAL_NUDGE suspend") and "timeout" not in e]
+assert len(_suspend_events) == 1, (
+    "ожидали ровно 1 событие MANUAL_NUDGE suspend, получили %d: %s"
+    % (len(_suspend_events), _suspend_events))
+print("    Tier 1: controllable=False, track_state=TRACKED, "
+      "_nudge_frozen_box не тронут, _nudge_abort_pending=False, "
+      "событие: %s" % _suspend_events[0])
+
+print("\n=== 6.2 Разрыв тянется дольше MANUAL_NUDGE_SUSPEND_TIMEOUT_S — "
+      "ТОЛЬКО теперь эскалация в персистентный abort (тот же путь, что и "
+      "раньше был единственным: track_state=HOLD, controllable=False, "
+      "explicit reset потребуется) ===")
+_tier1_entry_t = t._nudge_suspended_since_t
+_gap = 0.0
+while _gap <= t.MANUAL_NUDGE_SUSPEND_TIMEOUT_S:
+    _clk.tick(FRAME_DT)
+    _gap = _clk.t - _tier1_entry_t
+    t.process_locked_tracker(scene)
+    assert _gap < t.MANUAL_NUDGE_SUSPEND_TIMEOUT_S + 2.0, (
+        "тест сам по себе негоден: таймаут Tier 1 не наступил")
 assert t._nudge_frozen_box is None, (
-    "заморозка не снялась на stale-RC abort")
+    "заморозка не снялась на эскалации Tier 1 -> abort")
+assert t._nudge_suspended_since_t is None, (
+    "Tier-1 таймер не сброшен на эскалации в персистентный abort")
 with t.state_lock:
     _controllable_after_abort = t.target_controllable
 assert not _controllable_after_abort, (
-    "target_controllable остался True после abort — управление не "
-    "отдано пилоту, именно то, что ревью просило исправить")
+    "target_controllable остался True после эскалации в abort")
 assert t.track_state == t.TRACK_STATE_HOLD, (
-    "track_state=%r после abort, ожидали HOLD" % t.track_state)
+    "track_state=%r после эскалации, ожидали HOLD" % t.track_state)
+assert t._nudge_abort_pending, "abort не выставился после таймаута Tier 1"
 _abort_events = [e for e in _events if e.startswith("MANUAL_NUDGE abort")]
 assert len(_abort_events) == 1, (
-    "ожидали ровно 1 событие MANUAL_NUDGE abort, получили %d: %s"
-    % (len(_abort_events), _abort_events))
+    "ожидали ровно 1 событие MANUAL_NUDGE abort после таймаута, "
+    "получили %d: %s" % (len(_abort_events), _abort_events))
+_timeout_events = [e for e in _events
+                   if e.startswith("MANUAL_NUDGE suspend timeout")]
+assert len(_timeout_events) == 1, (
+    "ожидали событие эскалации 'MANUAL_NUDGE suspend timeout', "
+    "получили %d: %s" % (len(_timeout_events), _timeout_events))
 _reanchor_events = [e for e in _events if e.startswith("REANCHOR")]
 assert not _reanchor_events, (
-    "REANCHOR всё-таки случился на stale-RC кадре: %s" % _reanchor_events)
-print("    событие: %s; track_state=HOLD, target_controllable=False, "
-      "REANCHOR не вызывался" % _abort_events[0])
+    "REANCHOR всё-таки случился при эскалации Tier 1 -> abort: %s"
+    % _reanchor_events)
+print("    разрыв длился %.2fs (>%.1fs): события suspend -> suspend "
+      "timeout -> abort; track_state=HOLD, target_controllable=False, "
+      "REANCHOR не вызывался" % (_gap, t.MANUAL_NUDGE_SUSPEND_TIMEOUT_S))
 set_stick(0)
 with t.state_lock:
     t.track_state = t.TRACK_STATE_TRACKED
@@ -272,6 +344,19 @@ print("    track_state=TRACKED->HOLD при живом стике и свеже�
       "abort (не reanchor), controllable=False — nudge не оживил "
       "слежение: %s" % _abort_6b[0])
 assert t._nudge_abort_pending, "тест сам по себе негоден: флаг не выставлен"
+# НАЙДЕНО (ревью по c73aa24, разбор борта): Tier 1 существует ТОЛЬКО для
+# transport jitter (AUX/RC), а не для настоящей потери eligibility —
+# track_state сам ушёл из TRACKED здесь, а не устарели данные. Эскалация
+# обязана быть НЕМЕДЛЕННОЙ, Tier-1 таймер вообще не должен был завестись.
+_suspend_6b = [e for e in _events2 if e.startswith("MANUAL_NUDGE suspend")]
+assert not _suspend_6b, (
+    "Tier 1 завёлся на потере eligibility (track_state) — обязан "
+    "эскалировать немедленно, минуя Tier 1: %s" % _suspend_6b)
+assert t._nudge_suspended_since_t is None, (
+    "_nudge_suspended_since_t выставлен хотя потеря eligibility обязана "
+    "была эскалировать немедленно, минуя Tier 1")
+print("    Tier 1 не завёлся — потеря eligibility эскалирует немедленно, "
+      "в отличие от краткого AUX/RC gap (см. секцию 6)")
 
 print("\n=== 6c. ГЛАВНАЯ НАХОДКА ЭТОГО РЕВЬЮ: после abort НИЧЕГО не "
       "восстанавливаем руками — гоним ЕСТЕСТВЕННЫЕ следующие кадры (тем "
@@ -307,6 +392,8 @@ print("\n=== 6d. Явное действие пилота (reset_tracking — т
 t.reset_tracking(to_acq=False)
 assert not t._nudge_abort_pending, (
     "reset_tracking() не снял _nudge_abort_pending")
+assert t._nudge_suspended_since_t is None, (
+    "reset_tracking() не снял _nudge_suspended_since_t")
 capture()
 with t.state_lock:
     _controllable_after_reset = t.target_controllable
@@ -316,6 +403,140 @@ assert _controllable_after_reset, (
 print("    reset_tracking() снял _nudge_abort_pending; новый захват "
       "controllable=True — нормальная жизнь восстановлена явным "
       "действием, не сама по себе")
+
+print("\n=== 6e. Краткий gap, который РАЗРЕШАЕТСЯ САМ: активная правка -> "
+      "недолгий RC/AUX разрыв (меньше MANUAL_NUDGE_SUSPEND_TIMEOUT_S) -> "
+      "свежие данные снова, стик НЕЙТРАЛЕН -> чистое отпускание БЕЗ "
+      "explicit reset. Прямое требование по разбору борта 25.09: 'в "
+      "normal-release сценарии override не должен оставаться "
+      "защёлкнутым' ===")
+set_stick(ROLL_US)
+tick()
+assert t._match_dbg.get("manual_nudge") == 1, "тест сам по себе негоден"
+_frozen_6e = t._nudge_frozen_box
+assert _frozen_6e is not None, "тест сам по себе негоден"
+_events_6e = []
+t.flight_log.event = _events_6e.append
+# Короткий разрыв: тикаем МЕЛКИМИ шагами, как в секции 6, до кадра, где
+# RC впервые читается несвежим (manual_nudge падает до 0) — тот же приём,
+# не жёстко заданное число кадров (зависит от MANUAL_NUDGE_RC_FRESH_S).
+_elapsed_6e = 0.0
+while t._match_dbg.get("manual_nudge") == 1:
+    _clk.tick(FRAME_DT)
+    _elapsed_6e += FRAME_DT
+    t.process_locked_tracker(scene)
+    assert _elapsed_6e < 2.0, "тест сам по себе негоден: RC не устарел за 2с"
+assert _elapsed_6e < t.MANUAL_NUDGE_SUSPEND_TIMEOUT_S, (
+    "тест сам по себе негоден: RC устарел уже после таймаута Tier 1 — "
+    "это больше не 'короткий' gap")
+assert t._nudge_suspended_since_t is not None, (
+    "короткий разрыв обязан завести Tier-1 таймер")
+assert t._nudge_frozen_box == _frozen_6e, (
+    "Tier 1 не обязан трогать замороженный box")
+with t.state_lock:
+    assert not t.target_controllable, (
+        "control обязан быть на паузе во время Tier 1")
+# Данные снова свежие, стик В ДЕДБЕНДЕ — подтверждённое отпускание.
+set_stick(0)
+_epoch_before_6e = t.geometry_epoch
+tick()
+assert t._nudge_suspended_since_t is None, (
+    "Tier-1 таймер не сброшен на кадре подтверждённого отпускания")
+assert not t._nudge_abort_pending, (
+    "короткий gap ложно дошёл до персистентного abort — ровно та "
+    "ошибка, из-за которой 59/63 бортовых сессий 25.09 false-abort'ились "
+    "без Tier 1 (см. секцию 6)")
+assert t._nudge_frozen_box is None, (
+    "заморозка пережила подтверждённое отпускание после короткого gap")
+assert t.geometry_epoch == _epoch_before_6e + 1, (
+    "reanchor не сработал на кадре чистого отпускания после Tier 1")
+assert t.track_state == t.TRACK_STATE_TRACKED
+with t.state_lock:
+    _controllable_6e = t.target_controllable
+assert _controllable_6e, (
+    "controllable не вернулся в True на кадре чистого отпускания")
+_reanchor_6e = [e for e in _events_6e if e.startswith("REANCHOR")]
+assert _reanchor_6e, "REANCHOR не залогирован на чистом отпускании"
+_abort_6e = [e for e in _events_6e if e.startswith("MANUAL_NUDGE abort")]
+assert not _abort_6e, (
+    "MANUAL_NUDGE abort залогирован на нормальном отпускании после "
+    "короткого gap: %s" % _abort_6e)
+print("    короткий gap (%.3fs) -> подтверждённый нейтральный стик -> "
+      "reanchor, controllable=True, БЕЗ persistent abort и БЕЗ explicit "
+      "reset" % _elapsed_6e)
+
+# Override реально ЖИВОЙ на дальнейших естественных кадрах — контраст с
+# 6c/6d, где после НАСТОЯЩЕГО abort controllable остаётся заблокирован на
+# любом числе кадров без explicit действия пилота. Здесь проверяем не
+# общее качество слежения (это вне того, что меняет эта правка), а
+# именно то, что МЕХАНИЗМ nudge ничего не защёлкивает повторно: abort-
+# флаг и Tier-1-таймер остаются снятыми на протяжении естественной жизни.
+for _ in range(10):
+    tick()
+    assert not t._nudge_abort_pending, (
+        "_nudge_abort_pending выставился САМ на естественном кадре после "
+        "чистого release через Tier 1 — override оказался защёлкнут "
+        "задним числом")
+    assert t._nudge_suspended_since_t is None, (
+        "Tier-1 таймер завёлся сам на естественном кадре после чистого "
+        "release — не должно быть активного nudge, которому он нужен")
+print("    10 естественных кадров подряд после release — ни abort, ни "
+      "Tier-1 таймер не завелись сами по себе (override не защёлкнут "
+      "механизмом nudge)")
+
+print("\n=== 6f. Краткий gap, а на выходе стик ВСЁ ЕЩЁ отклонён: "
+      "продолжение той же правки, не новое начало — снимок заморозки НЕ "
+      "меняется (control возвращается к ТОЙ ЖЕ до-nudge позиции, что и "
+      "была до gap, а не к позиции в момент возобновления) ===")
+set_stick(ROLL_US)
+tick()
+assert t._match_dbg.get("manual_nudge") == 1, "тест сам по себе негоден"
+_frozen_6f = t._nudge_frozen_box
+assert _frozen_6f is not None, "тест сам по себе негоден"
+_elapsed_6f = 0.0
+while t._match_dbg.get("manual_nudge") == 1:
+    _clk.tick(FRAME_DT)
+    _elapsed_6f += FRAME_DT
+    t.process_locked_tracker(scene)
+    assert _elapsed_6f < 2.0, "тест сам по себе негоден: RC не устарел за 2с"
+assert _elapsed_6f < t.MANUAL_NUDGE_SUSPEND_TIMEOUT_S, (
+    "тест сам по себе негоден: RC устарел уже после таймаута Tier 1 — "
+    "это больше не 'короткий' gap")
+assert t._nudge_suspended_since_t is not None, (
+    "короткий разрыв обязан завести Tier-1 таймер")
+with t.state_lock:
+    assert not t.target_controllable, (
+        "control обязан быть на паузе во время Tier 1")
+# Данные снова свежие, стик ВСЁ ЕЩЁ отклонён — пилот его не отпускал,
+# это была просто пауза в телеметрии.
+set_stick(ROLL_US)
+_epoch_before_6f = t.geometry_epoch
+_events_6f = []
+t.flight_log.event = _events_6f.append
+tick()
+assert t._match_dbg.get("manual_nudge") == 1, (
+    "активный nudge не возобновился при свежих данных и отклонённом стике")
+assert t._nudge_suspended_since_t is None, (
+    "Tier-1 таймер не сброшен при возобновлении активного nudge")
+assert t._nudge_frozen_box == _frozen_6f, (
+    "снимок заморозки изменился при возобновлении — обязан оставаться "
+    "от САМОГО ПЕРВОГО начала этой серии правок, gap её не прерывал")
+assert t.geometry_epoch == _epoch_before_6f, (
+    "reanchor сработал при возобновлении активного nudge — gap не "
+    "должен был расцениваться как отпускание")
+with t.state_lock:
+    _controllable_6f = t.target_controllable
+assert _controllable_6f, (
+    "controllable не вернулся в True при возобновлении активного nudge")
+_reanchor_6f = [e for e in _events_6f if e.startswith("REANCHOR")]
+assert not _reanchor_6f, (
+    "REANCHOR залогирован при возобновлении активного nudge: %s"
+    % _reanchor_6f)
+print("    короткий gap (%.3fs) -> стик всё ещё отклонён -> активный "
+      "nudge возобновился С ТЕМ ЖЕ замороженным box, без reanchor"
+      % _elapsed_6f)
+set_stick(0)
+tick()   # чистое отпускание, вернуть в спокойное TRACKED для секции 7
 
 print("\n=== 7. НАЙДЕНО ревью (п.4): nudge_control_frozen в CSV не "
       "врёт на кадре смены lock_sequence — пишется ПОСЛЕ safety-сброса ===")
@@ -351,17 +572,33 @@ t.MANUAL_NUDGE_CONTROL_DELAY_ENABLED = True
 print("    5 активных кадров nudge при ENABLED=False -> заморозка не "
       "включилась ни разу")
 
-print("\n=== 9. reset_tracking() снимает заморозку — следующий лок не "
-      "наследует чужой box ===")
+print("\n=== 9. reset_tracking() снимает заморозку И Tier-1 таймер — "
+      "следующий лок не наследует чужое состояние ===")
 set_stick(ROLL_US)
 tick()
 assert t._nudge_frozen_box is not None, "тест сам по себе негоден"
+# Заводим Tier-1 таймер ПЕРЕД reset_tracking() — иначе проверка ниже была
+# бы тривиально верна и тогда, когда reset_tracking() вообще не трогает
+# _nudge_suspended_since_t (он и так был бы None, если Tier 1 не начат).
+_elapsed_9 = 0.0
+while t._match_dbg.get("manual_nudge") == 1:
+    _clk.tick(FRAME_DT)
+    _elapsed_9 += FRAME_DT
+    t.process_locked_tracker(scene)
+    assert _elapsed_9 < 2.0, "тест сам по себе негоден: RC не устарел за 2с"
+assert t._nudge_suspended_since_t is not None, (
+    "тест сам по себе негоден: Tier-1 таймер не завёлся")
 t.reset_tracking(to_acq=False)
 assert t._nudge_frozen_box is None, (
     "_nudge_frozen_box пережил reset_tracking()")
+assert t._nudge_suspended_since_t is None, (
+    "_nudge_suspended_since_t пережил reset_tracking() — новый лок мог "
+    "бы унаследовать чужой, уже бессмысленный отсчёт Tier 1")
 set_stick(0)
 capture()
-print("    reset_tracking() очищает _nudge_frozen_box")
+print("    reset_tracking() очищает и _nudge_frozen_box, и "
+      "_nudge_suspended_since_t (проверено из реально заведённого "
+      "состояния Tier 1, не из уже-пустого)")
 
 print("\n=== 10. По исходному тексту: заморозка читается ДО ветки "
       "'not controllable or box is None' — существующая защита не "
@@ -375,10 +612,12 @@ i_safety = src.index("if not controllable or box is None:", i_fn)
 assert i_freeze < i_safety
 print("    заморозка читается раньше safety-ветки 'not controllable'")
 
-print("\n=== 11. CSV: nudge_control_frozen на месте (nudge_settle_"
-      "remaining_ms убран вместе с окном устоя) ===")
+print("\n=== 11. CSV: nudge_control_frozen/nudge_abort_pending/"
+      "nudge_suspended на месте (nudge_settle_remaining_ms убран вместе "
+      "с окном устоя) ===")
 assert "nudge_control_frozen," in src
 assert "nudge_abort_pending," in src
+assert "nudge_suspended," in src
 assert "nudge_settle_remaining_ms" not in src, (
     "убранное окно устоя оставило след в CSV/коде — nudge_settle_"
     "remaining_ms всё ещё где-то упоминается")
@@ -387,11 +626,16 @@ i_row_end = src.index("\ndef ", i_row + 1)
 row_body = src[i_row:i_row_end]
 assert '_match_dbg.get("nudge_control_frozen")' in row_body
 assert '_match_dbg.get("nudge_abort_pending")' in row_body
-print("    обе колонки на месте, окно устоя нигде не осталось")
+assert '_match_dbg.get("nudge_suspended")' in row_body
+print("    все три колонки на месте, окно устоя нигде не осталось")
 
 print("\nOK: заморозка control на время ручной коррекции живёт строго "
       "пока стик отклонён, снимается ОДНИМ кадром с reanchor (не смешивая "
       "старый box с уже новой geometry-историей), переход сглажен уже "
-      "существующим _reset_geometry_history()+slew; устаревший RC "
-      "посреди правки — авария (без reanchor/заморозки), не "
-      "подтверждение; диагностика в CSV не врёт на кадре смены лока")
+      "существующим _reset_geometry_history()+slew; краткий AUX/RC "
+      "transport-разрыв ПОСРЕДИ правки — Tier 1 (пауза control без "
+      "reanchor и без persistent abort, разрешается сам на первом же "
+      "подтверждённом кадре), эскалирует в persistent abort только если "
+      "тянется дольше MANUAL_NUDGE_SUSPEND_TIMEOUT_S; настоящая потеря "
+      "eligibility (track_state) эскалирует немедленно, минуя Tier 1; "
+      "диагностика в CSV не врёт на кадре смены лока")
