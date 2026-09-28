@@ -248,6 +248,52 @@ ACQ_SNAP_MIN_OTN = 2.5
 # медиана почти ноль и любой шум превышает её в разы.
 ACQ_SNAP_MIN_ABS = 4.0
 
+# --- НЕОДНОЗНАЧНЫЙ ПАТЧ ПОД ПРИЦЕЛОМ — ОТКАЗ, А НЕ ДОГАДКА (отчёт 25.09,
+# п.3) ---
+#
+# НАХОДКА. ACQ_SNAP_YADRO_MIN_ABS=4.0 отделяет "неотличимо от фона" от
+# "есть за что цепляться" — но порог ОДИН на весь диапазон между двумя
+# принципиально разными случаями. Замер на модели (см. комментарий у
+# ACQ_SNAP_YADRO_MIN_ABS) сам это показывает:
+#     сосед в 18 px и дальше    0.8-0.9   (ниже порога — верно отвергается)
+#     сосед в 15 px                  5.2   (ВЫШЕ порога 4.0 — принимался бы
+#                                            как "прицел", хотя это хвост
+#                                            чужого объекта, не цель)
+#     сосед в 12 px                 12.9
+#     фактурный предмет             10.2
+#     цель ровно под прицелом       20.7
+# Разрыв между "хвост соседа" (5.2) и "настоящая структура" (10.2+) — вот
+# где на самом деле нужна граница, а не между "фон" и "не фон". До этой
+# правки estimate_initial_target() ВСЕГДА возвращал ok=True (даже когда
+# _nayti_pyatno вообще ничего не нашёл — тогда просто брался сырой прицел
+# с размером по умолчанию) — ровно то, о чём отчёт: "tracker too easily
+# calls itself TRACKED", только на шаг раньше, в момент самого захвата.
+#
+# ЧТО ДЕЛАЕТ. Порог ВЫШЕ уже существующего ACQ_SNAP_YADRO_MIN_ABS/porog_
+# uzko, не вместо него — как множитель ОТ уже адаптивного porog_uzko (тот
+# сам масштабируется с фоном зоны через ACQ_SNAP_YADRO_MIN_OTN), а не
+# отдельное абсолютное число: 5.2/4.0=1.3, 10.2/4.0=2.55 — множитель 2.0
+# чисто разделяет два кластера в приведённом замере, не выдумка "на глаз".
+# Значение НАЧАЛЬНОЕ (архитектура важнее конкретного числа, ТЗ п. "не
+# патчить коэффициентами") — уточняется офлайн-разбором реальных 96
+# заходов (п.3/п.9 отчёта), не подбором на лету.
+#
+# НЕ сравнение с соседними пятнами (это уже пробовали и отвергли — см.
+# докстроку _nayti_pyatno, "Сравнение и было ошибкой") — margin считается
+# ТОЛЬКО от локального фона зоны, ни один сосед никогда не участвует в
+# решении. "Guessing a neighboring object" отчёт просит не делать ВМЕСТО
+# отказа — здесь и вовсе нет такого пути: при отказе acquisition остаётся
+# в ACQ и пробует заново на следующем кадре (тот же путь, что уже
+# существует для "не нашли ничего" — см. process_locked_tracker), не
+# перескакивает ни на что.
+#
+# ТОЛЬКО случай "прицел" (fine-scale под прицелом) — для случая "пятно"
+# (ближайшее к прицелу, когда под самим прицелом пусто) эквивалентных
+# калиброванных на модели чисел нет, и вводить множитель туда без замера
+# значило бы придумывать коэффициент, а не архитектуру. Отдельный вопрос.
+ACQ_AMBIGUOUS_REJECT_ENABLED = True
+ACQ_YADRO_CONFIDENT_MULT = 2.0
+
 ACQ_RADIUS_MAIN = 18
 ACQ_RADIUS_LORES = max(8, int(round(ACQ_RADIUS_MAIN * LORES_W / MAIN_W)))
 
@@ -5501,8 +5547,15 @@ def _nayti_pyatno(gray):
     контрастнее, и захват перекидывало на него с уже наведённой цели. Зона
     поиска включается только тогда, когда под прицелом пусто.
 
-    Возвращает (x, y, причина) в координатах lores, либо None, если в зоне нет
-    ничего выраженного — тогда захват идёт ровно туда, куда навёл пилот.
+    Возвращает (x, y, причина, margin) в координатах lores, либо None, если в
+    зоне нет ничего выраженного вовсе. margin — во сколько раз отклик
+    ПРЕВЫСИЛ свой порог (>= 1.0 по построению — иначе не прошёл бы порог) —
+    НЕ сравнение с соседями (см. выше, почему это ошибка), а мера того,
+    насколько уверенно отклик оторвался от локального фона САМОЙ ЗОНЫ.
+    Разные единицы для "прицел" (uzko/porog_uzko) и "пятно" (sal/porog) —
+    решение об отказе (см. ACQ_AMBIGUOUS_REJECT_ENABLED в estimate_initial_
+    target) использует только margin случая "прицел", у "пятно" пока нет
+    эквивалентных калиброванных на модели чисел (отчёт 25.09, п.3).
     """
     if not ACQ_SNAP_ENABLED:
         return None
@@ -5588,8 +5641,10 @@ def _nayti_pyatno(gray):
             fon_uzko = float(np.median(uzko))
             porog_uzko = max(ACQ_SNAP_YADRO_MIN_ABS,
                              fon_uzko * ACQ_SNAP_YADRO_MIN_OTN)
-            if float(uzko[yy0:yy1, yx0:yx1].max()) >= porog_uzko:
-                return (float(CENTER_X_LORES), float(CENTER_Y_LORES), "прицел")
+            uzko_val = float(uzko[yy0:yy1, yx0:yx1].max())
+            if uzko_val >= porog_uzko:
+                return (float(CENTER_X_LORES), float(CENTER_Y_LORES),
+                       "прицел", uzko_val / max(porog_uzko, 1e-6))
 
         vnutri = rast <= R
         if not np.any(vnutri):
@@ -5597,7 +5652,8 @@ def _nayti_pyatno(gray):
         # Под прицелом пусто — берём БЛИЖАЙШЕЕ, а не самое выраженное: рядом
         # почти всегда найдётся предмет контрастнее, но пилот целился не в него.
         i = int(np.argmin(np.where(vnutri, rast, np.inf)))
-        return (float(px[i]), float(py[i]), "пятно")
+        sal_val = float(sal[ys[i], xs[i]])
+        return (float(px[i]), float(py[i]), "пятно", sal_val / max(porog, 1e-6))
     except Exception:
         return None
 
@@ -5665,6 +5721,19 @@ def estimate_size_at_position_any(gray, px, py):
 
 
 def estimate_initial_target(gray):
+    """Возвращает (tx, ty, lw, lh, ok). ok=False — ЗАХВАТ ОТКЛОНЁН (отчёт
+    25.09, п.3): patch под прицелом неоднозначен, или в зоне поиска нет
+    вообще ничего выраженного. Вызывающая сторона (process_locked_tracker)
+    на ok=False остаётся в ACQ и пробует заново на следующем кадре — тот
+    же путь, что уже существовал для "измерение не удалось", никакого
+    нового состояния. НЕТ пути "раз patch под прицелом сомнителен — возьмём
+    соседний": при отказе tx/ty/lw/lh вообще не используются.
+
+    ДИАГНОСТИКА (отчёт 25.09, п.3: "method, uniqueness/ambiguity of chosen
+    patch, rejection reason") — событие в лог при КАЖДОМ захвате, успешном
+    или нет: acq_method (прицел/пятно/none), margin (см. _nayti_pyatno),
+    и при отказе — явная причина.
+    """
     if ACQ_LOCK_AT_CROSSHAIR_EXACTLY:
         lw = lh = None
         # ЗОНА ПОИСКА. Пилот целится в район цели, а захватываемся мы за то,
@@ -5673,18 +5742,60 @@ def estimate_initial_target(gray):
         # однородной поверхностью зона целиться не мешает.
         tx, ty = float(CENTER_X_LORES), float(CENTER_Y_LORES)
         pyatno = _nayti_pyatno(gray)
+        if pyatno is None and ACQ_AMBIGUOUS_REJECT_ENABLED:
+            # НАЙДЕНО (отчёт 25.09, п.3): раньше ЭТОТ случай тоже давал
+            # ok=True — сырой прицел с размером по умолчанию, без единого
+            # признака того, что тут вообще есть цель. Ровно тезис отчёта
+            # "tracker too easily calls itself TRACKED", на шаг раньше.
+            flight_log.event(
+                "ЗАХВАТ ОТКЛОНЁН: в зоне %d ничего выраженного (method=none)"
+                % ACQ_SNAP_RADIUS_LORES)
+            return tx, ty, float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H), False
         if pyatno is None:
+            # ACQ_AMBIGUOUS_REJECT_ENABLED=False — kill-switch обязан
+            # восстанавливать СТАРОЕ поведение целиком (самостоятельный
+            # баг первой версии этой правки: здесь стоял безусловный
+            # return False, kill-switch проверялся ТОЛЬКО у margin-ветки
+            # ниже — поймано test_adaptation_gate.py, чей полосатый фон
+            # для МАТЧЕРА случайно даёт _nayti_pyatno=None). Старое
+            # поведение — сырой прицел, размер по умолчанию, ok=True.
             flight_log.event(
                 "захват по прицелу: в зоне %d ничего выраженного"
                 % ACQ_SNAP_RADIUS_LORES)
-        elif pyatno[2] == "прицел":
-            flight_log.event("захват по прицелу: под ним есть за что цепляться")
+            if ACQ_SIZE_BY_SEGMENTATION:
+                lw, lh = estimate_size_at_position_any(gray, tx, ty)
+            elif ACQ_DEBUG_DUMP:
+                estimate_size_at_crosshair(gray)
+            if lw is None or lh is None:
+                lw, lh = float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H)
+            return tx, ty, float(lw), float(lh), True
+        _acq_method = pyatno[2]
+        _acq_margin = pyatno[3]
+        if (_acq_method == "прицел" and ACQ_AMBIGUOUS_REJECT_ENABLED
+                and _acq_margin < ACQ_YADRO_CONFIDENT_MULT):
+            # НАЙДЕНО (отчёт 25.09, п.3): patch под прицелом превысил
+            # ACQ_SNAP_YADRO_MIN_ABS (иначе pyatno был бы None), но не
+            # настолько уверенно, чтобы отличить его от хвоста чужого
+            # объекта (см. калибровку у ACQ_YADRO_CONFIDENT_MULT — сосед в
+            # 15px давал margin~1.3, настоящая структура — 2.55+). НЕ берём
+            # соседнее пятно вместо него (та ветка ниже даже не
+            # рассматривается) — явный отказ, тот же путь, что и "ничего не
+            # нашли".
+            flight_log.event(
+                "ЗАХВАТ ОТКЛОНЁН: patch под прицелом неоднозначен "
+                "(method=прицел margin=%.2f < %.2f)"
+                % (_acq_margin, ACQ_YADRO_CONFIDENT_MULT))
+            return tx, ty, float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H), False
+        if _acq_method == "прицел":
+            flight_log.event(
+                "захват по прицелу: под ним есть за что цепляться "
+                "(margin=%.2f)" % _acq_margin)
         else:
             tx, ty = float(pyatno[0]), float(pyatno[1])
             sdvig = math.hypot(tx - CENTER_X_LORES, ty - CENTER_Y_LORES)
             flight_log.event(
-                "ЗАХВАТ ПО ПЯТНУ: под прицелом пусто, ближайшее в %.0f px"
-                % sdvig)
+                "ЗАХВАТ ПО ПЯТНУ: под прицелом пусто, ближайшее в %.0f px "
+                "(margin=%.2f)" % (sdvig, _acq_margin))
         if ACQ_SIZE_BY_SEGMENTATION:
             lw, lh = estimate_size_at_position_any(gray, tx, ty)
         elif ACQ_DEBUG_DUMP:
@@ -5696,6 +5807,10 @@ def estimate_initial_target(gray):
         if lw is None or lh is None:
             lw, lh = float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H)
         return tx, ty, float(lw), float(lh), True
+    # ACQ_LOCK_AT_CROSSHAIR_EXACTLY=False — отдельный, более простой режим
+    # ("всегда точно по прицелу"), в котором _nayti_pyatno вообще не
+    # вызывается и никакого сигнала выраженности не считается. Отказ по
+    # неоднозначности здесь вне области этой правки — нечего оценивать.
     return (float(CENTER_X_LORES), float(CENTER_Y_LORES),
             float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H), True)
 
