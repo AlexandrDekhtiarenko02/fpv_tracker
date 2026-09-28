@@ -2331,6 +2331,12 @@ _FLIGHT_LOG_COLUMNS = (
     # офлайн-калибровки IDENTITY_UNCERTAIN_CONFIRM_FRAMES по реальным
     # логам (п.9 отчёта), а не только по факту срабатывания.
     "identity_uncertain,identity_ambiguous,identity_flow_gap,identity_uncertain_streak,"
+    # VISUAL_UNSTABLE (отчёт 25.09, п.5). visual_unstable=1 — этот КАДР
+    # (не персистентно, в отличие от identity_uncertain выше) отключил
+    # controllable из-за свежего camera jump/top_saturated (freshness —
+    # тот же CAM_JUMP_MAX_VALID_DT_S, что и у cam_jump_* колонок выше).
+    # visual_unstable_reason — "jump" или "top_saturated", пусто, если 0.
+    "visual_unstable,visual_unstable_reason,"
     # ДИАГНОСТИКА ВХОДА. Сырые значения AUX2/AUX3 (копии правого стика,
     # заведённые в обход маски MSP-оверрайда) и свежесть MSP_RC — чтобы на
     # бортовом логе сразу было видно, что копии стика реально приходят и
@@ -2837,6 +2843,79 @@ def _camera_jump_check(exp_us, prev_exp_us, mean_gray, prev_gray,
         "top_saturated": top_saturated,
         "jump": bool(exp_jump or gray_jump),
     }
+
+
+# --- VISUAL_UNSTABLE: camera jump/top_saturated отключают automation
+# (отчёт 25.09, п.5), не только пишутся в лог ---
+#
+# ДО ЭТОЙ ПРАВКИ Camera Jump Shadow был ЧИСТО диагностическим: cam_jump/
+# top_saturated писались в CSV и events.log, но НИКАК не влияли на
+# target_controllable — прямая цитата отчёта: "Camera Jump Shadow fix was
+# diagnostic only, did not fix AE itself; AE/AWB is still fully dynamic".
+# Эта правка НЕ трогает AE/AWB (они остаются полностью динамическими,
+# как и решили в camera/display commit) — только заставляет control
+# реагировать на уже существующий сигнал их нестабильности.
+#
+# ПОЧЕМУ "ДЛЯ ЭТОГО КАДРА", А НЕ ПЕРСИСТЕНТНО (в отличие от IDENTITY_
+# UNCERTAIN/nudge-abort). Camera jump — не вопрос идентичности цели, а
+# вопрос доверия к ПИКСЕЛЯМ этого конкретного момента: exposure/gain
+# только что скакнули, или верхняя строка кадра пересвечена. Как только
+# свежий замер снова показывает стабильную картинку, нет причины держать
+# пилота отрезанным явным reset'ом — сама AE обычно сходится за доли
+# секунды-две (см. разбор корреляции AE с pitch в отчёте). Поэтому здесь
+# НЕТ персистентного флага и НЕТ центрального принуждения — гейт
+# читается ЗАНОВО каждый кадр из _cam_shadow_dbg, тот же freshness-принцип
+# (age против CAM_JUMP_MAX_VALID_DT_S), что уже используется в CSV (ревью
+# по 66b7f4b) — просто теперь ЕЩЁ и решает controllable, не только что
+# писать в строку лога.
+#
+# ПОЧЕМУ НЕ ТРОГАЕМ lost_frames/prev_gray/prev_pts. Camera jump — не
+# потеря цели (не в этом причина), lost_frames считает совсем другое, и
+# накопление такого счёта грозило бы случайно свалить в LOST/TOGGLE на
+# затяжном пересвете (например, солнце в кадре не одну секунду) — а это
+# УЖЕ явно избыточная реакция на временную нестабильность экспозиции,
+# которую отчёт прямо просит не делать ("для ЭТОГО кадра"). prev_gray не
+# обновляем НАРОЧНО: если ЭТОТ кадр — скачок, копировать его в prev_gray
+# значило бы, что flow следующего ХОРОШЕГО кадра сравнивался бы с ПЛОХИМ,
+# а не пропускал бы плохой целиком.
+#
+# ПОЧЕМУ ПРОВЕРЯЕТСЯ ПОСЛЕ ручной коррекции, а не до. На КАДРЕ ПЕРЕХОДА
+# (track_state ещё TRACKED, камера только что дала нестабильный замер)
+# nudge не должен быть отрезан ИМЕННО этим кадром — если пилот в этот
+# момент реально двигал стик, его ввод не завязан на matchTemplate/flow и
+# не должен потеряться из-за факта, не относящегося к нему. Пока
+# track_state уже VISUAL_UNSTABLE (следующие кадры, если нестабильность не
+# разрешилась) — nudge естественно недоступен, как и на HOLD/LOST/ACQ
+# (_nudge_eligible требует track_state==TRACKED); отдельно это не
+# усложняем — окно обычно меньше секунды (см. CAM_JUMP_MAX_VALID_DT_S).
+VISUAL_UNSTABLE_ENABLED = True
+
+
+def _visual_unstable_now(cam_shadow_dbg, now_mono):
+    """Достаточно ли свеж последний 1 Гц замер camera jump/top_saturated
+    и показывает ли он нестабильность ПРЯМО СЕЙЧАС.
+
+    Чистая функция (без globals) — та же причина обособления, что и у
+    _camera_jump_check: сравнение тестируется отдельно от побочных
+    эффектов (flight_log, состояние сэмплера в camera_callback).
+
+    Свежесть — ТОТ ЖЕ порог CAM_JUMP_MAX_VALID_DT_S, что уже решает
+    "доверять ли дельте" внутри самого _camera_jump_check, не новый
+    коэффициент: раз замер слишком стар для СРАВНЕНИЯ, он слишком стар
+    и для решения "отключать ли automation".
+
+    Возвращает (unstable, reason). reason пусто, если unstable=False.
+    """
+    sample_t = cam_shadow_dbg.get("sample_t")
+    if sample_t is None:
+        return False, ""
+    if (now_mono - sample_t) > CAM_JUMP_MAX_VALID_DT_S:
+        return False, ""
+    if cam_shadow_dbg.get("jump"):
+        return True, "jump"
+    if cam_shadow_dbg.get("top_saturated"):
+        return True, "top_saturated"
+    return False, ""
 
 
 def _read_cma_free_kb():
@@ -4174,6 +4253,13 @@ TRACK_STATE_LOST = "LOST"
 # автоматического пути назад (ни auto-reacq, ни обычный flow/match) —
 # только explicit pilot-действие (AUX4 toggle -> reset_tracking()).
 TRACK_STATE_IDENTITY_UNCERTAIN = "IDENTITY_UNCERTAIN"
+# "Не доверяем ПИКСЕЛЯМ этого кадра" (camera jump/top_saturated — отчёт
+# 25.09, п.5) — см. VISUAL_UNSTABLE_ENABLED/_visual_unstable_now перед
+# _read_cma_free_kb. В ОТЛИЧИЕ от IDENTITY_UNCERTAIN, персистентности НЕТ:
+# гейт читается заново каждый кадр, и как только свежий замер снова
+# показывает стабильную картинку, track_state сам возвращается в TRACKED
+# — explicit reset для ЭТОГО состояния не нужен и не требуется.
+TRACK_STATE_VISUAL_UNSTABLE = "VISUAL_UNSTABLE"
 
 track_state = TRACK_STATE_IDLE
 target_visible = False
@@ -10616,6 +10702,25 @@ def process_locked_tracker(gray, cb_t0=None):
             global_throttle_cmd = live_thr
         return
 
+    # VISUAL_UNSTABLE диагностика — БЕЗУСЛОВНО, на КАЖДОМ кадре и
+    # НЕЗАВИСИМО от VISUAL_UNSTABLE_ENABLED (тот же принцип, что и у
+    # identity_ambiguous/identity_flow_gap выше — kill-switch должен
+    # выключать РЕАКЦИЮ, не честность лога: иначе офлайн-калибровка
+    # порогов на выключенной живой реакции была бы невозможна — п.9
+    # отчёта прямо об этом). Пишется на КАЖДОМ кадре, а не только там, где
+    # реально решает controllable (см. gate дальше по функции, перед
+    # flow_predict) — та же причина, что и ревью по 66b7f4b для
+    # cam_jump_*: если писать _match_dbg["visual_unstable"] только внутри
+    # одной ветки (TRACKED), любой ДРУГОЙ путь (ACQ, LOST, активный nudge,
+    # IDENTITY_UNCERTAIN) молча унаследовал бы значение с прошлого кадра —
+    # размазанная диагностика, которая на CSV выглядела бы как
+    # "нестабильность длится кадрами", которых на самом деле не было.
+    _visually_unstable_raw, _vu_reason = _visual_unstable_now(
+        _cam_shadow_dbg, time.monotonic())
+    _visually_unstable = _visually_unstable_raw and VISUAL_UNSTABLE_ENABLED
+    _match_dbg["visual_unstable"] = 1 if _visually_unstable_raw else 0
+    _match_dbg["visual_unstable_reason"] = _vu_reason
+
     # ВЕДЁМ ПО ТОЙ КАРТИНКЕ, ПО КОТОРОЙ РЕШИЛИ ПРИ ЗАХВАТЕ. Если выбран цвет,
     # дальше вся обработка — поиск, поток, размер — идёт по цветовой проекции.
     # Подмена именно здесь, чтобы ни одна часть не работала по другой картинке,
@@ -11110,6 +11215,36 @@ def process_locked_tracker(gray, cb_t0=None):
             target_controllable = False
             target_box_main = box
             overlay_text = "HOLD"
+            overlay_color = COLOR_YELLOW
+        update_control_from_target()
+        return
+
+    # VISUAL_UNSTABLE (отчёт 25.09, п.5 — см. константы и _visual_
+    # unstable_now перед _read_cma_free_kb; _visually_unstable/_vu_reason
+    # уже вычислены БЕЗУСЛОВНО в начале функции, для честной CSV-
+    # диагностики на ЛЮБОМ кадре — здесь используем тот же результат для
+    # решения controllable, не пересчитываем). ПОСЛЕ nudge (тот не
+    # запускает matchTemplate/flow и пересвета не боится) и ДО flow_
+    # predict/template_match_locked — не тратим CV на кадр, чьим пикселям
+    # только что перестали доверять, и не даём ему заразить lock_cx/cy,
+    # шаблон или prev_gray. НЕ персистентно (в отличие от IDENTITY_
+    # UNCERTAIN выше) — gate читается заново каждый кадр, explicit reset
+    # не нужен.
+    if _visually_unstable:
+        # Событие ТОЛЬКО на переднем фронте (тот же приём, что уже
+        # использован для CAM_TOP_SATURATED, ревью по 66b7f4b) — гейт
+        # перепроверяется КАЖДЫЙ кадр, и при затяжном пересвете (солнце в
+        # кадре секундами) лог иначе залился бы десятками одинаковых строк
+        # в секунду вместо одной на начало эпизода.
+        if track_state != TRACK_STATE_VISUAL_UNSTABLE:
+            flight_log.event("VISUAL_UNSTABLE reason=%s" % _vu_reason)
+        box = lores_box_to_main(lock_cx, lock_cy, lock_w, lock_h)
+        with state_lock:
+            track_state = TRACK_STATE_VISUAL_UNSTABLE
+            target_visible = True
+            target_controllable = False
+            target_box_main = box
+            overlay_text = "UNSTABLE"
             overlay_color = COLOR_YELLOW
         update_control_from_target()
         return
@@ -12196,6 +12331,8 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("identity_ambiguous"),
             _match_dbg.get("identity_flow_gap"),
             _match_dbg.get("identity_uncertain_streak"),
+            _match_dbg.get("visual_unstable"),
+            _match_dbg.get("visual_unstable_reason"),
             _match_dbg.get("aux2_raw"), _match_dbg.get("aux3_raw"),
             _match_dbg.get("nudge_rc_fresh"),
             _cam_exp_us, _cam_gain, _cam_colour_gain_r, _cam_colour_gain_b,
