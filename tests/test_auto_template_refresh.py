@@ -642,6 +642,37 @@ assert t._auto_tref_total_count == _count_before_13b + 1, (
 print("    согласованный с anchor candidate -> сработал как обычно "
       "(count вырос на 1)")
 
+print("\n=== 13в. НАЙДЕНО САМОСТОЯТЕЛЬНО (при разборе аналогичной дыры в "
+      "AUTO_REACQ): ok=True сам по себе НЕ значит 'anchor подтвердил' — "
+      "это лишь 'matchTemplate вообще посчитался' (см. докстроку "
+      "_shadow_match_against_template: False только на вырожденных "
+      "формах/None). Первая версия anchor-гейта (секции 13/13б выше) "
+      "читала ТОЛЬКО ok — низкий, но формально валидный score проходил бы "
+      "молча ===")
+acquire()
+t._shadow_match_against_template = fake_match(True, 0.10, GOOD_FRESH_PSR, 0.1, gap_px=0.0)
+_events13v = []
+t.flight_log.event = _events13v.append
+_count_before_13v = t._auto_tref_total_count
+_tg_before_13v = t.template_gray.copy()
+for i in range(N):
+    next_fresh_slot()
+assert t._auto_tref_total_count == _count_before_13v, (
+    "AUTO_TEMPLATE_REFRESH сработал (count вырос), хотя anchor-проверка "
+    "вернула ok=True с score=0.10 — заведомо слабым сходством с anchor "
+    "(порог MATCH_GOOD_SCORE=%.2f) — это ровно баг, который первая версия "
+    "гейта пропускала молча" % t.MATCH_GOOD_SCORE)
+assert np.array_equal(t.template_gray, _tg_before_13v), (
+    "template_gray изменился при слабом (ok=True, score=0.10) anchor-score")
+_anchor_rej13v = [e for e in _events13v if "anchor" in e]
+assert len(_anchor_rej13v) >= 1, (
+    "ожидали хотя бы 1 событие отказа по anchor при score=0.10, получили: "
+    "%s" % _events13v)
+assert "anchor_score=0.10" in _anchor_rej13v[0], (
+    "событие отказа не содержит реальный anchor_score: %s" % _anchor_rej13v[0])
+print("    ok=True, score=0.10 (< MATCH_GOOD_SCORE=%.2f) -> 0 срабатываний, "
+      "событие: %s" % (t.MATCH_GOOD_SCORE, _anchor_rej13v[0]))
+
 t._shadow_match_against_template = _orig_shadow_match
 t.template_match_locked = _orig_live_match
 

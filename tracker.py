@@ -10970,26 +10970,62 @@ def process_locked_tracker(gray, cb_t0=None):
                 gray, lock_cx, lock_cy, flow_motion=float(AUTO_REACQ_SEARCH_MARGIN)
             )
             if match_ok_r and score_r >= AUTO_REACQ_MIN_SCORE:
-                # Нашли с уверенностью — возвращаемся в TRACKED, переинициализируем flow.
-                lock_cx = float(mcx)
-                lock_cy = float(mcy)
-                prev_gray = gray.copy()
-                prev_pts = refresh_flow_points(gray, lock_cx, lock_cy, lock_w, lock_h)
-                lost_frames = 0
-                last_match_score = score_r
-                last_flow_ok = False
-                auto_reacq_attempts = 0
-                box = lores_box_to_main(lock_cx, lock_cy, lock_w, lock_h)
-                with state_lock:
-                    track_state = TRACK_STATE_TRACKED
-                    target_visible = True
-                    target_controllable = True
-                    target_box_main = box
-                    overlay_text = "REACQ"
-                    overlay_color = COLOR_RED
-                update_control_from_target()
-                return
-            # Не нашли в этом кадре — продолжаем висеть в LOST, повторим в следующем.
+                # НАЙДЕНО (проверено оператором на реальном коде 71d6e00):
+                # до этой правки match_ok_r/score_r против mutable
+                # template_gray было ЕДИНСТВЕННЫМ условием — LOST оставался
+                # ровно тем самым обходом hard-lock invariant, который весь
+                # остальной разбор закрывал везде: template_gray со временем
+                # утёк (addWeighted/rescale-адаптация, п.B/докстрока
+                # template_base), а confirmed identity anchor при этом
+                # проверить не пытались вовсе. Дополнительный кандидат мог
+                # тихо выиграть матч у УЖЕ УЕХАВШЕГО шаблона и вернуться в
+                # TRACKED/controllable=True без единой сверки с тем, что
+                # пилот подтверждал первично. Тот же принцип, что и у
+                # AUTO_TEMPLATE_REFRESH (п.C) — переиспользуем ТУ ЖЕ
+                # _shadow_match_against_template против _identity_anchor_
+                # gray, не новый matcher. Ищем ВОКРУГ НАЙДЕННОЙ кандидатом
+                # позиции (mcx, mcy) — проверяем, что ИМЕННО ТУТ анкор тоже
+                # узнаёт цель, не где-то ещё в кадре.
+                (_reacq_anchor_ok, _reacq_anchor_score, _reacq_anchor_psr,
+                 _reacq_anchor_second, _reacq_anchor_mx, _reacq_anchor_my
+                 ) = _shadow_match_against_template(
+                    gray, _identity_anchor_gray, _identity_anchor_w,
+                    _identity_anchor_h, _identity_anchor_std,
+                    mcx, mcy, 0.0)
+                if _reacq_anchor_ok and _reacq_anchor_score >= MATCH_GOOD_SCORE:
+                    # Анкор согласен — нашли с уверенностью И это та же
+                    # identity. Возвращаемся в TRACKED, переинициализируем flow.
+                    lock_cx = float(mcx)
+                    lock_cy = float(mcy)
+                    prev_gray = gray.copy()
+                    prev_pts = refresh_flow_points(gray, lock_cx, lock_cy, lock_w, lock_h)
+                    lost_frames = 0
+                    last_match_score = score_r
+                    last_flow_ok = False
+                    auto_reacq_attempts = 0
+                    box = lores_box_to_main(lock_cx, lock_cy, lock_w, lock_h)
+                    with state_lock:
+                        track_state = TRACK_STATE_TRACKED
+                        target_visible = True
+                        target_controllable = True
+                        target_box_main = box
+                        overlay_text = "REACQ"
+                        overlay_color = COLOR_RED
+                    update_control_from_target()
+                    return
+                # live template нашёл кандидата уверенно, но anchor его НЕ
+                # подтверждает — НЕ возвращаемся в TRACKED на чужом patch.
+                # Тот же failure mode, что и "не нашли вовсе" ниже: остаёмся
+                # в LOST, тратим попытку из окна AUTO_REACQ_FRAMES. Если
+                # окно исчерпается, не найдя anchor-подтверждённого
+                # кандидата, — LOST/TOGGLE и explicit AUX4 от пилота, а не
+                # молчаливый TRACKED на другой структуре.
+                flight_log.event(
+                    "AUTO_REACQ отклонён: candidate live_score=%.2f, но не "
+                    "согласуется с confirmed identity anchor "
+                    "(anchor_score=%.2f)" % (score_r, _reacq_anchor_score))
+            # Не нашли в этом кадре (либо anchor отклонил найденного live-
+            # кандидата) — продолжаем висеть в LOST, повторим в следующем.
             with state_lock:
                 target_visible = False
                 target_controllable = False
@@ -12132,10 +12168,25 @@ def process_locked_tracker(gray, cb_t0=None):
                                         # сам этот механизм чуть выше) — НЕ
                                         # новый matcher — против
                                         # _identity_anchor_gray вместо live
-                                        # template. match_ok — тот же
-                                        # бинарный сигнал "вообще похоже",
-                                        # которым template_match_locked уже
-                                        # пользуется everywhere, не новый
+                                        # template.
+                                        #
+                                        # НАЙДЕНО (при разборе аналогичного
+                                        # пробела в AUTO_REACQ): _anchor_ok
+                                        # САМ ПО СЕБЕ — НЕ сигнал "похоже на
+                                        # anchor", а лишь "matchTemplate
+                                        # вообще посчитался" (см. докстроку
+                                        # _shadow_match_against_template —
+                                        # False только на вырожденных formах/
+                                        # None). Слабый, случайный score всё
+                                        # равно даёт ok=True. Первая версия
+                                        # этой проверки читала только
+                                        # _anchor_ok — то есть реально
+                                        # отсекала только вырожденные случаи,
+                                        # а не низкое сходство с anchor. Порог
+                                        # тот же, что MATCH_GOOD_SCORE
+                                        # (тот самый "вообще похоже", которым
+                                        # уже пользуется template_match_
+                                        # locked/AUTO_REACQ) — не новый
                                         # изобретённый порог.
                                         (_anchor_ok, _anchor_score, _anchor_psr,
                                          _anchor_second, _anchor_mx, _anchor_my
@@ -12144,11 +12195,12 @@ def process_locked_tracker(gray, cb_t0=None):
                                             _identity_anchor_w, _identity_anchor_h,
                                             _identity_anchor_std,
                                             lock_cx, lock_cy, flow_motion)
-                                        if not _anchor_ok:
+                                        if not _anchor_ok or _anchor_score < MATCH_GOOD_SCORE:
                                             flight_log.event(
                                                 "AUTO_TEMPLATE_REFRESH отклонён: "
                                                 "candidate не согласуется с "
-                                                "confirmed identity anchor")
+                                                "confirmed identity anchor "
+                                                "(anchor_score=%.2f)" % _anchor_score)
                                             _auto_tref_confirm_streak = 0
                                         else:
                                             _old_tref_psr = _live_psr
