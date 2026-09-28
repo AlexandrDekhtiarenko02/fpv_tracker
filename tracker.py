@@ -11836,7 +11836,29 @@ def process_locked_tracker(gray, cb_t0=None):
                                         # match+flow выше) — комментарий
                                         # утверждал "та же уверенность, что
                                         # у live", а порог был другой.
-                                        and _v_gap <= MATCH_GAP_SOFT)
+                                        and _v_gap <= MATCH_GAP_SOFT
+                                        # НАЙДЕНО (отчёт 25.09, п.4): голос
+                                        # candidate'а (PSR/gap ВЫШЕ) ничего
+                                        # не знает о том, насколько
+                                        # неоднозначен САМ ЖИВОЙ матч ЭТОГО
+                                        # кадра (_identity_ambiguous/
+                                        # _identity_flow_match_disagree —
+                                        # см. IDENTITY_UNCERTAIN выше) — это
+                                        # ДВА разных измерения (candidate
+                                        # против live-шаблона vs live-матч
+                                        # против потока), candidate может
+                                        # честно выигрывать PSR ровно в
+                                        # момент, когда сам live уже не
+                                        # уверен, КТО под рамкой. Refresh
+                                        # шаблона в такой момент — прямая
+                                        # цитата отчёта — рискует
+                                        # "зацементировать уже неверный
+                                        # стабильный фоновый лок": учим
+                                        # эталон на кадре, где мы САМИ не
+                                        # уверены, что смотрим на цель, а не
+                                        # на то, что матч перепутал с ней.
+                                        and not _identity_ambiguous
+                                        and not _identity_flow_match_disagree)
                                     if _tref_vote:
                                         _auto_tref_confirm_streak += 1
                                     else:

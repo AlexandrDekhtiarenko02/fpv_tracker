@@ -147,15 +147,19 @@ def fake_match(ok, score, psr, second, gap_px=0.0):
     return _f
 
 
-def fake_live(psr, score=0.7, second=0.1):
+def fake_live(psr, score=0.7, second=0.1, gap_px=0.0):
     """Подменяет template_match_locked фиксированным live-результатом и
     честно пишет _match_dbg['psr'] — ровно так, как это делает реальная
-    функция (см. tracker.py: _match_dbg['psr'] = psr на каждом вызове)."""
+    функция (см. tracker.py: _match_dbg['psr'] = psr на каждом вызове).
+    gap_px (по умолчанию 0.0 — как во всех секциях ДО п.11) даёт live-
+    матчу разойтись с потоком, ровно как gap_px у fake_match для
+    candidate — управляет _identity_flow_match_disagree (п.4 отчёта,
+    секция 12)."""
     def _f(gray, pred_cx, pred_cy, flow_motion=0.0, tgt_dx=0.0, tgt_dy=0.0):
         t._match_dbg["psr"] = psr
         t._match_dbg["second"] = second
         t._match_dbg["margin"] = 20.0
-        return True, pred_cx, pred_cy, score
+        return True, pred_cx + gap_px, pred_cy, score
     return _f
 
 
@@ -508,6 +512,66 @@ assert t._auto_tref_confirm_streak == 0, (
 print("    psr-margin недобор -> голосов нет; flow_gap > MAX_LOCK_STEP -> "
       "голосов нет, несмотря на хороший psr")
 
+print("\n=== 12. IDENTITY_UNCERTAIN сигналы блокируют голос НА ЖИВОМ "
+      "кадре (отчёт 25.09, п.4) — даже когда candidate САМ ПО СЕБЕ "
+      "голосует 'да' (хороший PSR-margin, низкий gap). Это ДВА РАЗНЫХ "
+      "измерения: candidate против шаблона (что уже проверяют секции "
+      "1-11) vs live против потока (новое) — candidate может честно "
+      "выигрывать ровно в момент, когда сам live уже неоднозначен ===")
+t._shadow_match_against_template = fake_match(True, 0.9, GOOD_FRESH_PSR, 0.1, gap_px=0.0)
+# Изолируем ИМЕННО п.4: держать live неоднозначным достаточно кадров для
+# N fresh-слотов ЗАОДНО достаточно кадров, чтобы сработал сам IDENTITY_
+# UNCERTAIN (п.2, тот же _identity_ambiguous/_identity_flow_match_
+# disagree, независимо протестирован в test_identity_uncertain.py) — он
+# увёл бы track_state ИЗ TRACKED вовсе, и Tracking Shadow (значит, и
+# next_fresh_slot()) перестал бы находить активные слоты. Эта секция
+# проверяет ТОЛЬКО новую проверку внутри _tref_vote, не взаимодействие
+# двух механизмов — отключаем IDENTITY_UNCERTAIN на время секции.
+_orig_identity_uncertain_enabled = t.IDENTITY_UNCERTAIN_ENABLED
+t.IDENTITY_UNCERTAIN_ENABLED = False
+
+acquire()
+# lead = (score-second)/score = (0.7-0.65)/0.7 ≈ 0.071 < MATCH_LEAD_FULL
+# (0.10) -> _identity_ambiguous=True на КАЖДОМ live-кадре.
+t.template_match_locked = fake_live(LIVE_PSR, score=0.7, second=0.65)
+for i in range(N):
+    next_fresh_slot()
+assert t._auto_tref_confirm_streak == 0, (
+    "серия голосов накопилась несмотря на identity_ambiguous=True на "
+    "каждом live-кадре — п.4 отчёта не соблюдён (streak=%d)"
+    % t._auto_tref_confirm_streak)
+print("    неоднозначный live-матч (lead<MATCH_LEAD_FULL) -> ни один из "
+      "%d кадров не проголосовал 'да', несмотря на хороший candidate" % N)
+
+acquire()
+# dist_fm = gap_px > MATCH_GAP_SOFT -> _identity_flow_match_disagree=True
+# на каждом live-кадре (второй ambiguous=False, чтобы изолировать именно
+# эту причину).
+t.template_match_locked = fake_live(
+    LIVE_PSR, score=0.7, second=0.1, gap_px=t.MATCH_GAP_SOFT + 1.0)
+for i in range(N):
+    next_fresh_slot()
+assert t._auto_tref_confirm_streak == 0, (
+    "серия голосов накопилась несмотря на identity_flow_gap=True на "
+    "каждом live-кадре — п.4 отчёта не соблюдён (streak=%d)"
+    % t._auto_tref_confirm_streak)
+print("    live-матч расходится с потоком (dist_fm>MATCH_GAP_SOFT) -> "
+      "ни один из %d кадров не проголосовал 'да'" % N)
+
+acquire()
+# Контроль: с ЧИСТЫМ live (как во всех секциях 1-11) всё по-прежнему
+# срабатывает — новая проверка не сломала обычный путь.
+t.template_match_locked = fake_live(LIVE_PSR)
+_count_before_12c = t._auto_tref_total_count
+for i in range(N):
+    next_fresh_slot()
+assert t._auto_tref_total_count == _count_before_12c + 1, (
+    "чистый (не ambiguous/gap) live-сценарий перестал срабатывать — "
+    "новая проверка п.4 оказалась шире, чем нужно")
+print("    чистый live-матч по-прежнему срабатывает как раньше — "
+      "проверка п.4 не задевает обычный путь")
+
+t.IDENTITY_UNCERTAIN_ENABLED = _orig_identity_uncertain_enabled
 t._shadow_match_against_template = _orig_shadow_match
 t.template_match_locked = _orig_live_match
 
