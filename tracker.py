@@ -2317,6 +2317,20 @@ _FLIGHT_LOG_COLUMNS = (
     # разбор борта: 59/63 сессий ложно доходили до abort из-за
     # транспортного джиттера MSP).
     "nudge_suspended,"
+    # IDENTITY_UNCERTAIN (отчёт 25.09, п.2). identity_uncertain=1 —
+    # персистентный флаг: track_state=IDENTITY_UNCERTAIN, controllable
+    # принудительно False, explicit reset_tracking() обязателен (та же
+    # схема, что nudge_abort_pending, никакого auto-reacq из этого
+    # состояния). identity_ambiguous/identity_flow_gap — сырые ПРИЧИНЫ
+    # этого КОНКРЕТНОГО кадра (те же признаки, что уже режут вес
+    # блендинга/адаптацию шаблона — см. MATCH_LEAD_FULL/MATCH_GAP_SOFT —
+    # здесь просто видимы отдельно, не только как их побочный эффект):
+    # ambiguous — конкурирующий пик не хуже выбранного; flow_gap — матч
+    # тянет заметно в сторону от потока. identity_uncertain_streak —
+    # сырой счётчик подряд идущих сомнительных dual-signal кадров, для
+    # офлайн-калибровки IDENTITY_UNCERTAIN_CONFIRM_FRAMES по реальным
+    # логам (п.9 отчёта), а не только по факту срабатывания.
+    "identity_uncertain,identity_ambiguous,identity_flow_gap,identity_uncertain_streak,"
     # ДИАГНОСТИКА ВХОДА. Сырые значения AUX2/AUX3 (копии правого стика,
     # заведённые в обход маски MSP-оверрайда) и свежесть MSP_RC — чтобы на
     # бортовом логе сразу было видно, что копии стика реально приходят и
@@ -4154,6 +4168,12 @@ TRACK_STATE_ACQ = "ACQ"
 TRACK_STATE_TRACKED = "TRACKED"
 TRACK_STATE_HOLD = "HOLD"
 TRACK_STATE_LOST = "LOST"
+# Единое состояние безопасности "не уверены, ТА ли это цель" (отчёт 25.09,
+# п.2) — см. константы IDENTITY_UNCERTAIN_* и их обоснование перед
+# process_locked_tracker. В отличие от HOLD/LOST, из этого состояния НЕТ
+# автоматического пути назад (ни auto-reacq, ни обычный flow/match) —
+# только explicit pilot-действие (AUX4 toggle -> reset_tracking()).
+TRACK_STATE_IDENTITY_UNCERTAIN = "IDENTITY_UNCERTAIN"
 
 track_state = TRACK_STATE_IDLE
 target_visible = False
@@ -6815,6 +6835,7 @@ def reset_tracking(to_acq=False):
     global launch_phase, launch_counter, prev_controllable_for_launch
     global _nudge_was_active, _nudge_prev_t, _adapt_frozen_posle_reanchor
     global _nudge_frozen_box, _nudge_abort_pending, _nudge_suspended_since_t
+    global _identity_uncertain_pending, _identity_uncertain_streak
     global _shadow_track_dbg
     global _shadow_fresh_candidate, _shadow_fresh_candidate_w, _shadow_fresh_candidate_h
     global _shadow_fresh_candidate_std, _shadow_fresh_candidate_t, _shadow_fresh_candidate_epoch
@@ -6913,6 +6934,13 @@ def reset_tracking(to_acq=False):
     # не должен унаследовать чужой, уже бессмысленный отсчёт.
     _nudge_suspended_since_t = None
     _adapt_frozen_posle_reanchor = False
+    # IDENTITY_UNCERTAIN относится к ТЕКУЩЕМУ локу — тот же принцип, что и
+    # у nudge-состояния выше: explicit pilot-действие (AUX4 toggle), которое
+    # ведёт сюда, обязано и снять персистентный флаг, и обнулить streak —
+    # иначе новый, ещё ничем не скомпрометированный заход унаследовал бы
+    # счётчик сомнительных кадров от СОВСЕМ ДРУГОЙ, уже прошлой цели.
+    _identity_uncertain_pending = False
+    _identity_uncertain_streak = 0
 
 # =========================================================
 # 8. CONTROL — главные исправления здесь
@@ -7707,6 +7735,7 @@ def _update_control_from_target_impl():
     global _shadow_roll_hold_value, _shadow_pitch_hold_value, _shadow_yaw_hold_value
     global _shadow_pitch_conflict_since_t
     global _nudge_frozen_box, _nudge_abort_pending, _nudge_suspended_since_t
+    global _identity_uncertain_pending
     global target_controllable
 
     with state_lock:
@@ -7737,6 +7766,15 @@ def _update_control_from_target_impl():
     # сама команда честно нейтральна — обманчиво. Пишем обратно в
     # ГЛОБАЛЬНЫЙ флаг тоже, под тем же state_lock.
     if _nudge_abort_pending and controllable:
+        controllable = False
+        with state_lock:
+            target_controllable = False
+
+    # ТОТ ЖЕ ПРИНЦИП, ДРУГАЯ ПРИЧИНА (отчёт 25.09, п.2, см. докстрока у
+    # _identity_uncertain_pending): пока пилот явно не сбросил флаг через
+    # reset_tracking(), controllable принудительно False независимо от
+    # того, что решил бы process_locked_tracker на очередном кадре.
+    if _identity_uncertain_pending and controllable:
         controllable = False
         with state_lock:
             target_controllable = False
@@ -7776,6 +7814,7 @@ def _update_control_from_target_impl():
     _match_dbg["nudge_control_frozen"] = 1 if box is not _live_box else 0
     _match_dbg["nudge_abort_pending"] = 1 if _nudge_abort_pending else 0
     _match_dbg["nudge_suspended"] = 1 if _nudge_suspended_since_t is not None else 0
+    _match_dbg["identity_uncertain"] = 1 if _identity_uncertain_pending else 0
 
     now_mono = time.monotonic()
     # СЫРОЙ интервал — до dt_ratio(), который его ЗАЖИМАЕТ до DT_MAX (см.
@@ -10412,6 +10451,67 @@ _nudge_abort_pending = False
 MANUAL_NUDGE_SUSPEND_TIMEOUT_S = 1.5
 _nudge_suspended_since_t = None
 
+# --- IDENTITY_UNCERTAIN: единое состояние "не уверены, ТА ли это цель"
+# (отчёт 25.09, п.2) ---
+#
+# НАХОДКА (тот же разбор борта). "Tracker too easily calls itself TRACKED":
+# match_ok+tracked_ok=True само по себе не видит, что матч и поток МОГЛИ
+# разойтись во мнениях об одном и том же кадре — этот сигнал уже существует
+# (см. w_m/lead/dist_fm ниже в process_locked_tracker, и _template_
+# adaptation_gate, которая теми же признаками режет обучение шаблона), но
+# раньше он влиял ТОЛЬКО на вес блендинга позиции и на то, учим ли эталон —
+# controllable оставался True независимо от того, насколько матч согласен
+# сам с собой (лид над конкурентом) и с потоком (flow_gap).
+#
+# ЧТО ДЕЛАЕТ. Переиспользует РОВНО ТЕ ЖЕ признаки (никаких новых порогов
+# сравнения — MATCH_LEAD_FULL и MATCH_GAP_SOFT уже откалиброваны и уже
+# используются для этой же классификации "кадр сомнителен"): если кадр,
+# где матч оценивался ПОЛНОЦЕННО (score>=MATCH_GOOD_SCORE и
+# dist_fm<=MAX_LOCK_STEP — та же ветка, что и у w_m), оказался
+# неоднозначным (lead<MATCH_LEAD_FULL) или разошёлся с потоком
+# (dist_fm>MATCH_GAP_SOFT) — это НЕ повод сразу останавливать automation
+# (единичный сомнительный кадр — обычный шум, echo той же логики, что уже
+# была у w_m/adaptation_gate), но СЕРИЯ таких кадров подряд
+# (IDENTITY_UNCERTAIN_CONFIRM_FRAMES) — уже основание перестать доверять,
+# КТО именно под рамкой.
+#
+# ПОЧЕМУ ОТДЕЛЬНОЕ СОСТОЯНИЕ, А НЕ ПРОСТО HOLD. HOLD в этом кодe означает
+# "видим/вели, но сейчас нет свежего подтверждения (flow_ok/match_ok оба
+# отказали)" — временная просадка СИГНАЛА. IDENTITY_UNCERTAIN — сигнал ЕСТЬ
+# (flow_ok и match_ok оба живы), просто он ПРОТИВОРЕЧИВ. Это разные причины
+# не доверять, и разбор борта прямо просит не путать их с новым "просто
+# увеличить timeout"-паттчем — нужна архитектура, не коэффициент.
+#
+# ПОЧЕМУ НЕЛЬЗЯ САМО-ВОССТАНОВИТЬСЯ (прямое требование отчёта). LOST/
+# REQUIRE_AUX_TOGGLE_AFTER_LOST даёт короткое окно AUTO_REACQ — это
+# оправдано, когда цель просто пропала из виду (закрыл столб) и не о ком
+# спорить. IDENTITY_UNCERTAIN — принципиально другой случай: система
+# СОМНЕВАЕТСЯ, ТА ли это цель, и автоматический повторный поиск рискует
+# закрепить именно эту ошибку (или переключиться на другую ложную цель) без
+# единого подтверждения человеком. Поэтому process_locked_tracker для этого
+# состояния НЕ содержит ветки авто-восстановления вовсе (см. её начало) —
+# единственный выход, как и у LOST/TOGGLE и у nudge-abort, explicit pilot-
+# действие: AUX4 toggle -> reset_tracking().
+#
+# ПОЧЕМУ ПЕРСИСТЕНТНЫЙ ФЛАГ, А НЕ ТОЛЬКО track_state (тот же урок, что и у
+# _nudge_abort_pending, ревью по dfdde00: HOLD/новое состояние — не
+# гарантия раннего выхода из ЛЮБОГО будущего пути кода). _identity_
+# uncertain_pending проверяется ЦЕНТРАЛЬНО в _update_control_from_target_
+# impl(), той же точке, что и _nudge_abort_pending — то, чем бы ни
+# оказался следующий кадр, controllable принудительно остаётся False, пока
+# пилот явно не сбросит флаг через reset_tracking().
+IDENTITY_UNCERTAIN_ENABLED = True
+# Дебаунс: одиночный сомнительный кадр — обычный шум (та же логика, что и
+# у w_m/adaptation_gate, которые НЕ останавливают всё на одном кадре). 6
+# кадров подряд при CAM_FPS=24 — около 250мс устойчивого противоречия
+# между матчем и потоком, не единичный всплеск. Начальное, принципиальное
+# значение (архитектура важнее конкретного числа, ТЗ п. "не патчить
+# коэффициентами") — уточняется офлайн-реплеем существующих логов (п.9
+# отчёта), а не подбором на лету.
+IDENTITY_UNCERTAIN_CONFIRM_FRAMES = 6
+_identity_uncertain_pending = False
+_identity_uncertain_streak = 0
+
 
 def reanchor_tracker_at_current_box(gray, reason):
     """Мягкая перепривязка ВНУТРИ TRACKED, без LOST->ACQ (ТЗ §12).
@@ -10485,6 +10585,7 @@ def process_locked_tracker(gray, cb_t0=None):
     global lock_w0, lock_h0
     global _nudge_was_active, _nudge_prev_t
     global _nudge_frozen_box, _nudge_abort_pending, _nudge_suspended_since_t
+    global _identity_uncertain_pending, _identity_uncertain_streak
     global _shadow_track_dbg
     global _shadow_fresh_candidate, _shadow_fresh_candidate_w, _shadow_fresh_candidate_h
     global _shadow_fresh_candidate_std, _shadow_fresh_candidate_t, _shadow_fresh_candidate_epoch
@@ -10597,6 +10698,25 @@ def process_locked_tracker(gray, cb_t0=None):
             target_box_main = None
             overlay_text = "LOST/TOGGLE"
             overlay_color = COLOR_WHITE
+        update_control_from_target()
+        return
+
+    if track_state == TRACK_STATE_IDENTITY_UNCERTAIN:
+        # НЕТ окна авто-восстановления вовсе (в отличие от LOST выше) —
+        # см. обоснование у констант IDENTITY_UNCERTAIN_*. Сидим и ждём
+        # explicit pilot-действия (AUX4 toggle обрабатывается в самом
+        # начале этой функции и вызывает reset_tracking() универсально для
+        # ЛЮБОГО состояния, не только этого — отдельного пути здесь не
+        # нужно). Показываем box, если он ещё есть, чтобы пилоту было
+        # видно, где система в последний раз считала цель — как у HOLD.
+        box = (lores_box_to_main(lock_cx, lock_cy, lock_w, lock_h)
+               if lock_cx is not None else None)
+        with state_lock:
+            target_visible = box is not None
+            target_controllable = False
+            target_box_main = box
+            overlay_text = "UNCERTAIN"
+            overlay_color = COLOR_YELLOW
         update_control_from_target()
         return
 
@@ -11012,6 +11132,14 @@ def process_locked_tracker(gray, cb_t0=None):
 
     new_cx, new_cy = lock_cx, lock_cy
     tracked_ok = False
+    # IDENTITY_UNCERTAIN (см. константы перед reanchor_tracker_at_current_
+    # box): переиспользуют РОВНО те же сигналы, что и w_m/adaptation_gate
+    # ниже, никаких новых порогов. Заполняются ТОЛЬКО в ветке, где матч
+    # оценивался ПОЛНОЦЕННО (dual-signal — flow_ok и match_ok оба живы, score
+    # и dist_fm оба в допуске) — только там есть с чем реально сравнивать.
+    _identity_dual_signal_frame = False
+    _identity_ambiguous = False
+    _identity_flow_match_disagree = False
 
     if flow_ok and match_ok:
         dist_fm = math.hypot(match_cx - pred_cx, match_cy - pred_cy)
@@ -11024,6 +11152,7 @@ def process_locked_tracker(gray, cb_t0=None):
         # потоком. Ни score, ни доля провалов такого показать не могут.
         _match_dbg["flow_gap"] = float(dist_fm)
         if score >= MATCH_GOOD_SCORE and dist_fm <= MAX_LOCK_STEP:
+            _identity_dual_signal_frame = True
             w_m = MATCH_WEIGHT
             if MATCH_AMBIGUITY_GUARD:
                 second = _match_dbg.get("second")
@@ -11034,11 +11163,13 @@ def process_locked_tracker(gray, cb_t0=None):
                     lead = (score - float(second)) / max(score, 1e-6)
                     if lead <= 0.0:
                         w_m = MATCH_WEIGHT_MIN
+                        _identity_ambiguous = True
                     elif lead < MATCH_LEAD_FULL:
                         # Плавный переход, чтобы не дёргать вес туда-сюда на
                         # границе: на 25% запаса — полное доверие.
                         f = lead / MATCH_LEAD_FULL
                         w_m = MATCH_WEIGHT_MIN + (MATCH_WEIGHT - MATCH_WEIGHT_MIN) * f
+                        _identity_ambiguous = True
             # ВЕС МАТЧА ПАДАЕТ, КОГДА ОН ТЯНЕТ В СТОРОНУ ОТ ПОТОКА.
             #
             # Здесь и рождается дёрганье. Скачок рамки равен весу матча,
@@ -11055,10 +11186,10 @@ def process_locked_tracker(gray, cb_t0=None):
             # почти не меняется (0.85 против 0.76): матч УВЕРЕННО держит не то.
             # Поток за фоном не гонится, поэтому расхождение с ним — самый
             # острый признак из всех, что есть.
-            if MATCH_GAP_SOFT > 0.0:
-                if dist_fm > MATCH_GAP_SOFT:
-                    zatuh = MATCH_GAP_SOFT / dist_fm
-                    w_m *= max(MATCH_GAP_MIN_K, zatuh)
+            if MATCH_GAP_SOFT > 0.0 and dist_fm > MATCH_GAP_SOFT:
+                _identity_flow_match_disagree = True
+                zatuh = MATCH_GAP_SOFT / dist_fm
+                w_m *= max(MATCH_GAP_MIN_K, zatuh)
             new_cx = (1.0 - w_m) * pred_cx + w_m * match_cx
             new_cy = (1.0 - w_m) * pred_cy + w_m * match_cy
             _match_dbg["w_m"] = w_m
@@ -11075,6 +11206,18 @@ def process_locked_tracker(gray, cb_t0=None):
         new_cx = match_cx
         new_cy = match_cy
         tracked_ok = True
+
+    # Streak обновляем ТОЛЬКО на dual-signal кадрах — иначе (только один из
+    # двух сигналов жив, либо score ниже MATCH_GOOD_SCORE) сравнивать не с
+    # чем, и это не свидетельство ни за, ни против identity.
+    if _identity_dual_signal_frame:
+        if _identity_ambiguous or _identity_flow_match_disagree:
+            _identity_uncertain_streak += 1
+        else:
+            _identity_uncertain_streak = 0
+    _match_dbg["identity_ambiguous"] = 1 if _identity_ambiguous else 0
+    _match_dbg["identity_flow_gap"] = 1 if _identity_flow_match_disagree else 0
+    _match_dbg["identity_uncertain_streak"] = _identity_uncertain_streak
 
     if tracked_ok:
         step = math.hypot(new_cx - lock_cx, new_cy - lock_cy)
@@ -11388,6 +11531,34 @@ def process_locked_tracker(gray, cb_t0=None):
                 # 10 кадров ужималась обратно.
                 lock_w = lock_w * (1.0 - SIZE_ADAPT_ALPHA) + est_w * SIZE_ADAPT_ALPHA
                 lock_h = lock_h * (1.0 - SIZE_ADAPT_ALPHA) + est_h * SIZE_ADAPT_ALPHA
+
+        # IDENTITY_UNCERTAIN (отчёт 25.09, п.2 — см. константы перед
+        # reanchor_tracker_at_current_box). Серия dual-signal кадров, где
+        # матч и поток расходятся или матч неоднозначен, набрала streak —
+        # ПЕРЕСТАЁМ считать это обычным TRACKED. НЕ reanchor, НЕ estimate_
+        # initial_target — явная, осознанная отдача управления, тот же
+        # target_controllable=False путь, что уже безопасно используется
+        # для nudge-abort. RETURN здесь же: Tracking Shadow/Auto Template
+        # Refresh ниже — диагностика и адаптация live-лока, а этот кадр
+        # только что объявил, что не доверяет самому локу.
+        if (IDENTITY_UNCERTAIN_ENABLED
+                and _identity_uncertain_streak >= IDENTITY_UNCERTAIN_CONFIRM_FRAMES):
+            flight_log.event(
+                "IDENTITY_UNCERTAIN streak=%d ambiguous=%s flow_gap=%s"
+                % (_identity_uncertain_streak, _identity_ambiguous,
+                   _identity_flow_match_disagree))
+            _identity_uncertain_pending = True
+            lost_frames += 1
+            box = lores_box_to_main(lock_cx, lock_cy, lock_w, lock_h)
+            with state_lock:
+                track_state = TRACK_STATE_IDENTITY_UNCERTAIN
+                target_visible = True
+                target_controllable = False
+                target_box_main = box
+                overlay_text = "UNCERTAIN"
+                overlay_color = COLOR_YELLOW
+            update_control_from_target()
+            return
 
         box = lores_box_to_main(lock_cx, lock_cy, lock_w, lock_h)
         with state_lock:
@@ -12021,6 +12192,10 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("nudge_control_frozen"),
             _match_dbg.get("nudge_abort_pending"),
             _match_dbg.get("nudge_suspended"),
+            _match_dbg.get("identity_uncertain"),
+            _match_dbg.get("identity_ambiguous"),
+            _match_dbg.get("identity_flow_gap"),
+            _match_dbg.get("identity_uncertain_streak"),
             _match_dbg.get("aux2_raw"), _match_dbg.get("aux3_raw"),
             _match_dbg.get("nudge_rc_fresh"),
             _cam_exp_us, _cam_gain, _cam_colour_gain_r, _cam_colour_gain_b,
