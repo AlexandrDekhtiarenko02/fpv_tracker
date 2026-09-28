@@ -529,6 +529,21 @@ t._shadow_match_against_template = fake_match(True, 0.9, GOOD_FRESH_PSR, 0.1, ga
 # двух механизмов — отключаем IDENTITY_UNCERTAIN на время секции.
 _orig_identity_uncertain_enabled = t.IDENTITY_UNCERTAIN_ENABLED
 t.IDENTITY_UNCERTAIN_ENABLED = False
+# НАЙДЕНО (при первом прогоне этой секции): flow_predict здесь НЕ мокан —
+# реальный optical flow на смещающейся синтетической сцене (offset)
+# иногда даёт flow_ok=False на отдельных тиках. На таком тике код падает
+# в single-signal ветку (match_ok и без flow) — а _identity_ambiguous/
+# _identity_flow_match_disagree считаются ТОЛЬКО в dual-signal ветке,
+# значит на этом одном тике остаются на дефолте False, и _tref_vote
+# (для gap_px-сценария конкретно) мог голосовать "да". Второй сценарий
+# (gap_px) ловил это чаще первого (ambiguous) случайно — dist_fm там
+# строится ИЗ pred_cx/pred_cy реального flow, а при ambiguous gap_px=0.0
+# и результат не зависит от того, какие именно pred_cx/pred_cy вернул
+# flow. Мокаем flow_predict тоже — dist_fm/lead этой секции обязаны
+# зависеть ТОЛЬКО от параметров fake_live, не от реального flow на
+# смещающейся сцене.
+_orig_flow_predict = t.flow_predict
+t.flow_predict = lambda prev_g, cur_g, pts, cx, cy: (True, cx, cy)
 
 acquire()
 # lead = (score-second)/score = (0.7-0.65)/0.7 ≈ 0.071 < MATCH_LEAD_FULL
@@ -572,6 +587,61 @@ print("    чистый live-матч по-прежнему срабатывае
       "проверка п.4 не задевает обычный путь")
 
 t.IDENTITY_UNCERTAIN_ENABLED = _orig_identity_uncertain_enabled
+t.flow_predict = _orig_flow_predict
+
+print("\n=== 13. Candidate не согласуется с confirmed identity anchor -> "
+      "refresh отклонён, ДАЖЕ когда PSR-margin/gap/live-ambiguity ВСЕ "
+      "пройдены (отчёт 25.09, разбор поверх 64949ec, п.C) ===")
+t.template_match_locked = fake_live(LIVE_PSR)   # чистый live, как в 12в
+
+
+def _fake_match_anchor_fails(gray, tmpl, tmpl_w, tmpl_h, tmpl_std,
+                             pred_cx, pred_cy, flow_motion):
+    # Кандидат ПРОТИВ live-шаблона (то, что использует _tref_vote выше) —
+    # хороший, как и в остальных секциях. НО ровно ТОТ ЖЕ candidate
+    # ПРОТИВ анкора (аргумент tmpl — это _identity_anchor_gray, см. вызов
+    # в tracker.py) — провален (ok=False), имитируя patch, который
+    # разошёлся с изначально подтверждённой identity.
+    if tmpl is t._identity_anchor_gray:
+        return False, 0.0, 0.0, 0.0, pred_cx, pred_cy
+    return True, 0.9, GOOD_FRESH_PSR, 0.1, pred_cx, pred_cy
+
+
+acquire()
+t._shadow_match_against_template = _fake_match_anchor_fails
+_events13 = []
+t.flight_log.event = _events13.append
+_count_before_13 = t._auto_tref_total_count
+_tg_before_13 = t.template_gray.copy()
+for i in range(N):
+    next_fresh_slot()
+assert t._auto_tref_total_count == _count_before_13, (
+    "AUTO_TEMPLATE_REFRESH сработал (count вырос), хотя candidate не "
+    "согласуется с confirmed identity anchor")
+assert np.array_equal(t.template_gray, _tg_before_13), (
+    "template_gray изменился, хотя refresh должен был быть отклонён "
+    "anchor-проверкой")
+_anchor_rej = [e for e in _events13 if "anchor" in e]
+assert len(_anchor_rej) >= 1, (
+    "ожидали хотя бы 1 событие отказа по anchor, получили: %s" % _events13)
+print("    N=%d хороших голосов (PSR-margin/gap/live-ambiguity все "
+      "пройдены), но candidate не согласуется с anchor -> 0 срабатываний. "
+      "событие: %s" % (N, _anchor_rej[0]))
+
+print("\n=== 13б. Контроль: КОГДА candidate согласуется и с live-"
+      "шаблоном, и с anchor — refresh срабатывает как обычно (anchor-"
+      "проверка не блокирует легитимный refresh) ===")
+acquire()
+t._shadow_match_against_template = fake_match(True, 0.9, GOOD_FRESH_PSR, 0.1, gap_px=0.0)
+_count_before_13b = t._auto_tref_total_count
+for i in range(N):
+    next_fresh_slot()
+assert t._auto_tref_total_count == _count_before_13b + 1, (
+    "легитимный refresh (candidate согласуется и с live, и с anchor) не "
+    "сработал — anchor-проверка оказалась шире, чем нужно")
+print("    согласованный с anchor candidate -> сработал как обычно "
+      "(count вырос на 1)")
+
 t._shadow_match_against_template = _orig_shadow_match
 t.template_match_locked = _orig_live_match
 

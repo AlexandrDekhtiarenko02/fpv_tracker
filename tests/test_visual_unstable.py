@@ -326,6 +326,44 @@ assert '_match_dbg.get("visual_unstable")' in row_body
 assert '_match_dbg.get("visual_unstable_reason")' in row_body
 print("    обе колонки объявлены и подключены")
 
+print("\n=== 12. Confirmed identity anchor НЕ трогается visual instability "
+      "(отчёт 25.09, разбор поверх 64949ec, п.I/K-8: 'плохой кадр не "
+      "должен становиться новым anchor для prev_gray/template') ===")
+capture()
+stable_cam()
+tick()
+assert t.track_state == t.TRACK_STATE_TRACKED, "тест сам по себе негоден"
+assert t._identity_anchor_gray is not None, (
+    "тест сам по себе негоден: anchor обязан быть установлен после захвата")
+_anchor_ref = t._identity_anchor_gray
+_anchor_bytes = t._identity_anchor_gray.copy()
+_events12 = []
+t.flight_log.event = _events12.append
+unstable_cam("jump")
+for _ in range(10):
+    tick()
+    assert t.track_state == t.TRACK_STATE_VISUAL_UNSTABLE
+    assert t._identity_anchor_gray is _anchor_ref, (
+        "_identity_anchor_gray стал другим объектом ВО ВРЕМЯ visual "
+        "instability")
+    assert np.array_equal(t._identity_anchor_gray, _anchor_bytes), (
+        "байты _identity_anchor_gray изменились во время visual "
+        "instability")
+    assert t._match_dbg.get("identity_anchor_changed") == 0, (
+        "identity_anchor_changed=1 на кадре visual instability")
+_anchor_events12 = [e for e in _events12 if e.startswith("IDENTITY ANCHOR")]
+assert not _anchor_events12, (
+    "событие 'IDENTITY ANCHOR: подтверждена' произошло во время visual "
+    "instability: %s" % _anchor_events12)
+stable_cam()
+tick()
+assert t.track_state == t.TRACK_STATE_TRACKED
+assert t._identity_anchor_gray is _anchor_ref, (
+    "anchor подменился уже ПОСЛЕ восстановления камеры")
+print("    10 кадров camera jump + восстановление — anchor остался тем же "
+      "объектом с теми же байтами на протяжении всего эпизода, "
+      "identity_anchor_changed ни разу не всплыл 1")
+
 print("\nOK: VISUAL_UNSTABLE переиспользует существующий freshness-гейт "
       "(CAM_JUMP_MAX_VALID_DT_S, ни одного нового порога), отключает "
       "controllable ТОЛЬКО пока замер свеж и показывает нестабильность, "

@@ -177,6 +177,59 @@ assert len(_trig_events) == 1, (
     % (len(_trig_events), _trig_events))
 print("    событие: %s; REANCHOR не вызывался" % _trig_events[0])
 
+print("\n=== 3б. COMMIT ORDER (отчёт 25.09, разбор поверх 64949ec, п.E): "
+      "на кадре, который ОКОНЧАТЕЛЬНО доказал неуверенность, lock_cx/cy, "
+      "prev_gray/pts и template НЕ должны сдвинуться на новое (уже не "
+      "доверенное) значение — снимок ДО и ПОСЛЕ триггерящего кадра "
+      "обязан совпасть бит-в-бит, не только 'не было REANCHOR-события' "
+      "===")
+t.reset_tracking(to_acq=False)
+capture()
+install_fakes(**AMBIGUOUS)
+for _ in range(N - 1):
+    tick()
+assert t.track_state == t.TRACK_STATE_TRACKED, "тест сам по себе негоден"
+_lock_before = (t.lock_cx, t.lock_cy)
+_prev_gray_before = t.prev_gray            # identity, не .copy()
+_prev_pts_before = t.prev_pts
+_tmpl_before = t.template_gray.copy()
+_tmpl_wh_before = (t.tmpl_w, t.tmpl_h, t.template_std)
+_lost_frames_before = t.lost_frames
+tick()   # N-й кадр — тот самый, что триггерит
+assert t.track_state == t.TRACK_STATE_IDENTITY_UNCERTAIN, (
+    "тест сам по себе негоден: триггер не сработал на ожидаемом кадре")
+assert (t.lock_cx, t.lock_cy) == _lock_before, (
+    "lock_cx/cy изменились на триггерящем кадре (%r -> %r) — новая, уже "
+    "недоверенная позиция была закоммичена ДО решения об identity"
+    % (_lock_before, (t.lock_cx, t.lock_cy)))
+assert t.prev_gray is _prev_gray_before, (
+    "prev_gray переустановлен на триггерящем кадре — следующий 'хороший' "
+    "кадр сравнивался бы с уже недоверенным prev_gray как с подтверждённым")
+assert t.prev_pts is _prev_pts_before, (
+    "prev_pts переустановлены на триггерящем кадре")
+assert np.array_equal(t.template_gray, _tmpl_before), (
+    "template_gray изменился на триггерящем кадре — эталон 'обучился' "
+    "на кадре, который сам же объявил себя недоверенным")
+assert (t.tmpl_w, t.tmpl_h, t.template_std) == _tmpl_wh_before, (
+    "tmpl_w/tmpl_h/template_std разошлись с исходными на триггерящем кадре")
+assert t.lost_frames == _lost_frames_before, (
+    "lost_frames изменился на триггерящем кадре (%r -> %r) — commit "
+    "произошёл частично"
+    % (_lost_frames_before, t.lost_frames))
+print("    lock_cx/cy, prev_gray/pts (identity), template_gray (побайтово), "
+      "tmpl_w/h/template_std, lost_frames — ВСЕ остались ровно такими, "
+      "какими были ДО триггерящего кадра")
+# Возвращаем состояние туда же, где его оставила секция 3 (IDENTITY_
+# UNCERTAIN после срабатывания) — секция 4 продолжает именно с этого.
+t.reset_tracking(to_acq=False)
+capture()
+install_fakes(**AMBIGUOUS)
+for _ in range(N):
+    tick()
+assert t.track_state == t.TRACK_STATE_IDENTITY_UNCERTAIN, (
+    "тест сам по себе негоден: не удалось восстановить состояние для "
+    "секции 4")
+
 print("\n=== 4. Ни один флаг не читается по одной проверке: не восстанавливаем "
       "руками, гоним ЕСТЕСТВЕННЫЕ следующие кадры (даже с ЧИСТЫМ матчем — "
       "проверяем, что controllable НЕ включился обратно САМ) ===")
@@ -271,9 +324,12 @@ print("    расхождение матча с потоком (без ambiguity
       "триггерит IDENTITY_UNCERTAIN")
 t.reset_tracking(to_acq=False)
 
-print("\n=== 9. Один сигнал из двух (только поток ИЛИ только матч) — "
-      "streak НЕ трогается вообще (сравнивать не с чем, это не "
-      "свидетельство ни за, ни против) ===")
+print("\n=== 9. Один сигнал из двух (только поток ИЛИ только матч) — НЕ "
+      "свидетельство ни за, ни против identity, но ПРЕРЫВАЕТ серию "
+      "(отчёт 25.09, разбор поверх 64949ec, п.D: streak — это N ПОДРЯД "
+      "ИДУЩИХ сомнительных кадров, а не N сомнительных с произвольными "
+      "разрывами между ними; single-signal кадр прерывает так же, как и "
+      "явно чистый) ===")
 capture()
 install_fakes(**AMBIGUOUS)
 for _ in range(N - 1):
@@ -288,15 +344,26 @@ def fake_flow_fail(prev_g, cur_g, pts, cx, cy):
 
 t.flow_predict = fake_flow_fail   # только матч, поток недоступен
 tick()
-assert t._match_dbg.get("identity_uncertain_streak") == _streak_before, (
-    "streak изменился на кадре с одним сигналом из двух (flow_ok=False) — "
-    "должен был остаться нетронутым: %r -> %r"
-    % (_streak_before, t._match_dbg.get("identity_uncertain_streak")))
+assert t._match_dbg.get("identity_uncertain_streak") == 0, (
+    "streak не сброшен на кадре с одним сигналом из двух (flow_ok=False) "
+    "— серия из %d сомнительных кадров ДО этого не должна была уцелеть "
+    "через несравнимый кадр (%r -> %r, ожидали 0)"
+    % (_streak_before, _streak_before, t._match_dbg.get("identity_uncertain_streak")))
 assert t.track_state == t.TRACK_STATE_TRACKED, (
     "single-signal кадр (только матч) сам по себе не должен переводить в "
     "IDENTITY_UNCERTAIN")
-print("    streak остался на %d после single-signal кадра (только матч, "
-      "поток недоступен) — не сброшен и не увеличен" % _streak_before)
+t.flow_predict = _real_flow_predict
+# И серия ПОСЛЕ разрыва обязана начинаться с 1, а не продолжать счёт —
+# иначе разрыв был бы чисто косметическим (та же проверка методологии,
+# что уже сделана для "чистого" разрыва в секции 7).
+install_fakes(**AMBIGUOUS)
+tick()
+assert t._match_dbg.get("identity_uncertain_streak") == 1, (
+    "после несравнимого кадра streak не начал считать заново с 1, а с %r"
+    % t._match_dbg.get("identity_uncertain_streak"))
+print("    N-1 сомнительных -> 1 single-signal кадр (streak=0, прерван, "
+      "не заморожен) -> 1 сомнительный (streak=1) — несравнимый кадр "
+      "прерывает серию так же, как и чистый")
 t.reset_tracking(to_acq=False)
 
 print("\n=== 10. Центральное принуждение: _update_control_from_target_impl "

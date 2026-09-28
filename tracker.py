@@ -248,51 +248,41 @@ ACQ_SNAP_MIN_OTN = 2.5
 # медиана почти ноль и любой шум превышает её в разы.
 ACQ_SNAP_MIN_ABS = 4.0
 
-# --- НЕОДНОЗНАЧНЫЙ ПАТЧ ПОД ПРИЦЕЛОМ — ОТКАЗ, А НЕ ДОГАДКА (отчёт 25.09,
-# п.3) ---
+# --- НЕОДНОЗНАЧНЫЙ CANDIDATE — ОТКАЗ, А НЕ ДОГАДКА (отчёт 25.09, п.3,
+# пересмотрено после разбора оператора поверх 64949ec) ---
 #
-# НАХОДКА. ACQ_SNAP_YADRO_MIN_ABS=4.0 отделяет "неотличимо от фона" от
-# "есть за что цепляться" — но порог ОДИН на весь диапазон между двумя
-# принципиально разными случаями. Замер на модели (см. комментарий у
-# ACQ_SNAP_YADRO_MIN_ABS) сам это показывает:
-#     сосед в 18 px и дальше    0.8-0.9   (ниже порога — верно отвергается)
-#     сосед в 15 px                  5.2   (ВЫШЕ порога 4.0 — принимался бы
-#                                            как "прицел", хотя это хвост
-#                                            чужого объекта, не цель)
-#     сосед в 12 px                 12.9
-#     фактурный предмет             10.2
-#     цель ровно под прицелом       20.7
-# Разрыв между "хвост соседа" (5.2) и "настоящая структура" (10.2+) — вот
-# где на самом деле нужна граница, а не между "фон" и "не фон". До этой
-# правки estimate_initial_target() ВСЕГДА возвращал ok=True (даже когда
-# _nayti_pyatno вообще ничего не нашёл — тогда просто брался сырой прицел
-# с размером по умолчанию) — ровно то, о чём отчёт: "tracker too easily
-# calls itself TRACKED", только на шаг раньше, в момент самого захвата.
+# До ЭТОЙ правки estimate_initial_target() ВСЕГДА возвращал ok=True — даже
+# когда _nayti_pyatno вообще ничего не нашёл (тогда брался сырой прицел с
+# размером по умолчанию). Ровно тезис отчёта "tracker too easily calls
+# itself TRACKED", только на шаг раньше, в момент самого захвата.
 #
-# ЧТО ДЕЛАЕТ. Порог ВЫШЕ уже существующего ACQ_SNAP_YADRO_MIN_ABS/porog_
-# uzko, не вместо него — как множитель ОТ уже адаптивного porog_uzko (тот
-# сам масштабируется с фоном зоны через ACQ_SNAP_YADRO_MIN_OTN), а не
-# отдельное абсолютное число: 5.2/4.0=1.3, 10.2/4.0=2.55 — множитель 2.0
-# чисто разделяет два кластера в приведённом замере, не выдумка "на глаз".
-# Значение НАЧАЛЬНОЕ (архитектура важнее конкретного числа, ТЗ п. "не
-# патчить коэффициентами") — уточняется офлайн-разбором реальных 96
-# заходов (п.3/п.9 отчёта), не подбором на лету.
+# ДВЕ РАЗНЫЕ ПРИЧИНЫ ОТКАЗА, ОДИН ПУТЬ:
+#   1. В зоне поиска нет вообще ничего выраженного (_nayti_pyatno -> None)
+#      — БЕЗУСЛОВНО, не опция этого переключателя: "ничего не нашли ->
+#      всё равно захватить сырой прицел" убрано из архитектуры целиком
+#      (прямое требование оператора), а не спрятано за ENABLED=False.
+#   2. Candidate НАЙДЕН, но недостаточно уверенно оторвался от локального
+#      фона зоны (margin < ACQ_CANDIDATE_CONFIDENT_MULT) — ЭТО и есть то,
+#      чем управляет ACQ_AMBIGUOUS_REJECT_ENABLED ниже.
+# Ни в одном из двух случаев нет пути "возьмём что-то другое вместо" — при
+# отказе acquisition остаётся в ACQ и пробует заново на следующем кадре
+# (тот же путь, что уже существует для "измерение не удалось").
 #
-# НЕ сравнение с соседними пятнами (это уже пробовали и отвергли — см.
-# докстроку _nayti_pyatno, "Сравнение и было ошибкой") — margin считается
-# ТОЛЬКО от локального фона зоны, ни один сосед никогда не участвует в
-# решении. "Guessing a neighboring object" отчёт просит не делать ВМЕСТО
-# отказа — здесь и вовсе нет такого пути: при отказе acquisition остаётся
-# в ACQ и пробует заново на следующем кадре (тот же путь, что уже
-# существует для "не нашли ничего" — см. process_locked_tracker), не
-# перескакивает ни на что.
-#
-# ТОЛЬКО случай "прицел" (fine-scale под прицелом) — для случая "пятно"
-# (ближайшее к прицелу, когда под самим прицелом пусто) эквивалентных
-# калиброванных на модели чисел нет, и вводить множитель туда без замера
-# значило бы придумывать коэффициент, а не архитектуру. Отдельный вопрос.
+# ACQ_CANDIDATE_CONFIDENT_MULT=1.0 — НАМЕРЕННО НЕЙТРАЛЬНОЕ значение. Любой
+# член vershiny уже имеет margin>=1.0 по самому построению (иначе не
+# прошёл бы порог обнаружения peak'а) — то есть при 1.0 эта проверка
+# СЕЙЧАС не фильтрует ничего сверх самого факта "candidate найден".
+# Прежний ACQ_YADRO_CONFIDENT_MULT=2.0 был откалиброван на бенч-цифрах для
+# ОТДЕЛЬНОЙ, убранной ветки (uzko/"прицел" — фон 0.8-0.9, хвост соседа в
+# 15px 5.2, настоящая структура 10.2+) — для ЕДИНОГО sal-based margin
+# candidate'а (та же величина, что раньше называлась margin случая
+# "пятно") эквивалентных калиброванных чисел нет, и переносить старый
+# множитель значило бы сравнивать разные единицы измерения. Отчёт прямо
+# просит: сначала архитектура (единый выбор candidate'а, честная
+# диагностика), потом реальные числа — офлайн-разбором логов, не
+# подбором на лету. Механизм готов, порог — нет.
 ACQ_AMBIGUOUS_REJECT_ENABLED = True
-ACQ_YADRO_CONFIDENT_MULT = 2.0
+ACQ_CANDIDATE_CONFIDENT_MULT = 1.0
 
 ACQ_RADIUS_MAIN = 18
 ACQ_RADIUS_LORES = max(8, int(round(ACQ_RADIUS_MAIN * LORES_W / MAIN_W)))
@@ -2377,6 +2367,32 @@ _FLIGHT_LOG_COLUMNS = (
     # офлайн-калибровки IDENTITY_UNCERTAIN_CONFIRM_FRAMES по реальным
     # логам (п.9 отчёта), а не только по факту срабатывания.
     "identity_uncertain,identity_ambiguous,identity_flow_gap,identity_uncertain_streak,"
+    # ПОДТВЕРЖДЁННАЯ IDENTITY (отчёт 25.09, разбор поверх 64949ec, п.B/J).
+    # identity_confirmed=1 — для ТЕКУЩЕГО лока есть подтверждённый anchor
+    # (_identity_anchor_gray не None; ACQ/IDLE — 0). identity_anchor_
+    # changed=1 — anchor РЕАЛЬНО переписался ИМЕННО на этом кадре (не
+    # персистентно — сбрасывается в 0 на каждом следующем, см.
+    # process_locked_tracker); допустим ТОЛЬКО на кадре явного
+    # подтверждения (acquisition/manual_nudge_release, см. identity_
+    # anchor_change_reason) — в нормальном захвате должен оставаться 0
+    # всё время между подтверждениями. По этой паре полей в реальном логе
+    # можно прямо доказать, что identity не переписывалась молча.
+    "identity_confirmed,identity_anchor_changed,identity_anchor_change_reason,"
+    # ACQUISITION CANDIDATE (отчёт 25.09, п.A/J) — диагностика КАЖДОЙ
+    # попытки захвата, успешной или нет (см. estimate_initial_target).
+    # acq_candidate_present=0 — в зоне поиска не нашлось вообще ничего
+    # выраженного (отказ безусловен, не опция). acq_candidate_dx/dy —
+    # смещение найденного candidate от крестика в px lores (0 — ровно под
+    # крестиком). acq_candidate_confirmed=0 при present=1 значит candidate
+    # найден, но признан сомнительным (ACQ_AMBIGUOUS_REJECT_ENABLED) —
+    # тоже отказ, никакого "возьмём другой".
+    "acq_candidate_present,acq_candidate_dx,acq_candidate_dy,acq_candidate_confirmed,"
+    # template_refresh_allowed — голос ТЕКУЩЕГО fresh-слота Auto Template
+    # Refresh (PSR-margin/gap/identity_ambiguous/flow_gap все пройдены на
+    # ЭТОМ слоте) — не то же самое, что реальное срабатывание refresh'а
+    # (см. events.log AUTO_TEMPLATE_REFRESH): тому ещё нужны confirm-
+    # streak, cooldown и согласие с confirmed identity anchor.
+    "template_refresh_allowed,"
     # VISUAL_UNSTABLE (отчёт 25.09, п.5). visual_unstable=1 — этот КАДР
     # (не персистентно, в отличие от identity_uncertain выше) отключил
     # controllable из-за свежего camera jump/top_saturated (freshness —
@@ -4326,6 +4342,21 @@ template_gray = None
 # Эталон, снятый в момент захвата: не обновляется и не размывается.
 template_base = None
 template_scale_acc = 1.0
+# ПОДТВЕРЖДЁННАЯ IDENTITY (отчёт 25.09, разбор поверх 64949ec, п.B) —
+# ОТДЕЛЬНО от template_base/template_gray. Хотя template_base назван
+# "эталон, снятый при захвате" в комментарии выше, на деле его мутирует
+# _adapt_template_base() (addWeighted, подмешивание свежих пикселей) —
+# нужно самому механизму рескейла БЕЗ повторной интерполяции, но это
+# значит template_base НЕ иммутабелен на практике, вопреки собственному
+# докстрингу. _identity_anchor_gray — единственная величина, которую
+# НИКОГДА не трогают adaptation/refresh/size-adapt/rescale — только явное
+# подтверждение через _commit_confirmed_identity() (см. её докстроку: ровно
+# ОДНО легитимное вызывающее место — первичный захват; ручная коррекция
+# (nudge-release) якорь НЕ подтверждает и НЕ трогает).
+_identity_anchor_gray = None
+_identity_anchor_w = None
+_identity_anchor_h = None
+_identity_anchor_std = None
 # Плоскости цветности текущего кадра и цветовая подпись цели.
 chroma_u = None
 chroma_v = None
@@ -5541,21 +5572,27 @@ def _nayti_pyatno(gray):
     тёмном. Дальше порог и связные области; мелочь ниже ACQ_SNAP_MIN_PLOSHCHAD
     отбрасывается — у цели есть размер, у шумной крупинки нет.
 
-    ПОРЯДОК ВАЖНЕЕ САМОГО ПОИСКА. Сначала проверяется, есть ли выраженность
-    под самим прицелом. Если есть — берём её и ни с чем не сравниваем: пилот
-    уже навёл. Сравнение и было ошибкой — рядом почти всегда найдётся предмет
-    контрастнее, и захват перекидывало на него с уже наведённой цели. Зона
-    поиска включается только тогда, когда под прицелом пусто.
+    КРЕСТИК — ЦЕНТР ЗОНЫ ПОИСКА, А НЕ КАНДИДАТ С БЕЗУСЛОВНЫМ ПРИОРИТЕТОМ
+    (пересмотрено после разбора оператора поверх 64949ec). Раньше здесь
+    стояла ОТДЕЛЬНАЯ, более мелкомасштабная проверка "есть ли структура ПОД
+    самим крестиком" — она срабатывала первой и решала захват безусловно,
+    даже не заглядывая в остальную зону. Формально это должно было
+    "доверять наводке пилота", но реально означало: если под самим
+    крестиком случайно фон, а не цель, крестик всё равно "выигрывал", хотя
+    рядом в той же зоне мог быть явно выраженный, ничем не хуже patch. Эта
+    ветка убрана целиком — вершины ищутся ПО ВСЕЙ ЗОНЕ одним и тем же
+    способом, и побеждает БЛИЖАЙШАЯ к крестику. Если она оказывается ровно
+    под ним (dx=dy≈0) — результат совпадает с прежним "прицел"; если рядом
+    — берётся она, а не пустое место под крестиком. Детектор (sal/vershiny/
+    rast) и его пороги не менялись — переписана только семантика выбора.
 
-    Возвращает (x, y, причина, margin) в координатах lores, либо None, если в
+    Возвращает (x, y, margin, dx, dy) в координатах lores, либо None, если в
     зоне нет ничего выраженного вовсе. margin — во сколько раз отклик
     ПРЕВЫСИЛ свой порог (>= 1.0 по построению — иначе не прошёл бы порог) —
-    НЕ сравнение с соседями (см. выше, почему это ошибка), а мера того,
-    насколько уверенно отклик оторвался от локального фона САМОЙ ЗОНЫ.
-    Разные единицы для "прицел" (uzko/porog_uzko) и "пятно" (sal/porog) —
-    решение об отказе (см. ACQ_AMBIGUOUS_REJECT_ENABLED в estimate_initial_
-    target) использует только margin случая "прицел", у "пятно" пока нет
-    эквивалентных калиброванных на модели чисел (отчёт 25.09, п.3).
+    НЕ сравнение с соседями (выбор уже сделан через rast/argmin ДО margin),
+    а мера того, насколько уверенно отклик оторвался от локального фона
+    САМОЙ ЗОНЫ. dx/dy — смещение найденного patch от крестика (0.0 при
+    точном совпадении), для диагностики (отчёт 25.09, п.J).
     """
     if not ACQ_SNAP_ENABLED:
         return None
@@ -5605,55 +5642,22 @@ def _nayti_pyatno(gray):
         py = y0 + ys.astype(np.float32)
         rast = np.hypot(px - CENTER_X_LORES, py - CENTER_Y_LORES)
 
-        # ПРИЦЕЛ ИМЕЕТ ПРИОРИТЕТ. Есть под ним за что цепляться — выбор
-        # окончен, берём прицел и ни с чем не сравниваем: пилот уже навёл.
-        #
-        # ВОПРОС В ТОМ, ЧЕМ ЭТО ПРОВЕРЯТЬ. Здесь сменилось три ответа, и два
-        # первых были неверны:
-        #
-        #   1. Превышение порога — мало. Широкое размытие расплывает отклик
-        #      соседнего предмета далеко за его края, и его ХВОСТ под прицелом
-        #      порог превышает. Захват решал, что цель под прицелом есть, хотя
-        #      там только край чужого отклика.
-        #
-        #   2. Наличие своей вершины — слишком строго. У фактурного предмета
-        #      вершин много, и стоит прицелу оказаться не точно на одной из
-        #      них, захват уезжал на соседнюю вершину ТОГО ЖЕ предмета.
-        #
-        #   3. Отклик на МЕЛКОМ масштабе — то, что нужно. Он спрашивает не
-        #      «есть ли тут вершина», а «есть ли под прицелом собственная
-        #      мелкая структура». У фактуры она есть в любой её точке, а
-        #      хвост соседа — гладкий скат, и на мелком масштабе он почти
-        #      ноль: разность близких размытий гасит плавный перепад.
-        #
-        # Заодно это ровно то, что нужно самому слежению: эталон цепляется
-        # именно за мелкую структуру, а не за гладкий градиент.
-        uzko = cv2.absdiff(melko, cv2.GaussianBlur(f, (0, 0),
-                                                   ACQ_SNAP_SIGMA_YADRO))
-        ydro_r = int(max(2, ACQ_SNAP_YADRO_LORES))
-        cx_l = int(CENTER_X_LORES) - x0
-        cy_l = int(CENTER_Y_LORES) - y0
-        yx0 = max(0, cx_l - ydro_r)
-        yy0 = max(0, cy_l - ydro_r)
-        yx1 = min(uzko.shape[1], cx_l + ydro_r + 1)
-        yy1 = min(uzko.shape[0], cy_l + ydro_r + 1)
-        if yx1 > yx0 and yy1 > yy0:
-            fon_uzko = float(np.median(uzko))
-            porog_uzko = max(ACQ_SNAP_YADRO_MIN_ABS,
-                             fon_uzko * ACQ_SNAP_YADRO_MIN_OTN)
-            uzko_val = float(uzko[yy0:yy1, yx0:yx1].max())
-            if uzko_val >= porog_uzko:
-                return (float(CENTER_X_LORES), float(CENTER_Y_LORES),
-                       "прицел", uzko_val / max(porog_uzko, 1e-6))
-
+        # КРЕСТИК — ЦЕНТР ЗОНЫ ПОИСКА, НЕ БЕЗУСЛОВНЫЙ ПРИОРИТЕТ (см. докстрока
+        # выше — отдельная ветка "структура ПОД самим крестиком" убрана
+        # целиком после разбора оператора поверх 64949ec). Единственный
+        # критерий выбора — расстояние до крестика среди уже найденных
+        # вершин, независимо от того, есть ли отклик РОВНО под ним.
         vnutri = rast <= R
         if not np.any(vnutri):
             return None
-        # Под прицелом пусто — берём БЛИЖАЙШЕЕ, а не самое выраженное: рядом
-        # почти всегда найдётся предмет контрастнее, но пилот целился не в него.
         i = int(np.argmin(np.where(vnutri, rast, np.inf)))
+        chosen_x = float(px[i])
+        chosen_y = float(py[i])
         sal_val = float(sal[ys[i], xs[i]])
-        return (float(px[i]), float(py[i]), "пятно", sal_val / max(porog, 1e-6))
+        margin = sal_val / max(porog, 1e-6)
+        dx = chosen_x - float(CENTER_X_LORES)
+        dy = chosen_y - float(CENTER_Y_LORES)
+        return (chosen_x, chosen_y, margin, dx, dy)
     except Exception:
         return None
 
@@ -5721,81 +5725,72 @@ def estimate_size_at_position_any(gray, px, py):
 
 
 def estimate_initial_target(gray):
-    """Возвращает (tx, ty, lw, lh, ok). ok=False — ЗАХВАТ ОТКЛОНЁН (отчёт
-    25.09, п.3): patch под прицелом неоднозначен, или в зоне поиска нет
-    вообще ничего выраженного. Вызывающая сторона (process_locked_tracker)
-    на ok=False остаётся в ACQ и пробует заново на следующем кадре — тот
-    же путь, что уже существовал для "измерение не удалось", никакого
-    нового состояния. НЕТ пути "раз patch под прицелом сомнителен — возьмём
-    соседний": при отказе tx/ty/lw/lh вообще не используются.
+    """Возвращает (tx, ty, lw, lh, ok). ok=False — ЗАХВАТ ОТКЛОНЁН: либо в
+    зоне поиска нет вообще ничего выраженного (БЕЗУСЛОВНО — не опция; путь
+    "ничего не нашли -> всё равно захватить сырой прицел" убран из
+    архитектуры целиком, прямое требование разбора поверх 64949ec), либо
+    найденный candidate признан сомнительным (ACQ_AMBIGUOUS_REJECT_ENABLED
+    — гейтит ИМЕННО это, не отсутствие candidate'а). Вызывающая сторона
+    (process_locked_tracker) на ok=False остаётся в ACQ и пробует заново на
+    следующем кадре. НЕТ пути "candidate сомнителен — возьмём другой": при
+    отказе tx/ty/lw/lh вообще не используются, альтернатива не выбирается.
 
-    ДИАГНОСТИКА (отчёт 25.09, п.3: "method, uniqueness/ambiguity of chosen
-    patch, rejection reason") — событие в лог при КАЖДОМ захвате, успешном
-    или нет: acq_method (прицел/пятно/none), margin (см. _nayti_pyatno),
-    и при отказе — явная причина.
+    КРЕСТИК — ТОЛЬКО ЦЕНТР ЗОНЫ ПОИСКА (см. докстрока _nayti_pyatno). Один
+    AUX4-жест — один поиск, один результат за ОДИН кадр: либо ближайший к
+    крестику candidate сразу становится TRACKED, либо явный отказ. Никакого
+    отдельного "предложенного" состояния и подтверждения нет — по прямому
+    указанию оператора после разбора: "PROPOSED как пользовательский этап
+    не нужен, одно действие сразу привязывает рамку".
+
+    ДИАГНОСТИКА (отчёт 25.09, п.3/п.J) — событие в лог при КАЖДОМ захвате,
+    успешном или нет: margin, dx/dy candidate'а от крестика, при отказе —
+    явная причина. _match_dbg["acq_candidate_*"] — то же для CSV; персистит
+    на весь TRACKED-сеанс как свойство ЭТОГО лока (та же семантика, что и у
+    lock_w0/lock_h0), не сбрасывается каждый кадр.
     """
     if ACQ_LOCK_AT_CROSSHAIR_EXACTLY:
         lw = lh = None
-        # ЗОНА ПОИСКА. Пилот целится в район цели, а захватываемся мы за то,
-        # что в этом районе выделяется. Не нашли ничего выраженного — берём
-        # ровно ту точку, куда он навёл: прежнее поведение сохраняется, и над
-        # однородной поверхностью зона целиться не мешает.
-        tx, ty = float(CENTER_X_LORES), float(CENTER_Y_LORES)
         pyatno = _nayti_pyatno(gray)
-        if pyatno is None and ACQ_AMBIGUOUS_REJECT_ENABLED:
-            # НАЙДЕНО (отчёт 25.09, п.3): раньше ЭТОТ случай тоже давал
-            # ok=True — сырой прицел с размером по умолчанию, без единого
-            # признака того, что тут вообще есть цель. Ровно тезис отчёта
-            # "tracker too easily calls itself TRACKED", на шаг раньше.
-            flight_log.event(
-                "ЗАХВАТ ОТКЛОНЁН: в зоне %d ничего выраженного (method=none)"
-                % ACQ_SNAP_RADIUS_LORES)
-            return tx, ty, float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H), False
         if pyatno is None:
-            # ACQ_AMBIGUOUS_REJECT_ENABLED=False — kill-switch обязан
-            # восстанавливать СТАРОЕ поведение целиком (самостоятельный
-            # баг первой версии этой правки: здесь стоял безусловный
-            # return False, kill-switch проверялся ТОЛЬКО у margin-ветки
-            # ниже — поймано test_adaptation_gate.py, чей полосатый фон
-            # для МАТЧЕРА случайно даёт _nayti_pyatno=None). Старое
-            # поведение — сырой прицел, размер по умолчанию, ok=True.
+            # БЕЗУСЛОВНО — не гейтится ACQ_AMBIGUOUS_REJECT_ENABLED (тот
+            # решает судьбу НАЙДЕННОГО, но сомнительного candidate'а, а не
+            # то, есть ли вообще что решать). Раньше этот случай тоже давал
+            # ok=True — сырой прицел с размером по умолчанию, без единого
+            # признака того, что тут вообще есть цель.
+            _match_dbg["acq_candidate_present"] = 0
+            _match_dbg["acq_candidate_dx"] = None
+            _match_dbg["acq_candidate_dy"] = None
+            _match_dbg["acq_candidate_confirmed"] = 0
             flight_log.event(
-                "захват по прицелу: в зоне %d ничего выраженного"
+                "ЗАХВАТ ОТКЛОНЁН: в зоне %d ничего выраженного"
                 % ACQ_SNAP_RADIUS_LORES)
-            if ACQ_SIZE_BY_SEGMENTATION:
-                lw, lh = estimate_size_at_position_any(gray, tx, ty)
-            elif ACQ_DEBUG_DUMP:
-                estimate_size_at_crosshair(gray)
-            if lw is None or lh is None:
-                lw, lh = float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H)
-            return tx, ty, float(lw), float(lh), True
-        _acq_method = pyatno[2]
-        _acq_margin = pyatno[3]
-        if (_acq_method == "прицел" and ACQ_AMBIGUOUS_REJECT_ENABLED
-                and _acq_margin < ACQ_YADRO_CONFIDENT_MULT):
-            # НАЙДЕНО (отчёт 25.09, п.3): patch под прицелом превысил
-            # ACQ_SNAP_YADRO_MIN_ABS (иначе pyatno был бы None), но не
-            # настолько уверенно, чтобы отличить его от хвоста чужого
-            # объекта (см. калибровку у ACQ_YADRO_CONFIDENT_MULT — сосед в
-            # 15px давал margin~1.3, настоящая структура — 2.55+). НЕ берём
-            # соседнее пятно вместо него (та ветка ниже даже не
-            # рассматривается) — явный отказ, тот же путь, что и "ничего не
-            # нашли".
+            return (float(CENTER_X_LORES), float(CENTER_Y_LORES),
+                   float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H), False)
+        tx, ty, _acq_margin, _acq_dx, _acq_dy = pyatno
+        _match_dbg["acq_candidate_present"] = 1
+        _match_dbg["acq_candidate_dx"] = _acq_dx
+        _match_dbg["acq_candidate_dy"] = _acq_dy
+        if (ACQ_AMBIGUOUS_REJECT_ENABLED
+                and _acq_margin < ACQ_CANDIDATE_CONFIDENT_MULT):
+            # ACQ_CANDIDATE_CONFIDENT_MULT=1.0 по умолчанию (см. её
+            # докстроку) — это НЕ фильтр сверх самого обнаружения peak'а
+            # (любой член vershiny уже имеет margin>=1.0 по построению), а
+            # заготовленный, пока намеренно нейтральный порог: прежний
+            # ACQ_YADRO_CONFIDENT_MULT=2.0 был откалиброван на другую,
+            # убранную ветку (uzko/"прицел") и для sal-based margin
+            # candidate'а не годится без новых реальных замеров (отчёт
+            # прямо просит сначала архитектуру, потом числа).
+            _match_dbg["acq_candidate_confirmed"] = 0
             flight_log.event(
-                "ЗАХВАТ ОТКЛОНЁН: patch под прицелом неоднозначен "
-                "(method=прицел margin=%.2f < %.2f)"
-                % (_acq_margin, ACQ_YADRO_CONFIDENT_MULT))
-            return tx, ty, float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H), False
-        if _acq_method == "прицел":
-            flight_log.event(
-                "захват по прицелу: под ним есть за что цепляться "
-                "(margin=%.2f)" % _acq_margin)
-        else:
-            tx, ty = float(pyatno[0]), float(pyatno[1])
-            sdvig = math.hypot(tx - CENTER_X_LORES, ty - CENTER_Y_LORES)
-            flight_log.event(
-                "ЗАХВАТ ПО ПЯТНУ: под прицелом пусто, ближайшее в %.0f px "
-                "(margin=%.2f)" % (sdvig, _acq_margin))
+                "ЗАХВАТ ОТКЛОНЁН: candidate неоднозначен (margin=%.2f < "
+                "%.2f, dx=%.0f dy=%.0f)"
+                % (_acq_margin, ACQ_CANDIDATE_CONFIDENT_MULT, _acq_dx, _acq_dy))
+            return (float(CENTER_X_LORES), float(CENTER_Y_LORES),
+                   float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H), False)
+        _match_dbg["acq_candidate_confirmed"] = 1
+        flight_log.event(
+            "ЗАХВАТ: candidate margin=%.2f dx=%.0f dy=%.0f"
+            % (_acq_margin, _acq_dx, _acq_dy))
         if ACQ_SIZE_BY_SEGMENTATION:
             lw, lh = estimate_size_at_position_any(gray, tx, ty)
         elif ACQ_DEBUG_DUMP:
@@ -5809,8 +5804,12 @@ def estimate_initial_target(gray):
         return tx, ty, float(lw), float(lh), True
     # ACQ_LOCK_AT_CROSSHAIR_EXACTLY=False — отдельный, более простой режим
     # ("всегда точно по прицелу"), в котором _nayti_pyatno вообще не
-    # вызывается и никакого сигнала выраженности не считается. Отказ по
-    # неоднозначности здесь вне области этой правки — нечего оценивать.
+    # вызывается и никакого сигнала выраженности не считается. Вне области
+    # этой правки — нечего оценивать.
+    _match_dbg["acq_candidate_present"] = None
+    _match_dbg["acq_candidate_dx"] = None
+    _match_dbg["acq_candidate_dy"] = None
+    _match_dbg["acq_candidate_confirmed"] = None
     return (float(CENTER_X_LORES), float(CENTER_Y_LORES),
             float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H), True)
 
@@ -6586,6 +6585,58 @@ def sync_template_metadata():
     template_std = float(np.std(template_gray))
 
 
+def _commit_confirmed_identity(fresh_tmpl, cx, cy, reason):
+    """ЕДИНСТВЕННОЕ место, где ПОДТВЕРЖДЁННАЯ identity (immutable anchor)
+    может измениться (отчёт 25.09, разбор поверх 64949ec, п.B/G).
+
+    Ровно ОДНО легитимное вызывающее место — первичный захват
+    (estimate_initial_target -> ok=True, пилот навёл прицел и поднял
+    AUX4). Это единственный момент, где пилот явно, деятельно
+    подтверждает "вот эта цель" — а не решение трекера "само по себе".
+
+    reanchor_tracker_at_current_box (отпускание стика ручной коррекции)
+    НАРОЧНО эту функцию НЕ зовёт, хотя тоже является явным действием
+    пилота (отчёт 25.09, разбор поверх 64949ec, п.G): nudge поправляет,
+    ГДЕ мы считаем цель находящейся, а не ЧТО именно мы считаем целью —
+    "стик отпущен" само по себе не означает "пилот подтвердил новую
+    identity". Первая версия этой правки звала _commit_confirmed_identity
+    и из reanchor тоже — это было самопротиворечие с п.G и с тестом
+    K-7 (test_identity_uncertain.py), исправлено до коммита.
+
+    НИ ОДИН другой механизм (Auto Template Refresh, adaptation, size-
+    adapt/rescale, LOST auto-reacq, reanchor) не имеет права звать эту
+    функцию и не зовёт — полный список мест, способных менять
+    template/anchor/координаты, см. в отчёте о правке, приложенном к
+    этому коммиту.
+
+    fresh_tmpl — УЖЕ ПОСТРОЕННЫЙ вызывающей стороной массив (тот же самый
+    build_template(gray, cx, cy, box_w, box_h), которым она в ЭТОТ ЖЕ
+    момент пересобирает live template_gray). НЕ вызывает build_template()
+    заново: та пишет tmpl_w/tmpl_h/template_std как побочный эффект (см.
+    sync_template_metadata) — второй вызов здесь молча испортил бы
+    метаданные ЖИВОГО шаблона значениями кропа анкора. Копия (.copy())
+    делается здесь — анкор не должен зависеть от того, что вызывающая
+    сторона сделает с fresh_tmpl/template_gray дальше.
+
+    identity_anchor_changed=1 в CSV/логе ставится ТОЛЬКО здесь и ТОЛЬКО на
+    этом кадре (сбрасывается в 0 каждый следующий — см. process_locked_
+    tracker) — по этому полю в реальном логе можно прямо доказать, что
+    identity не переписывалась молча между подтверждениями.
+    """
+    global _identity_anchor_gray, _identity_anchor_w, _identity_anchor_h
+    global _identity_anchor_std
+    anchor = fresh_tmpl.copy()
+    _identity_anchor_gray = anchor
+    _identity_anchor_w = anchor.shape[1]
+    _identity_anchor_h = anchor.shape[0]
+    _identity_anchor_std = float(np.std(anchor)) if anchor.size else 0.0
+    _match_dbg["identity_anchor_changed"] = 1
+    _match_dbg["identity_anchor_change_reason"] = reason
+    flight_log.event(
+        "IDENTITY ANCHOR: подтверждена (%s) at=(%.1f,%.1f) size=%dx%d"
+        % (reason, cx, cy, _identity_anchor_w, _identity_anchor_h))
+
+
 def _shadow_template_target_size(box_w, box_h):
     """TRACKING SHADOW: чистая арифметика (без изображения) — побитово та
     же формула размера, что build_template() (TEMPLATE_SCALE/MIN/MAX).
@@ -7026,6 +7077,8 @@ def reset_tracking(to_acq=False):
     global lock_w0, lock_h0
     global template_base, target_uv, color_active, color_separation
     global color_axis
+    global _identity_anchor_gray, _identity_anchor_w, _identity_anchor_h
+    global _identity_anchor_std
     global prev_gray, prev_pts, lost_frames, last_match_score, last_flow_ok
     global acq_wait_left
     global filtered_dx_yaw, prev_adx, prev_ady_ctrl
@@ -7059,6 +7112,18 @@ def reset_tracking(to_acq=False):
     color_axis = None
     template_gray = None
     template_base = None
+    # ПОДТВЕРЖДЁННАЯ IDENTITY (отчёт 25.09, п.B) — принадлежит КОНКРЕТНОМУ
+    # заходу ровно как и template_base/template_gray: новый заход не
+    # должен унаследовать анкор от уже потерянной цели. Единственное
+    # МЕСТО, которое СНОВА установит её — _commit_confirmed_identity(),
+    # и вызывает её РОВНО один сценарий: следующий явный первичный захват
+    # (estimate_initial_target -> ok=True). Ручная коррекция (nudge-
+    # release) якорь НЕ трогает и НЕ восстанавливает (см. п.G/docstring
+    # reanchor_tracker_at_current_box) — не здесь.
+    _identity_anchor_gray = None
+    _identity_anchor_w = None
+    _identity_anchor_h = None
+    _identity_anchor_std = None
     target_uv = None
     color_active = False
     _shadow_track_dbg = {"active": False}
@@ -10744,6 +10809,18 @@ def reanchor_tracker_at_current_box(gray, reason):
        замораживается до первого кадра со свежим потоком — свежесобранный
        эталон снят с одного кадра и ещё не подтверждён повторным
        измерением.
+
+    НЕ ТРОГАЕТ _identity_anchor_gray (отчёт 25.09, разбор поверх 64949ec,
+    п.G, ЗАКРЕПЛЕНО test_identity_uncertain.py/test_manual_nudge_anchor.py
+    как обязательное поведение — nudge НЕ создаёт новую identity молча).
+    Nudge поправляет, ГДЕ мы считаем цель находящейся — а не ЧТО именно мы
+    считаем целью: template_gray/template_base (рабочее представление)
+    пересобираются, чтобы слежение продолжалось с верной позиции, но
+    ПОДТВЕРЖДЁННЫЙ анкор остаётся тем же, что и на момент первичного
+    захвата. Если после большой коррекции анкор перестанет соответствовать
+    новому месту — это узнается по тем же сигналам, что и везде
+    (identity_ambiguous/flow_gap/anchor-проверка Auto Template Refresh), а
+    не будет молча "прощено" самим фактом отпускания стика.
     """
     global prev_pts, prev_gray, _adapt_frozen_posle_reanchor
     global template_gray, template_base, template_scale_acc
@@ -10835,6 +10912,17 @@ def process_locked_tracker(gray, cb_t0=None):
     _visually_unstable = _visually_unstable_raw and VISUAL_UNSTABLE_ENABLED
     _match_dbg["visual_unstable"] = 1 if _visually_unstable_raw else 0
     _match_dbg["visual_unstable_reason"] = _vu_reason
+
+    # identity_anchor_changed — ТА ЖЕ причина безусловного сброса на
+    # каждом кадре (отчёт 25.09, п.B/J): пишется в 1 ТОЛЬКО внутри
+    # _commit_confirmed_identity(), на ЕЁ кадре — здесь заранее сбрасываем
+    # в 0, чтобы ЛЮБОЙ другой кадр (обычный TRACKED, ACQ без захвата,
+    # IDENTITY_UNCERTAIN, VISUAL_UNSTABLE) честно показывал "не менялась",
+    # а не унаследованное значение с прошлого подтверждения. Это САМОЕ
+    # важное поле по отчёту: "в нормальном захвате после confirmation он
+    # должен оставаться 0 всё время".
+    _match_dbg["identity_anchor_changed"] = 0
+    _match_dbg["identity_anchor_change_reason"] = ""
 
     # ВЕДЁМ ПО ТОЙ КАРТИНКЕ, ПО КОТОРОЙ РЕШИЛИ ПРИ ЗАХВАТЕ. Если выбран цвет,
     # дальше вся обработка — поиск, поток, размер — идёт по цветовой проекции.
@@ -10978,6 +11066,13 @@ def process_locked_tracker(gray, cb_t0=None):
                                            lock_w, lock_h)
             sync_template_metadata()
             template_base = template_gray.copy()
+            # ПОДТВЕРЖДЁННАЯ IDENTITY (отчёт 25.09, п.B): первичный захват
+            # — пилот навёл прицел и поднял AUX4, явное действие. Тот же
+            # массив (template_gray), что и live-представление выше — не
+            # второй build_template() (см. докстроку _commit_confirmed_
+            # identity, почему это важно).
+            _commit_confirmed_identity(
+                template_gray, lock_cx, lock_cy, "acquisition")
             template_scale_acc = 1.0
             # Один раз на захват решаем, помогает ли цвет. Если цель и её
             # окружение одного цвета — цвет не включаем, поведение прежнее.
@@ -11457,14 +11552,25 @@ def process_locked_tracker(gray, cb_t0=None):
         new_cy = match_cy
         tracked_ok = True
 
-    # Streak обновляем ТОЛЬКО на dual-signal кадрах — иначе (только один из
-    # двух сигналов жив, либо score ниже MATCH_GOOD_SCORE) сравнивать не с
-    # чем, и это не свидетельство ни за, ни против identity.
+    # НАЙДЕНО (отчёт 25.09, разбор поверх 64949ec, п.D): streak — это
+    # "N ПОДРЯД ИДУЩИХ сомнительных кадров", а не "N сомнительных кадров с
+    # произвольными разрывами между ними". Раньше НЕ-dual-signal кадр
+    # (только один сигнал жив, либо score ниже MATCH_GOOD_SCORE) оставлял
+    # streak НЕТРОНУТЫМ — то есть bad/неизвестно/неизвестно/bad/bad могло
+    # когда-нибудь накопить порог и называться "N подряд", хотя между bad-
+    # кадрами вклинивались кадры, о которых нечего сказать. Теперь
+    # НЕСРАВНИМЫЙ кадр прерывает серию ТАК ЖЕ, как и явно чистый —
+    # единственный способ удержать/поднять streak — непрерывная цепочка
+    # dual-signal кадров, где КАЖДЫЙ показывает несогласие. Порог
+    # (IDENTITY_UNCERTAIN_CONFIRM_FRAMES) не менялся — пересмотрена только
+    # семантика самого счётчика, не число.
     if _identity_dual_signal_frame:
         if _identity_ambiguous or _identity_flow_match_disagree:
             _identity_uncertain_streak += 1
         else:
             _identity_uncertain_streak = 0
+    else:
+        _identity_uncertain_streak = 0
     _match_dbg["identity_ambiguous"] = 1 if _identity_ambiguous else 0
     _match_dbg["identity_flow_gap"] = 1 if _identity_flow_match_disagree else 0
     _match_dbg["identity_uncertain_streak"] = _identity_uncertain_streak
@@ -11475,6 +11581,41 @@ def process_locked_tracker(gray, cb_t0=None):
             k = MAX_LOCK_STEP / max(step, 1e-6)
             new_cx = lock_cx + (new_cx - lock_cx) * k
             new_cy = lock_cy + (new_cy - lock_cy) * k
+
+        # IDENTITY_UNCERTAIN — РЕШЕНИЕ ДО ЛЮБОГО COMMIT (отчёт 25.09,
+        # разбор поверх 64949ec, п.E: "кадр, который окончательно доказал
+        # 'мы уже не уверены' не должен до этого успеть стать новым
+        # состоянием объекта"). Раньше эта проверка стояла В КОНЦЕ ветки
+        # tracked_ok — lock_cx/cy УЖЕ обновлялись на новую (возможно уже
+        # неверную) позицию, prev_gray/prev_pts УЖЕ переустанавливались на
+        # текущий кадр, template УЖЕ мог адаптироваться, size-adapt УЖЕ мог
+        # сдвинуть lock_w/h — а ТОЛЬКО ПОТОМ обнаруживалось, что streak
+        # набрал порог. К этому моменту "мы не уверены" запаздывало: живое
+        # состояние успевало молча стать новым ДО того, как решение вообще
+        # было принято. Теперь это ПЕРВОЕ, что происходит внутри
+        # tracked_ok (step-clamp выше — чистая геометрия ПРЕДЛОЖЕННОГО
+        # new_cx/new_cy, ещё не commit, побочных эффектов не имеет) — если
+        # identity не доверяем, НИЧЕГО ниже (lock_cx/cy, prev_gray/pts,
+        # template, lock_w/h) вообще не выполняется, track_state и
+        # geometry/template остаются РОВНО такими, какими были ДО этого
+        # кадра.
+        if (IDENTITY_UNCERTAIN_ENABLED
+                and _identity_uncertain_streak >= IDENTITY_UNCERTAIN_CONFIRM_FRAMES):
+            flight_log.event(
+                "IDENTITY_UNCERTAIN streak=%d ambiguous=%s flow_gap=%s"
+                % (_identity_uncertain_streak, _identity_ambiguous,
+                   _identity_flow_match_disagree))
+            _identity_uncertain_pending = True
+            box = lores_box_to_main(lock_cx, lock_cy, lock_w, lock_h)
+            with state_lock:
+                track_state = TRACK_STATE_IDENTITY_UNCERTAIN
+                target_visible = True
+                target_controllable = False
+                target_box_main = box
+                overlay_text = "UNCERTAIN"
+                overlay_color = COLOR_YELLOW
+            update_control_from_target()
+            return
 
         lock_cx = float(clamp(new_cx, 0, LORES_W - 1))
         lock_cy = float(clamp(new_cy, 0, LORES_H - 1))
@@ -11782,34 +11923,6 @@ def process_locked_tracker(gray, cb_t0=None):
                 lock_w = lock_w * (1.0 - SIZE_ADAPT_ALPHA) + est_w * SIZE_ADAPT_ALPHA
                 lock_h = lock_h * (1.0 - SIZE_ADAPT_ALPHA) + est_h * SIZE_ADAPT_ALPHA
 
-        # IDENTITY_UNCERTAIN (отчёт 25.09, п.2 — см. константы перед
-        # reanchor_tracker_at_current_box). Серия dual-signal кадров, где
-        # матч и поток расходятся или матч неоднозначен, набрала streak —
-        # ПЕРЕСТАЁМ считать это обычным TRACKED. НЕ reanchor, НЕ estimate_
-        # initial_target — явная, осознанная отдача управления, тот же
-        # target_controllable=False путь, что уже безопасно используется
-        # для nudge-abort. RETURN здесь же: Tracking Shadow/Auto Template
-        # Refresh ниже — диагностика и адаптация live-лока, а этот кадр
-        # только что объявил, что не доверяет самому локу.
-        if (IDENTITY_UNCERTAIN_ENABLED
-                and _identity_uncertain_streak >= IDENTITY_UNCERTAIN_CONFIRM_FRAMES):
-            flight_log.event(
-                "IDENTITY_UNCERTAIN streak=%d ambiguous=%s flow_gap=%s"
-                % (_identity_uncertain_streak, _identity_ambiguous,
-                   _identity_flow_match_disagree))
-            _identity_uncertain_pending = True
-            lost_frames += 1
-            box = lores_box_to_main(lock_cx, lock_cy, lock_w, lock_h)
-            with state_lock:
-                track_state = TRACK_STATE_IDENTITY_UNCERTAIN
-                target_visible = True
-                target_controllable = False
-                target_box_main = box
-                overlay_text = "UNCERTAIN"
-                overlay_color = COLOR_YELLOW
-            update_control_from_target()
-            return
-
         box = lores_box_to_main(lock_cx, lock_cy, lock_w, lock_h)
         with state_lock:
             track_state = TRACK_STATE_TRACKED
@@ -11974,6 +12087,14 @@ def process_locked_tracker(gray, cb_t0=None):
                                         # на то, что матч перепутал с ней.
                                         and not _identity_ambiguous
                                         and not _identity_flow_match_disagree)
+                                    # ДЛЯ CSV (отчёт 25.09, п.J): голос ЭТОГО
+                                    # fresh-слота — не то же самое, что сам
+                                    # факт срабатывания refresh'а (тот ещё и
+                                    # ждёт confirm-streak/cooldown/anchor-
+                                    # проверку ниже). "allowed" здесь = "этот
+                                    # слот не увидел причины отказать".
+                                    _match_dbg["template_refresh_allowed"] = (
+                                        1 if _tref_vote else 0)
                                     if _tref_vote:
                                         _auto_tref_confirm_streak += 1
                                     else:
@@ -11985,44 +12106,95 @@ def process_locked_tracker(gray, cb_t0=None):
                                     if (_auto_tref_confirm_streak
                                             >= AUTO_TEMPLATE_REFRESH_CONFIRM_N
                                             and _tref_cooldown_ok):
-                                        _old_tref_psr = _live_psr
-                                        _old_tref_tw, _old_tref_th = tmpl_w, tmpl_h
-                                        # ТОЛЬКО шаблон — тот же самый live
-                                        # build_template(), что и
-                                        # reanchor_tracker_at_current_box(),
-                                        # на ТЕКУЩИХ lock_cx/cy/w/h. Box не
-                                        # двигаем, geometry_epoch не рвём —
-                                        # положение цели не менялось,
-                                        # изменилось только то, чем мы её
-                                        # опознаём.
-                                        template_gray = build_template(
-                                            gray, lock_cx, lock_cy, lock_w, lock_h)
-                                        sync_template_metadata()
-                                        # Свежесобранный template ещё не
-                                        # подтверждён повторным измерением —
-                                        # та же заморозка addWeighted-
-                                        # адаптации, что и после полного
-                                        # reanchor, и по той же причине (см.
-                                        # docstring _template_adaptation_gate).
-                                        _adapt_frozen_posle_reanchor = True
-                                        _auto_tref_confirm_streak = 0
-                                        _auto_tref_last_t = time.monotonic()
-                                        _auto_tref_overlay_until_t = (
-                                            time.monotonic()
-                                            + AUTO_TEMPLATE_REFRESH_OVERLAY_S)
-                                        _auto_tref_total_count += 1
-                                        with state_lock:
-                                            overlay_text = "TREF"
-                                        try:
+                                        # НАЙДЕНО (отчёт 25.09, п.C, разбор
+                                        # поверх 64949ec): "refresh может
+                                        # улучшить рабочее представление, НО
+                                        # не может объявить новый patch
+                                        # продолжением старой identity". До
+                                        # сих пор candidate проверялся ТОЛЬКО
+                                        # против ЖИВОГО template (PSR-margin/
+                                        # gap выше) и live-матча ЭТОГО кадра
+                                        # (identity_ambiguous/flow_gap) — ни
+                                        # одна из этих проверок не спрашивает
+                                        # "похоже ли это на то, что пилот
+                                        # ПОДТВЕРДИЛ изначально". Цепочка
+                                        # мелких, каждый раз "разумных"
+                                        # refresh'ей могла бы со временем
+                                        # увести live template сколь угодно
+                                        # далеко от confirmed identity — и ни
+                                        # один ОТДЕЛЬНЫЙ шаг не выглядел бы
+                                        # плохим (то самое "зацементировать
+                                        # уже неверный лок", только
+                                        # постепенно, а не за один кадр).
+                                        # Переиспользуем СУЩЕСТВУЮЩУЮ
+                                        # _shadow_match_against_template (тот
+                                        # же matcher, что и Tracking Shadow и
+                                        # сам этот механизм чуть выше) — НЕ
+                                        # новый matcher — против
+                                        # _identity_anchor_gray вместо live
+                                        # template. match_ok — тот же
+                                        # бинарный сигнал "вообще похоже",
+                                        # которым template_match_locked уже
+                                        # пользуется everywhere, не новый
+                                        # изобретённый порог.
+                                        (_anchor_ok, _anchor_score, _anchor_psr,
+                                         _anchor_second, _anchor_mx, _anchor_my
+                                         ) = _shadow_match_against_template(
+                                            gray, _identity_anchor_gray,
+                                            _identity_anchor_w, _identity_anchor_h,
+                                            _identity_anchor_std,
+                                            lock_cx, lock_cy, flow_motion)
+                                        if not _anchor_ok:
                                             flight_log.event(
-                                                "AUTO_TEMPLATE_REFRESH old_psr=%.2f "
-                                                "fresh_psr=%.2f old_size=%dx%d "
-                                                "new_size=%dx%d"
-                                                % (_old_tref_psr, _v_psr,
-                                                   _old_tref_tw, _old_tref_th,
-                                                   tmpl_w, tmpl_h))
-                                        except Exception:
-                                            pass
+                                                "AUTO_TEMPLATE_REFRESH отклонён: "
+                                                "candidate не согласуется с "
+                                                "confirmed identity anchor")
+                                            _auto_tref_confirm_streak = 0
+                                        else:
+                                            _old_tref_psr = _live_psr
+                                            _old_tref_tw, _old_tref_th = tmpl_w, tmpl_h
+                                            # ТОЛЬКО шаблон — тот же самый live
+                                            # build_template(), что и
+                                            # reanchor_tracker_at_current_box(),
+                                            # на ТЕКУЩИХ lock_cx/cy/w/h. Box не
+                                            # двигаем, geometry_epoch не рвём —
+                                            # положение цели не менялось,
+                                            # изменилось только то, чем мы её
+                                            # опознаём. Подтверждённый anchor
+                                            # (_identity_anchor_gray) ТОЖЕ НЕ
+                                            # трогаем — refresh улучшает ЖИВОЕ
+                                            # представление, не переопределяет
+                                            # identity (см. _commit_confirmed_
+                                            # identity — этот код её не вызывает
+                                            # и не должен).
+                                            template_gray = build_template(
+                                                gray, lock_cx, lock_cy, lock_w, lock_h)
+                                            sync_template_metadata()
+                                            # Свежесобранный template ещё не
+                                            # подтверждён повторным измерением —
+                                            # та же заморозка addWeighted-
+                                            # адаптации, что и после полного
+                                            # reanchor, и по той же причине (см.
+                                            # docstring _template_adaptation_gate).
+                                            _adapt_frozen_posle_reanchor = True
+                                            _auto_tref_confirm_streak = 0
+                                            _auto_tref_last_t = time.monotonic()
+                                            _auto_tref_overlay_until_t = (
+                                                time.monotonic()
+                                                + AUTO_TEMPLATE_REFRESH_OVERLAY_S)
+                                            _auto_tref_total_count += 1
+                                            with state_lock:
+                                                overlay_text = "TREF"
+                                            try:
+                                                flight_log.event(
+                                                    "AUTO_TEMPLATE_REFRESH old_psr=%.2f "
+                                                    "fresh_psr=%.2f old_size=%dx%d "
+                                                    "new_size=%dx%d"
+                                                    % (_old_tref_psr, _v_psr,
+                                                       _old_tref_tw, _old_tref_th,
+                                                       tmpl_w, tmpl_h))
+                                            except Exception:
+                                                pass
                                 # ===== /AUTO TEMPLATE REFRESH =====
                             else:
                                 _skip_reason = "no_candidate"
@@ -12468,6 +12640,14 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("identity_ambiguous"),
             _match_dbg.get("identity_flow_gap"),
             _match_dbg.get("identity_uncertain_streak"),
+            1 if _identity_anchor_gray is not None else 0,
+            _match_dbg.get("identity_anchor_changed"),
+            _match_dbg.get("identity_anchor_change_reason"),
+            _match_dbg.get("acq_candidate_present"),
+            _match_dbg.get("acq_candidate_dx"),
+            _match_dbg.get("acq_candidate_dy"),
+            _match_dbg.get("acq_candidate_confirmed"),
+            _match_dbg.get("template_refresh_allowed"),
             _match_dbg.get("visual_unstable"),
             _match_dbg.get("visual_unstable_reason"),
             _match_dbg.get("aux2_raw"), _match_dbg.get("aux3_raw"),
