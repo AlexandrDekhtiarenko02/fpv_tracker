@@ -225,9 +225,20 @@ print("    --- шаг 4: серия IDENTITY_UNCERTAIN (неоднозначны
       "срабатывания ---")
 t.flow_predict = fake_flow_predict
 t.template_match_locked = make_fake_match(**AMBIGUOUS)
+# После правки по логам 8e2ac74 (IDENTITY_ANCHOR_ARBITER_ENABLED)
+# ambiguity сама по себе больше не триггерит persistent UNCERTAIN, если
+# anchor свежо подтверждает ту же позицию — а на этой сцене (объект A
+# остался на месте, ничем не заменён) реальный anchor честно подтверждает
+# каждую periodic-сверку. Этот файл не проверяет arbiter (для него —
+# отдельно test_identity_anchor_arbiter*.py), ему нужен один из
+# гарантированных путей до persistent UNCERTAIN на четвёртом шаге —
+# гасим arbiter на время шага, восстанавливаем сразу после.
+_orig_arbiter = t.IDENTITY_ANCHOR_ARBITER_ENABLED
+t.IDENTITY_ANCHOR_ARBITER_ENABLED = False
 N = t.IDENTITY_UNCERTAIN_CONFIRM_FRAMES
 for _ in range(N):
     tick()
+t.IDENTITY_ANCHOR_ARBITER_ENABLED = _orig_arbiter
 assert t.track_state == t.TRACK_STATE_IDENTITY_UNCERTAIN, (
     "тест сам по себе негоден: серия неоднозначных кадров не довела до "
     "IDENTITY_UNCERTAIN")

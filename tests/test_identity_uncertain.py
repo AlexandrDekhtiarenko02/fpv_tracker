@@ -123,6 +123,20 @@ assert t.IDENTITY_UNCERTAIN_ENABLED, "тест сам по себе негоде
 N = t.IDENTITY_UNCERTAIN_CONFIRM_FRAMES
 assert N >= 2, "тест предполагает дебаунс хотя бы в пару кадров"
 
+# Этот файл проверяет ИМЕННО streak/debounce механизм (реакцию на серию
+# явных противоречий flow↔matcher между собой) в изоляции — не путь
+# arbiter'а. В реальном 8e2ac74 arbiter (IDENTITY_ANCHOR_ARBITER_ENABLED)
+# намеренно ГАСИТ этот путь, когда свежее anchor-подтверждение говорит
+# "это по-прежнему тот же объект" — это правильное поведение по логам
+# полёта (13/17 срывов оказались ложными именно потому, что streak
+# триггерил при живом anchor). Но сам streak как СИГНАЛ (не как самостоя-
+# тельная причина persistent UNCERTAIN) остаётся полезным: soft distrust,
+# гейт template adaptation, диагностика. Отключаем arbiter здесь, чтобы
+# честно проверить сам streak-механизм — за arbiter отдельные файлы
+# (test_identity_anchor_arbiter*.py).
+_orig_arbiter = t.IDENTITY_ANCHOR_ARBITER_ENABLED
+t.IDENTITY_ANCHOR_ARBITER_ENABLED = False
+
 print("=== 1. Одиночный неоднозначный кадр — НЕ триггер (дебаунс) ===")
 capture()
 install_fakes(**AMBIGUOUS)
@@ -438,6 +452,8 @@ for key in ("identity_uncertain", "identity_ambiguous", "identity_flow_gap",
     assert ('_match_dbg.get("%s")' % key) in row_body, (
         "_match_dbg.get(%r) не найден в _capture_flight_row" % key)
 print("    все четыре колонки объявлены и подключены")
+
+t.IDENTITY_ANCHOR_ARBITER_ENABLED = _orig_arbiter
 
 print("\nOK: IDENTITY_UNCERTAIN переиспользует существующие сигналы "
       "ambiguity/flow_gap (никаких новых порогов сравнения), дебаунс "

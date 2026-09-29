@@ -2410,6 +2410,12 @@ _FLIGHT_LOG_COLUMNS = (
     # ещё формально TRACKED (debounce для persistent IDENTITY_UNCERTAIN
     # ещё не набрался). НЕ sticky — пересчитывается каждый кадр заново.
     "identity_soft_distrust,"
+    # ANCHOR ARBITER (реальные стендовые логи 8e2ac74 показали: ambiguity/
+    # flow_gap streak сами по себе давали 15/17 ложных срывов, при этом
+    # anchor в тех же кадрах score>=0.88 offset<0.2px). =1 когда последнее
+    # успешное anchor-подтверждение свежее (IDENTITY_ANCHOR_FRESH_S) —
+    # ambiguous_or_gap путь тогда НЕ триггерит persistent UNCERTAIN.
+    "identity_anchor_recently_confirmed,"
     # ПОДТВЕРЖДЁННАЯ IDENTITY (отчёт 25.09, разбор поверх 64949ec, п.B/J).
     # identity_confirmed=1 — для ТЕКУЩЕГО лока есть подтверждённый anchor
     # (_identity_anchor_gray не None; ACQ/IDLE — 0). identity_anchor_
@@ -7391,6 +7397,7 @@ def reset_tracking(to_acq=False):
     global _nudge_frozen_box, _nudge_abort_pending, _nudge_suspended_since_t
     global _identity_uncertain_pending, _identity_uncertain_streak
     global _identity_anchor_check_streak, _identity_anchor_check_last_t
+    global _identity_anchor_last_confirm_t
     global _dual_signal_gap_frames
     global _identity_soft_distrust
     global _shadow_track_dbg
@@ -7515,6 +7522,7 @@ def reset_tracking(to_acq=False):
     # подтверждения) тоже принадлежат ТЕКУЩЕМУ локу.
     _identity_anchor_check_streak = 0
     _identity_anchor_check_last_t = 0.0
+    _identity_anchor_last_confirm_t = 0.0
     _dual_signal_gap_frames = 0
     _identity_soft_distrust = False
 
@@ -11134,6 +11142,10 @@ IDENTITY_ANCHOR_CHECK_PERIOD_S = 0.5
 IDENTITY_ANCHOR_CHECK_CONFIRM_N = 3
 _identity_anchor_check_streak = 0
 _identity_anchor_check_last_t = 0.0
+# Отметка ВРЕМЕНИ последнего успешного anchor-подтверждения (см. ниже блок
+# ANCHOR ARBITER). Не путать с _identity_anchor_check_last_t (тот — время
+# последней ПОПЫТКИ, успешной или нет; это — только успехи).
+_identity_anchor_last_confirm_t = 0.0
 
 # PROLONGED SINGLE-SIGNAL BYPASS (разбор оператора, п.7/8): "система может
 # бесконечно жить только на flow или только на matcher, оставаясь TRACKED —
@@ -11152,6 +11164,45 @@ IDENTITY_DUAL_SIGNAL_GAP_ENABLED = True
 # число — офлайн-реплей логов, как и везде в этом разделе.
 IDENTITY_DUAL_SIGNAL_GAP_MAX_FRAMES = 60
 _dual_signal_gap_frames = 0
+
+# ANCHOR ARBITER (найдено оператором на РЕАЛЬНЫХ стендовых логах 8e2ac74:
+# 27 захватов, 17 IDENTITY_UNCERTAIN, из них 13 — только по ambiguity, 2 —
+# только по flow_gap, при том что immutable anchor в тех же кадрах давал
+# score 0.88-0.99 и offset <0.2px, т.е. ЧЁТКО подтверждал ту же позицию).
+#
+# ЧТО ПОКАЗАЛИ ЛОГИ. Три разных сигнала СМЕШИВАЛИСЬ в одно persistent-
+# состояние с одинаковыми последствиями (target_controllable=False sticky,
+# до explicit reset пилотом):
+#   1. matcher ambiguous (score≈second) — matcher не уверен ВНУТРИ СЕБЯ;
+#   2. flow disagrees with matcher (flow_gap>MATCH_GAP_SOFT) — два метода
+#      движения расходятся;
+#   3. anchor mismatch — сверка с изначально подтверждённой identity
+#      провалилась.
+# Только #3 отвечает на вопрос "это всё ещё тот же объект?". #1 и #2 —
+# только качество ЖИВОГО тракта, не признак смены identity: мелкая цель
+# часто имеет несколько почти равных correlation peaks (ambiguity — это
+# норма для 4-6px объектов, не поломка), а обычная ручная тряска рвёт
+# flow<->matcher согласие даже когда сам объект не менялся ни на пиксель.
+#
+# АРХИТЕКТУРНОЕ ИСПРАВЛЕНИЕ. Ambiguity/flow_gap продолжают:
+#  - Уменьшать w_m (доверие к matcher в блендинге позиции) — как было;
+#  - Запрещать template adaptation/refresh на своём кадре — как было;
+#  - Давать soft distrust на своём кадре (см. IDENTITY_SOFT_DISTRUST_ENABLED)
+#    — контrollable=False, но НЕ persistent, self-healing;
+# но БОЛЬШЕ НЕ переводят в persistent IDENTITY_UNCERTAIN САМИ ПО СЕБЕ,
+# если свежий immutable-anchor check УСПЕШНО подтвердил ту же позицию.
+# Anchor как арбитр: если он говорит "это по-прежнему A", ambiguity в
+# matcher или jitter во flow не отменяют его вердикт.
+#
+# ЧТО ЗНАЧИТ "СВЕЖИЙ". Одно успешное anchor-подтверждение остаётся
+# "свежим" IDENTITY_ANCHOR_FRESH_S секунд. За это окно должно уложиться
+# несколько периодических замеров (IDENTITY_ANCHOR_CHECK_PERIOD_S=0.5с)
+# — так одна временная промашка не превращает лок в незащищённый, а
+# длительный gap без anchor-подтверждения перестаёт быть покрытием для
+# streak-триггера. Начальное значение (1.5с ≈ 3 периода), реальная
+# калибровка — офлайн-реплеем.
+IDENTITY_ANCHOR_ARBITER_ENABLED = True
+IDENTITY_ANCHOR_FRESH_S = 1.5
 
 # SOFT DISTRUST (найдено оператором на реальном коде bf7957f, не отчёте):
 # и IDENTITY_ANCHOR_CHECK_CONFIRM_N=3 (0.5с x 3 ≈ 1.5с), и IDENTITY_DUAL_
@@ -11271,6 +11322,7 @@ def process_locked_tracker(gray, cb_t0=None):
     global _nudge_frozen_box, _nudge_abort_pending, _nudge_suspended_since_t
     global _identity_uncertain_pending, _identity_uncertain_streak
     global _identity_anchor_check_streak, _identity_anchor_check_last_t
+    global _identity_anchor_last_confirm_t
     global _dual_signal_gap_frames
     global _identity_soft_distrust
     global _shadow_track_dbg
@@ -12108,6 +12160,15 @@ def process_locked_tracker(gray, cb_t0=None):
                 if _anchor_confirms_position(
                         _iac_ok, _iac_score, _iac_mx, _iac_my, new_cx, new_cy):
                     _identity_anchor_check_streak = 0
+                    # Отметка ВРЕМЕНИ последнего успешного подтверждения —
+                    # используется ANCHOR ARBITER ниже (см. блок IDENTITY_
+                    # ANCHOR_ARBITER_ENABLED): пока это подтверждение свежее,
+                    # ambiguity/flow_gap streak сам по себе не переводит в
+                    # persistent IDENTITY_UNCERTAIN (реальные логи 8e2ac74
+                    # показали, что 13/17 срывов были ложные — anchor
+                    # тогда же давал score>=0.88, offset<0.2px, т.е. чётко
+                    # говорил "это по-прежнему та же цель").
+                    _identity_anchor_last_confirm_t = time.monotonic()
                 else:
                     _identity_anchor_check_streak += 1
                 _match_dbg["identity_anchor_check_ran"] = 1
@@ -12156,29 +12217,59 @@ def process_locked_tracker(gray, cb_t0=None):
         # lock_w/h) вообще не выполняется, track_state и geometry/template
         # остаются РОВНО такими, какими были ДО этого кадра.
         #
-        # ТРИ НЕЗАВИСИМЫХ, РАВНОПРАВНЫХ ПРИЧИНЫ (разбор оператора, п.5/6/7)
-        # — любая одна достаточна: (1) серия явных противоречий flow/
-        # matcher между собой (streak, п.D, было); (2) периодическая сверка
-        # с anchor провалилась N раз подряд (новое, п.5/6 — ловит именно
-        # "flow и matcher согласны, но оба неправы"); (3) долгий разрыв без
-        # ЕДИНОЙ dual-signal возможности сверить их вообще (новое, п.7).
+        # ТРИ НЕЗАВИСИМЫХ, НО НЕ РАВНОПРАВНЫХ ПРИЧИНЫ (пересмотрено после
+        # реальных стендовых логов 8e2ac74, см. блок IDENTITY_ANCHOR_
+        # ARBITER_ENABLED у объявлений).
+        #
+        # (2) anchor_mismatch — единственный автоматический ответ на
+        #     "это всё ещё та же цель?": arbiter говорит НЕТ. Триггер
+        #     безусловный, никем не гасится (только он и является
+        #     доказательством смены identity).
+        # (3) dual_signal_gap — "мы давно ни разу не смогли независимо
+        #     сверить flow с matcher". Тоже безусловный, но по другой
+        #     причине: тут нет arbiter'а, отсутствие сверки САМО ПО СЕБЕ
+        #     сигнал (см. её объявление про grace-окно).
+        # (1) ambiguous_or_gap — matcher внутри себя неуверен ИЛИ
+        #     расходится с flow. НЕ доказательство смены identity: это
+        #     только качество ЖИВОГО тракта (реальные логи 8e2ac74:
+        #     ambiguity на мелкой цели — норма из-за нескольких равных
+        #     correlation peaks; flow_gap при ручной тряске — норма даже
+        #     когда объект не менялся ни на пиксель). Триггерит persistent
+        #     UNCERTAIN ТОЛЬКО если arbiter (immutable anchor) недавно
+        #     ТОЖЕ не подтвердил ту же позицию. Иначе — ambiguity/flow_gap
+        #     остаются polezными как soft-distrust и как гейт adaptation
+        #     (см. _template_adaptation_gate), но не хоронят лок.
         _iu_reason = None
-        if (IDENTITY_UNCERTAIN_ENABLED
-                and _identity_uncertain_streak >= IDENTITY_UNCERTAIN_CONFIRM_FRAMES):
-            _iu_reason = "ambiguous_or_gap"
-        elif (IDENTITY_ANCHOR_CHECK_ENABLED
+        _anchor_recently_confirmed = (
+            IDENTITY_ANCHOR_ARBITER_ENABLED
+            and IDENTITY_ANCHOR_CHECK_ENABLED
+            and _identity_anchor_gray is not None
+            and _identity_anchor_last_confirm_t > 0.0
+            and (time.monotonic() - _identity_anchor_last_confirm_t)
+                <= IDENTITY_ANCHOR_FRESH_S)
+        _match_dbg["identity_anchor_recently_confirmed"] = (
+            1 if _anchor_recently_confirmed else 0)
+        if (IDENTITY_ANCHOR_CHECK_ENABLED
                 and _identity_anchor_check_streak >= IDENTITY_ANCHOR_CHECK_CONFIRM_N):
             _iu_reason = "anchor_mismatch"
         elif (IDENTITY_DUAL_SIGNAL_GAP_ENABLED
                 and _dual_signal_gap_frames >= IDENTITY_DUAL_SIGNAL_GAP_MAX_FRAMES):
             _iu_reason = "dual_signal_gap"
+        elif (IDENTITY_UNCERTAIN_ENABLED
+                and _identity_uncertain_streak >= IDENTITY_UNCERTAIN_CONFIRM_FRAMES
+                and not _anchor_recently_confirmed):
+            _iu_reason = "ambiguous_or_gap"
 
         if _iu_reason is not None:
             if _iu_reason == "ambiguous_or_gap":
+                _age_ms = ((time.monotonic() - _identity_anchor_last_confirm_t)
+                          * 1000.0 if _identity_anchor_last_confirm_t > 0.0 else -1.0)
                 flight_log.event(
-                    "IDENTITY_UNCERTAIN streak=%d ambiguous=%s flow_gap=%s"
+                    "IDENTITY_UNCERTAIN streak=%d ambiguous=%s flow_gap=%s "
+                    "anchor_recently_confirmed=%s anchor_last_confirm_age_ms=%.0f"
                     % (_identity_uncertain_streak, _identity_ambiguous,
-                       _identity_flow_match_disagree))
+                       _identity_flow_match_disagree,
+                       _anchor_recently_confirmed, _age_ms))
             elif _iu_reason == "anchor_mismatch":
                 # НЕ "or -1.0" — score=0.0 честное значение (полное
                 # несовпадение с anchor), а `0.0 or -1.0` в Python молча
@@ -13259,6 +13350,7 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("identity_anchor_check_streak"),
             _match_dbg.get("identity_dual_signal_gap_frames"),
             _match_dbg.get("identity_soft_distrust"),
+            _match_dbg.get("identity_anchor_recently_confirmed"),
             1 if _identity_anchor_gray is not None else 0,
             _match_dbg.get("identity_anchor_changed"),
             _match_dbg.get("identity_anchor_change_reason"),

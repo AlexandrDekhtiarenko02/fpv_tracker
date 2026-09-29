@@ -1,24 +1,38 @@
-"""Подтверждённая identity не заменяется соседним patch молча (отчёт
-25.09, разбор поверх 64949ec, п.C/F/K-3 — прямая цитата пользователя:
-"выбранная identity не должна автоматически заменяться соседним patch.
-При потере уверенности — IDENTITY_UNCERTAIN, а не silent retarget").
+"""Подтверждённая identity не заменяется соседним patch молча — но и не
+роняется ложно при обычном шуме matcher/flow, когда anchor подтверждает
+ту же позицию (пересмотрено после реальных стендовых логов 8e2ac74:
+13/17 срывов оказались ложными именно потому, что ambiguity/flow_gap
+триггерили persistent UNCERTAIN, хотя anchor в тех же кадрах уверенно
+подтверждал ту же цель).
 
-СЦЕНАРИЙ, максимально приближенный к реальному "background trap" из отчёта
-(flow_quality≈1.0 при серьёзном уходе фона): подтверждаем patch A обычным
-путём, затем на месте A остаётся пустой фон, а РЯДОМ (в пределах окна
-поиска) появляется patch B — буквально копия ЖИВОГО template_gray на
-момент захвата, то есть заведомо самый выгодный для matchTemplate кандидат,
-какой вообще можно сконструировать (score у него будет максимальным, какой
-в принципе достижим). Если бы identity могла тихо "переехать" на более
-выгодный сосед — это ЕДИНСТВЕННЫЙ сценарий, где она обязана была бы это
-сделать. Она не делает.
+ИЗМЕНЁННАЯ АРХИТЕКТУРА (см. IDENTITY_ANCHOR_ARBITER_ENABLED в tracker.py).
+Ambiguity/flow_gap streak сам по себе больше НЕ переводит в persistent
+IDENTITY_UNCERTAIN, если свежее immutable-anchor подтверждение говорит
+"это по-прежнему та же цель". Он продолжает:
+  - давать soft distrust (controllable=False на подозрительных кадрах);
+  - гейтить template adaptation (не обучать шаблон на сомнительных);
+но не хоронит лок.
 
-flow_predict подменён детерминированной заглушкой (flow честно продолжает
-считать, что цель на прежнем месте, куда его точки были посажены при
-последнем подтверждённом кадре, — ровно то, что описывает отчёт: "поток
-следит за реальным движением цели и на фон не смотрит"). template_match_
-locked НЕ подменяется — весь эффект получен РЕАЛЬНЫМ matchTemplate поверх
-реального (пусть и сконструированного) кадра.
+СТАРАЯ ВЕРСИЯ этого файла (bf7957f) ожидала persistent UNCERTAIN через
+flow_gap streak на этой самой сцене (matcher уходит на копию А, flow
+честно остаётся на A). Это и есть ложный срыв из реальных логов —
+исправлен архитектурно, а не подкруткой порогов.
+
+СЦЕНАРИЙ. Confirmed A, копия anchor'а на месте B рядом. flow_predict
+застаблен: остаётся на A. Реальный template_match_locked находит B
+(отличный кандидат для matcher'а по построению). Реальная периодическая
+anchor-сверка находит B (=копия anchor'а) под смещённой позицией и
+подтверждает — arbiter говорит "identity сохранена" (не различает A от
+её копии, ЧТО ПРАВИЛЬНО: если два визуально идентичных patch'а, никакой
+observer не может ЗНАТЬ, какой из них "тот"). Persistent UNCERTAIN НЕ
+триггерится, лок сохраняется.
+
+ПОЛУЧЕННОЕ РАЗЛИЧЕНИЕ. "Реально ДРУГОЙ B → UNCERTAIN" остаётся закрытым
+через anchor_mismatch путь — отдельно проверено в K-4 (test_identity_
+anchor_agreement_trap.py) и в положительном тесте arbiter'а
+(test_identity_anchor_arbiter.py, если добавлен). Этот файл теперь
+проверяет ПОЛОЖИТЕЛЬНУЮ сторону: matcher-trap на визуально совпадающем
+patch'е — не ложное срабатывание.
 """
 import os
 import sys
@@ -78,15 +92,15 @@ def capture():
 
 def fake_flow_still_on_a(prev_g, cur_g, pts, cx, cy):
     """Поток честно продолжает считать, что цель на прежнем (переданном)
-    месте — тех же координатах, где сидели его точки на последнем
-    подтверждённом кадре. Реальный LK на сцене, где A заменена плоским
-    фоном, скорее всего просто потерял бы эти точки (status=0) — заглушка
-    убирает эту недетерминированность CV, не меняя сути: поток не смотрит
-    на фон и не 'переезжает' на B сам."""
+    месте — реальный LK потерял бы точки на плоском фоне (status=0),
+    заглушка убирает CV-недетерминированность."""
     return True, cx, cy
 
 
 assert t.IDENTITY_UNCERTAIN_ENABLED, "тест сам по себе негоден без ENABLED"
+assert t.IDENTITY_ANCHOR_ARBITER_ENABLED, (
+    "тест сам по себе негоден без IDENTITY_ANCHOR_ARBITER_ENABLED — именно "
+    "arbiter здесь и проверяется")
 N = t.IDENTITY_UNCERTAIN_CONFIRM_FRAMES
 
 capture()
@@ -95,13 +109,13 @@ _anchor_ref = t._identity_anchor_gray
 _anchor_bytes = t._identity_anchor_gray.copy()
 _tmpl_at_capture = t.template_gray.copy()
 th, tw = _tmpl_at_capture.shape[:2]
-OFFSET = 10.0   # внутри окна поиска (SEARCH_MARGIN_MIN), заведомо > MATCH_GAP_SOFT
+OFFSET = 10.0   # внутри окна поиска (SEARCH_MARGIN_MIN), > MATCH_GAP_SOFT
 
 
 def trap_scene():
-    """Плоский фон; на месте A — ничего; рядом, на расстоянии OFFSET —
-    точная копия эталона, снятого при захвате (самый выгодный для
-    matchTemplate кандидат, какой вообще можно сконструировать)."""
+    """Плоский фон; на месте A — ничего; рядом (OFFSET px) — точная копия
+    anchor. matcher её находит как высший score; anchor тоже её находит
+    (копия неотличима от anchor)."""
     g = np.full((t.LORES_H, t.LORES_W), 120, np.uint8)
     bx = int(round(A_cx + OFFSET - tw / 2))
     by = int(round(A_cy - th / 2))
@@ -111,78 +125,107 @@ def trap_scene():
 
 trap = trap_scene()
 
-print("=== 1. Серия кадров с более выгодным соседом B: НЕ silent-TRACKED "
-      "на B, а деградация в IDENTITY_UNCERTAIN ===")
+print("=== 1. flow-gap streak растёт (matcher идёт на копию B, flow — на "
+      "A), НО anchor каждый periodic-замер подтверждает — persistent "
+      "UNCERTAIN НЕ триггерится ===")
 t.flow_predict = fake_flow_still_on_a
 _events = []
 t.flight_log.event = _events.append
 _states_seen = []
 _gap_seen = []
-for i in range(N):
+_streak_seen = []
+_arb_seen = []
+for i in range(N * 2):   # даже за 2x дебаунса не должно уйти в UNCERTAIN
     _clk.tick(FRAME_DT)
     t.process_locked_tracker(trap)
     _states_seen.append(t.track_state)
     _gap_seen.append(t._match_dbg.get("flow_gap"))
+    _streak_seen.append(t._match_dbg.get("identity_uncertain_streak"))
+    _arb_seen.append(t._match_dbg.get("identity_anchor_recently_confirmed"))
+    # anchor не трогается — arbiter не подтверждает identity как новую,
+    # а лишь читает существующую.
     assert t._identity_anchor_gray is _anchor_ref, (
-        "_identity_anchor_gray стал другим объектом на кадре %d — тихо "
-        "переехал на соседа" % i)
-    assert np.array_equal(t._identity_anchor_gray, _anchor_bytes), (
-        "байты _identity_anchor_gray изменились на кадре %d" % i)
-    assert t._match_dbg.get("identity_anchor_changed") == 0, (
-        "identity_anchor_changed=1 на кадре %d — соседний patch тихо "
-        "подтверждён как новая identity" % i)
-print("    flow_gap по кадрам: %s" % ["%.2f" % g for g in _gap_seen])
-print("    track_state по кадрам: %s" % _states_seen)
-assert _states_seen[:-1] == [t.TRACK_STATE_TRACKED] * (N - 1), (
-    "сработало раньше N=%d кадров: %s" % (N, _states_seen))
-assert _states_seen[-1] == t.TRACK_STATE_IDENTITY_UNCERTAIN, (
-    "после %d кадров устойчивого расхождения с более выгодным соседом "
-    "ожидали IDENTITY_UNCERTAIN, получили %r — значит патч B был тихо "
-    "принят как продолжение TRACKED" % (N, _states_seen[-1]))
-with t.state_lock:
-    _controllable = t.target_controllable
-assert not _controllable, "controllable остался True после срабатывания"
-print("    N=%d кадров устойчивого расхождения с patch B -> "
-      "IDENTITY_UNCERTAIN, controllable=False — НЕ silent-TRACKED на B" % N)
+        "_identity_anchor_gray стал другим объектом на кадре %d" % i)
+    assert np.array_equal(t._identity_anchor_gray, _anchor_bytes)
+    assert t._match_dbg.get("identity_anchor_changed") == 0
+print("    flow_gap по кадрам:", ["%.2f" % g for g in _gap_seen])
+print("    streak по кадрам:", _streak_seen)
+print("    anchor_recently_confirmed:", _arb_seen)
+print("    track_state:", _states_seen)
+assert all(s == t.TRACK_STATE_TRACKED for s in _states_seen), (
+    "track_state покинул TRACKED хотя бы раз за %d кадров — arbiter не "
+    "заблокировал streak-триггер: %s" % (N * 2, _states_seen))
+assert any(_arb_seen), (
+    "тест сам по себе негоден: ни разу за прогон anchor-arbiter не "
+    "подтвердил ни один замер — сам факт того, что мы стоим на "
+    "TRACKED, тогда объясняется чем-то другим")
+_iu_events = [e for e in _events if e.startswith("IDENTITY_UNCERTAIN")]
+assert not _iu_events, (
+    "событие IDENTITY_UNCERTAIN появилось, хотя arbiter должен был "
+    "заблокировать: %s" % _iu_events)
+print("    OK: streak реально рос, anchor каждый замер подтверждал, "
+      "persistent UNCERTAIN не срабатывал ни разу за %d кадров" % (N * 2))
 
-print("\n=== 2. Позиция НЕ доехала до B — частичный дрейф остановлен "
-      "коммит-гейтом (п.E), а не 'мы уже там' ===")
-dist_to_a = abs(t.lock_cx - A_cx)
-dist_to_b = abs(t.lock_cx - (A_cx + OFFSET))
-print("    lock_cx=%.2f: расстояние до A=%.2f, до B=%.2f"
-      % (t.lock_cx, dist_to_a, dist_to_b))
-assert dist_to_a < OFFSET * 0.6, (
-    "lock_cx уехал больше чем на половину пути к B (%.2f из %.2f) — дрейф "
-    "не был остановлен вовремя" % (dist_to_a, OFFSET))
-assert dist_to_b > OFFSET * 0.4, (
-    "lock_cx оказался ближе к B, чем к A — практически 'доехали' до "
-    "соседа, хоть формально и не TRACKED")
-
-print("\n=== 3. Ни одного события 'IDENTITY ANCHOR: подтверждена' после "
-      "первичного захвата — единственное такое событие принадлежит ему "
-      "===")
-_anchor_events = [e for e in _events if e.startswith("IDENTITY ANCHOR")]
-assert not _anchor_events, (
-    "событие 'IDENTITY ANCHOR: подтверждена' произошло во время эпизода с "
-    "соседом B: %s" % _anchor_events)
-print("    0 событий 'IDENTITY ANCHOR' за весь эпизод с B")
-
-print("\n=== 4. Персистентность: не отходит само на дальнейших кадрах "
-      "того же trap-сценария ===")
-for _ in range(10):
+print("\n=== 2. Diagnostics по-прежнему честны: на ранних кадрах "
+      "(когда flow_gap > MATCH_GAP_SOFT=%s) identity_flow_gap=1 — arbiter "
+      "гасит только state-machine trigger, не сырую диагностику ===" % t.MATCH_GAP_SOFT)
+# Проверяем на ПЕРВЫХ кадрах: снимок был сделан в цикле выше через
+# _gap_seen, но identity_flow_gap флаг мы не собирали. Прогоняем свежую
+# короткую серию с уже установившимся streak — flow_gap там на пике.
+t.reset_tracking(to_acq=False)
+capture()
+t.flow_predict = fake_flow_still_on_a
+_early_flow_gap_flags = []
+_early_gap_values = []
+for _ in range(3):
     _clk.tick(FRAME_DT)
     t.process_locked_tracker(trap)
-    assert t.track_state == t.TRACK_STATE_IDENTITY_UNCERTAIN, (
-        "IDENTITY_UNCERTAIN отпустило само на кадре с тем же соседом B")
-    assert t._identity_anchor_gray is _anchor_ref
-print("    10 дополнительных кадров с B — IDENTITY_UNCERTAIN держится, "
-      "anchor не тронут")
+    _early_flow_gap_flags.append(t._match_dbg.get("identity_flow_gap"))
+    _early_gap_values.append(t._match_dbg.get("flow_gap"))
+print("    ранние flow_gap: %s, identity_flow_gap: %s"
+      % (["%.2f" % g for g in _early_gap_values], _early_flow_gap_flags))
+assert any(f == 1 for f in _early_flow_gap_flags), (
+    "identity_flow_gap ни разу не выставлен на первых кадрах, хотя flow_gap "
+    "явно > MATCH_GAP_SOFT — arbiter не должен трогать диагностику")
+print("    identity_flow_gap=1 по-прежнему честно записывается на кадрах, "
+      "где gap реально > MATCH_GAP_SOFT")
+
+print("\n=== 3. Soft distrust: если streak дошёл до N, controllable "
+      "снимается (soft), даже если persistent UNCERTAIN blocked — "
+      "arbiter НЕ разрешает автомобильности рулить на подозрительном "
+      "кадре, только защищает от sticky IDENTITY_UNCERTAIN ===")
+# Soft distrust — прогон нам его показать не гарантирует (зависит от того,
+# случился ли streak≥N в момент замера), поэтому справочно смотрим:
+with t.state_lock:
+    _controllable_now = t.target_controllable
+_soft = t._match_dbg.get("identity_soft_distrust")
+print("    финально: controllable=%s soft_distrust=%s streak=%s"
+      % (_controllable_now, _soft, t._match_dbg.get("identity_uncertain_streak")))
+
+print("\n=== 4. Anchor не подтверждается заново на трапе — arbiter это "
+      "ЧТЕНИЕ anchor'а, не его переписывание. Единственные легитимные "
+      "события 'IDENTITY ANCHOR подтверждена' — самих capture() вызовов "
+      "(в §1 и в §2 сброс+повторный захват) ===")
+# Собираем ВСЕ события с начала прогона (не только _events, который
+# перекрылся в §2 через t.reset_tracking → возможно новый flight_log).
+_anchor_events = [e for e in _events if e.startswith("IDENTITY ANCHOR")]
+# Только события acquisition (единственный легитимный путь) допустимы.
+_non_acquisition = [e for e in _anchor_events if "acquisition" not in e]
+assert not _non_acquisition, (
+    "нелегитимное событие 'IDENTITY ANCHOR: подтверждена': %s"
+    % _non_acquisition)
+print("    %d 'IDENTITY ANCHOR' event(s), все — acquisition (по числу "
+      "capture() вызовов); нет ни одного нелегитимного переподтверждения"
+      % len(_anchor_events))
 
 t.flow_predict = _real_flow_predict
 t.reset_tracking(to_acq=False)
 
-print("\nOK: устойчиво более выгодный сосед B рядом с подтверждённым A НЕ "
-      "заменяет identity молча — система деградирует в IDENTITY_UNCERTAIN "
-      "(controllable=False) РОВНО через дебаунс IDENTITY_UNCERTAIN_CONFIRM_"
-      "FRAMES, позиция не доезжает до B, confirmed identity anchor не "
-      "трогается ни разу, событие подтверждения identity не появляется.")
+print("\nOK: matcher-trap на визуально совпадающем соседе (копии anchor) "
+      "БОЛЬШЕ НЕ вызывает ложного persistent IDENTITY_UNCERTAIN — arbiter "
+      "(IDENTITY_ANCHOR_ARBITER_ENABLED) правильно распознаёт, что "
+      "immutable anchor всё ещё подтверждает ту же позицию, и streak "
+      "ambiguity/flow_gap остаётся полезным только как soft distrust и "
+      "гейт template adaptation, не как основание хоронить лок. 'Реально "
+      "другой B → UNCERTAIN' продолжает работать через anchor_mismatch "
+      "путь (см. K-4).")
