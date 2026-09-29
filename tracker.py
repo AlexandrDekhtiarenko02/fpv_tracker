@@ -2403,7 +2403,13 @@ _FLIGHT_LOG_COLUMNS = (
     # TRACKED-кадров подряд идёт БЕЗ единой возможности сверить flow с
     # matcher (короткий разрыв нормален, длинный сам по себе подозрителен).
     "identity_anchor_check_ran,identity_anchor_check_score,"
+    "identity_anchor_check_offset,"
     "identity_anchor_check_streak,identity_dual_signal_gap_frames,"
+    # identity_soft_distrust=1 — controllable уже снят ЭТИМ кадром из-за
+    # первого anchor mismatch/начала долгого разрыва, ХОТЯ track_state
+    # ещё формально TRACKED (debounce для persistent IDENTITY_UNCERTAIN
+    # ещё не набрался). НЕ sticky — пересчитывается каждый кадр заново.
+    "identity_soft_distrust,"
     # ПОДТВЕРЖДЁННАЯ IDENTITY (отчёт 25.09, разбор поверх 64949ec, п.B/J).
     # identity_confirmed=1 — для ТЕКУЩЕГО лока есть подтверждённый anchor
     # (_identity_anchor_gray не None; ACQ/IDLE — 0). identity_anchor_
@@ -7037,6 +7043,41 @@ def _shadow_match_against_template(gray, tmpl, tmpl_w, tmpl_h, tmpl_std,
     return True, raw_score, psr, second, float(new_cx), float(new_cy)
 
 
+# НАЙДЕНО ОПЕРАТОРОМ на реальном коде (не на отчёте): все три места, где
+# _shadow_match_against_template зовётся против _identity_anchor_gray
+# (LOST->AUTO_REACQ, AUTO_TEMPLATE_REFRESH, периодическая TRACKED->TRACKED
+# сверка — IDENTITY_ANCHOR_CHECK_ENABLED) читали ТОЛЬКО score, полностью
+# игнорируя возвращаемые координаты найденного anchor-match (mx/my).
+# _shadow_match_against_template ищет ЛУЧШИЙ anchor-match ГДЕ-ТО внутри
+# search-окна вокруг запрошенной позиции — а не проверяет anchor РОВНО В
+# ЭТОЙ позиции. Если настоящая цель A всё ещё видна рядом с тем местом B,
+# куда live-путь (flow+matcher, mutable template, fresh-кандидат) уже
+# успел уехать, A легко попадает в то же search-окно вокруг B — anchor
+# matcher находит A, честно даёт высокий score, а код ошибочно засчитывал
+# бы это как "B подтверждён", хотя на самом деле подтвердился A РЯДОМ С B,
+# не сам B. Обёртка ниже — единственное место, которое решает "anchor
+# подтверждает ИМЕННО эту позицию", а не "anchor где-то нашёлся".
+#
+# Допуск — половина СОБСТВЕННОГО размера anchor'а, не независимая
+# придуманная константа: крупный объект естественно даёт больше subpixel/
+# квантования слопа при повторном обнаружении, чем мелкий, так допуск
+# масштабируется вместе с целью.
+IDENTITY_ANCHOR_MATCH_MAX_OFFSET_FRAC = 0.5
+
+
+def _anchor_confirms_position(ok, score, mx, my, query_cx, query_cy):
+    """True — anchor подтверждает ИМЕННО (query_cx, query_cy), не просто
+    'нашёлся где-то в окне'. См. докстроку константы выше."""
+    if not ok or score < MATCH_GOOD_SCORE:
+        return False
+    if _identity_anchor_w is None or _identity_anchor_h is None:
+        return False
+    limit = (max(_identity_anchor_w, _identity_anchor_h)
+            * IDENTITY_ANCHOR_MATCH_MAX_OFFSET_FRAC)
+    offset = math.hypot(mx - query_cx, my - query_cy)
+    return offset <= limit
+
+
 def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0,
                           tgt_dx=0.0, tgt_dy=0.0):
     """Темплейт-матч с distance-penalty + субпиксельная интерполяция пика.
@@ -7351,6 +7392,7 @@ def reset_tracking(to_acq=False):
     global _identity_uncertain_pending, _identity_uncertain_streak
     global _identity_anchor_check_streak, _identity_anchor_check_last_t
     global _dual_signal_gap_frames
+    global _identity_soft_distrust
     global _shadow_track_dbg
     global _shadow_fresh_candidate, _shadow_fresh_candidate_w, _shadow_fresh_candidate_h
     global _shadow_fresh_candidate_std, _shadow_fresh_candidate_t, _shadow_fresh_candidate_epoch
@@ -7474,6 +7516,7 @@ def reset_tracking(to_acq=False):
     _identity_anchor_check_streak = 0
     _identity_anchor_check_last_t = 0.0
     _dual_signal_gap_frames = 0
+    _identity_soft_distrust = False
 
 # =========================================================
 # 8. CONTROL — главные исправления здесь
@@ -8269,6 +8312,7 @@ def _update_control_from_target_impl():
     global _shadow_pitch_conflict_since_t
     global _nudge_frozen_box, _nudge_abort_pending, _nudge_suspended_since_t
     global _identity_uncertain_pending
+    global _identity_soft_distrust
     global target_controllable
 
     with state_lock:
@@ -8308,6 +8352,20 @@ def _update_control_from_target_impl():
     # reset_tracking(), controllable принудительно False независимо от
     # того, что решил бы process_locked_tracker на очередном кадре.
     if _identity_uncertain_pending and controllable:
+        controllable = False
+        with state_lock:
+            target_controllable = False
+
+    # ТОТ ЖЕ ПРИНЦИП, ТРЕТЬЯ ПРИЧИНА, НО НЕ PERSISTENT (найдено оператором
+    # на реальном коде, см. докстроку IDENTITY_SOFT_DISTRUST_ENABLED):
+    # первый реально измеренный anchor mismatch / начало долгого разрыва
+    # без dual-signal — снимает controllable УЖЕ СЕЙЧАС, не дожидаясь,
+    # пока debounce наберёт полный persistent IDENTITY_UNCERTAIN (1.5-2.5с
+    # по умолчанию). В отличие от _identity_uncertain_pending выше —
+    # _identity_soft_distrust НЕ sticky: пересчитывается process_locked_
+    # tracker заново каждый TRACKED-кадр и снимается сам, как только
+    # anchor/dual-signal снова подтвердились, без reset_tracking().
+    if _identity_soft_distrust and controllable:
         controllable = False
         with state_lock:
             target_controllable = False
@@ -11095,6 +11153,37 @@ IDENTITY_DUAL_SIGNAL_GAP_ENABLED = True
 IDENTITY_DUAL_SIGNAL_GAP_MAX_FRAMES = 60
 _dual_signal_gap_frames = 0
 
+# SOFT DISTRUST (найдено оператором на реальном коде bf7957f, не отчёте):
+# и IDENTITY_ANCHOR_CHECK_CONFIRM_N=3 (0.5с x 3 ≈ 1.5с), и IDENTITY_DUAL_
+# SIGNAL_GAP_MAX_FRAMES=60 (≈2.5с) — это ДЕБАУНС для PERSISTENT-состояния
+# (track_state=IDENTITY_UNCERTAIN): нужен, чтобы единичный CV-шум не ронял
+# лок. Но до этой правки controllable=True ОСТАВАЛСЯ все эти 1.5-2.5с,
+# пока debounce не наберётся целиком — сам K-4 честно показывает: lock уже
+# мог доехать до непроверенной позиции НА ПРЕДЫДУЩИХ кадрах, гарантия
+# коммит-гейта (п.E) — только про САМ триггерящий кадр.
+#
+# Разделяем ДВЕ РАЗНЫЕ вещи: debounce остаётся решать, когда состояние
+# СТАНОВИТСЯ persistent IDENTITY_UNCERTAIN (не убираем — единичный сбой
+# замера НЕ должен ронять лок совсем) — но controllable перестаёт быть
+# безусловно True уже на ПЕРВОМ реально измеренном anchor mismatch / на
+# первых признаках долгого разрыва, а не ждёт, пока debounce наберётся
+# целиком. TRACKED, geometry, template — не трогаются (это НЕ
+# IDENTITY_UNCERTAIN, лок не персистентный, self-healing на следующем же
+# успешном замере/dual-signal кадре) — трогается ТОЛЬКО controllable,
+# тем же централизованным механизмом, что уже применён к _identity_
+# uncertain_pending/_nudge_abort_pending в _update_control_from_target_
+# impl() (см. её код).
+#
+# Anchor-check streak >= 1 — сразу (один периодический замер УЖЕ
+# недёшев — раз в IDENTITY_ANCHOR_CHECK_PERIOD_S, не по кадрам, поэтому
+# не тот случай, где единичный per-frame шум пугает зря). Dual-signal
+# gap переиспользует IDENTITY_UNCERTAIN_CONFIRM_FRAMES (тот же дебаунс,
+# что уже есть у streak неоднозначности выше, не новое число) — не с
+# первого single-signal кадра (это рутина, ~каждый второй-третий кадр в
+# полёте), а после короткой серии.
+IDENTITY_SOFT_DISTRUST_ENABLED = True
+_identity_soft_distrust = False
+
 
 def reanchor_tracker_at_current_box(gray, reason):
     """Мягкая перепривязка ВНУТРИ TRACKED, без LOST->ACQ (ТЗ §12).
@@ -11183,6 +11272,7 @@ def process_locked_tracker(gray, cb_t0=None):
     global _identity_uncertain_pending, _identity_uncertain_streak
     global _identity_anchor_check_streak, _identity_anchor_check_last_t
     global _dual_signal_gap_frames
+    global _identity_soft_distrust
     global _shadow_track_dbg
     global _shadow_fresh_candidate, _shadow_fresh_candidate_w, _shadow_fresh_candidate_h
     global _shadow_fresh_candidate_std, _shadow_fresh_candidate_t, _shadow_fresh_candidate_epoch
@@ -11242,6 +11332,17 @@ def process_locked_tracker(gray, cb_t0=None):
     # должен оставаться 0 всё время".
     _match_dbg["identity_anchor_changed"] = 0
     _match_dbg["identity_anchor_change_reason"] = ""
+
+    # _identity_soft_distrust — ТА ЖЕ причина: честный сигнал ТОЛЬКО на
+    # кадре, где он реально ещё раз пересчитан (см. блок tracked_ok ниже,
+    # п.2 разбора: "первый anchor mismatch/начало долгого разрыва -> не
+    # ждать debounce, снять controllable уже сейчас"). Любой кадр, не
+    # дошедший до пересчёта (ACQ, LOST/HOLD, IDENTITY_UNCERTAIN,
+    # VISUAL_UNSTABLE), обязан честно показывать False, а не унаследованное
+    # значение с прошлого TRACKED-кадра — иначе централизованная проверка
+    # в _update_control_from_target_impl() могла бы душить controllable
+    # ПОСЛЕ того, как лок вообще уже сменился (новый явный захват и т.п.).
+    _identity_soft_distrust = False
 
     # ВЕДЁМ ПО ТОЙ КАРТИНКЕ, ПО КОТОРОЙ РЕШИЛИ ПРИ ЗАХВАТЕ. Если выбран цвет,
     # дальше вся обработка — поиск, поток, размер — идёт по цветовой проекции.
@@ -11311,7 +11412,12 @@ def process_locked_tracker(gray, cb_t0=None):
                     gray, _identity_anchor_gray, _identity_anchor_w,
                     _identity_anchor_h, _identity_anchor_std,
                     mcx, mcy, 0.0)
-                if _reacq_anchor_ok and _reacq_anchor_score >= MATCH_GOOD_SCORE:
+                # НЕ просто "anchor нашёлся где-то в окне" — anchor обязан
+                # подтверждать ИМЕННО (mcx, mcy) (найдено оператором на
+                # реальном коде, см. докстроку _anchor_confirms_position).
+                if _anchor_confirms_position(
+                        _reacq_anchor_ok, _reacq_anchor_score,
+                        _reacq_anchor_mx, _reacq_anchor_my, mcx, mcy):
                     # Анкор согласен — нашли с уверенностью И это та же
                     # identity. Возвращаемся в TRACKED, переинициализируем flow.
                     lock_cx = float(mcx)
@@ -11339,10 +11445,14 @@ def process_locked_tracker(gray, cb_t0=None):
                 # окно исчерпается, не найдя anchor-подтверждённого
                 # кандидата, — LOST/TOGGLE и explicit AUX4 от пилота, а не
                 # молчаливый TRACKED на другой структуре.
+                _reacq_anchor_offset = math.hypot(
+                    _reacq_anchor_mx - mcx, _reacq_anchor_my - mcy)
                 flight_log.event(
                     "AUTO_REACQ отклонён: candidate live_score=%.2f, но не "
                     "согласуется с confirmed identity anchor "
-                    "(anchor_score=%.2f)" % (score_r, _reacq_anchor_score))
+                    "(anchor_score=%.2f anchor_offset=%.1fpx — anchor "
+                    "мог найтись РЯДОМ, не в самой candidate-позиции)"
+                    % (score_r, _reacq_anchor_score, _reacq_anchor_offset))
             # Не нашли в этом кадре (либо anchor отклонил найденного live-
             # кандидата) — продолжаем висеть в LOST, повторим в следующем.
             with state_lock:
@@ -11976,6 +12086,7 @@ def process_locked_tracker(gray, cb_t0=None):
                 and (time.monotonic() - _identity_anchor_check_last_t)
                 >= IDENTITY_ANCHOR_CHECK_PERIOD_S):
             _identity_anchor_check_last_t = time.monotonic()
+            _iac_ran_ok = True
             try:
                 (_iac_ok, _iac_score, _iac_psr, _iac_second, _iac_mx, _iac_my
                  ) = _shadow_match_against_template(
@@ -11988,21 +12099,45 @@ def process_locked_tracker(gray, cb_t0=None):
                 # (см. её except Exception ниже по функции). Сбой замера —
                 # не доказательство ни согласия, ни расхождения с anchor:
                 # просто пропускаем ЭТУ попытку, streak не трогаем.
-                _iac_ok = False
-                _iac_score = None
-            if _iac_score is not None:
-                if _iac_ok and _iac_score >= MATCH_GOOD_SCORE:
+                _iac_ran_ok = False
+            if _iac_ran_ok:
+                # НЕ просто "anchor нашёлся где-то в окне" — anchor обязан
+                # подтверждать ИМЕННО (new_cx, new_cy) (найдено оператором
+                # на реальном коде: A рядом с B легко попадает в то же
+                # search-окно, см. докстроку _anchor_confirms_position).
+                if _anchor_confirms_position(
+                        _iac_ok, _iac_score, _iac_mx, _iac_my, new_cx, new_cy):
                     _identity_anchor_check_streak = 0
                 else:
                     _identity_anchor_check_streak += 1
                 _match_dbg["identity_anchor_check_ran"] = 1
                 _match_dbg["identity_anchor_check_score"] = (
                     _iac_score if _iac_ok else 0.0)
+                _match_dbg["identity_anchor_check_offset"] = (
+                    math.hypot(_iac_mx - new_cx, _iac_my - new_cy) if _iac_ok else None)
             else:
                 _match_dbg["identity_anchor_check_ran"] = 0
         else:
             _match_dbg["identity_anchor_check_ran"] = 0
         _match_dbg["identity_anchor_check_streak"] = _identity_anchor_check_streak
+
+        # SOFT DISTRUST (найдено оператором на реальном коде, см. докстроку
+        # IDENTITY_SOFT_DISTRUST_ENABLED у объявления) — НЕ ждём, пока
+        # debounce наберётся целиком, чтобы снять controllable. anchor
+        # streak>=1 сразу (один периодический замер уже недёшев); dual-
+        # signal gap — после IDENTITY_UNCERTAIN_CONFIRM_FRAMES (тот же
+        # дебаунс, что уже есть у streak неоднозначности, не новое число;
+        # с первого single-signal кадра было бы слишком дёргано — это
+        # рутина, не сигнал). TRACKED/geometry/template НЕ трогает — это
+        # НЕ persistent-состояние, self-healing на следующем же успешном
+        # замере/dual-signal кадре; действует ЦЕНТРАЛЬНО через _update_
+        # control_from_target_impl(), тем же путём, что и _identity_
+        # uncertain_pending.
+        _identity_soft_distrust = IDENTITY_SOFT_DISTRUST_ENABLED and (
+            (IDENTITY_ANCHOR_CHECK_ENABLED and _identity_anchor_check_streak >= 1)
+            or (IDENTITY_DUAL_SIGNAL_GAP_ENABLED
+                and _dual_signal_gap_frames >= IDENTITY_UNCERTAIN_CONFIRM_FRAMES))
+        _match_dbg["identity_soft_distrust"] = 1 if _identity_soft_distrust else 0
 
         # IDENTITY_UNCERTAIN — РЕШЕНИЕ ДО ЛЮБОГО COMMIT (отчёт 25.09,
         # разбор поверх 64949ec, п.E: "кадр, который окончательно доказал
@@ -12613,7 +12748,15 @@ def process_locked_tracker(gray, cb_t0=None):
                                             _identity_anchor_w, _identity_anchor_h,
                                             _identity_anchor_std,
                                             lock_cx, lock_cy, flow_motion)
-                                        if not _anchor_ok or _anchor_score < MATCH_GOOD_SCORE:
+                                        # НЕ просто "anchor нашёлся где-то в
+                                        # окне" — обязан подтверждать
+                                        # ИМЕННО (lock_cx, lock_cy) (найдено
+                                        # оператором на реальном коде, см.
+                                        # докстроку _anchor_confirms_position).
+                                        if not _anchor_confirms_position(
+                                                _anchor_ok, _anchor_score,
+                                                _anchor_mx, _anchor_my,
+                                                lock_cx, lock_cy):
                                             flight_log.event(
                                                 "AUTO_TEMPLATE_REFRESH отклонён: "
                                                 "candidate не согласуется с "
@@ -13112,8 +13255,10 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("identity_uncertain_streak"),
             _match_dbg.get("identity_anchor_check_ran"),
             _match_dbg.get("identity_anchor_check_score"),
+            _match_dbg.get("identity_anchor_check_offset"),
             _match_dbg.get("identity_anchor_check_streak"),
             _match_dbg.get("identity_dual_signal_gap_frames"),
+            _match_dbg.get("identity_soft_distrust"),
             1 if _identity_anchor_gray is not None else 0,
             _match_dbg.get("identity_anchor_changed"),
             _match_dbg.get("identity_anchor_change_reason"),
