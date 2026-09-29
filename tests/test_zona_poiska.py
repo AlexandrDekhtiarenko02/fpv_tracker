@@ -39,14 +39,19 @@ src = io.open(os.path.join(_ROOT, "tracker.py"), encoding="utf-8").read()
 
 ns = {"np": np, "cv2": cv2, "math": math}
 for name in ("ACQ_SNAP_ENABLED", "ACQ_SNAP_SIGMA_MELKO", "ACQ_SNAP_SIGMA_KRUPNO",
-             "ACQ_SNAP_PEAK_OKNO", "ACQ_SNAP_YADRO_LORES",
-             "ACQ_SNAP_SIGMA_YADRO", "ACQ_SNAP_YADRO_MIN_OTN",
-             "ACQ_SNAP_YADRO_MIN_ABS", "ACQ_SNAP_MIN_OTN", "ACQ_SNAP_MIN_ABS"):
+             "ACQ_SNAP_PEAK_OKNO", "ACQ_SNAP_MIN_OTN", "ACQ_SNAP_MIN_ABS"):
     ns[name] = eval(re.search(r"^%s = (.+?)(?:\s+#.*)?$" % name, src, re.M).group(1))
 W, H = 320, 240
 ns["CENTER_X_LORES"], ns["CENTER_Y_LORES"] = W // 2, H // 2
 ns["ACQ_SNAP_RADIUS_LORES"] = 30
-exec(re.search(r"^def _nayti_pyatno.*?(?=\n\ndef )", src, re.S | re.M).group(0), ns)
+# _nayti_pyatno теперь тонкая обёртка над _nayti_vershiny_v_zone (общее
+# ядро с small-object детектором, разбор оператора "мелкие объекты теряются
+# / small-object detector") — извлекаем ОБЕ функции в изолированный
+# namespace, арифметика самого ядра не изменилась ни на бит.
+exec(re.search(r"^def _nayti_vershiny_v_zone.*?(?=\n\ndef )",
+               src, re.S | re.M).group(0), ns)
+exec(re.search(r"^def _nayti_pyatno\(gray\):.*?(?=\n\ndef )",
+               src, re.S | re.M).group(0), ns)
 nayti = ns["_nayti_pyatno"]
 
 rng = np.random.default_rng(7)

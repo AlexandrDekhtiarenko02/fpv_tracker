@@ -1,19 +1,34 @@
 """Запрет адаптации на сомнительных кадрах (ТЗ next-commit spec §9).
 
 Высокий score сам по себе не значит «кадр надёжен» — он может быть
-одновременно у нескольких кандидатов. На периодической текстуре (полосатый
-фон — классический случай, ради которого писан ambiguity guard) рядом с
-целью есть почти такой же по силе конкурент через каждый период полосы:
-низкий PSR/lead, guard уже режет вес матча при выборе позиции. Шаблон не
-должен на таком кадре учиться — иначе он рискует медленно съехать к
-соседней полосе, даже когда позиция ещё держится потоком.
+одновременно у нескольких кандидатов (низкий PSR/lead). Шаблон не должен
+на таком кадре учиться — иначе он рискует медленно съехать к конкуренту,
+даже когда позиция ещё держится потоком.
+
+НЕОДНОЗНАЧНОСТЬ — ЧЕРЕЗ ДЕТЕРМИНИРОВАННЫЙ ФЕЙК template_match_locked, А НЕ
+ЧЕРЕЗ ОРГАНИЧЕСКУЮ CV-СЦЕНУ (пересмотрено после сужения ACQ_SNAP_RADIUS_MAIN
+60->36, разбор оператора о selection/sensitivity). Раньше секция A клала
+периодические полосы прямо под прицел и полагалась на то, что matchTemplate
+сам найдёт равного конкурента через период — специально откалиброванная
+амплитуда (110..130) и период. Более узкая зона захвата изменила саму
+геометрию настолько, что прежняя калибровка перестала держаться (проверено
+прямой инъекцией состояния, минуя acquisition вовсе: тот же period=7 на
+сколь угодно большом шаблоне давал lead~0.12-0.40, а не <MATCH_LEAD_FULL=
+0.1 — упёрлось в структурный предел самой схемы, не в подбор чисел).
+Гоняться за новой калибровкой синтетической периодики — точно тот
+"подбор порога под один тест", которого явно просят избегать. Вместо этого:
+захват — ВСЕГДА на обычной (гарантированно однозначной) сцене, а
+неоднозначность матча на кадрах СЛЕЖЕНИЯ задаётся напрямую через
+_match_dbg["second"] — тот же единственный сигнал, которым
+_template_adaptation_gate реально пользуется (MATCH_LEAD_FULL), без
+зависимости от CV-нюансов конкретной синтетической текстуры.
 
 Два сценария, оба с независимым шумом по кадрам (без него addWeighted было
 бы неотличимо от «не изменилось вовсе» — цель сама по себе не движется):
-  A. Периодические полосы вокруг цели (искусственная неоднозначность).
+  A. Каждый TRACKED-кадр — гарантированный конкурент (lead<MATCH_LEAD_FULL).
      Шаблон обязан остаться БИТ-В-БИТ неизменным все кадры подряд.
-  B. Непериодическая текстура, обычный однозначный лок. Шаблон ОБЯЗАН
-     меняться — иначе гейт просто блокирует адаптацию всегда, а не по делу.
+  B. Обычный однозначный лок. Шаблон ОБЯЗАН меняться — иначе гейт просто
+     блокирует адаптацию всегда, а не по делу.
 """
 import os
 import sys
@@ -36,91 +51,92 @@ t.color_active = False
 # ровно то, что заявлено, а не "какой-то из нескольких механизмов".
 t.AUTO_TEMPLATE_REFRESH_ENABLED = False
 t.SIZE_ADAPT_ENABLED = False
-# НАЙДЕНО (отчёт 25.09, п.3): сценарий A нарочно кладёт периодические
-# полосы (искусственную неоднозначность ДЛЯ МАТЧЕРА) прямо под прицел —
-# ровно то же место, которое проверяет НОВЫЙ, независимый acquisition-
-# time гейт (ACQ_AMBIGUOUS_REJECT_ENABLED, см. estimate_initial_target).
-# Два разных механизма, две разные точки кода (захват vs. адаптация УЖЕ
-# идущего слежения), случайно делящие один и тот же синтетический фон —
-# этот файл проверяет ВТОРОЕ, отключаем первое, чтобы не мешало захвату
-# состояться (тот же принцип, что и у AUTO_TEMPLATE_REFRESH/SIZE_ADAPT
-# выше — изолируем ровно то, что заявлено в докстроке файла).
-t.ACQ_AMBIGUOUS_REJECT_ENABLED = False
+# IDENTITY_UNCERTAIN (отдельный, независимый механизм) переиспользует ТЕ ЖЕ
+# признаки (ambiguous/flow_gap), которыми управляет этот файл. Секция A
+# нарочно держит кадр неоднозначным ВСЕ 15 кадров подряд — без изоляции это
+# через IDENTITY_UNCERTAIN_CONFIRM_FRAMES=6 увело бы track_state в
+# IDENTITY_UNCERTAIN на середине прогона, что этот файл не проверяет и не
+# должен проверять (см. test_identity_uncertain.py — там же отдельно).
+t.IDENTITY_UNCERTAIN_ENABLED = False
 
 CX, CY = t.LORES_W // 2, t.LORES_H // 2
-R = 40  # покрывает окно поиска при типичном margin
+R = 12  # внутри узкой зоны захвата — надёжный однозначный пик
 
 
-def make_scene(frame_seed, periodic, period=7):
-    """periodic=True — полосатая текстура вокруг цели (много равных пиков
-    в карте откликов через каждый период); periodic=False — обычный шум
-    (один уверенный пик)."""
+def make_scene(frame_seed):
+    """Обычный шум, один уверенный пик — ГАРАНТИРОВАННО однозначная сцена
+    (та же роль, что раньше играла ветка periodic=False). Неоднозначность
+    для секций A/C задаётся ОТДЕЛЬНО, фейком template_match_locked, не
+    сценой (см. докстроку файла)."""
     rng = np.random.default_rng(1000 + frame_seed)
     frame = (rng.random((t.LORES_H, t.LORES_W)) * 70 + 50).astype(np.uint8)
     frame = cv2.GaussianBlur(frame, (5, 5), 0)
     y0, y1 = CY - R, CY + R
     x0, x1 = CX - R, CX + R
-    if periodic:
-        xs = np.arange(x0, x1)
-        # НАЙДЕНО (отчёт 25.09, разбор поверх 64949ec, п.A): исходная
-        # амплитуда полос (60..180) заливала ВСЮ зону поиска настолько
-        # сильной выраженностью, что относительный порог acquisition
-        # (ACQ_SNAP_MIN_OTN х медиана ПО ВСЕЙ ЗОНЕ) вырастал вместе с ней —
-        # НИ ОДНА комбинация размера/яркости добавленного пятна-цели не
-        # проходила его (порог рос быстрее самого пятна). Приглушённая
-        # амплитуда (110..130 вместо 60..180) держит медиану зоны низкой —
-        # acquisition снова находит genuine peak — но остаётся достаточной
-        # для matchTemplate: относительная (не абсолютная) периодическая
-        # похожесть через период не пропадает, ambiguity guard по-прежнему
-        # срабатывает (проверено: find 16/16 по всем seed'ам файла,
-        # template_adaptation_allowed=0 на всех 15 TRACKED-кадрах).
-        stripe = ((np.sin(2 * np.pi * xs / period) > 0).astype(np.uint8)
-                  * 20 + 110)
-        patch = np.tile(stripe, (y1 - y0, 1))
-        cv2.circle(patch, (R, R), R // 3, 40, -1)
-        cv2.line(patch, (0, 2 * R - 1), (2 * R - 1, 0), 20, R // 8)
-    else:
-        patch = (rng.random((y1 - y0, x1 - x0)) * 120 + 60).astype(np.uint8)
-        cv2.circle(patch, (R, R), R // 3, 40, -1)
-        cv2.line(patch, (0, 2 * R - 1), (2 * R - 1, 0), 20, R // 8)
+    patch = (rng.random((y1 - y0, x1 - x0)) * 120 + 60).astype(np.uint8)
+    cv2.circle(patch, (R, R), R // 3, 40, -1)
+    cv2.line(patch, (0, 2 * R - 1), (2 * R - 1, 0), 20, max(2, R // 8))
     noise = rng.integers(-6, 7, patch.shape)
     patch = np.clip(patch.astype(np.int16) + noise, 0, 255).astype(np.uint8)
     frame[y0:y1, x0:x1] = patch
     return frame
 
 
-def run_scenario(periodic, n_frames=15):
+_real_template_match_locked = t.template_match_locked
+
+
+def fake_ambiguous_match(score=0.90, lead_gap=0.02):
+    """ДЕТЕРМИНИРОВАННАЯ неоднозначность: _match_dbg["second"] выставлен
+    так, что lead=lead_gap<MATCH_LEAD_FULL на КАЖДОМ кадре — ровно
+    единственный сигнал, которым _template_adaptation_gate реально
+    пользуется для решения "ambiguous_peak" (см. её код в tracker.py).
+    match_cx/cy = predicted (dist_fm=0) — секция проверяет ИМЕННО lead-
+    путь гейта, не flow_gap (тот отдельно проверен в test_identity_
+    uncertain.py)."""
+    def _f(gray, pred_cx, pred_cy, flow_motion=0.0, tgt_dx=0.0, tgt_dy=0.0):
+        t._match_dbg["second"] = score * (1.0 - lead_gap)
+        return True, pred_cx, pred_cy, score
+    return _f
+
+
+def run_scenario(ambiguous, n_frames=15):
     t.reset_tracking(to_acq=True)
     with t.state_lock:
         t.aux4_state = True
     t.acq_wait_left = 0
     t.prev_aux_on = True
     t.track_state = t.TRACK_STATE_ACQ
-    scene0 = make_scene(0, periodic)
+    # Захват — ВСЕГДА на обычной, гарантированно однозначной сцене:
+    # неоднозначность (если нужна) вступает в силу ТОЛЬКО на кадрах
+    # слежения, ниже.
+    scene0 = make_scene(0)
     t.process_locked_tracker(scene0)
     assert t.track_state == t.TRACK_STATE_TRACKED, "захват не состоялся"
     tmpl0 = t.template_gray.copy()
+    if ambiguous:
+        t.template_match_locked = fake_ambiguous_match()
     changed_any = False
     allowed_seen = []
     for i in range(1, n_frames + 1):
-        scene = make_scene(i, periodic)
+        scene = make_scene(i)
         t.process_locked_tracker(scene)
         allowed_seen.append(t._match_dbg.get("template_adaptation_allowed"))
         if (t.track_state == t.TRACK_STATE_TRACKED
                 and t.template_gray.shape == tmpl0.shape
                 and not np.array_equal(t.template_gray, tmpl0)):
             changed_any = True
+    t.template_match_locked = _real_template_match_locked
     return changed_any, allowed_seen, t._match_dbg.get("adapt_skip_reason")
 
 
-print("=== A. Полосатый фон — конкурент через каждый период, шаблон не учится ===")
-changed, allowed, reason = run_scenario(periodic=True)
+print("=== A. Гарантированный конкурент каждый кадр — шаблон не учится ===")
+changed, allowed, reason = run_scenario(ambiguous=True)
 print("    template_adaptation_allowed по кадрам:", allowed)
 print("    template_gray менялся:", changed, " причина запрета:", reason)
 assert not any(allowed), (
-    "полосатый фон рядом с целью даёт равных конкурентов через период, а "
-    "гейт хоть раз разрешил адаптацию — ambiguity guard не подключён к "
-    "запрету обучения шаблона")
+    "конкурент через lead<MATCH_LEAD_FULL на каждом кадре, а гейт хоть раз "
+    "разрешил адаптацию — ambiguity guard не подключён к запрету обучения "
+    "шаблона")
 assert not changed, (
     "template_gray изменился, хотя гейт держал adaptation_allowed=0 весь "
     "прогон — запрет не долистался до реального вызова addWeighted")
@@ -128,13 +144,13 @@ assert reason == "ambiguous_peak", (
     "причина запрета должна называться ambiguous_peak, получено %r" % reason)
 
 print("\n=== B. Обычная текстура — однозначный лок, адаптация должна идти ===")
-changed2, allowed2, _ = run_scenario(periodic=False)
+changed2, allowed2, _ = run_scenario(ambiguous=False)
 print("    template_adaptation_allowed по кадрам:", allowed2)
 print("    template_gray менялся:", changed2)
 assert any(allowed2), (
-    "без периодической текстуры гейт всё равно держит adaptation_allowed=0 "
-    "— либо порог MATCH_LEAD_FULL проверяется неверно, либо gate закрыт "
-    "навсегда")
+    "без искусственной неоднозначности гейт всё равно держит adaptation_"
+    "allowed=0 — либо порог MATCH_LEAD_FULL проверяется неверно, либо gate "
+    "закрыт навсегда")
 assert changed2, (
     "template_gray не изменился ни разу за несколько кадров при "
     "разрешённой адаптации — либо шум кадра недостаточен, либо addWeighted "
@@ -151,12 +167,13 @@ with t.state_lock:
 t.acq_wait_left = 0
 t.prev_aux_on = True
 t.track_state = t.TRACK_STATE_ACQ
-scene0 = make_scene(0, periodic=True)
+scene0 = make_scene(0)
 t.process_locked_tracker(scene0)
 assert t.track_state == t.TRACK_STATE_TRACKED
+t.template_match_locked = fake_ambiguous_match()
 _mismatches = []
 for i in range(1, 16):
-    scene = make_scene(i, periodic=True)
+    scene = make_scene(i)
     t.process_locked_tracker(scene)
     if t.track_state != t.TRACK_STATE_TRACKED:
         continue
@@ -173,6 +190,7 @@ for i in range(1, 16):
         _mismatches.append("frame %d: template_std=%.4f != реальный "
                            "np.std(template_gray)=%.4f"
                            % (i, t.template_std, _real_std))
+t.template_match_locked = _real_template_match_locked
 assert not _mismatches, (
     "tmpl_w/tmpl_h/template_std разошлись с реальным template_gray после "
     "того, как cur_tmpl был отвергнут гейтом:\n  " + "\n  ".join(_mismatches))
@@ -191,14 +209,14 @@ with t.state_lock:
 t.acq_wait_left = 0
 t.prev_aux_on = True
 t.track_state = t.TRACK_STATE_ACQ
-scene0 = make_scene(0, periodic=False)
+scene0 = make_scene(0)
 t.process_locked_tracker(scene0)
 assert t.track_state == t.TRACK_STATE_TRACKED
 _checked_addweighted_frames = 0
 _mismatches_d = []
 _tg_prev = t.template_gray.copy()
 for i in range(1, 30):
-    scene = make_scene(i, periodic=False)
+    scene = make_scene(i)
     t.process_locked_tracker(scene)
     if t.track_state != t.TRACK_STATE_TRACKED:
         continue
@@ -225,7 +243,10 @@ print("    %d кадров с реальным addWeighted-смешивание�
       "каждый раз совпадал с np.std(смешанного template_gray)"
       % _checked_addweighted_frames)
 
-print("\nOK: адаптация блокируется на неоднозначном (полосатом) кадре, "
-      "работает как прежде на однозначном, и tmpl_w/tmpl_h/template_std "
-      "не расходятся с реальным template_gray — ни когда cur_tmpl "
-      "выброшен целиком (C), ни когда он смешан через addWeighted (D)")
+t.IDENTITY_UNCERTAIN_ENABLED = True
+
+print("\nOK: адаптация блокируется на неоднозначном (lead<MATCH_LEAD_FULL) "
+      "кадре, работает как прежде на однозначном, и tmpl_w/tmpl_h/"
+      "template_std не расходятся с реальным template_gray — ни когда "
+      "cur_tmpl выброшен целиком (C), ни когда он смешан через addWeighted "
+      "(D)")

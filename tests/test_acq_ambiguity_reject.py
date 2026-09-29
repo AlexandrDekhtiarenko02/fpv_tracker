@@ -76,6 +76,16 @@ def fake_pyatno(margin, dx=3.0, dy=-2.0):
 
 
 assert t.ACQ_AMBIGUOUS_REJECT_ENABLED, "тест сам по себе негоден без ENABLED"
+# Этот файл проверяет ИСКЛЮЧИТЕЛЬНО decision-логику (margin -> ok/reject)
+# на normal-детекторе через фейки _nayti_pyatno — small-object детектор
+# (разбор оператора, отдельная правка) тут не участвует ни на йоту:
+# на тестовой сцене он вполне может честно найти собственный candidate и
+# исказить секции, фейкающие "ничего не нашли" через один только
+# _nayti_pyatno. Изолируем через его же kill-switch (не через фейк — тот
+# же принцип, что и у AUTO_TEMPLATE_REFRESH_ENABLED/SIZE_ADAPT_ENABLED в
+# соседних файлах), восстанавливаем в конце файла.
+_orig_small_enabled = t.ACQ_SNAP_SMALL_ENABLED
+t.ACQ_SNAP_SMALL_ENABLED = False
 # Дефолт ACQ_CANDIDATE_CONFIDENT_MULT=1.0 — намеренно нейтральный (см. его
 # докстроку в tracker.py: любой найденный vershiny-кандидат уже имеет
 # margin>=1.0 по построению, значит 1.0 ничего доп. не фильтрует). Чтобы
@@ -202,6 +212,7 @@ print("    следующий же уверенный кадр -> TRACKED, contr
 
 t._nayti_pyatno = _real_nayti_pyatno
 t.ACQ_CANDIDATE_CONFIDENT_MULT = _orig_mult
+t.ACQ_SNAP_SMALL_ENABLED = _orig_small_enabled
 
 print("\n=== 8. По исходному тексту: отказ по неоднозначности не берёт "
       "другого candidate вместо этого — единственный путь после отказа "

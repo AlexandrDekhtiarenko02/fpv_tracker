@@ -204,10 +204,18 @@ MAG_ONLY_WHEN_AUX = False
 # пилот, то есть прежним поведением. Это важно: над однородной поверхностью
 # зона поиска не должна мешать целиться вручную.
 ACQ_SNAP_ENABLED = True
-# Радиус зоны в пикселях КАДРА (не lores). 60 px при 640 в ширину — примерно
-# десятая часть кадра: заметно шире промаха от тряски, но не настолько, чтобы
-# захватить соседний предмет.
-ACQ_SNAP_RADIUS_MAIN = 60
+# Радиус зоны в пикселях КАДРА (не lores). БЫЛО 60 px при 640 в ширину —
+# примерно десятая часть кадра. Разбор новой серии (несколько выраженных
+# объектов рядом с крестиком): при 60 в зону легко попадает больше одного
+# объекта, и «ближайший к крестику» перестаёт надёжно означать «тот, на
+# что пилот целился» — слишком широкое окно для решения, а не для точности
+# наводки. СТАЛО 36 px (~18 px lores) — provisional, начальная цифра по
+# прямому указанию: architecture first, калибровка реальными логами потом
+# (тот же принцип, что и у ACQ_CANDIDATE_CONFIDENT_MULT ниже). Никакого
+# автоматического расширения обратно до 60, если в 36 ничего не нашлось, —
+# НЕ делается: "не нашли в узкой зоне" остаётся честным отказом (см.
+# estimate_initial_target), а не поводом тихо смотреть шире.
+ACQ_SNAP_RADIUS_MAIN = 36
 ACQ_SNAP_RADIUS_LORES = max(6, int(round(ACQ_SNAP_RADIUS_MAIN * LORES_W / MAIN_W)))
 # Размытия для оценки выраженности: мелкое убирает шум, крупное даёт фон.
 ACQ_SNAP_SIGMA_MELKO = 1.2
@@ -217,29 +225,6 @@ ACQ_SNAP_SIGMA_KRUPNO = 6.0
 # расстояние между двумя целями: ближе этого они сольются в одну вершину.
 # 9 при радиусе зоны около 30 — примерно шестая часть зоны.
 ACQ_SNAP_PEAK_OKNO = 9
-# Радиус ЯДРА под прицелом в пикселях lores. В нём выраженность решает всё:
-# нашлась — берём прицел и никуда не смотрим. Ядро должно покрывать дрожание
-# руки и рассинхрон кадра, но не соседний предмет: 5 при зоне около 30 — это
-# шестая часть зоны.
-ACQ_SNAP_YADRO_LORES = 5
-# Масштаб проверки «есть ли под прицелом собственная структура». Заметно
-# мельче ACQ_SNAP_SIGMA_KRUPNO: на мелком масштабе гладкий скат от соседнего
-# предмета гаснет, а фактура самой цели остаётся.
-ACQ_SNAP_SIGMA_YADRO = 3.0
-# Во сколько раз структура под прицелом должна превосходить типичную по зоне.
-# Мягче, чем ACQ_SNAP_MIN_OTN: тут решается не «цель ли это», а «есть ли за
-# что цепляться» — и ошибиться в сторону доверия пилоту дешевле.
-ACQ_SNAP_YADRO_MIN_OTN = 1.8
-# Нижняя абсолютная граница отклика под прицелом. ЗАМЕРЕНО на модели, отклик
-# в ядре:
-#     пустой фон                     1.2
-#     сосед в 18 px и дальше    0.8-0.9   (неотличим от фона — уезжаем)
-#     сосед в 15 px                  5.2
-#     сосед в 12 px                 12.9   (прицел фактически на нём — держим)
-#     фактурный предмет             10.2   (держим, ради этого всё и делалось)
-#     цель ровно под прицелом       20.7
-# Порог 4.0 ложится в разрыв между «неотличимо от фона» и всем остальным.
-ACQ_SNAP_YADRO_MIN_ABS = 4.0
 # Порог: во сколько раз пятно должно превосходить типичную выраженность в
 # самой зоне. Относительный, а не абсолютный: абсолютный зависел бы от
 # освещённости и от фона.
@@ -247,6 +232,33 @@ ACQ_SNAP_MIN_OTN = 2.5
 # И нижняя абсолютная граница в уровнях яркости — против пустого неба, где
 # медиана почти ноль и любой шум превышает её в разы.
 ACQ_SNAP_MIN_ABS = 4.0
+
+# --- SMALL-OBJECT ACQUISITION DETECTOR (разбор оператора, "мелкие объекты
+# сейчас теряются") ---
+#
+# ОТДЕЛЬНЫЙ путь РЯДОМ с обычным детектором (sigma 1.2/6.0 выше) — сам он
+# НЕ ИЗМЕНЁН НИ НА ЙОТУ (прямое требование: "не ломать существующий
+# _nayti_pyatno()"). Причина завести второй путь, а не просто уменьшить
+# существующие пороги: пороги (ACQ_SNAP_MIN_ABS/OTN) решают "выраженное
+# пятно или шум" уже ПОСЛЕ размытия — если объект настолько мал, что крупное
+# размытие (sigma=6.0) его почти стирает, снижение порога ловит не столько
+# мелкую цель, сколько шум на текстуре/фоне (два РАЗНЫХ типа ошибки:
+# selection — не тот из нескольких видимых; sensitivity — нужный вообще не
+# стал кандидатом; лечатся по-разному, см. докстроку ниже).
+#
+# Масштаб — вдвое мельче обычного (та же пропорция melko:krupno=1:5), чтобы
+# ловить компактные пики, которые обычный детектор сглаживает. ПОРОГИ пока
+# СОЗНАТЕЛЬНО те же числа, что и у обычного детектора (не подобраны под
+# малый масштаб отдельно) — сначала нужна диагностика (acq_sal_peak/
+# acq_sal_threshold/acq_margin в CSV, событие в лог на каждой попытке) на
+# реальных мелких целях/фоне/текстуре/соседних объектах, потом offline
+# калибровка, не подбор на лету под один синтетический тест.
+ACQ_SNAP_SMALL_ENABLED = True
+ACQ_SNAP_SMALL_SIGMA_MELKO = 0.6
+ACQ_SNAP_SMALL_SIGMA_KRUPNO = 3.0
+ACQ_SNAP_SMALL_PEAK_OKNO = 5
+ACQ_SNAP_SMALL_MIN_OTN = ACQ_SNAP_MIN_OTN
+ACQ_SNAP_SMALL_MIN_ABS = ACQ_SNAP_MIN_ABS
 
 # --- НЕОДНОЗНАЧНЫЙ CANDIDATE — ОТКАЗ, А НЕ ДОГАДКА (отчёт 25.09, п.3,
 # пересмотрено после разбора оператора поверх 64949ec) ---
@@ -728,9 +740,23 @@ TRUST_PSR_FULL = 6.0
 # честно выигрывает сравнение.
 #
 # Ниже — вес матча в слиянии с потоком. Когда конкурент сильнее выбранного,
-# вес уходит к нулю и позицию ведёт ОПТИЧЕСКИЙ ПОТОК: он следит за реальным
-# движением цели и на фон не смотрит. В обычной ситуации (конкурент слабее)
-# ничего не меняется — правка срабатывает только в самом отказе.
+# вес уходит к нулю и позицию ведёт ОПТИЧЕСКИЙ ПОТОК — в МОМЕНТ, когда матч
+# сам уже ошибся, это лучше, чем довериться ошибочному матчу. В обычной
+# ситуации (конкурент слабее) ничего не меняется — правка срабатывает
+# только в самом отказе.
+#
+# НЕ СЧИТАТЬ (разбор оператора поверх dc49a29, п.8): "поток следит за
+# движением цели и на фон не смотрит" — АРХИТЕКТУРНО НЕВЕРНОЕ
+# предположение. Поток честно следит за движением СВОИХ ТОЧЕК, а не за
+# "целью" как понятием — если точки посажены на фон (или на него съехали),
+# поток так же уверенно, с тем же высоким flow_quality, повезёт за фоном:
+# реальные логи флота показывали flow_quality≈1.0 именно во время
+# серьёзного ухода по фону. w_m->0 здесь означает "доверять ДВИЖЕНИЮ, а не
+# СВЕЖЕМУ СОВПАДЕНИЮ" — это НЕ то же самое, что "доверять тому, что это
+# всё ещё confirmed identity". Независимая сверка с identity anchor (см.
+# IDENTITY_ANCHOR_CHECK_ENABLED и docstring у объявления константы) —
+# отдельный, не полагающийся на это допущение путь именно для случая,
+# когда flow И match согласны МЕЖДУ СОБОЙ, но оба неправы одновременно.
 MATCH_AMBIGUITY_GUARD = True
 MATCH_WEIGHT = 0.22          # прежний постоянный вес
 MATCH_WEIGHT_MIN = 0.02      # почти полностью доверяем потоку
@@ -2367,6 +2393,17 @@ _FLIGHT_LOG_COLUMNS = (
     # офлайн-калибровки IDENTITY_UNCERTAIN_CONFIRM_FRAMES по реальным
     # логам (п.9 отчёта), а не только по факту срабатывания.
     "identity_uncertain,identity_ambiguous,identity_flow_gap,identity_uncertain_streak,"
+    # ПЕРИОДИЧЕСКАЯ СВЕРКА С ANCHOR + PROLONGED SINGLE-SIGNAL (разбор
+    # оператора, п.5/6/7: закрыть оставшийся hard-lock bypass в обычном
+    # TRACKED->TRACKED, где flow и matcher согласны друг с другом, но оба
+    # тихо уехали на постороннюю структуру). identity_anchor_check_ran/
+    # score — честны ТОЛЬКО на кадре, где периодический замер реально
+    # состоялся (см. IDENTITY_ANCHOR_CHECK_PERIOD_S), streak — накопитель
+    # подряд НЕудачных замеров. identity_dual_signal_gap_frames — сколько
+    # TRACKED-кадров подряд идёт БЕЗ единой возможности сверить flow с
+    # matcher (короткий разрыв нормален, длинный сам по себе подозрителен).
+    "identity_anchor_check_ran,identity_anchor_check_score,"
+    "identity_anchor_check_streak,identity_dual_signal_gap_frames,"
     # ПОДТВЕРЖДЁННАЯ IDENTITY (отчёт 25.09, разбор поверх 64949ec, п.B/J).
     # identity_confirmed=1 — для ТЕКУЩЕГО лока есть подтверждённый anchor
     # (_identity_anchor_gray не None; ACQ/IDLE — 0). identity_anchor_
@@ -2387,6 +2424,18 @@ _FLIGHT_LOG_COLUMNS = (
     # найден, но признан сомнительным (ACQ_AMBIGUOUS_REJECT_ENABLED) —
     # тоже отказ, никакого "возьмём другой".
     "acq_candidate_present,acq_candidate_dx,acq_candidate_dy,acq_candidate_confirmed,"
+    # ACQUISITION ROI/SENSITIVITY (разбор оператора, п.1/2: сузили зону,
+    # добавили small-object детектор — эти поля дают честный ответ, ПОЧЕМУ
+    # каждая попытка захвата прошла или нет, из ОДНОГО лога). acq_search_
+    # radius — реальный радиус зоны (lores) на ЭТОЙ попытке. acq_candidate_
+    # count — сколько вершин нашлось ВСЕГО (оба детектора, внутри зоны).
+    # acq_candidate_distance — расстояние ПОБЕДИВШЕГО candidate'а от
+    # крестика. acq_sal_peak/threshold/margin — сырой пик выраженности в
+    # зоне и его порог (у победителя, если он есть; иначе — у наиболее
+    # близкого к порогу детектора, различить случаи "ничего вообще" от
+    # "было, но слабее порога"). acq_winner_detector — normal/small/пусто.
+    "acq_search_radius,acq_candidate_count,acq_candidate_distance,"
+    "acq_sal_peak,acq_sal_threshold,acq_margin,acq_winner_detector,"
     # template_refresh_allowed — голос ТЕКУЩЕГО fresh-слота Auto Template
     # Refresh (PSR-margin/gap/identity_ambiguous/flow_gap все пройдены на
     # ЭТОМ слоте) — не то же самое, что реальное срабатывание refresh'а
@@ -5552,6 +5601,69 @@ def _acq_debug_dump(gray, results):
         flight_log.event("СНИМОК ЗАХВАТА не удался: %s" % exc)
 
 
+def _nayti_vershiny_v_zone(gray, sigma_melko, sigma_krupno, min_abs, min_otn,
+                           peak_okno):
+    """ЯДРО детектора пятен — вынесено из _nayti_pyatno (разбор оператора:
+    "мелкие объекты теряются... завести отдельный small-object detector,
+    не трогая существующий _nayti_pyatno()"). Параметризовано масштабом
+    (sigma_melko/krupno) и порогами — ОДНА и та же арифметика для обычного
+    и для small-object детектора, разные только числа на входе. Сама мера
+    (разность двух размытий, дилатация-NMS, порог от медианы зоны) НЕ
+    менялась — побитово то же, что было внутри _nayti_pyatno раньше.
+
+    Возвращает (candidates, porog, raw_peak):
+      candidates — список (x, y, sal_val, dist) ВСЕХ вершин внутри зоны
+        (rast <= ACQ_SNAP_RADIUS_LORES), пустой список если ничего нет;
+      porog — применённый порог (нужен и когда candidates пуст — отличить
+        "ничего похожего на пятно вообще" от "пятно есть, но ниже порога",
+        отчёт п.2, случаи A/B);
+      raw_peak — МАКСИМУМ sal по всей зоне, БЕЗ фильтра по порогу и БЕЗ
+        NMS — та же диагностическая пара, только считается всегда, даже
+        если ни один candidate не прошёл (иначе случай A от B в логе не
+        отличить: candidates=[] сам по себе не говорит, было ли там хоть
+        что-то слабое или буквально ничего).
+    """
+    try:
+        R = int(ACQ_SNAP_RADIUS_LORES)
+        if R < 4:
+            return [], 0.0, 0.0
+        h, w = gray.shape[:2]
+        x0 = max(0, int(CENTER_X_LORES) - R)
+        y0 = max(0, int(CENTER_Y_LORES) - R)
+        x1 = min(w, int(CENTER_X_LORES) + R + 1)
+        y1 = min(h, int(CENTER_Y_LORES) + R + 1)
+        roi = gray[y0:y1, x0:x1]
+        if roi.shape[0] < 8 or roi.shape[1] < 8:
+            return [], 0.0, 0.0
+        f = roi.astype(np.float32)
+        melko = cv2.GaussianBlur(f, (0, 0), sigma_melko)
+        krupno = cv2.GaussianBlur(f, (0, 0), sigma_krupno)
+        sal = cv2.GaussianBlur(cv2.absdiff(melko, krupno), (0, 0), sigma_melko)
+
+        fon = float(np.median(sal))
+        porog = max(min_abs, fon * min_otn)
+        raw_peak = float(np.max(sal)) if sal.size else 0.0
+
+        okno = max(3, int(peak_okno) | 1)
+        yadro = cv2.getStructuringElement(cv2.MORPH_RECT, (okno, okno))
+        rasshir = cv2.dilate(sal, yadro)
+        vershiny = np.logical_and(sal >= rasshir - 1e-3, sal >= porog)
+        ys, xs = np.nonzero(vershiny)
+        if len(xs) == 0:
+            return [], porog, raw_peak
+        px = x0 + xs.astype(np.float32)
+        py = y0 + ys.astype(np.float32)
+        rast = np.hypot(px - CENTER_X_LORES, py - CENTER_Y_LORES)
+        vnutri = rast <= R
+        candidates = [
+            (float(px[i]), float(py[i]), float(sal[ys[i], xs[i]]), float(rast[i]))
+            for i in np.nonzero(vnutri)[0]
+        ]
+        return candidates, porog, raw_peak
+    except Exception:
+        return [], 0.0, 0.0
+
+
 def _nayti_pyatno(gray):
     """БЛИЖАЙШЕЕ к прицелу выраженное пятно в зоне поиска.
 
@@ -5596,70 +5708,126 @@ def _nayti_pyatno(gray):
     """
     if not ACQ_SNAP_ENABLED:
         return None
-    try:
-        R = int(ACQ_SNAP_RADIUS_LORES)
-        if R < 4:
-            return None
-        h, w = gray.shape[:2]
-        x0 = max(0, int(CENTER_X_LORES) - R)
-        y0 = max(0, int(CENTER_Y_LORES) - R)
-        x1 = min(w, int(CENTER_X_LORES) + R + 1)
-        y1 = min(h, int(CENTER_Y_LORES) + R + 1)
-        roi = gray[y0:y1, x0:x1]
-        if roi.shape[0] < 8 or roi.shape[1] < 8:
-            return None
-        f = roi.astype(np.float32)
-        melko = cv2.GaussianBlur(f, (0, 0), ACQ_SNAP_SIGMA_MELKO)
-        krupno = cv2.GaussianBlur(f, (0, 0), ACQ_SNAP_SIGMA_KRUPNO)
-        sal = cv2.GaussianBlur(cv2.absdiff(melko, krupno), (0, 0),
-                               ACQ_SNAP_SIGMA_MELKO)
-
-        # Порог — от типичной выраженности В САМОЙ ЗОНЕ, а не абсолютный:
-        # абсолютный зависел бы от освещённости и от того, что за фон. Нижняя
-        # абсолютная граница нужна против пустого неба, где медиана почти ноль
-        # и любой шум превышает её в разы.
-        fon = float(np.median(sal))
-        porog = max(ACQ_SNAP_MIN_ABS, fon * ACQ_SNAP_MIN_OTN)
-        # ВЕРШИНЫ, А НЕ СВЯЗНЫЕ ОБЛАСТИ.
-        #
-        # Первая попытка брала пороговую маску и её связные области. На двух
-        # предметах рядом это разваливается: широкое размытие фона расплывается
-        # шире самих предметов, области СЛИПАЮТСЯ в одну, и её центр оказывается
-        # МЕЖДУ ними — то есть ни на чём. Проверено: два пятна в 24 px друг от
-        # друга давали одну область площадью 699 с центром в пустоте.
-        #
-        # У локального максимума такой беды нет: у каждого предмета своя
-        # вершина, и слипнуться они не могут по определению. Окно сравнения
-        # заодно задаёт наименьшее различимое расстояние между целями.
-        okno = max(3, int(ACQ_SNAP_PEAK_OKNO) | 1)
-        yadro = cv2.getStructuringElement(cv2.MORPH_RECT, (okno, okno))
-        rasshir = cv2.dilate(sal, yadro)
-        vershiny = np.logical_and(sal >= rasshir - 1e-3, sal >= porog)
-        ys, xs = np.nonzero(vershiny)
-        if len(xs) == 0:
-            return None
-        px = x0 + xs.astype(np.float32)
-        py = y0 + ys.astype(np.float32)
-        rast = np.hypot(px - CENTER_X_LORES, py - CENTER_Y_LORES)
-
-        # КРЕСТИК — ЦЕНТР ЗОНЫ ПОИСКА, НЕ БЕЗУСЛОВНЫЙ ПРИОРИТЕТ (см. докстрока
-        # выше — отдельная ветка "структура ПОД самим крестиком" убрана
-        # целиком после разбора оператора поверх 64949ec). Единственный
-        # критерий выбора — расстояние до крестика среди уже найденных
-        # вершин, независимо от того, есть ли отклик РОВНО под ним.
-        vnutri = rast <= R
-        if not np.any(vnutri):
-            return None
-        i = int(np.argmin(np.where(vnutri, rast, np.inf)))
-        chosen_x = float(px[i])
-        chosen_y = float(py[i])
-        sal_val = float(sal[ys[i], xs[i]])
-        margin = sal_val / max(porog, 1e-6)
-        dx = chosen_x - float(CENTER_X_LORES)
-        dy = chosen_y - float(CENTER_Y_LORES)
-        return (chosen_x, chosen_y, margin, dx, dy)
-    except Exception:
+    # ЯДРО вынесено в _nayti_vershiny_v_zone (см. её докстроку) — сама
+    # арифметика НЕ изменилась ни на бит, только переехала в переиспользуемый
+    # вид ради small-object детектора рядом. Здесь — побитово тот же выбор
+    # "ближайшая вершина внутри зоны", что был раньше написан здесь напрямую.
+    candidates, porog, _raw_peak = _nayti_vershiny_v_zone(
+        gray, ACQ_SNAP_SIGMA_MELKO, ACQ_SNAP_SIGMA_KRUPNO,
+        ACQ_SNAP_MIN_ABS, ACQ_SNAP_MIN_OTN, ACQ_SNAP_PEAK_OKNO)
+    if not candidates:
         return None
+    chosen_x, chosen_y, sal_val, _dist = min(candidates, key=lambda c: c[3])
+    margin = sal_val / max(porog, 1e-6)
+    dx = chosen_x - float(CENTER_X_LORES)
+    dy = chosen_y - float(CENTER_Y_LORES)
+    return (chosen_x, chosen_y, margin, dx, dy)
+
+
+def _nayti_pyatno_melkiy(gray):
+    """Small-object counterpart of _nayti_pyatno (разбор оператора: "мелкие
+    объекты сейчас теряются"). ТОТ ЖЕ контракт (5-tuple (x, y, margin, dx,
+    dy) или None), ТОТ ЖЕ принцип выбора (ближайшая к крестику вершина
+    внутри зоны) — отличается только масштаб размытий и пороги
+    (ACQ_SNAP_SMALL_*, см. их докстроку у объявления). НЕ замена
+    _nayti_pyatno и НЕ "более умный" детектор — второй, параллельный взгляд
+    на ТОТ ЖЕ кадр на другом spatial scale; кто из двух реально выигрывает
+    решает объединение кандидатов в _nayti_kandidata_acquisition, не эта
+    функция сама по себе.
+    """
+    if not ACQ_SNAP_SMALL_ENABLED:
+        return None
+    candidates, porog, _raw_peak = _nayti_vershiny_v_zone(
+        gray, ACQ_SNAP_SMALL_SIGMA_MELKO, ACQ_SNAP_SMALL_SIGMA_KRUPNO,
+        ACQ_SNAP_SMALL_MIN_ABS, ACQ_SNAP_SMALL_MIN_OTN, ACQ_SNAP_SMALL_PEAK_OKNO)
+    if not candidates:
+        return None
+    chosen_x, chosen_y, sal_val, _dist = min(candidates, key=lambda c: c[3])
+    margin = sal_val / max(porog, 1e-6)
+    dx = chosen_x - float(CENTER_X_LORES)
+    dy = chosen_y - float(CENTER_Y_LORES)
+    return (chosen_x, chosen_y, margin, dx, dy)
+
+
+def _nayti_kandidata_acquisition(gray):
+    """Объединяет normal (_nayti_pyatno) и small-object (_nayti_pyatno_
+    melkiy) детекторы (отчёт: "объединить кандидатов обоих detector'ов...
+    отсеять всё вне ROI... выбрать ближайший"). Отсев по ROI уже сделан
+    ВНУТРИ каждого детектора (rast <= ACQ_SNAP_RADIUS_LORES) — здесь только
+    сравнение и финальный выбор.
+
+    Оба детектора зовутся ПО ИМЕНИ (_nayti_pyatno(gray) /
+    _nayti_pyatno_melkiy(gray), не через сохранённую ссылку) — существующие
+    тесты подменяют t._nayti_pyatno напрямую (test_acq_ambiguity_reject.py
+    и другие), и это обязано продолжать работать НЕ ЗАВИСИМО от того, что
+    появился ещё один уровень вызова.
+
+    Возвращает (winner, diag):
+      winner — (x, y, margin, dx, dy, detector_type) или None;
+      diag — словарь СЫРОЙ диагностики зоны (отчёт п.2/п.3): candidate_
+        count, sal_peak/threshold ОТДЕЛЬНО по каждому детектору (различить
+        случаи A/B — "ничего вообще" от "есть, но ниже порога" — на ЛЮБОМ
+        из двух детекторов, даже если оба провалились), полный список
+        candidates с detector_type/x/y/dist/peak/threshold/margin — для
+        событийного лога (переменная длина, в CSV не помещается).
+
+      diag считается НАПРЯМУЮ через _nayti_vershiny_v_zone (не через
+      winner-редуцирующие _nayti_pyatno/_nayti_pyatno_melkiy) — акт
+      захвата редкий (не каждый кадр), двойной счёт сцены дёшев, а без
+      этого не получить ни candidate_count, ни raw_peak при полном отказе.
+      Если _nayti_pyatno/_nayti_pyatno_melkiy сейчас подменены тестом —
+      diag всё равно отражает ЧЕСТНУЮ картину зоны, просто winner в этом
+      случае определяется подменой, а diag — нет (то же самое уже верно
+      для acq_candidate_dx/dy при существующих подменах).
+    """
+    normal_winner = _nayti_pyatno(gray)
+    small_winner = _nayti_pyatno_melkiy(gray) if ACQ_SNAP_SMALL_ENABLED else None
+
+    winner = None
+    if normal_winner is not None and small_winner is not None:
+        d_normal = math.hypot(normal_winner[3], normal_winner[4])
+        d_small = math.hypot(small_winner[3], small_winner[4])
+        winner = (("normal", normal_winner) if d_normal <= d_small
+                  else ("small", small_winner))
+    elif normal_winner is not None:
+        winner = ("normal", normal_winner)
+    elif small_winner is not None:
+        winner = ("small", small_winner)
+
+    normal_all, normal_porog, normal_raw_peak = _nayti_vershiny_v_zone(
+        gray, ACQ_SNAP_SIGMA_MELKO, ACQ_SNAP_SIGMA_KRUPNO,
+        ACQ_SNAP_MIN_ABS, ACQ_SNAP_MIN_OTN, ACQ_SNAP_PEAK_OKNO)
+    small_all, small_porog, small_raw_peak = [], 0.0, 0.0
+    if ACQ_SNAP_SMALL_ENABLED:
+        small_all, small_porog, small_raw_peak = _nayti_vershiny_v_zone(
+            gray, ACQ_SNAP_SMALL_SIGMA_MELKO, ACQ_SNAP_SMALL_SIGMA_KRUPNO,
+            ACQ_SNAP_SMALL_MIN_ABS, ACQ_SNAP_SMALL_MIN_OTN,
+            ACQ_SNAP_SMALL_PEAK_OKNO)
+
+    diag_candidates = []
+    for (x, y, sal_val, dist) in normal_all:
+        diag_candidates.append({
+            "detector_type": "normal", "x": x, "y": y, "dist": dist,
+            "peak": sal_val, "threshold": normal_porog,
+            "margin": sal_val / max(normal_porog, 1e-6)})
+    for (x, y, sal_val, dist) in small_all:
+        diag_candidates.append({
+            "detector_type": "small", "x": x, "y": y, "dist": dist,
+            "peak": sal_val, "threshold": small_porog,
+            "margin": sal_val / max(small_porog, 1e-6)})
+
+    diag = {
+        "search_radius": float(ACQ_SNAP_RADIUS_LORES),
+        "candidate_count": len(diag_candidates),
+        "candidates": diag_candidates,
+        "sal_peak_normal": normal_raw_peak, "sal_threshold_normal": normal_porog,
+        "sal_peak_small": small_raw_peak, "sal_threshold_small": small_porog,
+    }
+
+    if winner is None:
+        return None, diag
+    detector_type, (x, y, margin, dx, dy) = winner
+    return (x, y, margin, dx, dy, detector_type), diag
 
 
 def estimate_size_at_crosshair(gray):
@@ -5724,6 +5892,51 @@ def estimate_size_at_position_any(gray, px, py):
     return best
 
 
+def _fmt_acq_candidates_dbg(candidates, limit=8):
+    """Компактный, читаемый дамп ВСЕХ кандидатов зоны для events.log (отчёт
+    п.3: "для каждого candidate в debug иметь хотя бы detector_type/x/y/
+    distance/peak/threshold/margin") — переменная длина, поэтому в CSV не
+    помещается, только текстом. Ограничение limit — против патологически
+    текстурной сцены, не рабочий механизм отбора."""
+    if not candidates:
+        return "none"
+    parts = ["%s(x=%.0f,y=%.0f,d=%.1f,peak=%.2f,thr=%.2f,m=%.2f)"
+            % (c["detector_type"], c["x"], c["y"], c["dist"], c["peak"],
+               c["threshold"], c["margin"])
+            for c in candidates[:limit]]
+    if len(candidates) > limit:
+        parts.append("+%d more" % (len(candidates) - limit))
+    return "; ".join(parts)
+
+
+def _set_acq_diag(diag, winner_detector=None, winner_peak=None,
+                  winner_threshold=None, winner_dist=None):
+    """Заполняет _match_dbg["acq_*"] диагностику зоны (отчёт п.1/п.2) —
+    ОБЩАЯ хвостовая часть для ВСЕХ трёх исходов estimate_initial_target
+    (ничего не нашли / отклонён по margin / принят), чтобы поля не
+    расходились между путями."""
+    _match_dbg["acq_search_radius"] = diag["search_radius"]
+    _match_dbg["acq_candidate_count"] = diag["candidate_count"]
+    _match_dbg["acq_candidate_distance"] = winner_dist
+    _match_dbg["acq_winner_detector"] = winner_detector or ""
+    if winner_peak is not None and winner_threshold is not None:
+        _match_dbg["acq_sal_peak"] = winner_peak
+        _match_dbg["acq_sal_threshold"] = winner_threshold
+        _match_dbg["acq_margin"] = winner_peak / max(winner_threshold, 1e-6)
+    else:
+        # Полный отказ (candidates пуст на ОБОИХ детекторах) — сырой пик
+        # зоны всё равно нужен для различения случаев A/B (отчёт п.2): без
+        # этого "ничего не нашли" от "было, но слабое" в логе неотличимо.
+        # Берём детектор с БОЛЬШИМ сырым пиком — он ближе к "почти прошёл".
+        if diag["sal_peak_normal"] >= diag["sal_peak_small"]:
+            _peak, _thr = diag["sal_peak_normal"], diag["sal_threshold_normal"]
+        else:
+            _peak, _thr = diag["sal_peak_small"], diag["sal_threshold_small"]
+        _match_dbg["acq_sal_peak"] = _peak
+        _match_dbg["acq_sal_threshold"] = _thr
+        _match_dbg["acq_margin"] = _peak / max(_thr, 1e-6)
+
+
 def estimate_initial_target(gray):
     """Возвращает (tx, ty, lw, lh, ok). ok=False — ЗАХВАТ ОТКЛОНЁН: либо в
     зоне поиска нет вообще ничего выраженного (БЕЗУСЛОВНО — не опция; путь
@@ -5735,22 +5948,36 @@ def estimate_initial_target(gray):
     следующем кадре. НЕТ пути "candidate сомнителен — возьмём другой": при
     отказе tx/ty/lw/lh вообще не используются, альтернатива не выбирается.
 
-    КРЕСТИК — ТОЛЬКО ЦЕНТР ЗОНЫ ПОИСКА (см. докстрока _nayti_pyatno). Один
-    AUX4-жест — один поиск, один результат за ОДИН кадр: либо ближайший к
-    крестику candidate сразу становится TRACKED, либо явный отказ. Никакого
+    КРЕСТИК — ТОЛЬКО ЦЕНТР УЗКОЙ ЗОНЫ ПОИСКА (см. докстроку _nayti_pyatno и
+    ACQ_SNAP_RADIUS_MAIN — сужена после разбора: несколько объектов рядом
+    легко попадали в широкую зону, и "ближайший" переставал надёжно
+    означать "тот, на что целился пилот"). Один AUX4-жест — один поиск,
+    один результат за ОДИН кадр: либо ближайший ДОПУСТИМЫЙ (внутри зоны)
+    candidate сразу становится TRACKED, либо явный отказ. Никакого
     отдельного "предложенного" состояния и подтверждения нет — по прямому
     указанию оператора после разбора: "PROPOSED как пользовательский этап
     не нужен, одно действие сразу привязывает рамку".
 
-    ДИАГНОСТИКА (отчёт 25.09, п.3/п.J) — событие в лог при КАЖДОМ захвате,
-    успешном или нет: margin, dx/dy candidate'а от крестика, при отказе —
-    явная причина. _match_dbg["acq_candidate_*"] — то же для CSV; персистит
-    на весь TRACKED-сеанс как свойство ЭТОГО лока (та же семантика, что и у
+    ДВА ДЕТЕКТОРА, ОДИН ВЫБОР (разбор: "мелкие объекты теряются" — отдельно
+    от узости зоны, sensitivity problem, не selection problem, см.
+    _nayti_kandidata_acquisition). Крупный объект обычно выигрывает у
+    normal-детектора, совсем мелкий — у small-детектора; какой именно
+    победил — acq_winner_detector в CSV/логе, чисто диагностика, само
+    решение не различает их природу.
+
+    ДИАГНОСТИКА (отчёт 25.09, п.2/п.3/п.J) — событие в лог при КАЖДОМ
+    захвате, успешном или нет: margin, dx/dy candidate'а от крестика, при
+    отказе — явная причина, плюс полный список candidates обоих
+    детекторов (detector_type/x/y/distance/peak/threshold/margin — видно
+    из ОДНОГО лога, различить случаи A/B/C без повторных правок).
+    _match_dbg["acq_*"] — то же компактно для CSV; персистит на весь
+    TRACKED-сеанс как свойство ЭТОГО лока (та же семантика, что и у
     lock_w0/lock_h0), не сбрасывается каждый кадр.
     """
     if ACQ_LOCK_AT_CROSSHAIR_EXACTLY:
         lw = lh = None
-        pyatno = _nayti_pyatno(gray)
+        pyatno, _acq_diag = _nayti_kandidata_acquisition(gray)
+        _cand_dbg = _fmt_acq_candidates_dbg(_acq_diag["candidates"])
         if pyatno is None:
             # БЕЗУСЛОВНО — не гейтится ACQ_AMBIGUOUS_REJECT_ENABLED (тот
             # решает судьбу НАЙДЕННОГО, но сомнительного candidate'а, а не
@@ -5761,12 +5988,23 @@ def estimate_initial_target(gray):
             _match_dbg["acq_candidate_dx"] = None
             _match_dbg["acq_candidate_dy"] = None
             _match_dbg["acq_candidate_confirmed"] = 0
+            _set_acq_diag(_acq_diag)
             flight_log.event(
-                "ЗАХВАТ ОТКЛОНЁН: в зоне %d ничего выраженного"
-                % ACQ_SNAP_RADIUS_LORES)
+                "ЗАХВАТ ОТКЛОНЁН: в зоне %d ничего выраженного (candidates: "
+                "count=%d [%s], normal peak=%.2f/thr=%.2f, "
+                "small peak=%.2f/thr=%.2f)"
+                % (ACQ_SNAP_RADIUS_LORES, _acq_diag["candidate_count"],
+                   _cand_dbg, _acq_diag["sal_peak_normal"],
+                   _acq_diag["sal_threshold_normal"],
+                   _acq_diag["sal_peak_small"], _acq_diag["sal_threshold_small"]))
             return (float(CENTER_X_LORES), float(CENTER_Y_LORES),
                    float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H), False)
-        tx, ty, _acq_margin, _acq_dx, _acq_dy = pyatno
+        tx, ty, _acq_margin, _acq_dx, _acq_dy, _acq_detector = pyatno
+        _acq_dist = math.hypot(_acq_dx, _acq_dy)
+        _acq_winner = next(
+            (c for c in _acq_diag["candidates"]
+             if c["detector_type"] == _acq_detector and c["x"] == tx and c["y"] == ty),
+            None)
         _match_dbg["acq_candidate_present"] = 1
         _match_dbg["acq_candidate_dx"] = _acq_dx
         _match_dbg["acq_candidate_dy"] = _acq_dy
@@ -5781,16 +6019,30 @@ def estimate_initial_target(gray):
             # candidate'а не годится без новых реальных замеров (отчёт
             # прямо просит сначала архитектуру, потом числа).
             _match_dbg["acq_candidate_confirmed"] = 0
+            _set_acq_diag(
+                _acq_diag, winner_detector=_acq_detector,
+                winner_peak=_acq_winner["peak"] if _acq_winner else None,
+                winner_threshold=_acq_winner["threshold"] if _acq_winner else None,
+                winner_dist=_acq_dist)
             flight_log.event(
-                "ЗАХВАТ ОТКЛОНЁН: candidate неоднозначен (margin=%.2f < "
-                "%.2f, dx=%.0f dy=%.0f)"
-                % (_acq_margin, ACQ_CANDIDATE_CONFIDENT_MULT, _acq_dx, _acq_dy))
+                "ЗАХВАТ ОТКЛОНЁН: candidate неоднозначен (detector=%s "
+                "margin=%.2f < %.2f, dx=%.0f dy=%.0f, candidates: count=%d "
+                "[%s])"
+                % (_acq_detector, _acq_margin, ACQ_CANDIDATE_CONFIDENT_MULT,
+                   _acq_dx, _acq_dy, _acq_diag["candidate_count"], _cand_dbg))
             return (float(CENTER_X_LORES), float(CENTER_Y_LORES),
                    float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H), False)
         _match_dbg["acq_candidate_confirmed"] = 1
+        _set_acq_diag(
+            _acq_diag, winner_detector=_acq_detector,
+            winner_peak=_acq_winner["peak"] if _acq_winner else None,
+            winner_threshold=_acq_winner["threshold"] if _acq_winner else None,
+            winner_dist=_acq_dist)
         flight_log.event(
-            "ЗАХВАТ: candidate margin=%.2f dx=%.0f dy=%.0f"
-            % (_acq_margin, _acq_dx, _acq_dy))
+            "ЗАХВАТ: detector=%s margin=%.2f dx=%.0f dy=%.0f (candidates: "
+            "count=%d [%s])"
+            % (_acq_detector, _acq_margin, _acq_dx, _acq_dy,
+               _acq_diag["candidate_count"], _cand_dbg))
         if ACQ_SIZE_BY_SEGMENTATION:
             lw, lh = estimate_size_at_position_any(gray, tx, ty)
         elif ACQ_DEBUG_DUMP:
@@ -5803,13 +6055,20 @@ def estimate_initial_target(gray):
             lw, lh = float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H)
         return tx, ty, float(lw), float(lh), True
     # ACQ_LOCK_AT_CROSSHAIR_EXACTLY=False — отдельный, более простой режим
-    # ("всегда точно по прицелу"), в котором _nayti_pyatno вообще не
-    # вызывается и никакого сигнала выраженности не считается. Вне области
+    # ("всегда точно по прицелу"), в котором детекторы вообще не
+    # вызываются и никакого сигнала выраженности не считается. Вне области
     # этой правки — нечего оценивать.
     _match_dbg["acq_candidate_present"] = None
     _match_dbg["acq_candidate_dx"] = None
     _match_dbg["acq_candidate_dy"] = None
     _match_dbg["acq_candidate_confirmed"] = None
+    _match_dbg["acq_search_radius"] = None
+    _match_dbg["acq_candidate_count"] = None
+    _match_dbg["acq_candidate_distance"] = None
+    _match_dbg["acq_sal_peak"] = None
+    _match_dbg["acq_sal_threshold"] = None
+    _match_dbg["acq_margin"] = None
+    _match_dbg["acq_winner_detector"] = ""
     return (float(CENTER_X_LORES), float(CENTER_Y_LORES),
             float(ACQ_DEFAULT_LOCK_W), float(ACQ_DEFAULT_LOCK_H), True)
 
@@ -7090,6 +7349,8 @@ def reset_tracking(to_acq=False):
     global _nudge_was_active, _nudge_prev_t, _adapt_frozen_posle_reanchor
     global _nudge_frozen_box, _nudge_abort_pending, _nudge_suspended_since_t
     global _identity_uncertain_pending, _identity_uncertain_streak
+    global _identity_anchor_check_streak, _identity_anchor_check_last_t
+    global _dual_signal_gap_frames
     global _shadow_track_dbg
     global _shadow_fresh_candidate, _shadow_fresh_candidate_w, _shadow_fresh_candidate_h
     global _shadow_fresh_candidate_std, _shadow_fresh_candidate_t, _shadow_fresh_candidate_epoch
@@ -7207,6 +7468,12 @@ def reset_tracking(to_acq=False):
     # счётчик сомнительных кадров от СОВСЕМ ДРУГОЙ, уже прошлой цели.
     _identity_uncertain_pending = False
     _identity_uncertain_streak = 0
+    # Тот же принцип, что и у _identity_uncertain_streak выше — оба новых
+    # счётчика (периодическая сверка с anchor, разрыв без dual-signal
+    # подтверждения) тоже принадлежат ТЕКУЩЕМУ локу.
+    _identity_anchor_check_streak = 0
+    _identity_anchor_check_last_t = 0.0
+    _dual_signal_gap_frames = 0
 
 # =========================================================
 # 8. CONTROL — главные исправления здесь
@@ -10778,6 +11045,56 @@ IDENTITY_UNCERTAIN_CONFIRM_FRAMES = 6
 _identity_uncertain_pending = False
 _identity_uncertain_streak = 0
 
+# ПЕРИОДИЧЕСКАЯ СВЕРКА С ANCHOR В ОБЫЧНОМ TRACKED (разбор оператора,
+# оставшийся hard-lock bypass: "flow ошибочно перешёл на B, matcher тоже
+# перешёл на B, flow и matcher СОГЛАСНЫ друг с другом — dist_fm маленький,
+# ambiguity нет, uncertain streak=0 — TRACKED продолжает жить на B").
+#
+# ПОЧЕМУ streak/ambiguous/flow_gap ВЫШЕ ЭТОГО НЕ ЛОВЯТ. Оба сигнала — это
+# СОГЛАСИЕ/НЕСОГЛАСИЕ flow и matcher МЕЖДУ СОБОЙ, а не сверка с тем, что
+# пилот подтверждал изначально. Если оба тихо съехали на одну и ту же
+# постороннюю структуру — они полностью согласны друг с другом, ничего не
+# видно ни по lead, ни по dist_fm. LOST->AUTO_REACQ и AUTO_TEMPLATE_REFRESH
+# уже сверяются с _identity_anchor_gray (см. коммиты выше) — ЭТОТ путь,
+# обычный TRACKED->TRACKED, был последним, где такой сверки не было вовсе.
+#
+# ПОЧЕМУ ПЕРИОДИЧЕСКИ, А НЕ КАЖДЫЙ КАДР. _shadow_match_against_template —
+# ещё один matchTemplate, по стоимости сравнимый с самим template_match_
+# locked() — каждый кадр значило бы удвоить самый дорогой этап кадра (см.
+# комментарий у SEARCH_MARGIN в template_match_locked). Раз в
+# IDENTITY_ANCHOR_CHECK_PERIOD_S секунд — та же кадансовая философия, что
+# уже применена к CAM_JUMP/диагностике 1 Гц: достаточно часто, чтобы не
+# держать automation на чужой цели секундами, но не каждый кадр.
+IDENTITY_ANCHOR_CHECK_ENABLED = True
+IDENTITY_ANCHOR_CHECK_PERIOD_S = 0.5
+# Дебаунс тем же принципом, что и у IDENTITY_UNCERTAIN_CONFIRM_FRAMES выше:
+# один неудачный периодический замер — не повод сразу остановить всё (CV
+# шум, временная деформация/блик). N=3 подряд НЕУДАЧНЫХ замера при периоде
+# 0.5с — около 1.5с устойчивого расхождения с anchor, прежде чем automation
+# отключится. Начальное значение, калибровка — офлайн-реплеем логов, тем же
+# принципом, что и у остальных порогов этого раздела.
+IDENTITY_ANCHOR_CHECK_CONFIRM_N = 3
+_identity_anchor_check_streak = 0
+_identity_anchor_check_last_t = 0.0
+
+# PROLONGED SINGLE-SIGNAL BYPASS (разбор оператора, п.7/8): "система может
+# бесконечно жить только на flow или только на matcher, оставаясь TRACKED —
+# single signal не доказательство identity". Короткий разрыв кадров без
+# dual-signal — нормальная работа (см. п.D/семантику streak выше). Долгий —
+# отдельный признак: НЕ "matcher/flow ошибаются", а "мы давно ни разу не
+# смогли независимо ДРУГ ДРУГОМ подтвердить, что это всё ещё та же цель".
+# Переиспользует ТОТ ЖЕ флаг _identity_dual_signal_frame, которым уже
+# управляет streak выше — не новый CV-признак, только другая state-machine
+# семантика поверх него (прямое требование: "не придумывать новый CV score
+# прямо сейчас").
+IDENTITY_DUAL_SIGNAL_GAP_ENABLED = True
+# ~2.5с при CAM_FPS=24 — заметно больше IDENTITY_UNCERTAIN_CONFIRM_FRAMES
+# (тот про короткую серию явных противоречий, этот про долгое отсутствие
+# ЛЮБОГО независимого подтверждения). Начальное значение, не откалиброванное
+# число — офлайн-реплей логов, как и везде в этом разделе.
+IDENTITY_DUAL_SIGNAL_GAP_MAX_FRAMES = 60
+_dual_signal_gap_frames = 0
+
 
 def reanchor_tracker_at_current_box(gray, reason):
     """Мягкая перепривязка ВНУТРИ TRACKED, без LOST->ACQ (ТЗ §12).
@@ -10864,6 +11181,8 @@ def process_locked_tracker(gray, cb_t0=None):
     global _nudge_was_active, _nudge_prev_t
     global _nudge_frozen_box, _nudge_abort_pending, _nudge_suspended_since_t
     global _identity_uncertain_pending, _identity_uncertain_streak
+    global _identity_anchor_check_streak, _identity_anchor_check_last_t
+    global _dual_signal_gap_frames
     global _shadow_track_dbg
     global _shadow_fresh_candidate, _shadow_fresh_candidate_w, _shadow_fresh_candidate_h
     global _shadow_fresh_candidate_std, _shadow_fresh_candidate_t, _shadow_fresh_candidate_epoch
@@ -11526,11 +11845,14 @@ def process_locked_tracker(gray, cb_t0=None):
         dist_fm = math.hypot(match_cx - pred_cx, match_cy - pred_cy)
         # Насколько матч ТЯНЕТ в сторону от предсказания потока.
         #
-        # Поток следит за реальным движением цели и на фон не смотрит, поэтому
-        # устойчивое расхождение означает, что матч зацепился за что-то другое.
-        # В отличие от score, эта величина различает «держит цель» и «уверенно
-        # держит не то»: сидя на фоне, матч даёт высокий score, но расходится с
-        # потоком. Ни score, ни доля провалов такого показать не могут.
+        # Пока поток честно следит за СВОИМИ точками (а не съехал на фон
+        # тоже — см. предостережение у MATCH_AMBIGUITY_GUARD выше и
+        # IDENTITY_ANCHOR_CHECK_ENABLED ниже про случай, когда оба
+        # согласны и оба неправы), устойчивое расхождение с ним означает,
+        # что матч зацепился за что-то другое. В отличие от score, эта
+        # величина различает «держит цель» и «уверенно держит не то»: сидя
+        # на фоне, матч даёт высокий score, но расходится с потоком. Ни
+        # score, ни доля провалов такого показать не могут.
         _match_dbg["flow_gap"] = float(dist_fm)
         if score >= MATCH_GOOD_SCORE and dist_fm <= MAX_LOCK_STEP:
             _identity_dual_signal_frame = True
@@ -11565,8 +11887,11 @@ def process_locked_tracker(gray, cb_t0=None):
             #
             # Почему именно расхождение, а не score. В тех же кадрах score
             # почти не меняется (0.85 против 0.76): матч УВЕРЕННО держит не то.
-            # Поток за фоном не гонится, поэтому расхождение с ним — самый
-            # острый признак из всех, что есть.
+            # Расхождение с потоком — самый острый признак из тех, что
+            # сравнивают match и flow МЕЖДУ СОБОЙ. Он не покрывает случай,
+            # когда согласны оба (см. IDENTITY_ANCHOR_CHECK_ENABLED) — за
+            # это отвечает отдельная, не полагающаяся на поток сверка с
+            # identity anchor.
             if MATCH_GAP_SOFT > 0.0 and dist_fm > MATCH_GAP_SOFT:
                 _identity_flow_match_disagree = True
                 zatuh = MATCH_GAP_SOFT / dist_fm
@@ -11611,12 +11936,73 @@ def process_locked_tracker(gray, cb_t0=None):
     _match_dbg["identity_flow_gap"] = 1 if _identity_flow_match_disagree else 0
     _match_dbg["identity_uncertain_streak"] = _identity_uncertain_streak
 
+    # PROLONGED SINGLE-SIGNAL BYPASS (разбор оператора, п.7/8: "flow/matcher
+    # согласие МЕЖДУ СОБОЙ — не доказательство identity; наши логи уже
+    # показывали flow_quality≈1.0 на фоне"). Переиспользует ТОТ ЖЕ флаг
+    # _identity_dual_signal_frame, которым уже управляет streak выше — не
+    # новый CV-признак, другая state-machine семантика поверх него: не "N
+    # ПОДРЯД противоречивых", а "сколько подряд кадров TRACKED идёт БЕЗ
+    # единой возможности независимо сверить flow с matcher вообще" —
+    # короткий разрыв нормален (предсказание/continuity), долгий — уже
+    # сигнал сам по себе, независимо от того, ошибается каждый сигнал по
+    # отдельности или нет.
+    if tracked_ok:
+        if _identity_dual_signal_frame:
+            _dual_signal_gap_frames = 0
+        else:
+            _dual_signal_gap_frames += 1
+    else:
+        _dual_signal_gap_frames = 0
+    _match_dbg["identity_dual_signal_gap_frames"] = _dual_signal_gap_frames
+
     if tracked_ok:
         step = math.hypot(new_cx - lock_cx, new_cy - lock_cy)
         if step > MAX_LOCK_STEP:
             k = MAX_LOCK_STEP / max(step, 1e-6)
             new_cx = lock_cx + (new_cx - lock_cx) * k
             new_cy = lock_cy + (new_cy - lock_cy) * k
+
+        # ПЕРИОДИЧЕСКАЯ СВЕРКА С ANCHOR (разбор оператора, оставшийся
+        # hard-lock bypass в обычном TRACKED->TRACKED: "flow и matcher
+        # СОГЛАСНЫ друг с другом на B, dist_fm маленький, ambiguity нет,
+        # uncertain streak=0 — TRACKED продолжает жить на B, при этом
+        # _identity_anchor_gray всё ещё честно хранит A"). Сверяем
+        # ПРЕДЛОЖЕННУЮ (new_cx/new_cy, ещё НЕ закоммиченную) позицию с
+        # confirmed identity anchor — тем же _shadow_match_against_template,
+        # что уже используют LOST->AUTO_REACQ и AUTO_TEMPLATE_REFRESH (не
+        # новый matcher). Только по времени (IDENTITY_ANCHOR_CHECK_PERIOD_S)
+        # — см. её докстроку у объявления константы про стоимость кадра.
+        if (IDENTITY_ANCHOR_CHECK_ENABLED and _identity_anchor_gray is not None
+                and (time.monotonic() - _identity_anchor_check_last_t)
+                >= IDENTITY_ANCHOR_CHECK_PERIOD_S):
+            _identity_anchor_check_last_t = time.monotonic()
+            try:
+                (_iac_ok, _iac_score, _iac_psr, _iac_second, _iac_mx, _iac_my
+                 ) = _shadow_match_against_template(
+                    gray, _identity_anchor_gray, _identity_anchor_w,
+                    _identity_anchor_h, _identity_anchor_std,
+                    new_cx, new_cy, flow_motion)
+            except Exception:
+                # Диагностика/safety-check не имеет права уронить живой
+                # путь — тот же принцип изоляции, что и у TRACKING SHADOW
+                # (см. её except Exception ниже по функции). Сбой замера —
+                # не доказательство ни согласия, ни расхождения с anchor:
+                # просто пропускаем ЭТУ попытку, streak не трогаем.
+                _iac_ok = False
+                _iac_score = None
+            if _iac_score is not None:
+                if _iac_ok and _iac_score >= MATCH_GOOD_SCORE:
+                    _identity_anchor_check_streak = 0
+                else:
+                    _identity_anchor_check_streak += 1
+                _match_dbg["identity_anchor_check_ran"] = 1
+                _match_dbg["identity_anchor_check_score"] = (
+                    _iac_score if _iac_ok else 0.0)
+            else:
+                _match_dbg["identity_anchor_check_ran"] = 0
+        else:
+            _match_dbg["identity_anchor_check_ran"] = 0
+        _match_dbg["identity_anchor_check_streak"] = _identity_anchor_check_streak
 
         # IDENTITY_UNCERTAIN — РЕШЕНИЕ ДО ЛЮБОГО COMMIT (отчёт 25.09,
         # разбор поверх 64949ec, п.E: "кадр, который окончательно доказал
@@ -11629,18 +12015,50 @@ def process_locked_tracker(gray, cb_t0=None):
         # набрал порог. К этому моменту "мы не уверены" запаздывало: живое
         # состояние успевало молча стать новым ДО того, как решение вообще
         # было принято. Теперь это ПЕРВОЕ, что происходит внутри
-        # tracked_ok (step-clamp выше — чистая геометрия ПРЕДЛОЖЕННОГО
-        # new_cx/new_cy, ещё не commit, побочных эффектов не имеет) — если
-        # identity не доверяем, НИЧЕГО ниже (lock_cx/cy, prev_gray/pts,
-        # template, lock_w/h) вообще не выполняется, track_state и
-        # geometry/template остаются РОВНО такими, какими были ДО этого
-        # кадра.
+        # tracked_ok (step-clamp и анкор-сверка выше — ни то, ни другое не
+        # коммитит lock_cx/cy/template/prev_*) — если identity не
+        # доверяем, НИЧЕГО ниже (lock_cx/cy, prev_gray/pts, template,
+        # lock_w/h) вообще не выполняется, track_state и geometry/template
+        # остаются РОВНО такими, какими были ДО этого кадра.
+        #
+        # ТРИ НЕЗАВИСИМЫХ, РАВНОПРАВНЫХ ПРИЧИНЫ (разбор оператора, п.5/6/7)
+        # — любая одна достаточна: (1) серия явных противоречий flow/
+        # matcher между собой (streak, п.D, было); (2) периодическая сверка
+        # с anchor провалилась N раз подряд (новое, п.5/6 — ловит именно
+        # "flow и matcher согласны, но оба неправы"); (3) долгий разрыв без
+        # ЕДИНОЙ dual-signal возможности сверить их вообще (новое, п.7).
+        _iu_reason = None
         if (IDENTITY_UNCERTAIN_ENABLED
                 and _identity_uncertain_streak >= IDENTITY_UNCERTAIN_CONFIRM_FRAMES):
-            flight_log.event(
-                "IDENTITY_UNCERTAIN streak=%d ambiguous=%s flow_gap=%s"
-                % (_identity_uncertain_streak, _identity_ambiguous,
-                   _identity_flow_match_disagree))
+            _iu_reason = "ambiguous_or_gap"
+        elif (IDENTITY_ANCHOR_CHECK_ENABLED
+                and _identity_anchor_check_streak >= IDENTITY_ANCHOR_CHECK_CONFIRM_N):
+            _iu_reason = "anchor_mismatch"
+        elif (IDENTITY_DUAL_SIGNAL_GAP_ENABLED
+                and _dual_signal_gap_frames >= IDENTITY_DUAL_SIGNAL_GAP_MAX_FRAMES):
+            _iu_reason = "dual_signal_gap"
+
+        if _iu_reason is not None:
+            if _iu_reason == "ambiguous_or_gap":
+                flight_log.event(
+                    "IDENTITY_UNCERTAIN streak=%d ambiguous=%s flow_gap=%s"
+                    % (_identity_uncertain_streak, _identity_ambiguous,
+                       _identity_flow_match_disagree))
+            elif _iu_reason == "anchor_mismatch":
+                # НЕ "or -1.0" — score=0.0 честное значение (полное
+                # несовпадение с anchor), а `0.0 or -1.0` в Python молча
+                # даёт -1.0 (0.0 falsy), маскируя реальный ноль.
+                _iac_score_for_log = _match_dbg.get("identity_anchor_check_score")
+                if _iac_score_for_log is None:
+                    _iac_score_for_log = -1.0
+                flight_log.event(
+                    "IDENTITY_UNCERTAIN anchor_check_streak=%d "
+                    "anchor_score=%.2f"
+                    % (_identity_anchor_check_streak, _iac_score_for_log))
+            else:
+                flight_log.event(
+                    "IDENTITY_UNCERTAIN dual_signal_gap=%d frames"
+                    % _dual_signal_gap_frames)
             _identity_uncertain_pending = True
             box = lores_box_to_main(lock_cx, lock_cy, lock_w, lock_h)
             with state_lock:
@@ -12692,6 +13110,10 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("identity_ambiguous"),
             _match_dbg.get("identity_flow_gap"),
             _match_dbg.get("identity_uncertain_streak"),
+            _match_dbg.get("identity_anchor_check_ran"),
+            _match_dbg.get("identity_anchor_check_score"),
+            _match_dbg.get("identity_anchor_check_streak"),
+            _match_dbg.get("identity_dual_signal_gap_frames"),
             1 if _identity_anchor_gray is not None else 0,
             _match_dbg.get("identity_anchor_changed"),
             _match_dbg.get("identity_anchor_change_reason"),
@@ -12699,6 +13121,13 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("acq_candidate_dx"),
             _match_dbg.get("acq_candidate_dy"),
             _match_dbg.get("acq_candidate_confirmed"),
+            _match_dbg.get("acq_search_radius"),
+            _match_dbg.get("acq_candidate_count"),
+            _match_dbg.get("acq_candidate_distance"),
+            _match_dbg.get("acq_sal_peak"),
+            _match_dbg.get("acq_sal_threshold"),
+            _match_dbg.get("acq_margin"),
+            _match_dbg.get("acq_winner_detector"),
             _match_dbg.get("template_refresh_allowed"),
             _match_dbg.get("visual_unstable"),
             _match_dbg.get("visual_unstable_reason"),

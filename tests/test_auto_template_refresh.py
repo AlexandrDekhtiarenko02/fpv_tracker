@@ -181,6 +181,24 @@ t.FREEZE_TEMPLATE = True
 # AUTO_TEMPLATE_REFRESH.
 _orig_size_adapt = t.SIZE_ADAPT_ENABLED
 t.SIZE_ADAPT_ENABLED = False
+# Четвёртый, тоже несвязанный механизм: периодическая сверка с identity
+# anchor в обычном TRACKED->TRACKED (разбор оператора, hard-lock bypass) —
+# независимый от AUTO_TEMPLATE_REFRESH kill-switch, а сцена этого файла
+# нарочно сдвигает объект на 1..20 px КАЖДЫЙ кадр (см. tick()/_off) ради
+# самого AUTO_TEMPLATE_REFRESH — при таких скачках anchor-сверка (на
+# РЕАЛЬНОМ image/anchor, без фейка) может честно не поспевать за
+# синтетическим прыжком и увести track_state в IDENTITY_UNCERTAIN, что
+# этот файл не проверяет и не должен. Гасим её здесь же.
+_orig_identity_anchor_check_enabled = t.IDENTITY_ANCHOR_CHECK_ENABLED
+t.IDENTITY_ANCHOR_CHECK_ENABLED = False
+# Пятый: долгий разрыв без dual-signal кадра (тот же разбор, п.7) — секция
+# 3 этого файла нарочно гоняет часы через весь AUTO_TEMPLATE_REFRESH_
+# COOLDOWN_S (несколько секунд, десятки кадров) на той же быстро
+# сдвигающейся сцене; реальный live-матч/поток на ней не гарантированно
+# dual-signal каждый кадр — без изоляции разрыв мог бы накопиться выше
+# IDENTITY_DUAL_SIGNAL_GAP_MAX_FRAMES и увести в IDENTITY_UNCERTAIN.
+_orig_dual_signal_gap_enabled = t.IDENTITY_DUAL_SIGNAL_GAP_ENABLED
+t.IDENTITY_DUAL_SIGNAL_GAP_ENABLED = False
 
 t.TRACKING_SHADOW_ENABLED = True
 t.TRACKING_SHADOW_EVERY_N_FRAMES = 4
@@ -686,3 +704,5 @@ print("\nOK: AUTO TEMPLATE REFRESH — серия из %d подтвержден
 
 t.FREEZE_TEMPLATE = _orig_freeze_template
 t.SIZE_ADAPT_ENABLED = _orig_size_adapt
+t.IDENTITY_ANCHOR_CHECK_ENABLED = _orig_identity_anchor_check_enabled
+t.IDENTITY_DUAL_SIGNAL_GAP_ENABLED = _orig_dual_signal_gap_enabled

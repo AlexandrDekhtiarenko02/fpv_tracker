@@ -82,6 +82,14 @@ FRAME_DT = 1.0 / t.CAM_FPS
 # набраться за несколько кадров теста.
 _orig_auto_tref_enabled = t.AUTO_TEMPLATE_REFRESH_ENABLED
 t.AUTO_TEMPLATE_REFRESH_ENABLED = False
+# Тот же принцип, тот же риск: периодическая сверка с identity anchor
+# (разбор оператора, hard-lock bypass в обычном TRACKED->TRACKED) — ТРЕТИЙ
+# независимый вызывающий _shadow_match_against_template, гейтится СВОИМ
+# kill-switch (не TRACKING_SHADOW_ENABLED). §6 ниже считает ВЫЗОВЫ этой
+# функции именно ЧЕРЕЗ TRACKING_SHADOW-блок — без изоляции сюда прилетал
+# бы ещё и её вызов, искажая счётчик.
+_orig_identity_anchor_check_enabled = t.IDENTITY_ANCHOR_CHECK_ENABLED
+t.IDENTITY_ANCHOR_CHECK_ENABLED = False
 
 
 def make_scene(cx, cy, size, offset=0, seed=7):
@@ -543,3 +551,4 @@ print("\nOK: Tracking Shadow (после бенча 24.09.2026 + ревью self
       "пишет в live-переменные по исходному тексту")
 
 t.AUTO_TEMPLATE_REFRESH_ENABLED = _orig_auto_tref_enabled
+t.IDENTITY_ANCHOR_CHECK_ENABLED = _orig_identity_anchor_check_enabled

@@ -61,6 +61,16 @@ def make_offset_scene(dx, dy, seed=4242):
 
 assert t.ACQ_LOCK_AT_CROSSHAIR_EXACTLY, (
     "тест рассчитан именно на ветку _nayti_pyatno/estimate_initial_target")
+# Этот файл проверяет K-1 (одно действие -> немедленный лок через ПОЛНЫЙ
+# pipeline) на normal-детекторе — small-object детектор (разбор оператора,
+# отдельная правка) тут не участвует: на более узкой зоне (после сужения
+# ACQ_SNAP_RADIUS_MAIN) он способен честно найти СВОЙ пик на БЛИЖНЕМ К
+# КРЕСТИКУ краю той же самой цели (не её геометрический центр, но всё ещё
+# часть объекта) и выиграть выбор "ближайший" — тест тогда сравнивал бы
+# промах не с тем, что предполагал. У small-object детектора будут свои,
+# отдельные тесты.
+_orig_small_enabled = t.ACQ_SNAP_SMALL_ENABLED
+t.ACQ_SNAP_SMALL_ENABLED = False
 # Заметно в стороне (не под крестиком), но надёжно внутри зоны поиска.
 OFFSET = int(round(t.ACQ_SNAP_RADIUS_LORES * 0.4))
 assert OFFSET >= 5, "тест сам по себе негоден: OFFSET слишком мал"
@@ -120,6 +130,12 @@ assert t._identity_anchor_gray is not None, (
     "действия — точка B (отдельность confirmed identity) не выполнена")
 print("    identity anchor установлен ОДНИМ действием, без отдельного "
       "шага подтверждения")
+
+assert t._match_dbg.get("acq_winner_detector") == "normal", (
+    "acq_winner_detector=%r, ожидали 'normal' (small-object детектор "
+    "изолирован в этом файле)" % t._match_dbg.get("acq_winner_detector"))
+
+t.ACQ_SNAP_SMALL_ENABLED = _orig_small_enabled
 
 print("\nOK: одно действие AUX4 на реальных пикселях, цель заметно в "
       "стороне от крестика -> немедленный TRACKED на РЕАЛЬНОЙ цели (не на "
