@@ -12196,11 +12196,48 @@ def process_locked_tracker(gray, cb_t0=None):
                 >= IDENTITY_ANCHOR_CHECK_PERIOD_S):
             _identity_anchor_check_last_t = time.monotonic()
             _iac_ran_ok = True
+            # SCALED ANCHOR VERIFICATION (найдено оператором на реальных
+            # стендовых логах ab76eda: при физическом приближении цели
+            # (optical-flow expansion x2.5..x5.3) исходный immutable
+            # anchor, снятый в acquisition-размере, постепенно
+            # переставал совпадать с той же самой целью в текущем
+            # размере — anchor_score падал 0.85 -> 0.19, ложный
+            # IDENTITY_UNCERTAIN. Immutable bytes anchor'а НЕ ТРОГАЕМ
+            # (это identity), но для СРАВНЕНИЯ строим временную scaled
+            # копию по подтверждённому отношению текущей geometry к
+            # acquisition geometry. Соотношение уже накоплено в
+            # template_scale_acc — тот же множитель, которым выше в
+            # size_adapt блоке ресайзится рабочий template_gray из
+            # template_base. Если lock_w0/h0 недоступны — работаем как
+            # раньше на исходном anchor'е.
+            _iac_tmpl = _identity_anchor_gray
+            _iac_tw = _identity_anchor_w
+            _iac_th = _identity_anchor_h
+            _iac_tstd = _identity_anchor_std
+            if (lock_w0 is not None and lock_w0 > 0
+                    and abs(template_scale_acc - 1.0) > 1e-3):
+                try:
+                    _iac_nw = max(1, int(round(
+                        _identity_anchor_w * template_scale_acc)))
+                    _iac_nh = max(1, int(round(
+                        _identity_anchor_h * template_scale_acc)))
+                    if (_iac_nw, _iac_nh) != (_identity_anchor_w,
+                                              _identity_anchor_h):
+                        _iac_tmpl = cv2.resize(
+                            _identity_anchor_gray, (_iac_nw, _iac_nh),
+                            interpolation=cv2.INTER_LINEAR)
+                        _iac_tw = _iac_nw
+                        _iac_th = _iac_nh
+                        _iac_tstd = float(np.std(_iac_tmpl)) if _iac_tmpl.size else 0.0
+                except Exception:
+                    _iac_tmpl = _identity_anchor_gray
+                    _iac_tw = _identity_anchor_w
+                    _iac_th = _identity_anchor_h
+                    _iac_tstd = _identity_anchor_std
             try:
                 (_iac_ok, _iac_score, _iac_psr, _iac_second, _iac_mx, _iac_my
                  ) = _shadow_match_against_template(
-                    gray, _identity_anchor_gray, _identity_anchor_w,
-                    _identity_anchor_h, _identity_anchor_std,
+                    gray, _iac_tmpl, _iac_tw, _iac_th, _iac_tstd,
                     new_cx, new_cy, flow_motion)
             except Exception:
                 # Диагностика/safety-check не имеет права уронить живой
@@ -12588,38 +12625,28 @@ def process_locked_tracker(gray, cb_t0=None):
                     # Уменьшились — отсчёт начинаем заново.
                     _score_do_rosta = score
                 _match_dbg["size_scale"] = k_scale
-                if template_std < TEMPLATE_STARVED_STD:
-                    # НАЙДЕНО ОПЕРАТОРОМ на реальных стендовых логах 2f7d275:
-                    # ветка раздувала lock_w/lock_h в 1.30 раза до предела
-                    # 3.0×, ожидая, что "край объекта снова попадёт в
-                    # эталон" — но эталон физически НЕ растёт, потому что
-                    # TEMPLATE_RESCALE_ON_SIZE_CHANGE=False (см. ветку выше,
-                    # которая ЯВНО пропускает пересборку template_gray, если
-                    # cur_tmpl.shape != template_gray.shape). Получалась
-                    # ловушка: box=24→32→41→52→69, template=24×24 всё время.
-                    # Маленький template гулял внутри огромной box, matcher
-                    # стабильно давал почти равные пики (identity_ambiguous),
-                    # anchor_score постепенно падал ниже MATCH_GOOD_SCORE.
-                    #
-                    # Не лечить новым threshold, не включать TEMPLATE_RESCALE
-                    # вслепую (та ветка отдельно выключалась ради заморозки
-                    # адаптации): изначально низкий template_std сам по себе
-                    # НЕ является измерением размера цели и не должен
-                    # раздувать target box. Диагностика ("size_skip = 6/7",
-                    # т.е. starved-состояние) остаётся, живого мутирования
-                    # lock_w/lock_h — нет. Проблема "template безлик" должна
-                    # решаться на этапе acquisition (правильный размер сразу
-                    # при захвате), а не эскалацией box в рантайме.
-                    predel_w = (lock_w0 or lock_w) * TEMPLATE_STARVED_MAX_X
-                    predel_h = (lock_h0 or lock_h) * TEMPLATE_STARVED_MAX_X
-                    if lock_w >= predel_w or lock_h >= predel_h:
-                        _match_dbg["size_skip"] = 7   # был бы предел роста
-                    else:
-                        _match_dbg["size_skip"] = 6   # был бы starved-рост
-                elif k_scale is None:
-                    _match_dbg["size_skip"] = 3     # примерить не удалось
+                # НАЙДЕНО ОПЕРАТОРОМ на реальных стендовых логах ab76eda:
+                # раньше STARVED-ветка ПЕРЕХВАТЫВАЛА весь блок примерки на
+                # любом кадре с template_std < STARVED — то есть каждый
+                # раз, когда изначально при захвате template оказался
+                # безлик (частая ситуация для однотонной части реальной
+                # цели). Валидный k_scale от matchTemplate в такие кадры
+                # игнорировался целиком, размер цели физически рос
+                # (optical-flow scale в логах ×2.5..×5.3), а lock_w/h
+                # оставались 24-27 px. Матчер терял цель просто потому,
+                # что смотрел маленьким template в большую цель.
+                #
+                # Убираем STARVED как гейт: template_std сам по себе НЕ
+                # запрещает изменение размера. Диагностика STARVED
+                # остаётся (size_skip=6), но НЕ мешает валидному k_scale
+                # обновить lock_w/h и pull-ре ресайзу template из
+                # template_base через уже существующий template_scale_acc-
+                # путь (та же ветка "else" ниже — не новый код).
+                _starved = (template_std < TEMPLATE_STARVED_STD)
+                if k_scale is None:
+                    _match_dbg["size_skip"] = 6 if _starved else 3
                 elif k_scale == 1.0:
-                    _match_dbg["size_skip"] = 5     # масштаб не изменился
+                    _match_dbg["size_skip"] = 6 if _starved else 5
                 else:
                     _match_dbg["size_skip"] = 0
                     grow = 1.0 + (k_scale - 1.0) * SIZE_SCALE_ALPHA
@@ -12679,6 +12706,64 @@ def process_locked_tracker(gray, cb_t0=None):
                             # _adapt_template_base НИЖЕ забирает свежие
                             # пиксели ИЗ gray — это и есть обучение, которое
                             # ТЗ §9 просит запретить на сомнительном кадре.
+                            _ta_allowed, _ta_reason = _template_adaptation_gate(
+                                score, flow_ok)
+                            _match_dbg["template_adaptation_allowed"] = (
+                                1 if _ta_allowed else 0)
+                            _match_dbg["adapt_skip_reason"] = _ta_reason
+                            if _ta_allowed:
+                                _adapt_template_base(gray)
+
+            # FALLBACK НА OPTICAL-FLOW SCALE (найдено оператором на реальных
+            # стендовых логах ab76eda: cumulative optical-flow scale в
+            # захвате №2 достиг ×5.3 при flow_scale_confidence 0.99, а
+            # box/template остались 24-27 px, потому что matchTemplate
+            # scale провалил проверку на большинстве кадров — size_skip=
+            # 1/2/3, часто 6 при starved template. Optical flow —
+            # независимый источник, уже валидированный по числу inliers/
+            # r_med через FLOW_RASSH_MIN/MAX выше, и его результат уже
+            # используется для _flow_rasshirenie/_rassh_nakop; тот же
+            # сигнал теперь может ПРИМЕНИТЬСЯ к lock_w/h, когда match_scale
+            # молчит). Применяется через те же переиспользуемые пути
+            # (template_scale_acc / resize из template_base / adaptation
+            # gate) — не новая логика, только другой источник scale.
+            if (_match_dbg.get("size_skip") in (1, 2, 3, 5, 6)
+                    and _flow_rasshirenie is not None
+                    and (time.monotonic() - _flow_rasshirenie_t)
+                        <= FLOW_RASSH_SVEZH_S
+                    and _flow_rasshirenie != 1.0):
+                _flow_k = float(_flow_rasshirenie)
+                if _score_do_rosta is not None and _flow_k > 1.0 and (
+                        score < _score_do_rosta - SIZE_GROW_SCORE_PADENIE):
+                    # То же правило "рост запрещён при ухудшающемся score",
+                    # что и для match_scale — не отдельная политика.
+                    _match_dbg["rost_zapreshchen"] = 1
+                elif LOCK_MIN_W <= lock_w * _flow_k <= LOCK_MAX_W:
+                    _match_dbg["scale_source"] = "flow_scale"
+                    _match_dbg["size_skip"] = 0
+                    grow = 1.0 + (_flow_k - 1.0) * SIZE_SCALE_ALPHA
+                    lock_w = clamp(lock_w * grow, LOCK_MIN_W, LOCK_MAX_W)
+                    lock_h = clamp(lock_h * grow, LOCK_MIN_H, LOCK_MAX_H)
+                    if _flow_k > 1.0:
+                        _score_do_rosta = score
+                    # Тот же путь, что и у match_scale ветки выше: ресайз
+                    # рабочего template из ИСХОДНОГО template_base по
+                    # накопленному template_scale_acc — не обучение, только
+                    # геометрия representation.
+                    if template_base is not None:
+                        template_scale_acc = clamp(
+                            template_scale_acc * grow, 0.25, 6.0)
+                        bh, bw = template_base.shape[:2]
+                        nw = int(round(clamp(bw * template_scale_acc,
+                                             TEMPLATE_MIN, TEMPLATE_MAX)))
+                        nh = int(round(clamp(bh * template_scale_acc,
+                                             TEMPLATE_MIN, TEMPLATE_MAX)))
+                        if (nw, nh) != (template_gray.shape[1],
+                                        template_gray.shape[0]):
+                            template_gray = cv2.resize(
+                                template_base, (nw, nh),
+                                interpolation=cv2.INTER_LINEAR)
+                            sync_template_metadata()
                             _ta_allowed, _ta_reason = _template_adaptation_gate(
                                 score, flow_ok)
                             _match_dbg["template_adaptation_allowed"] = (
@@ -14308,56 +14393,48 @@ def main():
         _controls_dostupny = {}
     _ae_dostupen = "AeEnable" in _controls_dostupny
     _awb_dostupen = "AwbEnable" in _controls_dostupny
+    # СТАТИЧЕСКИЕ AE/AWB после startup-settle (прямое требование оператора
+    # после реальных стендовых логов ab76eda: динамика AE во время полёта
+    # давала pitch<->ExposureTime корреляцию 0.867, скачки выдержки
+    # 652 -> 4612 мкс за секунду наклона, реальные CAM_TOP_SATURATED и
+    # ошибочные CAM_JUMP → VISUAL_UNSTABLE. Динамическое AE больше не
+    # чинить). Ждём settle (уже сделано выше), измеряем текущие AE/AWB
+    # параметры на момент, когда камера СОШЛАСЬ на реальную сцену, — и
+    # фиксируем их. Разница со СТАРЫМ статическим поведением (до
+    # "оба динамические"): фиксация ТОЛЬКО ПОСЛЕ реального settle, а не
+    # первым же значением, к которому камера пришла за 0.5с — без этого
+    # старая версия замораживала выдержку "для тёмного" на светлой сцене.
     try:
         md = picam2.capture_metadata()
-        colour = md.get("ColourGains", None)
+        exp_measured = int(md.get("ExposureTime", 8000))
+        gain_measured = float(md.get("AnalogueGain", 1.0))
+        colour_measured = md.get("ColourGains", None)
         ctrl = {}
         if _ae_dostupen:
-            ctrl["AeEnable"] = True
-        else:
-            # ОТКАТ: AeEnable не значится в camera_controls этой камеры/
-            # сборки picamera2 — прежнее (статичное) поведение честнее,
-            # чем слепая попытка включить неподдерживаемый control. Ключ
-            # "AeEnable" здесь НЕ ставим вовсе (ни True, ни False) — раз
-            # его нет в camera_controls, любое его значение потенциально
-            # неподдерживаемый control; настоящий откат — просто не трогать
-            # его и явно задать ExposureTime/AnalogueGain, как раньше.
-            exp = int(md.get("ExposureTime", 8000))
-            exp = min(exp, 33000)
-            ctrl["ExposureTime"] = exp
-            ctrl["AnalogueGain"] = float(md.get("AnalogueGain", 1.0))
+            ctrl["AeEnable"] = False
+        # Явные ExposureTime/AnalogueGain — независимо от того, поддерживает
+        # ли камера AeEnable: если поддерживает, AeEnable=False + явные
+        # значения совместимо; если не поддерживает, ExposureTime/AnalogueGain
+        # это единственный способ зафиксировать AE вообще (тот же путь, что
+        # был у "ОТКАТ" ветки, но теперь не откат — основной путь).
+        ctrl["ExposureTime"] = min(exp_measured, 33000)
+        ctrl["AnalogueGain"] = gain_measured
         if _awb_dostupen:
-            ctrl["AwbEnable"] = True
-        elif colour is not None:
-            # ОТКАТ: тот же принцип, что для AE — AwbEnable отсутствует в
-            # camera_controls, значит настоящий откат — прежнее статичное
-            # поведение (зафиксированные ColourGains), а не попытка
-            # включить неподдерживаемый control.
-            ctrl["ColourGains"] = tuple(colour)
+            ctrl["AwbEnable"] = False
+        if colour_measured is not None:
+            ctrl["ColourGains"] = tuple(colour_measured)
         # Закрепляем частоту ЗАНОВО: в некоторых версиях libcamera установка
         # AE/AWB-контролов сбрасывает предел длительности кадра, и частота
-        # уезжает обратно к «как получится». AE/AWB обязаны оставаться в
-        # пределах этого потолка — сама выдержка и цвет меняться могут,
-        # частота кадров нет.
+        # уезжает обратно к «как получится».
         ctrl["FrameDurationLimits"] = (_fd, _fd)
         picam2.set_controls(ctrl)
-        # ЧТО ИМЕННО ДИНАМИЧЕСКОЕ/ЗАФИКСИРОВАНО — в журнал. Раньше в
-        # вечерних прогонах со статичным AWB цель приходила почти серой
-        # (U=125 V=126 при нейтрали 128), тогда как утром тот же предмет
-        # давал U=85 V=203 — без этой записи причину не отличить от
-        # «предмет просто не цветной».
         flight_log.event(
-            "КАМЕРА: настройка за %.1f с. Экспозиция %s (снимок на момент "
-            "старта: выдержка %d мкс, усиление %.2f), баланс белого %s "
-            "(снимок ColourGains на момент старта: %s)"
-            % (_settle_s,
-               "ДИНАМИЧЕСКАЯ (AeEnable=True)" if _ae_dostupen
-               else "СТАТИЧНАЯ — AeEnable нет в camera_controls, откат",
-               int(md.get("ExposureTime", 0)),
-               float(md.get("AnalogueGain", 1.0)),
-               "ДИНАМИЧЕСКИЙ (AwbEnable=True)" if _awb_dostupen
-               else "СТАТИЧНЫЙ — AwbEnable нет в camera_controls, откат",
-               ("%.2f/%.2f" % tuple(colour)) if colour else "не задан"))
+            "КАМЕРА: настройка за %.1f с. Экспозиция ЗАФИКСИРОВАНА (выдержка "
+            "%d мкс, усиление %.2f). Баланс белого %s (%s)."
+            % (_settle_s, exp_measured, gain_measured,
+               "ЗАФИКСИРОВАН" if colour_measured is not None else "не задан",
+               ("ColourGains=%.2f/%.2f" % tuple(colour_measured))
+               if colour_measured else "нет"))
     except Exception:
         pass
 
