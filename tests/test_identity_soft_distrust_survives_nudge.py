@@ -97,37 +97,42 @@ def fake_flow_still(prev_g, cur_g, pts, cx, cy):
     return True, cx, cy
 
 
-def fake_match_ambiguous(gray, pred_cx, pred_cy, flow_motion=0.0, tgt_dx=0.0, tgt_dy=0.0):
-    t._match_dbg["second"] = 0.90   # lead=0 -> ambiguous
-    return True, pred_cx, pred_cy, 0.90
-
-
 def fake_match_clean(gray, pred_cx, pred_cy, flow_motion=0.0, tgt_dx=0.0, tgt_dy=0.0):
     t._match_dbg["second"] = 0.05
     return True, pred_cx, pred_cy, 0.90
 
 
-N = t.IDENTITY_UNCERTAIN_CONFIRM_FRAMES
+def fake_shadow_anchor_bad(gray, tmpl, tmpl_w, tmpl_h, tmpl_std,
+                            pred_cx, pred_cy, flow_motion):
+    # Anchor-check возвращает низкий score точно в запрошенной позиции.
+    # Это НЕ гасится arbiter-gate (arbiter-gate только для ambiguity/
+    # flow_gap ветки soft distrust; anchor_check_streak — отдельный,
+    # прямой источник).
+    return True, 0.10, 1.0, 0.05, pred_cx, pred_cy
 
-print("=== 1. Накопить soft distrust: серия ambiguous кадров до "
-      "controllable=False (persistent UNCERTAIN блокируется anchor "
-      "arbiter'ом) ===")
+
+_real_shadow_match = t._shadow_match_against_template
+
+print("=== 1. Накопить soft distrust через anchor_check_streak (тот же "
+      "механизм, который НЕ гасится arbiter-gate, ambiguity после arbiter-"
+      "правки бы гасилась и nudge-bypass не воспроизводился бы вообще) ===")
 capture()
-t.flow_predict = fake_flow_still
-t.template_match_locked = fake_match_ambiguous
-for _ in range(N + 1):
-    _clk.tick(FRAME_DT)
-    t.process_locked_tracker(scene)
+# Дадим anchor_last_confirm_t "устареть" ЧАСТИЧНО — недостаточно чтобы
+# arbiter-gate сработал, но перезапустим таймер fake fails.
+t._shadow_match_against_template = fake_shadow_anchor_bad
+# Ускоряем часы через IDENTITY_ANCHOR_CHECK_PERIOD_S — один fail = streak>=1
+_clk.tick(t.IDENTITY_ANCHOR_CHECK_PERIOD_S + 0.01)
+t.process_locked_tracker(scene)
 with t.state_lock:
     _ctrl_before = t.target_controllable
 assert not _ctrl_before, "тест сам по себе негоден: soft distrust не набрался"
 assert t.track_state == t.TRACK_STATE_TRACKED, (
     "тест сам по себе негоден: persistent UNCERTAIN сработал раньше "
     "времени, проверять nudge-bypass нечего")
-assert t._identity_uncertain_streak >= N
-print("    _identity_uncertain_streak=%d, controllable=False, "
-      "track_state=TRACKED — исходное состояние для проверки установлено"
-      % t._identity_uncertain_streak)
+assert t._identity_anchor_check_streak >= 1
+print("    _identity_anchor_check_streak=%d, controllable=False, "
+      "track_state=TRACKED — исходное состояние установлено"
+      % t._identity_anchor_check_streak)
 
 print("\n=== 2. Активный nudge: target_controllable ставится в True "
       "локально в ветке, но должен быть принудительно возвращён в False "
@@ -163,22 +168,24 @@ print("    release: track_state=%s controllable=False, "
       "geometry_epoch=%d (reanchor реально случился, но identity trust "
       "не восстановлен)" % (t.track_state, _geom_epoch_after))
 
-print("\n=== 4. Свежий чистый dual-signal кадр — controllable "
+print("\n=== 4. Свежий успешный anchor-check — controllable "
       "восстанавливается только теперь ===")
-t.template_match_locked = fake_match_clean
-_clk.tick(FRAME_DT)
+t._shadow_match_against_template = _real_shadow_match
+_clk.tick(t.IDENTITY_ANCHOR_CHECK_PERIOD_S + 0.01)
 t.process_locked_tracker(scene)
-assert t._identity_uncertain_streak == 0
+assert t._identity_anchor_check_streak == 0
 with t.state_lock:
     _ctrl_after = t.target_controllable
 assert _ctrl_after, (
     "controllable не восстановился даже после явного identity "
-    "confirmation (чистый dual-signal кадр)")
-print("    чистый кадр -> streak=0, controllable=True — восстановлен "
-      "по свежему identity confirmation, а не по факту nudge/release")
+    "confirmation (успешный anchor-check)")
+print("    успешный anchor-check -> streak=0, controllable=True — "
+      "восстановлен по свежему identity confirmation, а не по факту "
+      "nudge/release")
 
 t.flow_predict = _real_flow_predict
 t.template_match_locked = _real_template_match_locked
+t._shadow_match_against_template = _real_shadow_match
 t.reset_tracking(to_acq=False)
 
 print("\nOK: manual nudge и nudge-release больше не бывают "

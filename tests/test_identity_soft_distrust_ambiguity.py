@@ -1,21 +1,20 @@
-"""Ambiguity/flow_gap streak даёт SOFT DISTRUST (снятие controllable),
-хотя anchor arbiter блокирует PERSISTENT UNCERTAIN (найдено оператором
-на реальном коде f6a10f7: комментарии и старая версия test_identity_
-anchor_no_silent_switch.py утверждали, что ambiguity/flow_gap
-продолжают давать soft distrust, но фактически _identity_soft_distrust
-это НЕ читал — только anchor_check_streak и dual_signal_gap).
+"""ARBITER-GATE на ambiguity/flow_gap soft distrust: если immutable anchor
+недавно подтвердил позицию — sustained ambiguity/flow_gap НЕ должны
+бесконечно душить controllable, только гейтить adaptation и снижать вес
+матча (найдено оператором на реальных стендовых логах 2f7d275).
 
-СЦЕНАРИЙ (класс, ловящий 76% реальных стендовых false-positive срывов
-до этой правки): mattc почти неоднозначен (score≈second, но lead<
-MATCH_LEAD_FULL), при этом immutable anchor уверенно подтверждает ту же
-позицию. Хорошо, что новая архитектура НЕ переводит это в persistent
-IDENTITY_UNCERTAIN (arbiter принимает anchor). Плохо, что до этой
-правки controllable оставался True — два live-источника устойчиво
-противоречили друг другу, но automation этого не замечало.
+СЦЕНАРИЙ ИЗ ЛОГОВ. Захват №3: track_state=TRACKED весь заход, ambiguity
+в ≈79.9% кадров (маленькая цель, matcher видит несколько почти равных
+correlation peaks — норма для tiny target), anchor подтверждает позицию,
+persistent UNCERTAIN НЕ триггерится (arbiter). Но override активен всего
+≈25.8% кадров — soft_distrust снимал controllable по накоплению streak.
 
-Требование: после IDENTITY_UNCERTAIN_CONFIRM_FRAMES подряд идущих
-ambiguous кадров controllable=False, track_state=TRACKED (не persistent
-UNCERTAIN), self-healing на первом чистом dual-signal кадре.
+ТРЕБОВАНИЕ ОПЕРАТОРА: sustained ambiguity + fresh anchor confirmation
+= streak растёт (диагностика остаётся), template adaptation блокируется
+(через уже существующий _identity_ambiguous в _template_adaptation_gate),
+но controllable оставаться True — arbiter говорит "это всё ещё та же
+цель". Только если anchor arbiter НЕ подтвердил недавно — тогда те же
+streak-условия действительно снимают controllable.
 """
 import os
 import sys
@@ -80,7 +79,6 @@ def fake_flow_still(prev_g, cur_g, pts, cx, cy):
 
 
 def fake_match_ambiguous(gray, pred_cx, pred_cy, flow_motion=0.0, tgt_dx=0.0, tgt_dy=0.0):
-    # score == second → lead=0 → identity_ambiguous=1 каждый кадр
     t._match_dbg["second"] = 0.90
     return True, pred_cx, pred_cy, 0.90
 
@@ -92,10 +90,11 @@ def fake_match_clean(gray, pred_cx, pred_cy, flow_motion=0.0, tgt_dx=0.0, tgt_dy
 
 N = t.IDENTITY_UNCERTAIN_CONFIRM_FRAMES
 
-print("=== 1. Sustained ambiguity + real anchor confirms: до N-1 кадра "
-      "controllable=True (шум не должен ронять управление сразу), на N-м "
-      "кадре controllable=False (устойчивое расхождение), track_state "
-      "остаётся TRACKED (arbiter блокирует persistent UNCERTAIN) ===")
+print("=== 1. Sustained ambiguity + real anchor confirms: track_state "
+      "остаётся TRACKED и controllable ТОЖЕ остаётся True — arbiter "
+      "признаёт, что это всё ещё та же цель, только 'lookalike' peaks "
+      "мешают live-matcher быть уверенным (реальный сценарий захвата №3 "
+      "из логов 2f7d275) ===")
 capture()
 _anchor_ref = t._identity_anchor_gray
 _anchor_bytes = t._identity_anchor_gray.copy()
@@ -104,57 +103,80 @@ t.template_match_locked = fake_match_ambiguous
 _states = []
 _controllable_seen = []
 _soft_seen = []
-for i in range(N + 3):
+_streak_seen = []
+_adapt_reasons = []
+for i in range(N + 5):
     _clk.tick(FRAME_DT)
     t.process_locked_tracker(scene)
     _states.append(t.track_state)
     with t.state_lock:
         _controllable_seen.append(t.target_controllable)
     _soft_seen.append(t._match_dbg.get("identity_soft_distrust"))
+    _streak_seen.append(t._match_dbg.get("identity_uncertain_streak"))
+    _adapt_reasons.append(t._match_dbg.get("adapt_skip_reason"))
 print("    track_state:", _states)
 print("    controllable:", _controllable_seen)
 print("    identity_soft_distrust:", _soft_seen)
+print("    identity_uncertain_streak:", _streak_seen)
 
 assert all(s == t.TRACK_STATE_TRACKED for s in _states), (
-    "arbiter должен был блокировать persistent UNCERTAIN, пока anchor "
-    "подтверждает — получили states=%s" % _states)
-assert all(_controllable_seen[:N - 1]), (
-    "controllable упал раньше debounce N=%d кадров: %s"
-    % (N, _controllable_seen))
-assert not any(_controllable_seen[N - 1:]), (
-    "controllable НЕ упал по достижении soft-порога N=%d — sustained "
-    "ambiguity никак не сказалось на управлении, хотя два live-источника "
-    "устойчиво противоречат друг другу: %s" % (N, _controllable_seen))
-assert _soft_seen[N - 1] == 1
+    "arbiter должен был блокировать persistent UNCERTAIN всё время — "
+    "получили states=%s" % _states)
+assert all(_controllable_seen), (
+    "controllable ушёл в False хотя бы раз, хотя arbiter подтверждает "
+    "позицию — sustained ambiguity сама по себе НЕ должна душить "
+    "override, если anchor согласен: %s" % _controllable_seen)
+assert not any(_soft_seen), (
+    "identity_soft_distrust включался хотя бы раз, хотя arbiter recently "
+    "confirmed — arbiter-gate не сработал: %s" % _soft_seen)
+assert _streak_seen[-1] >= N, (
+    "identity_uncertain_streak не рос — тест сам по себе негоден, "
+    "ambiguity должна была накапливать счётчик")
+_ambig_reasons = [r for r in _adapt_reasons if r == "ambiguous_peak"]
+assert len(_ambig_reasons) >= 1, (
+    "template_adaptation_gate не блокировал ambiguity даже одного раза — "
+    "arbiter-gate не должен был отменять уже существующие защиты по "
+    "ambiguity, только soft distrust: %s" % _adapt_reasons)
 assert t._identity_anchor_gray is _anchor_ref
 assert np.array_equal(t._identity_anchor_gray, _anchor_bytes)
-print("    OK: track_state=TRACKED всё время (arbiter корректно "
-      "блокирует persistent UNCERTAIN), controllable=False начиная с "
-      "кадра %d (soft distrust на устойчивую ambiguity)" % (N - 1))
+print("    OK: track_state=TRACKED всё время, controllable=True (arbiter "
+      "гарантирует), streak растёт как диагностика (%d к концу), "
+      "template adaptation по-прежнему блокируется на ambiguity (reason="
+      "'ambiguous_peak' %d кадров)" % (_streak_seen[-1], len(_ambig_reasons)))
 
-print("\n=== 2. Self-healing: один чистый кадр возвращает controllable, "
-      "без reset_tracking() ===")
-t.template_match_locked = fake_match_clean
-_clk.tick(FRAME_DT)
-t.process_locked_tracker(scene)
-assert t._match_dbg.get("identity_uncertain_streak") == 0, (
-    "чистый кадр не сбросил _identity_uncertain_streak")
-with t.state_lock:
-    _controllable_after_clean = t.target_controllable
-assert _controllable_after_clean, (
-    "controllable не восстановился после чистого dual-signal кадра — "
-    "soft distrust не self-healing на этом пути")
-assert t._match_dbg.get("identity_soft_distrust") == 0
-print("    один чистый кадр -> _identity_uncertain_streak=0, "
-      "controllable=True, soft_distrust=0")
+print("\n=== 2. Контрольная секция: ambiguity + anchor arbiter отключён "
+      "-> soft distrust срабатывает как раньше, доказывая, что защита "
+      "именно arbiter-gate'ом, а не выключением всей ambiguity-ветки "
+      "soft distrust ===")
+t.reset_tracking(to_acq=False)
+capture()
+_orig_arbiter = t.IDENTITY_ANCHOR_ARBITER_ENABLED
+t.IDENTITY_ANCHOR_ARBITER_ENABLED = False
+t.flow_predict = fake_flow_still
+t.template_match_locked = fake_match_ambiguous
+_controllable_arbiter_off = []
+for i in range(N + 2):
+    _clk.tick(FRAME_DT)
+    t.process_locked_tracker(scene)
+    with t.state_lock:
+        _controllable_arbiter_off.append(t.target_controllable)
+t.IDENTITY_ANCHOR_ARBITER_ENABLED = _orig_arbiter
+print("    controllable при arbiter OFF:", _controllable_arbiter_off)
+assert not _controllable_arbiter_off[-1], (
+    "с отключённым arbiter'ом sustained ambiguity должна была снять "
+    "controllable через дебаунс — не сработало, значит защита была не "
+    "arbiter-gate'ом, а чем-то другим: %s" % _controllable_arbiter_off)
+print("    OK: с arbiter OFF sustained ambiguity корректно триггерит soft "
+      "distrust — механизм именно arbiter-зависимый")
 
 t.flow_predict = _real_flow_predict
 t.template_match_locked = _real_template_match_locked
 t.reset_tracking(to_acq=False)
 
-print("\nOK: sustained ambiguity (или симметрично flow_gap — та же ветка "
-      "_identity_uncertain_streak) даёт SOFT DISTRUST через IDENTITY_"
-      "UNCERTAIN_CONFIRM_FRAMES кадров — снимает controllable, но не "
-      "переводит в persistent UNCERTAIN, пока anchor arbiter подтверждает "
-      "identity. Self-healing на первом же dual-signal кадре без явного "
-      "reset_tracking().")
+print("\nOK: sustained ambiguity + свежее anchor-подтверждение НЕ "
+      "снимает override (реальный сценарий захвата №3 из логов 2f7d275) "
+      "— arbiter решает, что это всё ещё та же цель. Ambiguity-ветка "
+      "продолжает работать как диагностика (streak, event log) и "
+      "продолжает блокировать template adaptation, но override живёт. "
+      "Anchor-check-streak и dual-signal-gap как источники soft distrust "
+      "arbiter-gate'ом не задеваются — те гейтятся другими механизмами.")

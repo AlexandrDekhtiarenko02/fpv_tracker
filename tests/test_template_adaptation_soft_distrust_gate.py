@@ -97,47 +97,46 @@ print("    _template_adaptation_gate(soft_distrust=True) -> "
 
 t._identity_soft_distrust = False
 
-print("\n=== 2. Интеграция через полный pipeline: sustained ambiguity "
-      "накапливает soft distrust, template_gray в этот период НЕ "
-      "меняется (adaptation blocked), даже если самый первый кадр этого "
-      "эпизода технически мог бы её разрешить ===")
+print("\n=== 2. Интеграция через полный pipeline: устойчивый anchor-fail "
+      "накапливает soft distrust, template adaptation блокируется с "
+      "reason='soft_distrust' ===")
 capture()
 
 
-def fake_flow_still(prev_g, cur_g, pts, cx, cy):
-    return True, cx, cy
+def fake_shadow_anchor_bad(gray, tmpl, tmpl_w, tmpl_h, tmpl_std,
+                            pred_cx, pred_cy, flow_motion):
+    # Anchor-check возвращает низкий score в запрошенной позиции — прямой
+    # источник soft distrust (не через ambiguity/flow_gap, чтобы arbiter-
+    # gate не гасил).
+    return True, 0.10, 1.0, 0.05, pred_cx, pred_cy
 
 
-def fake_match_ambiguous(gray, pred_cx, pred_cy, flow_motion=0.0, tgt_dx=0.0, tgt_dy=0.0):
-    t._match_dbg["second"] = 0.90
-    return True, pred_cx, pred_cy, 0.90
+_real_shadow_match = t._shadow_match_against_template
+t._shadow_match_against_template = fake_shadow_anchor_bad
 
-
-N = t.IDENTITY_UNCERTAIN_CONFIRM_FRAMES
-t.flow_predict = fake_flow_still
-t.template_match_locked = fake_match_ambiguous
-_tmpl_at_soft_distrust = None
+# Ускоряем часы через IDENTITY_ANCHOR_CHECK_PERIOD_S каждый шаг —
+# один шаг = один anchor-check запуск = streak растёт.
+_soft_seen = False
 _adapt_reasons = []
-for i in range(N + 5):
-    _clk.tick(FRAME_DT)
+for i in range(t.IDENTITY_ANCHOR_CHECK_CONFIRM_N + 2):
+    _clk.tick(t.IDENTITY_ANCHOR_CHECK_PERIOD_S + 0.01)
     t.process_locked_tracker(scene)
     _adapt_reasons.append(t._match_dbg.get("adapt_skip_reason"))
-    if t._match_dbg.get("identity_soft_distrust") == 1 and _tmpl_at_soft_distrust is None:
-        _tmpl_at_soft_distrust = t.template_gray.copy()
-assert _tmpl_at_soft_distrust is not None, (
+    if t._match_dbg.get("identity_soft_distrust") == 1:
+        _soft_seen = True
+    if t.track_state != t.TRACK_STATE_TRACKED:
+        break
+assert _soft_seen, (
     "тест сам по себе негоден: soft_distrust ни разу не набрался")
 print("    adapt_skip_reason по кадрам:", _adapt_reasons)
-assert not np.array_equal(t.template_gray, _tmpl_at_soft_distrust) or True, (
-    "справочно — template может и не меняться из-за самой ambiguity, "
-    "проверяем ПРИЧИНУ отказа явно ниже")
 _soft_reasons = [r for r in _adapt_reasons if r == "soft_distrust"]
-_ambig_reasons = [r for r in _adapt_reasons if r == "ambiguous_peak"]
 assert len(_soft_reasons) >= 1, (
     "ни один кадр soft distrust не оказал adapt_skip_reason='soft_"
     "distrust' — гейт не сработал: reasons=%s" % _adapt_reasons)
 print("    OK: %d кадров с adapt_skip_reason='soft_distrust' — обучение "
       "template во время soft distrust заблокировано" % len(_soft_reasons))
 
+t._shadow_match_against_template = _real_shadow_match
 t.flow_predict = _real_flow_predict
 t.template_match_locked = _real_template_match_locked
 t.reset_tracking(to_acq=False)

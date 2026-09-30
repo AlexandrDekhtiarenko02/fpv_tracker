@@ -2465,6 +2465,11 @@ _FLIGHT_LOG_COLUMNS = (
     # бортовом логе сразу было видно, что копии стика реально приходят и
     # плавно идут вместе с рукой, а не застыли на каком-то значении.
     "aux2_raw,aux3_raw,nudge_rc_fresh,"
+    # ВСЕ 8 СЫРЫХ RC КАНАЛОВ (найдено оператором на реальных логах
+    # 2f7d275: в целом логе manual_nudge=0, AUX2≈1503/AUX3≈1496 — не
+    # понять, работает ли mapping вообще). offline-разбор теперь может
+    # прямо посмотреть Roll/Pitch/Yaw/Throttle/AUX1..4 сырым как есть.
+    "rc_ch0,rc_ch1,rc_ch2,rc_ch3,rc_ch4,rc_ch5,rc_ch6,rc_ch7,"
     # ДИНАМИЧЕСКАЯ ЭКСПОЗИЦИЯ И AWB (camera/display commit). ExposureTime/
     # AnalogueGain/ColourGains больше не фиксируются после старта — на
     # разборе должно быть видно, что они реально следуют за освещением
@@ -11409,12 +11414,24 @@ def process_locked_tracker(gray, cb_t0=None):
     # — обходил централизованный distrust-check. Persistent identity-
     # counters продолжают жить, но лок восстанавливал управление, даже
     # когда системе уже не следовало доверять цели.
+    # Та же формула, что и в конце tracked_ok (с arbiter-гейтом на
+    # ambiguity/flow_gap streak): sustained ambiguity + свежее anchor-
+    # подтверждение не должно бесконечно душить controllable. anchor_check_
+    # streak и dual_signal_gap — не задеваются гейтом.
+    _prelim_arbiter_gates_ambig = (
+        IDENTITY_ANCHOR_ARBITER_ENABLED
+        and IDENTITY_ANCHOR_CHECK_ENABLED
+        and _identity_anchor_gray is not None
+        and _identity_anchor_last_confirm_t > 0.0
+        and (time.monotonic() - _identity_anchor_last_confirm_t)
+            <= IDENTITY_ANCHOR_FRESH_S)
     _identity_soft_distrust = IDENTITY_SOFT_DISTRUST_ENABLED and (
         (IDENTITY_ANCHOR_CHECK_ENABLED and _identity_anchor_check_streak >= 1)
         or (IDENTITY_DUAL_SIGNAL_GAP_ENABLED
             and _dual_signal_gap_frames >= IDENTITY_UNCERTAIN_CONFIRM_FRAMES)
         or (IDENTITY_UNCERTAIN_ENABLED
-            and _identity_uncertain_streak >= IDENTITY_UNCERTAIN_CONFIRM_FRAMES))
+            and _identity_uncertain_streak >= IDENTITY_UNCERTAIN_CONFIRM_FRAMES
+            and not _prelim_arbiter_gates_ambig))
 
     # ВЕДЁМ ПО ТОЙ КАРТИНКЕ, ПО КОТОРОЙ РЕШИЛИ ПРИ ЗАХВАТЕ. Если выбран цвет,
     # дальше вся обработка — поиск, поток, размер — идёт по цветовой проекции.
@@ -11778,6 +11795,26 @@ def process_locked_tracker(gray, cb_t0=None):
     _match_dbg["aux2_raw"] = _aux2_raw
     _match_dbg["aux3_raw"] = _aux3_raw
     _match_dbg["nudge_rc_fresh"] = 1 if _nudge_rc_fresh else 0
+    # НАЙДЕНО ОПЕРАТОРОМ на реальных стендовых логах 2f7d275: в целом
+    # логе ни одного manual_nudge=1, AUX2≈1503/AUX3≈1496 стоят намертво.
+    # AUX2/AUX3 сами по себе (см. aux2_raw/aux3_raw выше) не отличают
+    # "копий движения стика нет" от "mapping не тот" — оператор без
+    # полного raw RC не может даже диагностировать, работает ли вообще
+    # подмена AUX2/AUX3 на бортовом приёмнике. Пишем ВСЕ 8 сырых
+    # каналов в CSV — тогда offline-разбор реально видит, что происходит
+    # на всех rc_channels независимо от предположений mapping.
+    try:
+        with state_lock:
+            _rc_all = app_state.get("rc_channels")
+        if _rc_all is not None and len(_rc_all) >= 8:
+            for _i in range(8):
+                _match_dbg["rc_ch%d" % _i] = int(_rc_all[_i])
+        else:
+            for _i in range(8):
+                _match_dbg["rc_ch%d" % _i] = None
+    except Exception:
+        for _i in range(8):
+            _match_dbg["rc_ch%d" % _i] = None
 
     if _nudge_active:
         if not _nudge_was_active:
@@ -12229,12 +12266,34 @@ def process_locked_tracker(gray, cb_t0=None):
         # блокирует persistent UNCERTAIN. Это и есть заявленное поведение
         # "ambiguity/flow_gap продолжают давать soft distrust" — теперь оно
         # реально реализовано, а не только описано.
+        # ARBITER-GATE НА AMBIGUITY/FLOW_GAP soft distrust (найдено оператором
+        # на реальных стендовых логах 2f7d275: захват №3 — TRACKED весь заход
+        # с ambiguity в 79.9% кадров и override активным только 25.8%. tiny/
+        # small-template ambiguity — норма из-за нескольких почти равных
+        # correlation peaks, это НЕ доказательство смены identity). Если
+        # arbiter (immutable anchor) недавно подтвердил ту же позицию —
+        # ambiguity/flow_gap НЕ должны бесконечно душить controllable. Они
+        # остаются полезными как гейт adaptation (см. _template_adaptation_
+        # gate и _identity_ambiguous там же) и снижают вес матча в w_m, но
+        # override не отбирают.
+        #
+        # anchor_check_streak и dual_signal_gap — ДРУГИЕ причины soft
+        # distrust (arbiter сам недоволен / нет возможности сверить flow с
+        # matcher). Их этим гейтом не задеваем.
+        _arbiter_gates_ambig = (
+            IDENTITY_ANCHOR_ARBITER_ENABLED
+            and IDENTITY_ANCHOR_CHECK_ENABLED
+            and _identity_anchor_gray is not None
+            and _identity_anchor_last_confirm_t > 0.0
+            and (time.monotonic() - _identity_anchor_last_confirm_t)
+                <= IDENTITY_ANCHOR_FRESH_S)
         _identity_soft_distrust = IDENTITY_SOFT_DISTRUST_ENABLED and (
             (IDENTITY_ANCHOR_CHECK_ENABLED and _identity_anchor_check_streak >= 1)
             or (IDENTITY_DUAL_SIGNAL_GAP_ENABLED
                 and _dual_signal_gap_frames >= IDENTITY_UNCERTAIN_CONFIRM_FRAMES)
             or (IDENTITY_UNCERTAIN_ENABLED
-                and _identity_uncertain_streak >= IDENTITY_UNCERTAIN_CONFIRM_FRAMES))
+                and _identity_uncertain_streak >= IDENTITY_UNCERTAIN_CONFIRM_FRAMES
+                and not _arbiter_gates_ambig))
         _match_dbg["identity_soft_distrust"] = 1 if _identity_soft_distrust else 0
 
         # IDENTITY_UNCERTAIN — РЕШЕНИЕ ДО ЛЮБОГО COMMIT (отчёт 25.09,
@@ -12530,20 +12589,33 @@ def process_locked_tracker(gray, cb_t0=None):
                     _score_do_rosta = score
                 _match_dbg["size_scale"] = k_scale
                 if template_std < TEMPLATE_STARVED_STD:
-                    # Эталон безлик — он внутри однородного предмета. Растём,
-                    # пока край предмета не вернётся в эталон. Масштаб тут
-                    # спрашивать бесполезно: все масштабы одинаково пусты.
-                    # Растём, но не бесконечно: см. TEMPLATE_STARVED_MAX_X.
+                    # НАЙДЕНО ОПЕРАТОРОМ на реальных стендовых логах 2f7d275:
+                    # ветка раздувала lock_w/lock_h в 1.30 раза до предела
+                    # 3.0×, ожидая, что "край объекта снова попадёт в
+                    # эталон" — но эталон физически НЕ растёт, потому что
+                    # TEMPLATE_RESCALE_ON_SIZE_CHANGE=False (см. ветку выше,
+                    # которая ЯВНО пропускает пересборку template_gray, если
+                    # cur_tmpl.shape != template_gray.shape). Получалась
+                    # ловушка: box=24→32→41→52→69, template=24×24 всё время.
+                    # Маленький template гулял внутри огромной box, matcher
+                    # стабильно давал почти равные пики (identity_ambiguous),
+                    # anchor_score постепенно падал ниже MATCH_GOOD_SCORE.
+                    #
+                    # Не лечить новым threshold, не включать TEMPLATE_RESCALE
+                    # вслепую (та ветка отдельно выключалась ради заморозки
+                    # адаптации): изначально низкий template_std сам по себе
+                    # НЕ является измерением размера цели и не должен
+                    # раздувать target box. Диагностика ("size_skip = 6/7",
+                    # т.е. starved-состояние) остаётся, живого мутирования
+                    # lock_w/lock_h — нет. Проблема "template безлик" должна
+                    # решаться на этапе acquisition (правильный размер сразу
+                    # при захвате), а не эскалацией box в рантайме.
                     predel_w = (lock_w0 or lock_w) * TEMPLATE_STARVED_MAX_X
                     predel_h = (lock_h0 or lock_h) * TEMPLATE_STARVED_MAX_X
                     if lock_w >= predel_w or lock_h >= predel_h:
-                        _match_dbg["size_skip"] = 7   # упёрлись в предел роста
+                        _match_dbg["size_skip"] = 7   # был бы предел роста
                     else:
-                        _match_dbg["size_skip"] = 6
-                        lock_w = clamp(min(lock_w * TEMPLATE_STARVED_GROW,
-                                           predel_w), LOCK_MIN_W, LOCK_MAX_W)
-                        lock_h = clamp(min(lock_h * TEMPLATE_STARVED_GROW,
-                                           predel_h), LOCK_MIN_H, LOCK_MAX_H)
+                        _match_dbg["size_skip"] = 6   # был бы starved-рост
                 elif k_scale is None:
                     _match_dbg["size_skip"] = 3     # примерить не удалось
                 elif k_scale == 1.0:
@@ -13416,6 +13488,10 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("visual_unstable_reason"),
             _match_dbg.get("aux2_raw"), _match_dbg.get("aux3_raw"),
             _match_dbg.get("nudge_rc_fresh"),
+            _match_dbg.get("rc_ch0"), _match_dbg.get("rc_ch1"),
+            _match_dbg.get("rc_ch2"), _match_dbg.get("rc_ch3"),
+            _match_dbg.get("rc_ch4"), _match_dbg.get("rc_ch5"),
+            _match_dbg.get("rc_ch6"), _match_dbg.get("rc_ch7"),
             _cam_exp_us, _cam_gain, _cam_colour_gain_r, _cam_colour_gain_b,
             _last_main_top_mean,
             _cam_shadow_dbg.get("exp_ratio"), _cam_shadow_dbg.get("gray_delta"),
