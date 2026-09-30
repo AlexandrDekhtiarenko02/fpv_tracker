@@ -7362,6 +7362,14 @@ def _template_adaptation_gate(score, flow_ok):
             _adapt_frozen_posle_reanchor = False
         else:
             return False, "reanchor_cooldown"
+    # НАЙДЕНО ОПЕРАТОРОМ на реальном коде f6a10f7: если flow+matcher уехали
+    # на постороннюю структуру B, soft distrust (см. в конце tracked_ok)
+    # снимает controllable, но live template продолжал обучаться на B —
+    # цементируя ошибочный вид ещё до того, как persistent UNCERTAIN
+    # успел бы сработать. Adaptation на кадре, где мы уже не доверяем
+    # identity этой позиции, — учит трекер именно тому, чему учить нельзя.
+    if _identity_soft_distrust:
+        return False, "soft_distrust"
     if not flow_ok:
         return False, "no_flow"
     if MATCH_AMBIGUITY_GUARD:
@@ -11385,16 +11393,28 @@ def process_locked_tracker(gray, cb_t0=None):
     _match_dbg["identity_anchor_changed"] = 0
     _match_dbg["identity_anchor_change_reason"] = ""
 
-    # _identity_soft_distrust — ТА ЖЕ причина: честный сигнал ТОЛЬКО на
-    # кадре, где он реально ещё раз пересчитан (см. блок tracked_ok ниже,
-    # п.2 разбора: "первый anchor mismatch/начало долгого разрыва -> не
-    # ждать debounce, снять controllable уже сейчас"). Любой кадр, не
-    # дошедший до пересчёта (ACQ, LOST/HOLD, IDENTITY_UNCERTAIN,
-    # VISUAL_UNSTABLE), обязан честно показывать False, а не унаследованное
-    # значение с прошлого TRACKED-кадра — иначе централизованная проверка
-    # в _update_control_from_target_impl() могла бы душить controllable
-    # ПОСЛЕ того, как лок вообще уже сменился (новый явный захват и т.п.).
-    _identity_soft_distrust = False
+    # _identity_soft_distrust — ПРЕДВАРИТЕЛЬНОЕ значение из persistent-
+    # счётчиков ПРОШЛОГО кадра (streak / gap / anchor_check_streak):
+    # чтобы централизованная проверка в _update_control_from_target_impl()
+    # сработала даже если этот кадр — early-return ветка (nudge, HOLD,
+    # LOST, IDENTITY_UNCERTAIN) и не дойдёт до пересчёта. Если дойдёт
+    # (обычный TRACKED-путь), значение перезаписывается СВЕЖИМ ниже (по
+    # уже обновлённым за этот кадр счётчикам) — та же величина, только
+    # актуальнее.
+    #
+    # НАЙДЕНО ОПЕРАТОРОМ на реальном коде f6a10f7: до этой правки
+    # _identity_soft_distrust безусловно сбрасывался в False в начале
+    # каждого кадра, и manual nudge — который выполняется РАНЬШЕ обычного
+    # TRACKED-пути и самостоятельно ставит target_controllable=True + return
+    # — обходил централизованный distrust-check. Persistent identity-
+    # counters продолжают жить, но лок восстанавливал управление, даже
+    # когда системе уже не следовало доверять цели.
+    _identity_soft_distrust = IDENTITY_SOFT_DISTRUST_ENABLED and (
+        (IDENTITY_ANCHOR_CHECK_ENABLED and _identity_anchor_check_streak >= 1)
+        or (IDENTITY_DUAL_SIGNAL_GAP_ENABLED
+            and _dual_signal_gap_frames >= IDENTITY_UNCERTAIN_CONFIRM_FRAMES)
+        or (IDENTITY_UNCERTAIN_ENABLED
+            and _identity_uncertain_streak >= IDENTITY_UNCERTAIN_CONFIRM_FRAMES))
 
     # ВЕДЁМ ПО ТОЙ КАРТИНКЕ, ПО КОТОРОЙ РЕШИЛИ ПРИ ЗАХВАТЕ. Если выбран цвет,
     # дальше вся обработка — поиск, поток, размер — идёт по цветовой проекции.
@@ -12194,10 +12214,27 @@ def process_locked_tracker(gray, cb_t0=None):
         # замере/dual-signal кадре; действует ЦЕНТРАЛЬНО через _update_
         # control_from_target_impl(), тем же путём, что и _identity_
         # uncertain_pending.
+        # НАЙДЕНО ОПЕРАТОРОМ на реальном коде f6a10f7: комментарии и тесты
+        # утверждали, что ambiguity/flow_gap продолжают давать soft distrust
+        # (при том что persistent UNCERTAIN блокируется arbiter'ом), но
+        # фактически soft_distrust это НЕ читал — только anchor_check_streak
+        # и dual_signal_gap. Sustained ambiguity/flow_gap + свежее anchor-
+        # подтверждение оставляли controllable=True, хотя два live-источника
+        # устойчиво противоречили друг другу.
+        #
+        # Добавлено ambiguity/flow_gap streak как ЧЕТВЁРТЫЙ источник soft
+        # distrust — тот же дебаунс IDENTITY_UNCERTAIN_CONFIRM_FRAMES, что и
+        # у dual_signal_gap (не новое число): один сомнительный кадр — шум,
+        # серия — сигнал не доверять live-тракту, даже если anchor arbiter
+        # блокирует persistent UNCERTAIN. Это и есть заявленное поведение
+        # "ambiguity/flow_gap продолжают давать soft distrust" — теперь оно
+        # реально реализовано, а не только описано.
         _identity_soft_distrust = IDENTITY_SOFT_DISTRUST_ENABLED and (
             (IDENTITY_ANCHOR_CHECK_ENABLED and _identity_anchor_check_streak >= 1)
             or (IDENTITY_DUAL_SIGNAL_GAP_ENABLED
-                and _dual_signal_gap_frames >= IDENTITY_UNCERTAIN_CONFIRM_FRAMES))
+                and _dual_signal_gap_frames >= IDENTITY_UNCERTAIN_CONFIRM_FRAMES)
+            or (IDENTITY_UNCERTAIN_ENABLED
+                and _identity_uncertain_streak >= IDENTITY_UNCERTAIN_CONFIRM_FRAMES))
         _match_dbg["identity_soft_distrust"] = 1 if _identity_soft_distrust else 0
 
         # IDENTITY_UNCERTAIN — РЕШЕНИЕ ДО ЛЮБОГО COMMIT (отчёт 25.09,
@@ -12766,7 +12803,16 @@ def process_locked_tracker(gray, cb_t0=None):
                                         # уверены, что смотрим на цель, а не
                                         # на то, что матч перепутал с ней.
                                         and not _identity_ambiguous
-                                        and not _identity_flow_match_disagree)
+                                        and not _identity_flow_match_disagree
+                                        # Тот же принцип, шире зона: если
+                                        # уже накопился ЛЮБОЙ соф distrust
+                                        # (anchor mismatch, dual-signal gap,
+                                        # серия ambiguity/flow_gap), refresh
+                                        # ЖИВОГО template'а откладывается до
+                                        # свежего подтверждения — недоверенный
+                                        # период не должен цементировать
+                                        # новую visual память.
+                                        and not _identity_soft_distrust)
                                     # ДЛЯ CSV (отчёт 25.09, п.J): голос ЭТОГО
                                     # fresh-слота — не то же самое, что сам
                                     # факт срабатывания refresh'а (тот ещё и
