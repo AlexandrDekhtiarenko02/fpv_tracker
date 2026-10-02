@@ -2718,7 +2718,13 @@ _FLIGHT_LOG_COLUMNS = (
     # (самый дешёвый размер из проверенных) один matchTemplate стоил
     # p50=3.74мс/p90=4.65мс/max=31.1мс на Pi Zero 2W (24.09.2026). В
     # отличие от control-shadow (~130мкс) это НЕ округление погрешности.
-    "shadow_track_time_ms"
+    "shadow_track_time_ms,"
+    # Append-only: existing column positions stay compatible with old readers.
+    "tracking_step_seq,match_updated,match_score_age_ms,match_score_source,"
+    "match_diag_updated,match_diag_age_ms,cam_jump_dt_valid,"
+    "cam_jump_sample_fresh,cam_jump_exp_threshold,cam_jump_gray_threshold,"
+    "cam_top_threshold,cam_jump_max_age_ms,cb_wall_ms,cb_timing_source,"
+    "frame_budget_ms"
 )
 
 # Снимок внутренностей управления за текущий кадр. Заполняется в
@@ -3129,6 +3135,77 @@ _pid_dbg = {}
 # Внутренности сопоставления шаблона за текущий кадр. Нужны, чтобы понять
 # ПОЧЕМУ матч встал именно сюда, а не просто насколько он уверенный.
 _match_dbg = {}
+# Logging metadata only. These values are never read by tracking/control.
+_stand_diag = {"step": 0, "score_t": None, "score_step": None,
+               "score_source": "unavailable", "diag_t": None,
+               "diag_step": None}
+_stand_cb_wall_t0 = None
+_stand_cb_mono_t0 = None
+
+
+def _stand_begin_step():
+    _stand_diag["step"] += 1
+
+
+def _stand_score_sample(source):
+    if source == "match" and _stand_diag["diag_step"] != _stand_diag["step"]:
+        source = "match_unavailable"
+    _stand_diag["score_t"] = time.monotonic()
+    _stand_diag["score_step"] = _stand_diag["step"]
+    _stand_diag["score_source"] = source
+
+
+def _stand_match_diag_sample():
+    _stand_diag["diag_t"] = time.monotonic()
+    _stand_diag["diag_step"] = _stand_diag["step"]
+
+
+def _stand_reset_metrics():
+    _stand_diag.update(score_t=None, score_step=None, score_source="reset",
+                       diag_t=None, diag_step=None)
+
+
+def _stand_log_snapshot(now, cb_t0):
+    """Freshness and clock provenance; no decisions or hardware reads."""
+    score_t = _stand_diag["score_t"]
+    diag_t = _stand_diag["diag_t"]
+    sample_t = _cam_shadow_dbg.get("sample_t")
+    sample_age = None if sample_t is None else (now - sample_t) * 1000.0
+    wall_ms = None
+    if (_stand_cb_wall_t0 is not None and cb_t0 == _stand_cb_mono_t0
+            and hasattr(time, "perf_counter")):
+        wall_ms = (time.perf_counter() - _stand_cb_wall_t0) * 1000.0
+    return {
+        "step": _stand_diag["step"],
+        "match_updated": int(score_t is not None
+                             and _stand_diag["score_step"] == _stand_diag["step"]
+                             and _stand_diag["score_source"] == "match"),
+        "score_age_ms": None if score_t is None else (now - score_t) * 1000.0,
+        "score_source": _stand_diag["score_source"],
+        "diag_updated": int(diag_t is not None
+                            and _stand_diag["diag_step"] == _stand_diag["step"]),
+        "diag_age_ms": None if diag_t is None else (now - diag_t) * 1000.0,
+        "sample_fresh": (None if sample_age is None else
+                         int(0.0 <= sample_age <= CAM_JUMP_MAX_VALID_DT_S * 1000.0)),
+        "wall_ms": wall_ms,
+        "timing_source": "perf_counter" if wall_ms is not None else "unavailable",
+    }
+
+
+def _stand_visual_event_details(now):
+    sample_t = _cam_shadow_dbg.get("sample_t")
+    age = None if sample_t is None else (now - sample_t) * 1000.0
+    return ("sample_seq=%s sample_age_ms=%s dt_valid=%s exp_ratio=%s "
+            "gray_delta=%s top_mean=%s exp_threshold=%s gray_threshold=%s "
+            "top_threshold=%s max_age_ms=%s" % (
+                _cam_shadow_dbg.get("sample_seq"), age,
+                _cam_shadow_dbg.get("dt_valid"),
+                _cam_shadow_dbg.get("exp_ratio"),
+                _cam_shadow_dbg.get("gray_delta"), _last_main_top_mean,
+                CAM_JUMP_EXP_RATIO_THRESHOLD, CAM_JUMP_GRAY_DELTA_THRESHOLD,
+                CAM_JUMP_TOPROW_SATURATED_THRESHOLD,
+                CAM_JUMP_MAX_VALID_DT_S * 1000.0))
+
 # --- TRACKING SHADOW: TEMPLATE IDENTITY (первый срез Tracking Shadow,
 # разбор качества трекинга по 14 заходам 24.09.2026) ---
 #
@@ -3808,6 +3885,7 @@ class LockLogger:
         self._t0 = 0.0
         self._rows = 0
         self._hvost = collections.deque(maxlen=LOCK_HVOST_ROWS)
+        self._state_counts = collections.Counter()
         # Итог пишут двое: фоновый поток при захвате и камерный при конце.
         # Без замка они могли бы наложиться и оставить обрывок.
         self._itog_lock = threading.Lock()
@@ -3872,6 +3950,7 @@ class LockLogger:
             self._t0 = time.monotonic()
             self._rows = 0
             self._hvost.clear()
+            self._state_counts.clear()
             self.active = True
             # Условия захода известны ПРЯМО СЕЙЧАС — записываем их немедленно,
             # не дожидаясь конца. Прерывается всегда последний заход (сняли
@@ -3897,6 +3976,8 @@ class LockLogger:
             # форматирование, которое меняется.
             if values is not None:
                 self._hvost.append(values)
+                if _C_STATE < len(values):
+                    self._state_counts[str(values[_C_STATE])] += 1
             self._csv.write(line + "\n")
             self._rows += 1
             # Сброс на диск примерно раз в секунду. Буфер в 64 КБ — это около
@@ -3949,8 +4030,19 @@ class LockLogger:
                     f.write("длительность: %.1f с, строк %d\n"
                             % (dur, self._rows))
                 f.write("окончен: %s\n" % (why or "не указано"))
+                completion = ("incomplete" if dur is None else
+                              "manual_stop" if why == "AUX4 выключен" else
+                              "session_end")
+                f.write("completion_kind=%s\n" % completion)
+                f.write("состояния за весь захват: %s\n" % ", ".join(
+                    "%s=%d" % kv for kv in sorted(self._state_counts.items())))
                 ishod = self._razbor_ishoda()
                 if ishod:
+                    if completion == "manual_stop":
+                        ishod["вердикт"] = (
+                            "ЗАХВАТ ОСТАНОВЛЕН ОПЕРАТОРОМ; состояние в конце %s. "
+                            "Причина завершения не означает потерю сопровождения."
+                            % ishod.get("состояние_в_конце", "?"))
                     f.write("\nЧЕМ КОНЧИЛОСЬ\n")
                     f.write("  %s\n" % ishod.pop("вердикт"))
                     for k, v in ishod.items():
@@ -7314,6 +7406,8 @@ def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0,
         _match_dbg["second"] = None
         _match_dbg["margin"] = float(margin)
 
+    _stand_match_diag_sample()
+
     # Субпиксельное уточнение пика: убирает пиксельную квантовку матчера
     # (точность теперь ~0.1 px вместо ±0.5 px), особенно важно с маленьким
     # DEADBAND_X/Y — снимает «дребезг» крестика на покоящейся цели.
@@ -7480,6 +7574,7 @@ def reset_tracking(to_acq=False):
     prev_pts = None
     lost_frames = 0
     last_match_score = 0.0
+    _stand_reset_metrics()
     last_flow_ok = False
     acq_wait_left = 0
 
@@ -11346,6 +11441,7 @@ def process_locked_tracker(gray, cb_t0=None):
     global _auto_tref_total_count
 
     frame_index += 1
+    _stand_begin_step()
 
     with state_lock:
         aux_on = aux4_state
@@ -11515,6 +11611,7 @@ def process_locked_tracker(gray, cb_t0=None):
                     prev_pts = refresh_flow_points(gray, lock_cx, lock_cy, lock_w, lock_h)
                     lost_frames = 0
                     last_match_score = score_r
+                    _stand_score_sample("match")
                     last_flow_ok = False
                     auto_reacq_attempts = 0
                     box = lores_box_to_main(lock_cx, lock_cy, lock_w, lock_h)
@@ -11654,6 +11751,7 @@ def process_locked_tracker(gray, cb_t0=None):
             prev_pts = refresh_flow_points(gray, lock_cx, lock_cy, lock_w, lock_h)
             lost_frames = 0
             last_match_score = 1.0
+            _stand_score_sample("acquisition_default")
             last_flow_ok = False
             box = lores_box_to_main(lock_cx, lock_cy, lock_w, lock_h)
             with state_lock:
@@ -12021,7 +12119,8 @@ def process_locked_tracker(gray, cb_t0=None):
         # кадре секундами) лог иначе залился бы десятками одинаковых строк
         # в секунду вместо одной на начало эпизода.
         if track_state != TRACK_STATE_VISUAL_UNSTABLE:
-            flight_log.event("VISUAL_UNSTABLE reason=%s" % _vu_reason)
+            flight_log.event("VISUAL_UNSTABLE reason=%s %s" % (
+                _vu_reason, _stand_visual_event_details(time.monotonic())))
         box = lores_box_to_main(lock_cx, lock_cy, lock_w, lock_h)
         with state_lock:
             track_state = TRACK_STATE_VISUAL_UNSTABLE
@@ -12047,6 +12146,7 @@ def process_locked_tracker(gray, cb_t0=None):
         tgt_dx=pred_cx - lock_cx, tgt_dy=pred_cy - lock_cy)
     _etap("sovpadenie", _t_sovp)
     last_match_score = score
+    _stand_score_sample("match")
     last_flow_ok = flow_ok
 
     new_cx, new_cy = lock_cx, lock_cy
@@ -13296,6 +13396,8 @@ def fast_idle_update():
     global global_roll_cmd, global_pitch_cmd, global_yaw_cmd, global_throttle_cmd
     global _ctl_dbg, _shadow_ctl_dbg
 
+    _stand_begin_step()
+
     with state_lock:
         live_thr = app_state.get("rc_throttle", 1500)
 
@@ -13453,6 +13555,7 @@ def _capture_flight_row(cb_t0):
         _cam_sample_t = _cam_shadow_dbg.get("sample_t")
         _cam_sample_age_ms = (None if _cam_sample_t is None
                               else (time.monotonic() - _cam_sample_t) * 1000.0)
+        sd = _stand_log_snapshot(now, cb_t0)
 
         _row_values = (
             now - flight_log._t0, frame_index, fps_current, st, ctrl, aux, ov,
@@ -13623,6 +13726,13 @@ def _capture_flight_row(cb_t0):
             st_.get("score"), st_.get("psr"), st_.get("second"),
             st_.get("flow_gap"), st_.get("candidate_age_ms"),
             st_.get("time_ms"),
+            sd["step"], sd["match_updated"], sd["score_age_ms"],
+            sd["score_source"], sd["diag_updated"], sd["diag_age_ms"],
+            _cam_shadow_dbg.get("dt_valid"), sd["sample_fresh"],
+            CAM_JUMP_EXP_RATIO_THRESHOLD, CAM_JUMP_GRAY_DELTA_THRESHOLD,
+            CAM_JUMP_TOPROW_SATURATED_THRESHOLD,
+            CAM_JUMP_MAX_VALID_DT_S * 1000.0,
+            sd["wall_ms"], sd["timing_source"], FRAME_BUDGET_MS,
         )
         flight_log.row(_row_values)
         # Та же строка — в папку этого захвата. Форматируем один раз здесь, а
@@ -13900,7 +14010,10 @@ def camera_callback(request):
     global _cam_shadow_dbg, _cam_shadow_prev_exp_us, _cam_shadow_prev_gray
     global _cam_shadow_prev_sample_t, _cam_shadow_prev_top_saturated
     global _cam_shadow_sample_seq
+    global _stand_cb_wall_t0, _stand_cb_mono_t0
+    _stand_cb_wall_t0 = time.perf_counter() if hasattr(time, "perf_counter") else None
     _cb_t0 = time.monotonic()
+    _stand_cb_mono_t0 = _cb_t0
     # _etap_ms должен отражать ТОЛЬКО этапы, реально выполненные В ЭТОМ
     # кадре — без явной очистки словарь копил значения с прошлых вызовов
     # (комментарий у объявления "заводится каждый кадр заново" не
