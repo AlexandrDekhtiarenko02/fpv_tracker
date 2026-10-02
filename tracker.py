@@ -2724,7 +2724,8 @@ _FLIGHT_LOG_COLUMNS = (
     "match_diag_updated,match_diag_age_ms,cam_jump_dt_valid,"
     "cam_jump_sample_fresh,cam_jump_exp_threshold,cam_jump_gray_threshold,"
     "cam_top_threshold,cam_jump_max_age_ms,cb_wall_ms,cb_timing_source,"
-    "frame_budget_ms"
+    "frame_budget_ms,stand_video_time_s,stand_tracker_time_s,"
+    "stand_paused_tick"
 )
 
 # Снимок внутренностей управления за текущий кадр. Заполняется в
@@ -2979,66 +2980,18 @@ def _camera_jump_check(exp_us, prev_exp_us, mean_gray, prev_gray,
     }
 
 
-# --- VISUAL_UNSTABLE: camera jump/top_saturated отключают automation
-# (отчёт 25.09, п.5), не только пишутся в лог ---
-#
-# ДО ЭТОЙ ПРАВКИ Camera Jump Shadow был ЧИСТО диагностическим: cam_jump/
-# top_saturated писались в CSV и events.log, но НИКАК не влияли на
-# target_controllable — прямая цитата отчёта: "Camera Jump Shadow fix was
-# diagnostic only, did not fix AE itself; AE/AWB is still fully dynamic".
-# Эта правка НЕ трогает AE/AWB (они остаются полностью динамическими,
-# как и решили в camera/display commit) — только заставляет control
-# реагировать на уже существующий сигнал их нестабильности.
-#
-# ПОЧЕМУ "ДЛЯ ЭТОГО КАДРА", А НЕ ПЕРСИСТЕНТНО (в отличие от IDENTITY_
-# UNCERTAIN/nudge-abort). Camera jump — не вопрос идентичности цели, а
-# вопрос доверия к ПИКСЕЛЯМ этого конкретного момента: exposure/gain
-# только что скакнули, или верхняя строка кадра пересвечена. Как только
-# свежий замер снова показывает стабильную картинку, нет причины держать
-# пилота отрезанным явным reset'ом — сама AE обычно сходится за доли
-# секунды-две (см. разбор корреляции AE с pitch в отчёте). Поэтому здесь
-# НЕТ персистентного флага и НЕТ центрального принуждения — гейт
-# читается ЗАНОВО каждый кадр из _cam_shadow_dbg, тот же freshness-принцип
-# (age против CAM_JUMP_MAX_VALID_DT_S), что уже используется в CSV (ревью
-# по 66b7f4b) — просто теперь ЕЩЁ и решает controllable, не только что
-# писать в строку лога.
-#
-# ПОЧЕМУ НЕ ТРОГАЕМ lost_frames/prev_gray/prev_pts. Camera jump — не
-# потеря цели (не в этом причина), lost_frames считает совсем другое, и
-# накопление такого счёта грозило бы случайно свалить в LOST/TOGGLE на
-# затяжном пересвете (например, солнце в кадре не одну секунду) — а это
-# УЖЕ явно избыточная реакция на временную нестабильность экспозиции,
-# которую отчёт прямо просит не делать ("для ЭТОГО кадра"). prev_gray не
-# обновляем НАРОЧНО: если ЭТОТ кадр — скачок, копировать его в prev_gray
-# значило бы, что flow следующего ХОРОШЕГО кадра сравнивался бы с ПЛОХИМ,
-# а не пропускал бы плохой целиком.
-#
-# ПОЧЕМУ ПРОВЕРЯЕТСЯ ПОСЛЕ ручной коррекции, а не до. На КАДРЕ ПЕРЕХОДА
-# (track_state ещё TRACKED, камера только что дала нестабильный замер)
-# nudge не должен быть отрезан ИМЕННО этим кадром — если пилот в этот
-# момент реально двигал стик, его ввод не завязан на matchTemplate/flow и
-# не должен потеряться из-за факта, не относящегося к нему. Пока
-# track_state уже VISUAL_UNSTABLE (следующие кадры, если нестабильность не
-# разрешилась) — nudge естественно недоступен, как и на HOLD/LOST/ACQ
-# (_nudge_eligible требует track_state==TRACKED); отдельно это не
-# усложняем — окно обычно меньше секунды (см. CAM_JUMP_MAX_VALID_DT_S).
+# VISUAL_UNSTABLE uses a fresh camera jump (exposure/whole-frame gray delta).
+# The first four MAIN rows are a display diagnostic, not evidence that the
+# tracking region is unusable. Keep top_saturated in CSV/events only.
+# A jump skips this frame without increasing lost_frames or replacing prev_gray.
 VISUAL_UNSTABLE_ENABLED = True
 
 
 def _visual_unstable_now(cam_shadow_dbg, now_mono):
-    """Достаточно ли свеж последний 1 Гц замер camera jump/top_saturated
-    и показывает ли он нестабильность ПРЯМО СЕЙЧАС.
+    """Return (unstable, reason) for a fresh camera jump.
 
-    Чистая функция (без globals) — та же причина обособления, что и у
-    _camera_jump_check: сравнение тестируется отдельно от побочных
-    эффектов (flight_log, состояние сэмплера в camera_callback).
-
-    Свежесть — ТОТ ЖЕ порог CAM_JUMP_MAX_VALID_DT_S, что уже решает
-    "доверять ли дельте" внутри самого _camera_jump_check, не новый
-    коэффициент: раз замер слишком стар для СРАВНЕНИЯ, он слишком стар
-    и для решения "отключать ли automation".
-
-    Возвращает (unstable, reason). reason пусто, если unstable=False.
+    Top-strip saturation is diagnostic only. Freshness uses the same
+    CAM_JUMP_MAX_VALID_DT_S as the camera sampler.
     """
     sample_t = cam_shadow_dbg.get("sample_t")
     if sample_t is None:
@@ -3047,8 +3000,6 @@ def _visual_unstable_now(cam_shadow_dbg, now_mono):
         return False, ""
     if cam_shadow_dbg.get("jump"):
         return True, "jump"
-    if cam_shadow_dbg.get("top_saturated"):
-        return True, "top_saturated"
     return False, ""
 
 
@@ -3141,6 +3092,7 @@ _stand_diag = {"step": 0, "score_t": None, "score_step": None,
                "diag_step": None}
 _stand_cb_wall_t0 = None
 _stand_cb_mono_t0 = None
+_stand_frame_context = {}  # Desktop adapter only; empty on the board.
 
 
 def _stand_begin_step():
@@ -13733,6 +13685,9 @@ def _capture_flight_row(cb_t0):
             CAM_JUMP_TOPROW_SATURATED_THRESHOLD,
             CAM_JUMP_MAX_VALID_DT_S * 1000.0,
             sd["wall_ms"], sd["timing_source"], FRAME_BUDGET_MS,
+            _stand_frame_context.get("video_time_s"),
+            _stand_frame_context.get("tracker_time_s"),
+            _stand_frame_context.get("paused_tick"),
         )
         flight_log.row(_row_values)
         # Та же строка — в папку этого захвата. Форматируем один раз здесь, а

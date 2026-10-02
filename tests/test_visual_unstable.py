@@ -1,22 +1,4 @@
-"""VISUAL_UNSTABLE — camera jump/top_saturated отключают automation ДЛЯ
-ЭТОГО КАДРА, не только пишутся в лог (отчёт 25.09, п.5).
-
-КОНТЕКСТ. Camera Jump Shadow (66b7f4b..fe02d95) был чисто диагностическим:
-cam_jump/top_saturated считались раз в секунду и писались в CSV/events.log,
-но НИКАК не влияли на target_controllable — прямая цитата отчёта: "Camera
-Jump Shadow fix was diagnostic only, did not fix AE itself". Эта правка не
-трогает AE/AWB (остаются полностью динамическими) — только заставляет
-control реагировать на уже существующий сигнал их нестабильности.
-
-АРХИТЕКТУРНО ОТЛИЧАЕТСЯ ОТ IDENTITY_UNCERTAIN (п.2 того же отчёта):
-IDENTITY_UNCERTAIN персистентен (нужен explicit reset_tracking) — вопрос
-идентичности цели. VISUAL_UNSTABLE — вопрос доверия к ПИКСЕЛЯМ конкретного
-момента: gate читается заново каждый кадр из _cam_shadow_dbg (тот же
-freshness-принцип, что уже используют cam_jump_* колонки — возраст против
-CAM_JUMP_MAX_VALID_DT_S, ни одного нового порога), и как только свежий
-замер снова показывает стабильную картинку, track_state сам возвращается в
-TRACKED — БЕЗ explicit pilot-действия.
-"""
+"""Fresh camera jumps skip a frame; top-strip saturation is diagnostic only."""
 import io
 import os
 import sys
@@ -100,7 +82,7 @@ assert t._visual_unstable_now(
 ) == (True, "jump")
 assert t._visual_unstable_now(
     {"sample_t": 100.0, "jump": False, "top_saturated": True}, 100.0
-) == (True, "top_saturated")
+) == (False, "")
 assert t._visual_unstable_now(
     {"sample_t": 100.0, "jump": True, "top_saturated": True}, 100.0
 ) == (True, "jump"), "jump проверяется первым, если оба флага одновременно"
@@ -173,20 +155,20 @@ assert _controllable_3, (
 print("    один стабильный кадр -> TRACKED, controllable=True, без "
       "единого reset_tracking()")
 
-print("\n=== 4. top_saturated (без jump) триггерит НАРАВНЕ ===")
-stable_cam()
-tick()
-assert t.track_state == t.TRACK_STATE_TRACKED, "тест сам по себе негоден"
-unstable_cam("top_saturated")
-tick()
-assert t.track_state == t.TRACK_STATE_VISUAL_UNSTABLE
-with t.state_lock:
-    assert not t.target_controllable
+print("\n=== 4. top_saturated alone remains diagnostic ===")
 stable_cam()
 tick()
 assert t.track_state == t.TRACK_STATE_TRACKED
-print("    top_saturated отключает controllable так же, как jump, и "
-      "так же само разрешается")
+unstable_cam("top_saturated")
+_events.clear()
+tick()
+assert t._cam_shadow_dbg["top_saturated"]
+assert t.track_state == t.TRACK_STATE_TRACKED
+with t.state_lock:
+    assert t.target_controllable
+assert t._stand_log_snapshot(_clk.t, 0)["match_updated"] == 1
+assert not any(e.startswith("VISUAL_UNSTABLE") for e in _events)
+print("    bright top strip preserved; matcher updated; no VISUAL_UNSTABLE")
 
 print("\n=== 5. Устаревший замер (старше CAM_JUMP_MAX_VALID_DT_S) НЕ "
       "отключает controllable — freshness gate реально работает в "
@@ -209,7 +191,7 @@ stable_cam()
 tick()
 assert t.track_state == t.TRACK_STATE_TRACKED, "тест сам по себе негоден"
 _lost_frames_before = t.lost_frames
-unstable_cam("top_saturated")
+unstable_cam("jump")
 for _ in range(30):
     tick()
     assert t.track_state == t.TRACK_STATE_VISUAL_UNSTABLE
@@ -224,7 +206,7 @@ tick()
 assert t.track_state == t.TRACK_STATE_TRACKED, (
     "даже после 30 кадров нестабильности одного стабильного кадра "
     "достаточно, чтобы вернуться в TRACKED")
-print("    30 кадров подряд top_saturated -> lost_frames не вырос, "
+print("    30 кадров подряд jump -> lost_frames не вырос, "
       "восстановление одним стабильным кадром")
 
 print("\n=== 7. Событие VISUAL_UNSTABLE логируется ТОЛЬКО на переднем "

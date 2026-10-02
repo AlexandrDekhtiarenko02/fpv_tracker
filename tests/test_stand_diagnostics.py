@@ -21,6 +21,8 @@ class StandDiagnosticsTests(unittest.TestCase):
         self.old_cam = t._cam_shadow_dbg
         self.old_diag = t._stand_diag.copy()
         self.old_wall = t._stand_cb_wall_t0
+        self.old_context = t._stand_frame_context
+        t._stand_frame_context = {}
         self.old_mono = t._stand_cb_mono_t0
         self.clock = 100.0
         t.time = types.SimpleNamespace(monotonic=lambda: self.clock,
@@ -31,6 +33,7 @@ class StandDiagnosticsTests(unittest.TestCase):
         t._stand_cb_mono_t0 = None
 
     def tearDown(self):
+        t._stand_frame_context = self.old_context
         t.time = self.old_time
         t._cam_shadow_dbg = self.old_cam
         t._stand_diag.clear()
@@ -131,12 +134,20 @@ class StandDiagnosticsTests(unittest.TestCase):
             self.assertEqual(len(captured[-1]), len(t._COLS))
             self.assertEqual(fresh["match_updated"], 1)
             self.assertEqual(fresh["match_score"], 0.99)
+            self.assertIsNone(fresh["stand_video_time_s"])
+            self.assertIsNone(fresh["stand_tracker_time_s"])
+            self.assertIsNone(fresh["stand_paused_tick"])
+            t._stand_frame_context = {"video_time_s": 32.0,
+                                      "tracker_time_s": 33.5, "paused_tick": 1}
             self.clock += 0.8
             t._stand_begin_step()
             t._capture_flight_row(100.7)
             self.assertEqual(len(captured), 2)
             stale = dict(zip(t._COLS, captured[-1]))
             self.assertEqual(stale["match_score"], 0.99)
+            self.assertEqual(stale["stand_video_time_s"], 32.0)
+            self.assertEqual(stale["stand_tracker_time_s"], 33.5)
+            self.assertEqual(stale["stand_paused_tick"], 1)
             self.assertEqual(stale["match_updated"], 0)
             self.assertEqual(stale["match_diag_updated"], 0)
             self.assertAlmostEqual(stale["match_score_age_ms"], 800)
