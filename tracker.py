@@ -7176,26 +7176,55 @@ IDENTITY_ANCHOR_MATCH_MAX_OFFSET_FRAC = 0.5
 # от размазанного фонового.
 IDENTITY_ANCHOR_MIN_PSR = 4.0
 
+# МЕЛКАЯ ЦЕЛЬ (разбор реальных стендовых логов a41feb4). На мелкой цели
+# matchTemplate TM_CCOEFF_NORMED даёт АБСОЛЮТНЫЙ score в районе 0.3-0.5
+# даже при идеальном сопровождении — просто потому что мало уникальной
+# структуры в template. На zahvat01_164010 (UNCERTAIN end): anchor нашла
+# цель с offset=0.9-2.1 px (ровно там же где lock), score=0.30-0.36.
+# score<MATCH_GOOD_SCORE=0.40 → _anchor_confirms_position возвращала
+# False → streak дорастала до UNCERTAIN. Но offset в 1 px — это именно
+# подтверждение identity, а не drift.
+#
+# TIGHT-OFFSET PATH: если anchor нашла peak очень близко к lock
+# (offset <= IDENTITY_ANCHOR_TIGHT_OFFSET_PX), это подтверждение
+# identity даже на низком score — абсолютный score на мелкой цели
+# всегда низкий, а точное попадание в lock-позицию — убедительный
+# сигнал. Минимум score (IDENTITY_ANCHOR_MIN_SCORE_TIGHT) защищает от
+# полностью случайных peak'ов, которые могут попасть близко.
+IDENTITY_ANCHOR_TIGHT_OFFSET_PX = 3.0
+IDENTITY_ANCHOR_MIN_SCORE_TIGHT = 0.20
+
 
 def _anchor_confirms_position(ok, score, psr, mx, my, query_cx, query_cy):
-    """True — anchor подтверждает ИМЕННО (query_cx, query_cy), не просто
-    'нашёлся где-то в окне'. См. _anchor_confirms_position докстроку
-    выше. psr принимается в сигнатуре для будущего расширения и
-    диагностики (CSV identity_anchor_check_psr), но решение по-прежнему
-    по score+offset — PSR fallback пробовался и ложно пропускал
-    фоновые peaks (rectangle-pattern на свободном месте давал PSR>4
-    при score~0.30, то есть один чёткий, но слабый сигнал от
-    случайной структуры). Для мелких целей защита от ранних срывов
-    делается через больший дебаунс (IDENTITY_ANCHOR_CHECK_CONFIRM_N),
-    а не ослаблением критерия подтверждения."""
-    if not ok or score < MATCH_GOOD_SCORE:
+    """True — anchor подтверждает ИМЕННО (query_cx, query_cy).
+
+    Два пути:
+    * Нормальный: score >= MATCH_GOOD_SCORE И offset <= tolerance
+    * Tight-offset: offset <= IDENTITY_ANCHOR_TIGHT_OFFSET_PX И
+      score >= IDENTITY_ANCHOR_MIN_SCORE_TIGHT — на мелкой цели
+      абсолютный score низкий по природе matchTemplate, но точное
+      попадание в lock-позицию (1-3 px) само по себе — подтверждение.
+
+    PSR fallback пробовался и ложно пропускал фоновые peaks (одиночные
+    чёткие пики от случайной структуры).
+    """
+    if not ok:
         return False
     if _identity_anchor_w is None or _identity_anchor_h is None:
         return False
+    offset = math.hypot(mx - query_cx, my - query_cy)
     limit = (max(_identity_anchor_w, _identity_anchor_h)
             * IDENTITY_ANCHOR_MATCH_MAX_OFFSET_FRAC)
-    offset = math.hypot(mx - query_cx, my - query_cy)
-    return offset <= limit
+    # Нормальный путь: сильный score в пределах tolerance.
+    if score >= MATCH_GOOD_SCORE and offset <= limit:
+        return True
+    # Tight-offset путь: anchor нашла peak РОВНО там где lock — на
+    # мелкой цели абсолютный score низкий, но точное совпадение
+    # позиции само подтверждает identity.
+    if (score >= IDENTITY_ANCHOR_MIN_SCORE_TIGHT
+            and offset <= IDENTITY_ANCHOR_TIGHT_OFFSET_PX):
+        return True
+    return False
 
 
 def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0,
