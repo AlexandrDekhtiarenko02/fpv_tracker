@@ -12436,6 +12436,30 @@ def process_locked_tracker(gray, cb_t0=None):
                     # тогда же давал score>=0.88, offset<0.2px, т.е. чётко
                     # говорил "это по-прежнему та же цель").
                     _identity_anchor_last_confirm_t = time.monotonic()
+                    # PASSIVE PULL — непрерывная коррекция lock к anchor-
+                    # найденной позиции (разбор реальных стендовых логов
+                    # 22f4781: lock едет на 130 px при приближении, каждый
+                    # anchor-check подтверждает позицию через tight-offset
+                    # path с offset≤3px — streak не растёт, snap не
+                    # включается, drift накапливается).
+                    #
+                    # На каждом УСПЕШНОМ anchor-check: если anchor нашла
+                    # peak смещённым от new_cx/new_cy (offset>=2px),
+                    # пододвигаем lock к anchor-mx/my с малым весом 0.25.
+                    # Это непрерывная "пружина" к anchor-подтверждённой
+                    # позиции — anchor matcher видит реальный центр цели
+                    # (на уровне peak), live-matcher drift следует за
+                    # меняющимся feature inside object; passive pull
+                    # возвращает lock к центру цели по anchor.
+                    _pull_offset = math.hypot(_iac_mx - new_cx,
+                                               _iac_my - new_cy)
+                    if _pull_offset >= 2.0:
+                        _pull_dx = (_iac_mx - new_cx) * 0.25
+                        _pull_dy = (_iac_my - new_cy) * 0.25
+                        new_cx = new_cx + _pull_dx
+                        new_cy = new_cy + _pull_dy
+                        _match_dbg["identity_anchor_snap_dx"] = _pull_dx
+                        _match_dbg["identity_anchor_snap_dy"] = _pull_dy
                 else:
                     _identity_anchor_check_streak += 1
                     # ACTIVE SNAP — "рамка уползла на фон, anchor знает где
