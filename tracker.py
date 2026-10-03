@@ -12428,9 +12428,35 @@ def process_locked_tracker(gray, cb_t0=None):
                     # НЕ применяется, если anchor нашёл что-то слабое: тогда
                     # либо просто шум, либо A рядом с B (K-3 ситуация) —
                     # тащить к такому peak опаснее, чем остаться на месте.
-                    if (_iac_ok
+                    # ДВА ПУТИ срабатывания (разбор логов f454a77: на
+                    # мелкой цели median anchor_psr=2.4, порог 4.0 отсекал
+                    # 11 из 11 drift-кадров со score>=0.40 — snap работал
+                    # только в 2 случаях из 17 drift-событий):
+                    #
+                    # (1) STRONG — одиночный сильный anchor peak:
+                    #     score>=MATCH_GOOD_SCORE AND psr>=IDENTITY_ANCHOR_
+                    #     MIN_PSR. Корректирует silent drift сразу, пока
+                    #     anchor confidently знает позицию.
+                    #
+                    # (2) SUSTAINED — anchor_check_streak>=2 И score>=
+                    #     MATCH_GOOD_SCORE. На мелкой цели PSR fundamentally
+                    #     низкий, но 2 подряд anchor_check fails с
+                    #     приличным score — это устойчивый drift, а не
+                    #     одиночный шум. streak уже инкрементирован выше в
+                    #     этом же else-блоке, так что >=2 значит текущий
+                    #     кадр = 2-й подряд fail.
+                    #
+                    # В обоих путях snap сдвигает lock к anchor-позиции с
+                    # весом 0.5 — не полный telepot (который мог бы
+                    # сдёрнуть на A рядом с B в K-3-подобной ситуации),
+                    # а pull back on moving target.
+                    _snap_strong = (_iac_ok
                             and _iac_score >= MATCH_GOOD_SCORE
-                            and _iac_psr >= IDENTITY_ANCHOR_MIN_PSR):
+                            and _iac_psr >= IDENTITY_ANCHOR_MIN_PSR)
+                    _snap_sustained = (_iac_ok
+                            and _iac_score >= MATCH_GOOD_SCORE
+                            and _identity_anchor_check_streak >= 2)
+                    if _snap_strong or _snap_sustained:
                         _snap_dx = (_iac_mx - new_cx) * 0.5
                         _snap_dy = (_iac_my - new_cy) * 0.5
                         new_cx = new_cx + _snap_dx
@@ -12438,8 +12464,11 @@ def process_locked_tracker(gray, cb_t0=None):
                         _match_dbg["identity_anchor_snap_dx"] = _snap_dx
                         _match_dbg["identity_anchor_snap_dy"] = _snap_dy
                         flight_log.event(
-                            "ANCHOR SNAP dx=%.1f dy=%.1f score=%.2f psr=%.2f"
-                            % (_snap_dx, _snap_dy, _iac_score, _iac_psr))
+                            "ANCHOR SNAP dx=%.1f dy=%.1f score=%.2f psr=%.2f "
+                            "streak=%d path=%s"
+                            % (_snap_dx, _snap_dy, _iac_score, _iac_psr,
+                               _identity_anchor_check_streak,
+                               "strong" if _snap_strong else "sustained"))
                 _match_dbg["identity_anchor_check_ran"] = 1
                 _match_dbg["identity_anchor_check_score"] = (
                     _iac_score if _iac_ok else 0.0)
