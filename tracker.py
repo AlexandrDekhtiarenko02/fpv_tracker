@@ -6982,11 +6982,21 @@ def _commit_confirmed_identity(fresh_tmpl, cx, cy, reason):
     """
     global _identity_anchor_gray, _identity_anchor_w, _identity_anchor_h
     global _identity_anchor_std
+    global _identity_anchor_last_confirm_t
     anchor = fresh_tmpl.copy()
     _identity_anchor_gray = anchor
     _identity_anchor_w = anchor.shape[1]
     _identity_anchor_h = anchor.shape[0]
     _identity_anchor_std = float(np.std(anchor)) if anchor.size else 0.0
+    # Явный пилотский capture — САМОЕ сильное подтверждение identity (пилот
+    # осознанно указал цель через AUX4). Выставляем "последнее успешное
+    # подтверждение" именно СЕЙЧАС: без этого arbiter первые ~0.5с (до
+    # первого периодического anchor-check) не считает identity подтверждённой
+    # и ambiguity/flow-gap streak может уронить лок за 6 кадров (~0.25с).
+    # На реальных стендовых логах zahvat06 именно это: через 42мс после
+    # capture ambiguous+flow_gap, через 6 кадров — UNCERTAIN, за это окно
+    # anchor-check даже не успевает запуститься.
+    _identity_anchor_last_confirm_t = time.monotonic()
     _match_dbg["identity_anchor_changed"] = 1
     _match_dbg["identity_anchor_change_reason"] = reason
     flight_log.event(
