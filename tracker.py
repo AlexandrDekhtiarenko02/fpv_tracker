@@ -7041,7 +7041,8 @@ def _shadow_build_fresh_template(gray, cx, cy, box_w, box_h):
 
 
 def _shadow_match_against_template(gray, tmpl, tmpl_w, tmpl_h, tmpl_std,
-                                   pred_cx, pred_cy, flow_motion):
+                                   pred_cx, pred_cy, flow_motion,
+                                   extra_margin_px=0):
     """TRACKING SHADOW: ядро template_match_locked() (адаптивный margin,
     сужение окна для крупного эталона, canonical-масштаб, TM_CCOEFF/SQDIFF
     по std, distance penalty, PSR/second по тому же radius-exclusion,
@@ -7075,6 +7076,11 @@ def _shadow_match_against_template(gray, tmpl, tmpl_w, tmpl_h, tmpl_std,
             and flow_motion <= SEARCH_MARGIN_MIN - MATCH_BIG_ZAPAS_PX):
         if margin > SEARCH_MARGIN_MIN:
             margin = int(SEARCH_MARGIN_MIN)
+    # Расширение margin по требованию вызывающего (anchor-check на
+    # низкоконтрастном anchor-template: без доп. окна anchor "видит"
+    # только фон под уехавшим lock и подтверждает его как цель).
+    if extra_margin_px > 0:
+        margin = int(margin + extra_margin_px)
     sw = int(tmpl_w + margin * 2)
     sh = int(tmpl_h + margin * 2)
     search, (sx1, sy1, sx2, sy2) = crop_center(gray, pred_cx, pred_cy, sw, sh)
@@ -7193,6 +7199,24 @@ IDENTITY_ANCHOR_MIN_PSR = 4.0
 # полностью случайных peak'ов, которые могут попасть близко.
 IDENTITY_ANCHOR_TIGHT_OFFSET_PX = 3.0
 IDENTITY_ANCHOR_MIN_SCORE_TIGHT = 0.20
+# ANTI-FLAT GATE для tight-offset path (разбор реальных стендовых логов
+# 95209bf: на мелкой/низкоконтрастной цели matchTemplate TM_CCOEFF_NORMED
+# даёт ПЛОСКИЙ рельеф корреляции — "peak" со score=0.25-0.5 оказывается
+# где угодно рядом с lock, включая фон. Visual: рамка съезжает по
+# диагонали вниз на фон, но anchor_check_offset=0.5 px всё время —
+# tight-path ложно подтверждал фон. PSR отличает острый peak от плоского
+# рельефа: цель даёт PSR>=2 даже на мелком template, фон PSR≈1).
+# Нормальный путь (score>=0.40) этот gate НЕ трогает: там score сам
+# свидетельствует.
+IDENTITY_ANCHOR_TIGHT_MIN_PSR = 2.0
+# РАСШИРЕНИЕ ANCHOR-SEARCH для мелкой/бесфактурной цели. Если std
+# anchor-template низкий — SEARCH_MARGIN вокруг lock-pos даёт anchor'у
+# слишком узкое окно: когда lock реально уехал на фон, anchor "видит"
+# только фон под lock и подтверждает его. Расширяем, чтобы anchor мог
+# заглянуть туда, где цель реально осталась, и соответствующий offset
+# стрельнул passive pull обратно к центру цели.
+IDENTITY_ANCHOR_LOW_STD_PX = 8.0
+IDENTITY_ANCHOR_FLAT_EXTRA_MARGIN_PX = 40
 
 
 def _anchor_confirms_position(ok, score, psr, mx, my, query_cx, query_cy):
@@ -7201,12 +7225,14 @@ def _anchor_confirms_position(ok, score, psr, mx, my, query_cx, query_cy):
     Два пути:
     * Нормальный: score >= MATCH_GOOD_SCORE И offset <= tolerance
     * Tight-offset: offset <= IDENTITY_ANCHOR_TIGHT_OFFSET_PX И
-      score >= IDENTITY_ANCHOR_MIN_SCORE_TIGHT — на мелкой цели
-      абсолютный score низкий по природе matchTemplate, но точное
-      попадание в lock-позицию (1-3 px) само по себе — подтверждение.
+      score >= IDENTITY_ANCHOR_MIN_SCORE_TIGHT И
+      psr >= IDENTITY_ANCHOR_TIGHT_MIN_PSR — на мелкой цели абсолютный
+      score низкий по природе matchTemplate, но точное попадание в
+      lock-позицию с различимым peak-ом — подтверждение. Без PSR gate
+      фоновый плоский рельеф тоже проходил бы на score=0.25.
 
-    PSR fallback пробовался и ложно пропускал фоновые peaks (одиночные
-    чёткие пики от случайной структуры).
+    PSR fallback (OR score) пробовался и ложно пропускал фоновые peaks
+    (одиночные чёткие пики от случайной структуры).
     """
     if not ok:
         return False
@@ -7220,8 +7246,10 @@ def _anchor_confirms_position(ok, score, psr, mx, my, query_cx, query_cy):
         return True
     # Tight-offset путь: anchor нашла peak РОВНО там где lock — на
     # мелкой цели абсолютный score низкий, но точное совпадение
-    # позиции само подтверждает identity.
+    # позиции с различимым peak-ом (PSR>=TIGHT_MIN_PSR) подтверждает
+    # identity. PSR gate отсекает плоский фоновый рельеф.
     if (score >= IDENTITY_ANCHOR_MIN_SCORE_TIGHT
+            and psr >= IDENTITY_ANCHOR_TIGHT_MIN_PSR
             and offset <= IDENTITY_ANCHOR_TIGHT_OFFSET_PX):
         return True
     return False
@@ -12406,11 +12434,29 @@ def process_locked_tracker(gray, cb_t0=None):
                     _iac_tw = _identity_anchor_w
                     _iac_th = _identity_anchor_h
                     _iac_tstd = _identity_anchor_std
+            # Расширение search для мелкой/бесфактурной anchor-template:
+            # на низком std matchTemplate даёт плоский рельеф корреляции
+            # внутри обычного SEARCH_MARGIN, "peak" под lock-ом может
+            # оказаться на фоне. Доп. margin позволяет anchor-matcher'у
+            # найти реальный peak дальше от lock, если тот съехал.
+            _iac_extra_margin = 0
+            if (_iac_tstd is not None
+                    and _iac_tstd < IDENTITY_ANCHOR_LOW_STD_PX):
+                _iac_extra_margin = IDENTITY_ANCHOR_FLAT_EXTRA_MARGIN_PX
             try:
-                (_iac_ok, _iac_score, _iac_psr, _iac_second, _iac_mx, _iac_my
-                 ) = _shadow_match_against_template(
-                    gray, _iac_tmpl, _iac_tw, _iac_th, _iac_tstd,
-                    new_cx, new_cy, flow_motion)
+                if _iac_extra_margin > 0:
+                    (_iac_ok, _iac_score, _iac_psr, _iac_second,
+                     _iac_mx, _iac_my
+                     ) = _shadow_match_against_template(
+                        gray, _iac_tmpl, _iac_tw, _iac_th, _iac_tstd,
+                        new_cx, new_cy, flow_motion,
+                        extra_margin_px=_iac_extra_margin)
+                else:
+                    (_iac_ok, _iac_score, _iac_psr, _iac_second,
+                     _iac_mx, _iac_my
+                     ) = _shadow_match_against_template(
+                        gray, _iac_tmpl, _iac_tw, _iac_th, _iac_tstd,
+                        new_cx, new_cy, flow_motion)
             except Exception:
                 # Диагностика/safety-check не имеет права уронить живой
                 # путь — тот же принцип изоляции, что и у TRACKING SHADOW
