@@ -12451,11 +12451,19 @@ def process_locked_tracker(gray, cb_t0=None):
                     # (на уровне peak), live-matcher drift следует за
                     # меняющимся feature inside object; passive pull
                     # возвращает lock к центру цели по anchor.
+                    # Вес 0.5 вместо 0.25 (разбор логов f4f9bf3: pull=0.25
+                    # корректировал ~6px/s, drift накапливался ~24px/s —
+                    # недостаточно). При anchor_check периоде 0.5с и
+                    # offset=4-6px pull даёт 2-3px/0.5с = 4-6px/s.
+                    # Защита от K-3 trap остаётся: pull срабатывает только
+                    # на успешном anchor_confirms_position, где tight-
+                    # offset требует offset<=3px — decoy с большим offset
+                    # не пройдёт confirms.
                     _pull_offset = math.hypot(_iac_mx - new_cx,
                                                _iac_my - new_cy)
                     if _pull_offset >= 2.0:
-                        _pull_dx = (_iac_mx - new_cx) * 0.25
-                        _pull_dy = (_iac_my - new_cy) * 0.25
+                        _pull_dx = (_iac_mx - new_cx) * 0.5
+                        _pull_dy = (_iac_my - new_cy) * 0.5
                         new_cx = new_cx + _pull_dx
                         new_cy = new_cy + _pull_dy
                         _match_dbg["identity_anchor_snap_dx"] = _pull_dx
