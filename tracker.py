@@ -12505,9 +12505,24 @@ def process_locked_tracker(gray, cb_t0=None):
                     # на успешном anchor_confirms_position, где tight-
                     # offset требует offset<=3px — decoy с большим offset
                     # не пройдёт confirms.
+                    # TRUST-WEIGHTED PULL GATE (разбор реальных стендовых
+                    # логов 5598db8: при изменении формы/ракурса цели
+                    # immutable anchor знает только старый вид; live
+                    # mutable template учится и адаптируется, его score
+                    # на реальной цели ВЫШЕ, чем у anchor. В этот момент
+                    # anchor "видит" цель хуже live и может подтвердить
+                    # offset в сторону старой формы или фона → pull
+                    # тащит рамку с правильной позиции в неправильную.
+                    # Если live-matcher уверенее anchor'а — доверяем live,
+                    # pull пропускаем. Live уверенее = score >= anchor_
+                    # score И score >= MATCH_GOOD_SCORE (абсолютный
+                    # минимум доверия к live, иначе anchor-safety-net).
+                    _live_leads_anchor = (match_ok
+                            and score >= _iac_score
+                            and score >= MATCH_GOOD_SCORE)
                     _pull_offset = math.hypot(_iac_mx - new_cx,
                                                _iac_my - new_cy)
-                    if _pull_offset >= 2.0:
+                    if _pull_offset >= 2.0 and not _live_leads_anchor:
                         _pull_dx = (_iac_mx - new_cx) * 0.5
                         _pull_dy = (_iac_my - new_cy) * 0.5
                         new_cx = new_cx + _pull_dx
