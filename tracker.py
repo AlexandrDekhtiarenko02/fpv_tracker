@@ -2403,6 +2403,7 @@ _FLIGHT_LOG_COLUMNS = (
     # TRACKED-кадров подряд идёт БЕЗ единой возможности сверить flow с
     # matcher (короткий разрыв нормален, длинный сам по себе подозрителен).
     "identity_anchor_check_ran,identity_anchor_check_score,"
+    "identity_anchor_check_psr,"
     "identity_anchor_check_offset,"
     "identity_anchor_check_streak,identity_dual_signal_gap_frames,"
     # identity_soft_distrust=1 — controllable уже снят ЭТИМ кадром из-за
@@ -7156,9 +7157,17 @@ def _shadow_match_against_template(gray, tmpl, tmpl_w, tmpl_h, tmpl_std,
 IDENTITY_ANCHOR_MATCH_MAX_OFFSET_FRAC = 0.5
 
 
-def _anchor_confirms_position(ok, score, mx, my, query_cx, query_cy):
+def _anchor_confirms_position(ok, score, psr, mx, my, query_cx, query_cy):
     """True — anchor подтверждает ИМЕННО (query_cx, query_cy), не просто
-    'нашёлся где-то в окне'. См. докстроку константы выше."""
+    'нашёлся где-то в окне'. См. _anchor_confirms_position докстроку
+    выше. psr принимается в сигнатуре для будущего расширения и
+    диагностики (CSV identity_anchor_check_psr), но решение по-прежнему
+    по score+offset — PSR fallback пробовался и ложно пропускал
+    фоновые peaks (rectangle-pattern на свободном месте давал PSR>4
+    при score~0.30, то есть один чёткий, но слабый сигнал от
+    случайной структуры). Для мелких целей защита от ранних срывов
+    делается через больший дебаунс (IDENTITY_ANCHOR_CHECK_CONFIRM_N),
+    а не ослаблением критерия подтверждения."""
     if not ok or score < MATCH_GOOD_SCORE:
         return False
     if _identity_anchor_w is None or _identity_anchor_h is None:
@@ -11232,11 +11241,24 @@ IDENTITY_ANCHOR_CHECK_ENABLED = True
 IDENTITY_ANCHOR_CHECK_PERIOD_S = 0.5
 # Дебаунс тем же принципом, что и у IDENTITY_UNCERTAIN_CONFIRM_FRAMES выше:
 # один неудачный периодический замер — не повод сразу остановить всё (CV
-# шум, временная деформация/блик). N=3 подряд НЕУДАЧНЫХ замера при периоде
-# 0.5с — около 1.5с устойчивого расхождения с anchor, прежде чем automation
-# отключится. Начальное значение, калибровка — офлайн-реплеем логов, тем же
-# принципом, что и у остальных порогов этого раздела.
-IDENTITY_ANCHOR_CHECK_CONFIRM_N = 3
+# шум, временная деформация/блик, кратковременный rolling-shutter или
+# тряска камеры).
+#
+# ПОВЫШЕНО с 3 до 6 по реальным стендовым логам 8dfc8e9 (мелкие цели,
+# box=24 min). matchTemplate TM_CCOEFF_NORMED на мелкой цели даёт
+# АБСОЛЮТНЫЙ score у границы MATCH_GOOD_SCORE=0.40 просто из-за
+# физического количества уникальной структуры в template — zahvat05
+# median match_score=0.50, min 0.11; zahvat10 median=0.30 с цельным
+# TRACKED. Одиночные anchor-check fails на такой цели — норма, не
+# смена identity. 3 подряд fails при периоде 0.5с = 1.5с управления по
+# якобы недоверенной identity на цели, которая по сути корректна —
+# слишком жёстко. 6 подряд = 3с, за это время цель ЛИБО действительно
+# ушла (streak дорастёт), ЛИБО вернётся и streak сбросится.
+#
+# Критерий _anchor_confirms_position сам (score+offset) НЕ ослаблен —
+# PSR fallback пробовался и ложно пропускал фоновые peaks (см. его
+# докстроку).
+IDENTITY_ANCHOR_CHECK_CONFIRM_N = 6
 _identity_anchor_check_streak = 0
 _identity_anchor_check_last_t = 0.0
 # Отметка ВРЕМЕНИ последнего успешного anchor-подтверждения (см. ниже блок
@@ -11593,7 +11615,8 @@ def process_locked_tracker(gray, cb_t0=None):
                 # реальном коде, см. докстроку _anchor_confirms_position).
                 if _anchor_confirms_position(
                         _reacq_anchor_ok, _reacq_anchor_score,
-                        _reacq_anchor_mx, _reacq_anchor_my, mcx, mcy):
+                        _reacq_anchor_psr, _reacq_anchor_mx, _reacq_anchor_my,
+                        mcx, mcy):
                     # Анкор согласен — нашли с уверенностью И это та же
                     # identity. Возвращаемся в TRACKED, переинициализируем flow.
                     lock_cx = float(mcx)
@@ -12346,7 +12369,8 @@ def process_locked_tracker(gray, cb_t0=None):
                 # на реальном коде: A рядом с B легко попадает в то же
                 # search-окно, см. докстроку _anchor_confirms_position).
                 if _anchor_confirms_position(
-                        _iac_ok, _iac_score, _iac_mx, _iac_my, new_cx, new_cy):
+                        _iac_ok, _iac_score, _iac_psr,
+                        _iac_mx, _iac_my, new_cx, new_cy):
                     _identity_anchor_check_streak = 0
                     # Отметка ВРЕМЕНИ последнего успешного подтверждения —
                     # используется ANCHOR ARBITER ниже (см. блок IDENTITY_
@@ -12362,6 +12386,8 @@ def process_locked_tracker(gray, cb_t0=None):
                 _match_dbg["identity_anchor_check_ran"] = 1
                 _match_dbg["identity_anchor_check_score"] = (
                     _iac_score if _iac_ok else 0.0)
+                _match_dbg["identity_anchor_check_psr"] = (
+                    _iac_psr if _iac_ok else 0.0)
                 _match_dbg["identity_anchor_check_offset"] = (
                     math.hypot(_iac_mx - new_cx, _iac_my - new_cy) if _iac_ok else None)
             else:
@@ -13144,6 +13170,7 @@ def process_locked_tracker(gray, cb_t0=None):
                                         # докстроку _anchor_confirms_position).
                                         if not _anchor_confirms_position(
                                                 _anchor_ok, _anchor_score,
+                                                _anchor_psr,
                                                 _anchor_mx, _anchor_my,
                                                 lock_cx, lock_cy):
                                             flight_log.event(
@@ -13650,6 +13677,7 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("identity_uncertain_streak"),
             _match_dbg.get("identity_anchor_check_ran"),
             _match_dbg.get("identity_anchor_check_score"),
+            _match_dbg.get("identity_anchor_check_psr"),
             _match_dbg.get("identity_anchor_check_offset"),
             _match_dbg.get("identity_anchor_check_streak"),
             _match_dbg.get("identity_dual_signal_gap_frames"),

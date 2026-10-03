@@ -146,12 +146,14 @@ print("    подтверждено: score-only проверка ЗДЕСЬ ск
 print("\n=== 2. _anchor_confirms_position: ТА ЖЕ пара (ok, score) с "
       "координатами A -> НЕ подтверждает B ===")
 assert not t._anchor_confirms_position(
-    _iac_ok0, _iac_score0, _iac_mx0, _iac_my0, B_cx, B_cy), (
+    _iac_ok0, _iac_score0, _iac_psr0,
+    _iac_mx0, _iac_my0, B_cx, B_cy), (
     "_anchor_confirms_position подтвердила B, хотя найденные координаты "
     "принадлежат A (%.1fpx от B) — позиционная слепота не исправлена"
     % _offset0)
 assert t._anchor_confirms_position(
-    _iac_ok0, _iac_score0, _iac_mx0, _iac_my0, A_cx, A_cy), (
+    _iac_ok0, _iac_score0, _iac_psr0,
+    _iac_mx0, _iac_my0, A_cx, A_cy), (
     "контроль: та же пара координат ОБЯЗАНА подтверждать A (запрос ровно "
     "туда, где реально нашли) — иначе функция сломана в другую сторону")
 print("    _anchor_confirms_position(..., query=B) -> False; "
