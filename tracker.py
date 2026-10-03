@@ -2405,6 +2405,7 @@ _FLIGHT_LOG_COLUMNS = (
     "identity_anchor_check_ran,identity_anchor_check_score,"
     "identity_anchor_check_psr,"
     "identity_anchor_check_offset,"
+    "identity_anchor_snap_dx,identity_anchor_snap_dy,"
     "identity_anchor_check_streak,identity_dual_signal_gap_frames,"
     # identity_soft_distrust=1 — controllable уже снят ЭТИМ кадром из-за
     # первого anchor mismatch/начала долгого разрыва, ХОТЯ track_state
@@ -7166,6 +7167,15 @@ def _shadow_match_against_template(gray, tmpl, tmpl_w, tmpl_h, tmpl_std,
 # масштабируется вместе с целью.
 IDENTITY_ANCHOR_MATCH_MAX_OFFSET_FRAC = 0.5
 
+# PSR порог для ACTIVE SNAP (не для _anchor_confirms_position — туда PSR
+# не идёт как confirmation, см. её докстроку). По реальным логам
+# dd640eb: на крупной цели anchor_psr median=6+, на мелкой median=3.4;
+# на кадрах с реальным drift (anchor_offset > tolerance) PSR >= 4
+# встречается в редких, но ключевых "silent drift" моментах, где
+# anchor конфиденциально знает где цель. 4.0 отделяет уверенный peak
+# от размазанного фонового.
+IDENTITY_ANCHOR_MIN_PSR = 4.0
+
 
 def _anchor_confirms_position(ok, score, psr, mx, my, query_cx, query_cy):
     """True — anchor подтверждает ИМЕННО (query_cx, query_cy), не просто
@@ -11516,6 +11526,12 @@ def process_locked_tracker(gray, cb_t0=None):
     # должен оставаться 0 всё время".
     _match_dbg["identity_anchor_changed"] = 0
     _match_dbg["identity_anchor_change_reason"] = ""
+    # ACTIVE SNAP: diagnostic non-zero только когда snap реально применён;
+    # сброс по умолчанию каждый кадр иначе смазывание на soft-distrust
+    # кадрах покажет застарелое значение (та же защита, что и у остальных
+    # 1-кадровых диагностик).
+    _match_dbg["identity_anchor_snap_dx"] = 0.0
+    _match_dbg["identity_anchor_snap_dy"] = 0.0
 
     # _identity_soft_distrust — ПРЕДВАРИТЕЛЬНОЕ значение из persistent-
     # счётчиков ПРОШЛОГО кадра (streak / gap / anchor_check_streak):
@@ -12393,6 +12409,37 @@ def process_locked_tracker(gray, cb_t0=None):
                     _identity_anchor_last_confirm_t = time.monotonic()
                 else:
                     _identity_anchor_check_streak += 1
+                    # ACTIVE SNAP — "рамка уползла на фон, anchor знает где
+                    # цель" (разбор реальных стендовых логов dd640eb).
+                    # Проблема silent drift: live matcher уверенно показывает
+                    # score=0.9 на том месте, куда уехал lock, но anchor
+                    # confidently находит ту же цель в 20-26 px от lock.
+                    # CONFIRM_N=6 debounce гасит anchor-mismatch streak на
+                    # ~3 секунды — за это время рамка уже на фоне.
+                    #
+                    # Если anchor-check одновременно: (a) score и PSR
+                    # уверенные (>= MATCH_GOOD_SCORE и >= IDENTITY_ANCHOR_
+                    # MIN_PSR = 4.0) И (b) позиция в search-окне
+                    # (не на границе — иначе может быть "ещё дальше"), —
+                    # anchor знает ГДЕ цель, пододвигаем live lock к ней с
+                    # весом 0.5. Это НЕ UNCERTAIN, НЕ reset, НЕ обучение —
+                    # коррекция живой позиции по подтверждённому identity.
+                    #
+                    # НЕ применяется, если anchor нашёл что-то слабое: тогда
+                    # либо просто шум, либо A рядом с B (K-3 ситуация) —
+                    # тащить к такому peak опаснее, чем остаться на месте.
+                    if (_iac_ok
+                            and _iac_score >= MATCH_GOOD_SCORE
+                            and _iac_psr >= IDENTITY_ANCHOR_MIN_PSR):
+                        _snap_dx = (_iac_mx - new_cx) * 0.5
+                        _snap_dy = (_iac_my - new_cy) * 0.5
+                        new_cx = new_cx + _snap_dx
+                        new_cy = new_cy + _snap_dy
+                        _match_dbg["identity_anchor_snap_dx"] = _snap_dx
+                        _match_dbg["identity_anchor_snap_dy"] = _snap_dy
+                        flight_log.event(
+                            "ANCHOR SNAP dx=%.1f dy=%.1f score=%.2f psr=%.2f"
+                            % (_snap_dx, _snap_dy, _iac_score, _iac_psr))
                 _match_dbg["identity_anchor_check_ran"] = 1
                 _match_dbg["identity_anchor_check_score"] = (
                     _iac_score if _iac_ok else 0.0)
@@ -13689,6 +13736,8 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("identity_anchor_check_score"),
             _match_dbg.get("identity_anchor_check_psr"),
             _match_dbg.get("identity_anchor_check_offset"),
+            _match_dbg.get("identity_anchor_snap_dx"),
+            _match_dbg.get("identity_anchor_snap_dy"),
             _match_dbg.get("identity_anchor_check_streak"),
             _match_dbg.get("identity_dual_signal_gap_frames"),
             _match_dbg.get("identity_soft_distrust"),
