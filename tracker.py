@@ -12963,7 +12963,16 @@ def process_locked_tracker(gray, cb_t0=None):
             # молчит). Применяется через те же переиспользуемые пути
             # (template_scale_acc / resize из template_base / adaptation
             # gate) — не новая логика, только другой источник scale.
-            if (_match_dbg.get("size_skip") in (1, 2, 3, 5, 6)
+            # size_skip=0 добавлен в условие (разбор реальных стендовых логов
+            # 18671d7): matcher-scale на мелкой цели почти всегда возвращает
+            # k_scale=1.0 (size_skip=0) — microрост 2-10% внутри 24-px
+            # template слишком мал для детектирования. flow_scale при этом
+            # confidence=0.98 честно видит рост. Если matcher-scale выдал
+            # ровно 1.0, а flow показывает другое — применяем flow.
+            if (_match_dbg.get("size_skip") in (0, 1, 2, 3, 5, 6)
+                    and (_match_dbg.get("size_skip") != 0
+                         or _match_dbg.get("size_scale") == 1.0
+                         or _match_dbg.get("size_scale") == 1)
                     and _flow_rasshirenie is not None
                     and (time.monotonic() - _flow_rasshirenie_t)
                         <= FLOW_RASSH_SVEZH_S
