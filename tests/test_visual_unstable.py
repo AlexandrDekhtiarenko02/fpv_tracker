@@ -66,6 +66,8 @@ def stable_cam():
 def unstable_cam(reason="jump", age_s=0.0):
     d = {"sample_t": _clk.t - age_s, "jump": False, "top_saturated": False}
     d[reason] = True
+    if reason == "jump":
+        d.update(exp_ratio=2.0, dt_valid=True)
     t._cam_shadow_dbg = d
 
 
@@ -78,13 +80,13 @@ assert t._visual_unstable_now({}, 100.0) == (False, ""), (
     "нестабильным — недостаточно данных, не 'стабильно' и не "
     "'нестабильно', но controllable отключать не за что")
 assert t._visual_unstable_now(
-    {"sample_t": 100.0, "jump": True, "top_saturated": False}, 100.0
+    {"sample_t": 100.0, "jump": True, "exp_ratio": 2.0, "dt_valid": True, "top_saturated": False}, 100.0
 ) == (True, "jump")
 assert t._visual_unstable_now(
     {"sample_t": 100.0, "jump": False, "top_saturated": True}, 100.0
 ) == (False, "")
 assert t._visual_unstable_now(
-    {"sample_t": 100.0, "jump": True, "top_saturated": True}, 100.0
+    {"sample_t": 100.0, "jump": True, "exp_ratio": 2.0, "dt_valid": True, "top_saturated": True}, 100.0
 ) == (True, "jump"), "jump проверяется первым, если оба флага одновременно"
 assert t._visual_unstable_now(
     {"sample_t": 100.0, "jump": False, "top_saturated": False}, 100.0
@@ -92,11 +94,11 @@ assert t._visual_unstable_now(
 # Свежесть: РОВНО на границе ещё доверяем (та же граница, что и dt_valid
 # внутри _camera_jump_check: dt_s <= CAM_JUMP_MAX_VALID_DT_S).
 assert t._visual_unstable_now(
-    {"sample_t": 100.0, "jump": True, "top_saturated": False},
+    {"sample_t": 100.0, "jump": True, "exp_ratio": 2.0, "dt_valid": True, "top_saturated": False},
     100.0 + MAX_DT
 ) == (True, "jump"), "граница включительно должна ещё доверять замеру"
 assert t._visual_unstable_now(
-    {"sample_t": 100.0, "jump": True, "top_saturated": False},
+    {"sample_t": 100.0, "jump": True, "exp_ratio": 2.0, "dt_valid": True, "top_saturated": False},
     100.0 + MAX_DT + 0.001
 ) == (False, ""), "замер старше CAM_JUMP_MAX_VALID_DT_S не должен учитываться"
 print("    None-sample_t / jump / top_saturated / оба сразу / граница "

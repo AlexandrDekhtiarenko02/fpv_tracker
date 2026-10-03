@@ -2725,7 +2725,7 @@ _FLIGHT_LOG_COLUMNS = (
     "cam_jump_sample_fresh,cam_jump_exp_threshold,cam_jump_gray_threshold,"
     "cam_top_threshold,cam_jump_max_age_ms,cb_wall_ms,cb_timing_source,"
     "frame_budget_ms,stand_video_time_s,stand_tracker_time_s,"
-    "stand_paused_tick"
+    "stand_paused_tick,flow_pair_age_ms,flow_reinitialized,flow_reinit_reason"
 )
 
 # Снимок внутренностей управления за текущий кадр. Заполняется в
@@ -2964,7 +2964,7 @@ def _camera_jump_check(exp_us, prev_exp_us, mean_gray, prev_gray,
         gray_delta = mean_gray - prev_gray
     top_saturated = (top_row_mean is not None
                      and top_row_mean >= CAM_JUMP_TOPROW_SATURATED_THRESHOLD)
-    dt_valid = dt_s is not None and dt_s <= CAM_JUMP_MAX_VALID_DT_S
+    dt_valid = dt_s is not None and 0.0 < dt_s <= CAM_JUMP_MAX_VALID_DT_S
     exp_jump = (dt_valid and exp_ratio is not None
                and (exp_ratio >= CAM_JUMP_EXP_RATIO_THRESHOLD
                     or exp_ratio <= 1.0 / CAM_JUMP_EXP_RATIO_THRESHOLD))
@@ -2980,25 +2980,29 @@ def _camera_jump_check(exp_us, prev_exp_us, mean_gray, prev_gray,
     }
 
 
-# VISUAL_UNSTABLE uses a fresh camera jump (exposure/whole-frame gray delta).
-# The first four MAIN rows are a display diagnostic, not evidence that the
-# tracking region is unusable. Keep top_saturated in CSV/events only.
-# A jump skips this frame without increasing lost_frames or replacing prev_gray.
+# A whole-frame brightness delta over one second can come from scene motion.
+# Keep aggregate jump/top_saturated as diagnostics. Only a valid exposure
+# metadata jump can independently suspend processing; identity checks remain
+# responsible for deciding whether the tracked patch still matches.
 VISUAL_UNSTABLE_ENABLED = True
 
 
 def _visual_unstable_now(cam_shadow_dbg, now_mono):
-    """Return (unstable, reason) for a fresh camera jump.
+    """Return (unstable, reason) for a fresh, measured exposure jump.
 
-    Top-strip saturation is diagnostic only. Freshness uses the same
-    CAM_JUMP_MAX_VALID_DT_S as the camera sampler.
+    Brightness-only or top-strip diagnostics do not establish that the tracking
+    region is unusable. Missing metadata is not an exposure measurement.
     """
     sample_t = cam_shadow_dbg.get("sample_t")
     if sample_t is None:
         return False, ""
-    if (now_mono - sample_t) > CAM_JUMP_MAX_VALID_DT_S:
+    age = now_mono - sample_t
+    if not 0.0 <= age <= CAM_JUMP_MAX_VALID_DT_S:
         return False, ""
-    if cam_shadow_dbg.get("jump"):
+    ratio = cam_shadow_dbg.get("exp_ratio")
+    if (cam_shadow_dbg.get("dt_valid") and ratio is not None
+            and (ratio >= CAM_JUMP_EXP_RATIO_THRESHOLD
+                 or ratio <= 1.0 / CAM_JUMP_EXP_RATIO_THRESHOLD)):
         return True, "jump"
     return False, ""
 
@@ -3093,10 +3097,12 @@ _stand_diag = {"step": 0, "score_t": None, "score_step": None,
 _stand_cb_wall_t0 = None
 _stand_cb_mono_t0 = None
 _stand_frame_context = {}  # Desktop adapter only; empty on the board.
+_flow_pair_dbg = {"age_ms": None, "reinitialized": 0, "reason": ""}
 
 
 def _stand_begin_step():
     _stand_diag["step"] += 1
+    _flow_pair_dbg.update(age_ms=None, reinitialized=0, reason="")
 
 
 def _stand_score_sample(source):
@@ -4501,6 +4507,7 @@ _ground_flow_dbg = {
 }
 prev_gray = None
 prev_pts = None
+_flow_reference_t = None
 lost_frames = 0
 frame_index = 0
 last_match_score = 0.0
@@ -5331,6 +5338,35 @@ def _flow_fit_translation_scale(old, new, cx, cy):
     else:
         scale_confidence = 0.0
     return Tx, Ty, k, len(inliers), scale_confidence
+
+
+def _prepare_flow_pair(now):
+    """Drop stale LK inputs; the matcher must establish a current position.
+
+    A skipped processing interval is not a normal adjacent-frame displacement.
+    Reuse the existing flow freshness limit, including clock discontinuities.
+    Do not resnapshot identity/templates or reset their failure counters.
+    """
+    global prev_gray, prev_pts, _flow_reference_t
+    global _flow_rasshirenie, _flow_rasshirenie_t
+    if prev_gray is None:
+        return False
+    age = None if _flow_reference_t is None else now - _flow_reference_t
+    _flow_pair_dbg["age_ms"] = None if age is None else age * 1000.0
+    if age is not None and 0.0 <= age <= FLOW_RASSH_SVEZH_S:
+        return False
+    reason = ("reference_time_missing" if age is None else
+              "clock_regression" if age < 0.0 else "processing_gap")
+    prev_gray = None
+    prev_pts = None
+    _flow_reference_t = None
+    _match_dbg.pop("flow_gap", None)
+    _flow_rasshirenie = None
+    _flow_rasshirenie_t = 0.0
+    _flow_pair_dbg.update(reinitialized=1, reason=reason)
+    flight_log.event("FLOW_REINIT reason=%s pair_age_ms=%s max_age_ms=%.1f" % (
+        reason, _flow_pair_dbg["age_ms"], FLOW_RASSH_SVEZH_S * 1000.0))
+    return True
 
 
 def flow_predict(prev_g, cur_g, pts, cx, cy):
@@ -7444,7 +7480,7 @@ def reset_tracking(to_acq=False):
     global color_axis
     global _identity_anchor_gray, _identity_anchor_w, _identity_anchor_h
     global _identity_anchor_std
-    global prev_gray, prev_pts, lost_frames, last_match_score, last_flow_ok
+    global prev_gray, prev_pts, _flow_reference_t, lost_frames, last_match_score, last_flow_ok
     global acq_wait_left
     global filtered_dx_yaw, prev_adx, prev_ady_ctrl
     global smooth_throttle_out, throttle_integral, prev_ady
@@ -7524,6 +7560,7 @@ def reset_tracking(to_acq=False):
     template_std = 0.0
     prev_gray = None
     prev_pts = None
+    _flow_reference_t = None
     lost_frames = 0
     last_match_score = 0.0
     _stand_reset_metrics()
@@ -11339,7 +11376,7 @@ def reanchor_tracker_at_current_box(gray, reason):
     (identity_ambiguous/flow_gap/anchor-проверка Auto Template Refresh), а
     не будет молча "прощено" самим фактом отпускания стика.
     """
-    global prev_pts, prev_gray, _adapt_frozen_posle_reanchor
+    global prev_pts, prev_gray, _flow_reference_t, _adapt_frozen_posle_reanchor
     global template_gray, template_base, template_scale_acc
     _reset_geometry_history(reason)
     _cur_tmpl = build_template(gray, lock_cx, lock_cy, lock_w, lock_h)
@@ -11353,6 +11390,7 @@ def reanchor_tracker_at_current_box(gray, reason):
     template_scale_acc = 1.0
     prev_pts = refresh_flow_points(gray, lock_cx, lock_cy, lock_w, lock_h)
     prev_gray = gray.copy()
+    _flow_reference_t = time.monotonic()
     _adapt_frozen_posle_reanchor = True
     flight_log.event(
         "REANCHOR epoch=%d after=(%.1f,%.1f,%.1f,%.1f) template=rebuilt"
@@ -11370,6 +11408,7 @@ def process_locked_tracker(gray, cb_t0=None):
     """
     global track_state, target_visible, target_controllable, overlay_text, overlay_color, target_box_main
     global lock_cx, lock_cy, lock_w, lock_h, template_gray, prev_gray, prev_pts
+    global _flow_reference_t
     global tmpl_w, tmpl_h, template_std
     global template_base, target_uv, color_active, color_separation
     global lost_frames, frame_index, last_match_score, last_flow_ok
@@ -11560,6 +11599,7 @@ def process_locked_tracker(gray, cb_t0=None):
                     lock_cx = float(mcx)
                     lock_cy = float(mcy)
                     prev_gray = gray.copy()
+                    _flow_reference_t = time.monotonic()
                     prev_pts = refresh_flow_points(gray, lock_cx, lock_cy, lock_w, lock_h)
                     lost_frames = 0
                     last_match_score = score_r
@@ -11700,6 +11740,7 @@ def process_locked_tracker(gray, cb_t0=None):
             else:
                 color_active = False
             prev_gray = gray.copy()
+            _flow_reference_t = time.monotonic()
             prev_pts = refresh_flow_points(gray, lock_cx, lock_cy, lock_w, lock_h)
             lost_frames = 0
             last_match_score = 1.0
@@ -12085,6 +12126,7 @@ def process_locked_tracker(gray, cb_t0=None):
         return
 
     _t_etap = time.monotonic()
+    _flow_reinitialized = _prepare_flow_pair(time.monotonic())
     flow_ok, pred_cx, pred_cy = flow_predict(prev_gray, gray, prev_pts, lock_cx, lock_cy)
     _t_etap = _etap("potok", _t_etap)
     # Модуль flow-предсказанного смещения цели за кадр — используется
@@ -12487,9 +12529,10 @@ def process_locked_tracker(gray, cb_t0=None):
         lost_frames = 0
         auto_reacq_attempts = 0   # успешно идём — сбрасываем счётчик восстановлений
 
-        if frame_index % FLOW_REFRESH_EVERY == 0:
+        if _flow_reinitialized or frame_index % FLOW_REFRESH_EVERY == 0:
             prev_pts = refresh_flow_points(gray, lock_cx, lock_cy, lock_w, lock_h)
         prev_gray = gray.copy()
+        _flow_reference_t = time.monotonic()
 
         if not FREEZE_TEMPLATE and match_ok and score >= 0.60:
             # НАЙДЕНО (ревью по 9da5f65): build_template() пишет tmpl_w/
@@ -13218,7 +13261,10 @@ def process_locked_tracker(gray, cb_t0=None):
         # где Tracking Shadow вообще не считался (та же болезнь, что чинили
         # для _shadow_ctl_dbg в control-shadow-architecture).
         _shadow_track_dbg = {"active": False}
+        if _flow_reinitialized:
+            prev_pts = refresh_flow_points(gray, lock_cx, lock_cy, lock_w, lock_h)
         prev_gray = gray.copy()
+        _flow_reference_t = time.monotonic()
         if lost_frames <= HOLD_FRAMES:
             box = lores_box_to_main(lock_cx, lock_cy, lock_w, lock_h)
             with state_lock:
@@ -13688,6 +13734,8 @@ def _capture_flight_row(cb_t0):
             _stand_frame_context.get("video_time_s"),
             _stand_frame_context.get("tracker_time_s"),
             _stand_frame_context.get("paused_tick"),
+            _flow_pair_dbg["age_ms"], _flow_pair_dbg["reinitialized"],
+            _flow_pair_dbg["reason"],
         )
         flight_log.row(_row_values)
         # Та же строка — в папку этого захвата. Форматируем один раз здесь, а

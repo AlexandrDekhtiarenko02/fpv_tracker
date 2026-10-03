@@ -185,6 +185,8 @@ def stable_cam():
 def unstable_cam(reason="jump"):
     d = {"sample_t": _clk.t, "jump": False, "top_saturated": False}
     d[reason] = True
+    if reason == "jump":
+        d.update(exp_ratio=2.0, dt_valid=True)
     t._cam_shadow_dbg = d
 
 
