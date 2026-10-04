@@ -581,13 +581,21 @@ BLOB_VERIFY_MIN_CONTRAST = 10.0
 # Или edge-strength: центр заметно структурнее кольца (значит в
 # центре градиент локального объекта).
 BLOB_VERIFY_MIN_EDGE_RATIO = 1.2
+# ЦЕНТР patch'а для сравнения с кольцом. box_w × BLOB_VERIFY_CENTER_FRAC.
+# Разбор прогона 5f68fc6: при frac=0.5 (box_w/2=12 px для 24-рамки)
+# центр захватывал фон вокруг компактной цели, edge_ratio=0.5 — ложное
+# срабатывание на реальных захватах. frac=0.3 (7 px для 24-рамки)
+# ближе к размеру самой цели.
+BLOB_VERIFY_CENTER_FRAC = 0.3
 # BLOB VERIFY DEBOUNCE: сколько кадров подряд fail чтобы считать
-# что lock реально на фоне (а не кратковременное прохождение через
-# однородную область). При 30 fps 15 кадров ≈ 0.5 секунды.
-# Разбор прогона f3b9c4a: на реальном съезде (zahvat03) blob_verify_
-# ok=0 держалось 200+ кадров подряд — такой debounce ловит уверенно
-# без ложных срабатываний на микропрогалах.
-BLOB_VERIFY_FAIL_CONFIRM_FRAMES = 15
+# что lock реально на фоне. 30 кадров ≈ 1 секунда при 30 fps.
+# Разбор 5f68fc6: 15 кадров давали ложные срабатывания в первые
+# 0.5s после захвата; 30 даёт live-matcher'у время успокоиться.
+BLOB_VERIFY_FAIL_CONFIRM_FRAMES = 30
+# Через сколько секунд ПОСЛЕ захвата впервые разрешаем trigger.
+# Blob verify нестабилен в первые кадры лока (template ещё
+# не адаптировался к сцене, box может быть неоптимальным).
+BLOB_VERIFY_WARMUP_S = 1.0
 # Был 58, и это оказалось той самой преградой, из-за которой рамка уезжала с
 # однородного предмета. Эталон 58x58 внутри чёрной точки 96 px — ровный
 # квадрат без признаков, разброс яркости РОВНО НОЛЬ. Расширение коробки не
@@ -7060,8 +7068,8 @@ def _lock_blob_verify(gray, cx, cy, box_w, box_h):
         hh, hw = patch.shape[:2]
         if hh < 8 or hw < 8:
             return True, 0.0, 1.0
-        half_w = max(2, int(box_w) // 2)
-        half_h = max(2, int(box_h) // 2)
+        half_w = max(2, int(box_w * BLOB_VERIFY_CENTER_FRAC))
+        half_h = max(2, int(box_h * BLOB_VERIFY_CENTER_FRAC))
         cx_p, cy_p = hw // 2, hh // 2
         cx1, cx2 = max(0, cx_p - half_w), min(hw, cx_p + half_w + 1)
         cy1, cy2 = max(0, cy_p - half_h), min(hh, cy_p + half_h + 1)
@@ -12999,18 +13007,29 @@ def process_locked_tracker(gray, cb_t0=None):
         # текстуре. Разбор прогона f3b9c4a zahvat03: ok=0 держалось
         # 200+ кадров — реальный съезд легко переживает 15-кадровый
         # debounce.
+        # Warmup: пропустить trigger в первую секунду после захвата —
+        # blob verify нестабилен пока template и lock не устоялись.
+        _bv_warmup = (_identity_anchor_last_confirm_t > 0
+                      and (time.monotonic() - _identity_anchor_last_confirm_t)
+                          < BLOB_VERIFY_WARMUP_S)
         if (BLOB_VERIFY_ENABLED
+                and not _bv_warmup
                 and _blob_verify_fail_streak >= BLOB_VERIFY_FAIL_CONFIRM_FRAMES
                 and tracked_ok):
-            _identity_uncertain_streak += 1
+            # SOFT distrust вместо прямого UNCERTAIN: controllable снимется,
+            # пилот увидит что identity сомнительна, но track_state
+            # остаётся TRACKED — пилот сам решает ждать восстановления
+            # или перехватить. Циклический reset-reacq (который был на
+            # 5f68fc6 с прямым UNCERTAIN) этим путём невозможен.
+            _identity_soft_distrust = True
             flight_log.event(
                 "BLOB VERIFY FAIL: contrast=%.1f edge_ratio=%.2f "
-                "streak=%d → IDENTITY_UNCERTAIN"
+                "streak=%d → soft_distrust"
                 % (_match_dbg.get("blob_verify_contrast") or 0.0,
                    _match_dbg.get("blob_verify_edge_ratio") or 0.0,
                    _blob_verify_fail_streak))
             _blob_verify_fail_streak = 0
-            _match_dbg["blob_verify_triggered_uncertain"] = 1
+            _match_dbg["blob_verify_triggered_soft_distrust"] = 1
 
         # SOFT DISTRUST (найдено оператором на реальном коде, см. докстроку
         # IDENTITY_SOFT_DISTRUST_ENABLED у объявления) — НЕ ждём, пока
