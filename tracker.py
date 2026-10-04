@@ -4475,6 +4475,35 @@ _identity_anchor_gray = None
 _identity_anchor_w = None
 _identity_anchor_h = None
 _identity_anchor_std = None
+# ANCHOR BANK (разбор реальных стендовых логов 5041cb9: при изменении
+# формы/ракурса цели immutable anchor и live mutable template оба
+# "засыхают" на старом виде — anchor зафиксирован, live постепенно
+# цементирует смещённый вид, когда скорость изменения > rate adapt.
+# anchor_score и match_score падают синхронно 0.95→0.19 — цель
+# фактически теряется.
+#
+# Банк: несколько patch'ей цели из разных моментов. anchor-check берёт
+# max score по банку → если новый вид хоть одного слота совпадает,
+# идентификация подтверждается. Slot 0 — immutable original (как и был
+# _identity_anchor_gray), никогда не обновляется — защита от silent
+# drift на цепочке обновлений. Слоты 1..N-1 — round-robin updates на
+# stable high-confidence моментах.
+#
+# Каждый элемент: dict {gray, w, h, std, t}, где t — monotonic timestamp
+# момента записи (отладка). None = пустой слот.
+IDENTITY_ANCHOR_BANK_SIZE = 4
+IDENTITY_ANCHOR_BANK_REFRESH_PERIOD_S = 1.2
+# Минимальная уверенность live-matcher'а, при которой разрешаем
+# обновлять банк. Низкая live-уверенность = шумный crop, пачкать банк
+# такими — риск цементирования смещения.
+IDENTITY_ANCHOR_BANK_REFRESH_MIN_SCORE = 0.70
+# Макс. offset от last-confirmed anchor-pos, при котором разрешаем
+# обновление: если lock подпрыгнул далеко от anchor-pos, это не момент
+# для нового view (может быть переход на A/B decoy).
+IDENTITY_ANCHOR_BANK_REFRESH_MAX_ANCHOR_OFFSET = 3.0
+_identity_anchor_bank = []
+_identity_anchor_bank_next_slot = 1
+_identity_anchor_bank_last_refresh_t = 0.0
 # Плоскости цветности текущего кадра и цветовая подпись цели.
 chroma_u = None
 chroma_v = None
@@ -6984,11 +7013,26 @@ def _commit_confirmed_identity(fresh_tmpl, cx, cy, reason):
     global _identity_anchor_gray, _identity_anchor_w, _identity_anchor_h
     global _identity_anchor_std
     global _identity_anchor_last_confirm_t
+    global _identity_anchor_bank, _identity_anchor_bank_next_slot
+    global _identity_anchor_bank_last_refresh_t
     anchor = fresh_tmpl.copy()
     _identity_anchor_gray = anchor
     _identity_anchor_w = anchor.shape[1]
     _identity_anchor_h = anchor.shape[0]
     _identity_anchor_std = float(np.std(anchor)) if anchor.size else 0.0
+    # ANCHOR BANK init: slot 0 = immutable original (копия anchor),
+    # остальные слоты — пустые, заполняются round-robin через
+    # _anchor_bank_maybe_refresh на стабильных high-confidence моментах.
+    _identity_anchor_bank = [None] * IDENTITY_ANCHOR_BANK_SIZE
+    _identity_anchor_bank[0] = {
+        "gray": anchor,
+        "w": _identity_anchor_w,
+        "h": _identity_anchor_h,
+        "std": _identity_anchor_std,
+        "t": time.monotonic(),
+    }
+    _identity_anchor_bank_next_slot = 1
+    _identity_anchor_bank_last_refresh_t = 0.0
     # Явный пилотский capture — САМОЕ сильное подтверждение identity (пилот
     # осознанно указал цель через AUX4). Выставляем "последнее успешное
     # подтверждение" именно СЕЙЧАС: без этого arbiter первые ~0.5с (до
@@ -7150,6 +7194,117 @@ def _shadow_match_against_template(gray, tmpl, tmpl_w, tmpl_h, tmpl_std,
     new_cx = sx1 + (mx + sub_dx) / scale + tmpl_w / 2.0
     new_cy = sy1 + (my + sub_dy) / scale + tmpl_h / 2.0
     return True, raw_score, psr, second, float(new_cx), float(new_cy)
+
+
+def _anchor_bank_match_best(gray, pred_cx, pred_cy, flow_motion,
+                            extra_margin_px=0):
+    """Пробегает по всем занятым слотам anchor-банка и возвращает
+    результат с наибольшим raw_score. Если банк не инициализирован или
+    пуст, падает обратно на одиночный _identity_anchor_gray — поведение
+    совместимо со старым кодом в этот период.
+
+    Возврат: (ok, score, psr, second, mx, my, slot_idx). slot_idx — индекс
+    слота, давшего лучший score; -1 если банк пуст и использовался
+    классический anchor.
+
+    Smart loop: если первый же сильный score встречен (>= MATCH_GOOD_SCORE
+    AND offset<=small), ранний выход — экономия CPU на RPi.
+    """
+    best = None
+    best_slot = -1
+    try:
+        bank = _identity_anchor_bank
+    except NameError:
+        bank = []
+    def _call_shadow(tmpl, w, h, std):
+        # kwarg передаём только если >0: мокнутые в тестах fake'и
+        # _shadow_match_against_template не принимают extra_margin_px.
+        if extra_margin_px > 0:
+            return _shadow_match_against_template(
+                gray, tmpl, w, h, std,
+                pred_cx, pred_cy, flow_motion,
+                extra_margin_px=extra_margin_px)
+        return _shadow_match_against_template(
+            gray, tmpl, w, h, std,
+            pred_cx, pred_cy, flow_motion)
+    if not bank:
+        # Fallback: пустой банк, используем старую одиночную ссылку.
+        if _identity_anchor_gray is None:
+            return False, 0.0, 0.0, 0.0, pred_cx, pred_cy, -1
+        res = _call_shadow(_identity_anchor_gray, _identity_anchor_w,
+                           _identity_anchor_h, _identity_anchor_std)
+        return (res[0], res[1], res[2], res[3], res[4], res[5], 0)
+    for idx, slot in enumerate(bank):
+        if slot is None:
+            continue
+        res = _call_shadow(slot["gray"], slot["w"], slot["h"], slot["std"])
+        if not res[0]:
+            continue
+        if best is None or res[1] > best[1]:
+            best = res
+            best_slot = idx
+            # Ранний выход: сильный score И близкий offset — незачем
+            # прогонять остальные слоты.
+            _off = math.hypot(res[4] - pred_cx, res[5] - pred_cy)
+            if res[1] >= MATCH_GOOD_SCORE and _off <= 3.0:
+                break
+    if best is None:
+        return False, 0.0, 0.0, 0.0, pred_cx, pred_cy, -1
+    return (best[0], best[1], best[2], best[3], best[4], best[5], best_slot)
+
+
+def _anchor_bank_maybe_refresh(gray, cx, cy, w, h, live_score,
+                                anchor_offset):
+    """Round-robin обновление слотов 1..N-1 банка. Slot 0 неприкосновенный.
+
+    Условия обновления (все одновременно):
+    * identity_soft_distrust != True (идём обучаться только когда identity
+      доверенная)
+    * live_score >= IDENTITY_ANCHOR_BANK_REFRESH_MIN_SCORE
+    * anchor_offset <= IDENTITY_ANCHOR_BANK_REFRESH_MAX_ANCHOR_OFFSET
+      (lock действительно на цели по anchor-мнению)
+    * с последнего refresh прошло >= IDENTITY_ANCHOR_BANK_REFRESH_PERIOD_S
+    * банк инициализирован (slot 0 занят)
+
+    Снятие нового patch идёт прямо из gray вокруг (cx, cy) с размером
+    (w, h) — тот же crop_center, что и build_template, но БЕЗ записи
+    в живой tmpl_w/tmpl_h/template_std (это анкорный патч, не live).
+    """
+    global _identity_anchor_bank_next_slot
+    global _identity_anchor_bank_last_refresh_t
+    bank = _identity_anchor_bank
+    if not bank or bank[0] is None:
+        return False
+    if _identity_soft_distrust:
+        return False
+    if live_score < IDENTITY_ANCHOR_BANK_REFRESH_MIN_SCORE:
+        return False
+    if anchor_offset > IDENTITY_ANCHOR_BANK_REFRESH_MAX_ANCHOR_OFFSET:
+        return False
+    now = time.monotonic()
+    if (now - _identity_anchor_bank_last_refresh_t
+            < IDENTITY_ANCHOR_BANK_REFRESH_PERIOD_S):
+        return False
+    # Берём crop нужного размера. Переиспользуем crop_center.
+    patch, _ = crop_center(gray, cx, cy, int(w), int(h))
+    if patch.shape[0] != int(h) or patch.shape[1] != int(w):
+        return False
+    patch = patch.copy()
+    slot_idx = _identity_anchor_bank_next_slot
+    if slot_idx <= 0 or slot_idx >= IDENTITY_ANCHOR_BANK_SIZE:
+        slot_idx = 1
+    bank[slot_idx] = {
+        "gray": patch,
+        "w": int(w),
+        "h": int(h),
+        "std": float(np.std(patch)) if patch.size else 0.0,
+        "t": now,
+    }
+    _identity_anchor_bank_next_slot = slot_idx + 1
+    if _identity_anchor_bank_next_slot >= IDENTITY_ANCHOR_BANK_SIZE:
+        _identity_anchor_bank_next_slot = 1
+    _identity_anchor_bank_last_refresh_t = now
+    return True
 
 
 # НАЙДЕНО ОПЕРАТОРОМ на реальном коде (не на отчёте): все три места, где
@@ -7566,6 +7721,7 @@ def reset_tracking(to_acq=False):
     global color_axis
     global _identity_anchor_gray, _identity_anchor_w, _identity_anchor_h
     global _identity_anchor_std
+    global _identity_anchor_bank_next_slot, _identity_anchor_bank_last_refresh_t
     global prev_gray, prev_pts, _flow_reference_t, lost_frames, last_match_score, last_flow_ok
     global acq_wait_left
     global filtered_dx_yaw, prev_adx, prev_ady_ctrl
@@ -7615,6 +7771,14 @@ def reset_tracking(to_acq=False):
     _identity_anchor_w = None
     _identity_anchor_h = None
     _identity_anchor_std = None
+    # ANCHOR BANK: сбрасываем вместе с anchor-ом. Следующий commit
+    # _commit_confirmed_identity пересоздаст банк со slot 0.
+    try:
+        _identity_anchor_bank[:] = []
+    except Exception:
+        pass
+    _identity_anchor_bank_next_slot = 1
+    _identity_anchor_bank_last_refresh_t = 0.0
     target_uv = None
     color_active = False
     _shadow_track_dbg = {"active": False}
@@ -12444,19 +12608,34 @@ def process_locked_tracker(gray, cb_t0=None):
                     and _iac_tstd < IDENTITY_ANCHOR_LOW_STD_PX):
                 _iac_extra_margin = IDENTITY_ANCHOR_FLAT_EXTRA_MARGIN_PX
             try:
-                if _iac_extra_margin > 0:
-                    (_iac_ok, _iac_score, _iac_psr, _iac_second,
-                     _iac_mx, _iac_my
-                     ) = _shadow_match_against_template(
-                        gray, _iac_tmpl, _iac_tw, _iac_th, _iac_tstd,
-                        new_cx, new_cy, flow_motion,
-                        extra_margin_px=_iac_extra_margin)
-                else:
-                    (_iac_ok, _iac_score, _iac_psr, _iac_second,
-                     _iac_mx, _iac_my
-                     ) = _shadow_match_against_template(
-                        gray, _iac_tmpl, _iac_tw, _iac_th, _iac_tstd,
-                        new_cx, new_cy, flow_motion)
+                # ANCHOR BANK: пробегаем по всем слотам, берём max score.
+                # Банк покрывает изменение ракурса/формы — если новый вид
+                # цели совпадает хоть с одним ранее записанным patch'ем,
+                # identity подтверждается. Slot 0 (immutable original)
+                # остаётся safety-net от silent drift цепочки обновлений.
+                (_iac_ok, _iac_score, _iac_psr, _iac_second,
+                 _iac_mx, _iac_my, _iac_slot
+                 ) = _anchor_bank_match_best(
+                    gray, new_cx, new_cy, flow_motion,
+                    extra_margin_px=_iac_extra_margin)
+                # Если банк пуст (ещё не инициализирован — например тесты
+                # используют _identity_anchor_gray напрямую), падаем на
+                # исходный путь с ресайзнутым scale-template.
+                if _iac_slot < 0 and _iac_tmpl is not None:
+                    if _iac_extra_margin > 0:
+                        (_iac_ok, _iac_score, _iac_psr, _iac_second,
+                         _iac_mx, _iac_my
+                         ) = _shadow_match_against_template(
+                            gray, _iac_tmpl, _iac_tw, _iac_th, _iac_tstd,
+                            new_cx, new_cy, flow_motion,
+                            extra_margin_px=_iac_extra_margin)
+                    else:
+                        (_iac_ok, _iac_score, _iac_psr, _iac_second,
+                         _iac_mx, _iac_my
+                         ) = _shadow_match_against_template(
+                            gray, _iac_tmpl, _iac_tw, _iac_th, _iac_tstd,
+                            new_cx, new_cy, flow_motion)
+                    _iac_slot = 0
             except Exception:
                 # Диагностика/safety-check не имеет права уронить живой
                 # путь — тот же принцип изоляции, что и у TRACKING SHADOW
@@ -12598,6 +12777,16 @@ def process_locked_tracker(gray, cb_t0=None):
                     _iac_psr if _iac_ok else 0.0)
                 _match_dbg["identity_anchor_check_offset"] = (
                     math.hypot(_iac_mx - new_cx, _iac_my - new_cy) if _iac_ok else None)
+                _match_dbg["identity_anchor_bank_slot"] = _iac_slot
+                # ANCHOR BANK REFRESH: обновляем round-robin слот, если
+                # tracking стабилен и live-matcher уверен. Это даёт банку
+                # запомнить новые ракурсы цели между захватами.
+                if (_iac_ok and tracked_ok
+                        and tmpl_w is not None and tmpl_h is not None):
+                    _anc_off = math.hypot(_iac_mx - new_cx, _iac_my - new_cy)
+                    _anchor_bank_maybe_refresh(
+                        gray, new_cx, new_cy, tmpl_w, tmpl_h,
+                        score if match_ok else 0.0, _anc_off)
             else:
                 _match_dbg["identity_anchor_check_ran"] = 0
         else:
