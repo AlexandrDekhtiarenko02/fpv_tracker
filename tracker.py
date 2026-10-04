@@ -7717,15 +7717,27 @@ def _template_adaptation_gate(score, flow_ok):
         return False, "soft_distrust"
     if not flow_ok:
         return False, "no_flow"
+    # ANCHOR ARBITER для adaptation gate (разбор стендовых логов 6c47ef6:
+    # на дальних размазанных целях второй кандидат matcher'а всегда
+    # близок к первому — lead низкий, ambiguous_peak блокирует обучение,
+    # live template застревает на старом виде → при смене ракурса score
+    # падает → всё строже блокируется → полный коллапс. Если anchor-
+    # check недавно подтвердил позицию, ambiguity — норма для
+    # размазанной цели, template разрешено учить. Та же логика, что уже
+    # защищает uncertain_streak от persistent UNCERTAIN).
+    _anchor_fresh = (
+        _identity_anchor_last_confirm_t > 0.0
+        and (time.monotonic() - _identity_anchor_last_confirm_t)
+            <= IDENTITY_ANCHOR_FRESH_S)
     if MATCH_AMBIGUITY_GUARD:
         second = _match_dbg.get("second")
         if second is not None and score > 0.0:
             lead = (score - float(second)) / max(score, 1e-6)
-            if lead < MATCH_LEAD_FULL:
+            if lead < MATCH_LEAD_FULL and not _anchor_fresh:
                 return False, "ambiguous_peak"
     if MATCH_GAP_SOFT > 0.0:
         gap = _match_dbg.get("flow_gap")
-        if gap is not None and gap > MATCH_GAP_SOFT:
+        if gap is not None and gap > MATCH_GAP_SOFT and not _anchor_fresh:
             return False, "flow_gap"
     return True, ""
 
