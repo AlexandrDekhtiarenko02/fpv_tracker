@@ -549,6 +549,15 @@ TEMPLATE_MIN = 10
 # края ≤0.1.
 TEMPLATE_APODIZATION_ENABLED = True
 TEMPLATE_APODIZATION_SIGMA_DIV = 3.5
+# SMALL TARGET FREEZE: когда template мелкий (цель занимает несколько
+# пикселей, фон доминирует), live-adaptation и bank-refresh цементируют
+# фон быстрее, чем могут покрыть новый ракурс. Разбор видео 2026-10-04:
+# при 24x24 template на цели 5-10 px apodization помогла, но score всё
+# равно 0.74-0.84 на любом куске дороги — adapt гарантированно учит
+# фон. Для таких мелких целей замораживаем template и bank: пусть
+# держимся на initial anchor пока цель не вырастет в кадре. Порог
+# TEMPLATE_FREEZE_SMALL_PX: ниже = freeze.
+TEMPLATE_FREEZE_SMALL_PX = 16
 # Был 58, и это оказалось той самой преградой, из-за которой рамка уезжала с
 # однородного предмета. Эталон 58x58 внутри чёрной точки 96 px — ровный
 # квадрат без признаков, разброс яркости РОВНО НОЛЬ. Расширение коробки не
@@ -7334,6 +7343,10 @@ def _anchor_bank_maybe_refresh(gray, cx, cy, w, h, live_score,
         return False
     if _identity_soft_distrust:
         return False
+    # SMALL TARGET FREEZE: не загрязняем банк patch'ами мелкой цели —
+    # там всё равно доминирует фон, slots 1-3 станут "дорожными".
+    if int(w) < TEMPLATE_FREEZE_SMALL_PX:
+        return False
     if live_score < IDENTITY_ANCHOR_BANK_REFRESH_MIN_SCORE:
         return False
     if anchor_score < IDENTITY_ANCHOR_BANK_REFRESH_MIN_ANCHOR_SCORE:
@@ -7759,6 +7772,12 @@ def _template_adaptation_gate(score, flow_ok):
         return False, "soft_distrust"
     if not flow_ok:
         return False, "no_flow"
+    # SMALL TARGET FREEZE: на мелкой цели (template меньше порога)
+    # adaptation цементирует фон, лок соскальзывает. Держимся за
+    # initial template пока цель не вырастет в кадре.
+    if (tmpl_w is not None
+            and tmpl_w < TEMPLATE_FREEZE_SMALL_PX):
+        return False, "small_target_frozen"
     # ANCHOR ARBITER для adaptation gate (разбор стендовых логов 6c47ef6:
     # на дальних размазанных целях второй кандидат matcher'а всегда
     # близок к первому — lead низкий, ambiguous_peak блокирует обучение,
