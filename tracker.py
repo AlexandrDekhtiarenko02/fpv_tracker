@@ -534,7 +534,21 @@ LOCK_PAD = 2.05
 # захват просел с 18.5 до 14.8 с, длиннейший с 57.4 до 37.4 с.
 # Не повторять без нового механизма объяснения.
 TEMPLATE_SCALE = 2.0
-TEMPLATE_MIN = 14
+# TEMPLATE_MIN 14 → 10 (разбор видео 2026-10-04 стенд, "Без названия.mov":
+# при захвате дальней размазанной цели ~5-10 px минимальная рамка 14x14
+# покрывала 60-80% фоном — template учился дорожной текстуре, высокий
+# score "подтверждал" любую похожую обочину, lock съезжал. Меньший
+# минимум даёт template хотя бы шанс быть "в основном про цель").
+TEMPLATE_MIN = 10
+# CENTER-WEIGHTED (APODIZED) TEMPLATE: при сборке template умножаем на
+# 2D Gaussian window — центр доминирует в correlation, края (где фон)
+# подавлены. Так "цель + много фона" меньше похоже на "фон той же
+# текстуры", score на фоне падает, на цели держится. sigma подбирается
+# как template_size / TEMPLATE_APODIZATION_SIGMA_DIV: при DIV=3.5 для
+# tmpl=14x14 FWHM ≈ 8 px — центральные 8 px пикселей держат вес ≥0.5,
+# края ≤0.1.
+TEMPLATE_APODIZATION_ENABLED = True
+TEMPLATE_APODIZATION_SIGMA_DIV = 3.5
 # Был 58, и это оказалось той самой преградой, из-за которой рамка уезжала с
 # однородного предмета. Эталон 58x58 внутри чёрной точки 96 px — ровный
 # квадрат без признаков, разброс яркости РОВНО НОЛЬ. Расширение коробки не
@@ -6951,11 +6965,39 @@ def estimate_ground_speed(gray, now_mono):
         return None
 
 
+def _apodize_patch(patch):
+    """Умножает центр patch'а на 2D Gaussian window (apodization).
+    Центр доминирует в correlation, края приглушены. Среднее яркости
+    сохраняется (чтобы TM_CCOEFF_NORMED видел такой же DC-level).
+
+    Защита от крошечных patch'ей (<4 px): apodization бессмысленна,
+    возвращаем копию без изменений."""
+    if not TEMPLATE_APODIZATION_ENABLED:
+        return patch
+    if patch is None or patch.size == 0:
+        return patch
+    h, w = patch.shape[:2]
+    if h < 4 or w < 4:
+        return patch
+    sigma_w = max(w / TEMPLATE_APODIZATION_SIGMA_DIV, 2.0)
+    sigma_h = max(h / TEMPLATE_APODIZATION_SIGMA_DIV, 2.0)
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    _cy = (h - 1) * 0.5
+    _cx = (w - 1) * 0.5
+    win = np.exp(
+        -((xx - _cx) ** 2 / (2.0 * sigma_w * sigma_w)
+          + (yy - _cy) ** 2 / (2.0 * sigma_h * sigma_h)))
+    mean_val = float(patch.mean())
+    patch_f = (patch.astype(np.float32) - mean_val) * win + mean_val
+    return np.clip(patch_f, 0.0, 255.0).astype(np.uint8)
+
+
 def build_template(gray, cx, cy, box_w, box_h):
     global tmpl_w, tmpl_h, template_std
     tw = clamp(max(box_w * TEMPLATE_SCALE, TEMPLATE_MIN), TEMPLATE_MIN, TEMPLATE_MAX)
     th = clamp(max(box_h * TEMPLATE_SCALE, TEMPLATE_MIN), TEMPLATE_MIN, TEMPLATE_MAX)
     tmpl, rect = crop_center(gray, cx, cy, tw, th)
+    tmpl = _apodize_patch(tmpl)
     template_std = float(np.std(tmpl)) if tmpl.size else 0.0
     tmpl_w = tmpl.shape[1]
     tmpl_h = tmpl.shape[0]
@@ -7306,7 +7348,7 @@ def _anchor_bank_maybe_refresh(gray, cx, cy, w, h, live_score,
     patch, _ = crop_center(gray, cx, cy, int(w), int(h))
     if patch.shape[0] != int(h) or patch.shape[1] != int(w):
         return False
-    patch = patch.copy()
+    patch = _apodize_patch(patch.copy())
     slot_idx = _identity_anchor_bank_next_slot
     if slot_idx <= 0 or slot_idx >= IDENTITY_ANCHOR_BANK_SIZE:
         slot_idx = 1
