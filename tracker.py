@@ -581,6 +581,13 @@ BLOB_VERIFY_MIN_CONTRAST = 10.0
 # Или edge-strength: центр заметно структурнее кольца (значит в
 # центре градиент локального объекта).
 BLOB_VERIFY_MIN_EDGE_RATIO = 1.2
+# BLOB VERIFY DEBOUNCE: сколько кадров подряд fail чтобы считать
+# что lock реально на фоне (а не кратковременное прохождение через
+# однородную область). При 30 fps 15 кадров ≈ 0.5 секунды.
+# Разбор прогона f3b9c4a: на реальном съезде (zahvat03) blob_verify_
+# ok=0 держалось 200+ кадров подряд — такой debounce ловит уверенно
+# без ложных срабатываний на микропрогалах.
+BLOB_VERIFY_FAIL_CONFIRM_FRAMES = 15
 # Был 58, и это оказалось той самой преградой, из-за которой рамка уезжала с
 # однородного предмета. Эталон 58x58 внутри чёрной точки 96 px — ровный
 # квадрат без признаков, разброс яркости РОВНО НОЛЬ. Расширение коробки не
@@ -7901,6 +7908,7 @@ def reset_tracking(to_acq=False):
     global _identity_uncertain_pending, _identity_uncertain_streak
     global _identity_anchor_check_streak, _identity_anchor_check_last_t
     global _identity_anchor_last_confirm_t
+    global _blob_verify_fail_streak
     global _dual_signal_gap_frames
     global _identity_soft_distrust
     global _shadow_track_dbg
@@ -8036,6 +8044,7 @@ def reset_tracking(to_acq=False):
     _identity_anchor_check_streak = 0
     _identity_anchor_check_last_t = 0.0
     _identity_anchor_last_confirm_t = 0.0
+    _blob_verify_fail_streak = 0
     _dual_signal_gap_frames = 0
     _identity_soft_distrust = False
 
@@ -11668,6 +11677,7 @@ IDENTITY_ANCHOR_CHECK_PERIOD_S = 0.5
 IDENTITY_ANCHOR_CHECK_CONFIRM_N = 6
 _identity_anchor_check_streak = 0
 _identity_anchor_check_last_t = 0.0
+_blob_verify_fail_streak = 0
 # Отметка ВРЕМЕНИ последнего успешного anchor-подтверждения (см. ниже блок
 # ANCHOR ARBITER). Не путать с _identity_anchor_check_last_t (тот — время
 # последней ПОПЫТКИ, успешной или нет; это — только успехи).
@@ -11851,6 +11861,7 @@ def process_locked_tracker(gray, cb_t0=None):
     global _identity_uncertain_pending, _identity_uncertain_streak
     global _identity_anchor_check_streak, _identity_anchor_check_last_t
     global _identity_anchor_last_confirm_t
+    global _blob_verify_fail_streak
     global _dual_signal_gap_frames
     global _identity_soft_distrust
     global _shadow_track_dbg
@@ -12959,9 +12970,11 @@ def process_locked_tracker(gray, cb_t0=None):
         else:
             _match_dbg["identity_anchor_check_ran"] = 0
         _match_dbg["identity_anchor_check_streak"] = _identity_anchor_check_streak
-        # BLOB VERIFICATION (диагностика, см. BLOB_VERIFY_ENABLED выше).
-        # Независимая от template matching проверка: в центре lock-рамки
-        # должен быть компактный объект, не однородный фон.
+        # BLOB VERIFICATION (см. BLOB_VERIFY_ENABLED выше). Независимая
+        # от template matching проверка: в центре lock-рамки должен
+        # быть компактный объект, не однородный фон. При N подряд
+        # fail'ах переводим в IDENTITY_UNCERTAIN — лучше честно
+        # потерять чем ползти на обочине с match_score=0.8.
         if (BLOB_VERIFY_ENABLED and tracked_ok
                 and lock_w is not None and lock_h is not None):
             _bv_ok, _bv_contrast, _bv_edge = _lock_blob_verify(
@@ -12969,10 +12982,35 @@ def process_locked_tracker(gray, cb_t0=None):
             _match_dbg["blob_verify_ok"] = 1 if _bv_ok else 0
             _match_dbg["blob_verify_contrast"] = _bv_contrast
             _match_dbg["blob_verify_edge_ratio"] = _bv_edge
+            if _bv_ok:
+                _blob_verify_fail_streak = 0
+            else:
+                _blob_verify_fail_streak += 1
         else:
             _match_dbg["blob_verify_ok"] = 1
             _match_dbg["blob_verify_contrast"] = 0.0
             _match_dbg["blob_verify_edge_ratio"] = 1.0
+            _blob_verify_fail_streak = 0
+        _match_dbg["blob_verify_fail_streak"] = _blob_verify_fail_streak
+        # BLOB VERIFY TRIGGER: N кадров подряд "в центре нет компактного
+        # объекта" → форсим IDENTITY_UNCERTAIN. Независимый сигнал от
+        # template matching: tracker может быть уверен (score=0.8) что
+        # он на цели, но контраст/edge-ratio говорят что lock на ровной
+        # текстуре. Разбор прогона f3b9c4a zahvat03: ok=0 держалось
+        # 200+ кадров — реальный съезд легко переживает 15-кадровый
+        # debounce.
+        if (BLOB_VERIFY_ENABLED
+                and _blob_verify_fail_streak >= BLOB_VERIFY_FAIL_CONFIRM_FRAMES
+                and tracked_ok):
+            _identity_uncertain_streak += 1
+            flight_log.event(
+                "BLOB VERIFY FAIL: contrast=%.1f edge_ratio=%.2f "
+                "streak=%d → IDENTITY_UNCERTAIN"
+                % (_match_dbg.get("blob_verify_contrast") or 0.0,
+                   _match_dbg.get("blob_verify_edge_ratio") or 0.0,
+                   _blob_verify_fail_streak))
+            _blob_verify_fail_streak = 0
+            _match_dbg["blob_verify_triggered_uncertain"] = 1
 
         # SOFT DISTRUST (найдено оператором на реальном коде, см. докстроку
         # IDENTITY_SOFT_DISTRUST_ENABLED у объявления) — НЕ ждём, пока
