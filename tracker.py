@@ -2406,6 +2406,11 @@ _FLIGHT_LOG_COLUMNS = (
     "identity_anchor_check_psr,"
     "identity_anchor_check_offset,"
     "identity_anchor_snap_dx,identity_anchor_snap_dy,"
+    # identity_anchor_bank_slot: индекс слота анкор-банка, давшего
+    # лучший score в этом anchor-check. slot 0 = immutable original;
+    # slots 1..3 — round-robin обновляемые виды для устойчивости к
+    # изменению ракурса.
+    "identity_anchor_bank_slot,"
     "identity_anchor_check_streak,identity_dual_signal_gap_frames,"
     # identity_soft_distrust=1 — controllable уже снят ЭТИМ кадром из-за
     # первого anchor mismatch/начала долгого разрыва, ХОТЯ track_state
@@ -4492,15 +4497,25 @@ _identity_anchor_std = None
 # Каждый элемент: dict {gray, w, h, std, t}, где t — monotonic timestamp
 # момента записи (отладка). None = пустой слот.
 IDENTITY_ANCHOR_BANK_SIZE = 4
-IDENTITY_ANCHOR_BANK_REFRESH_PERIOD_S = 1.2
+IDENTITY_ANCHOR_BANK_REFRESH_PERIOD_S = 0.6
 # Минимальная уверенность live-matcher'а, при которой разрешаем
-# обновлять банк. Низкая live-уверенность = шумный crop, пачкать банк
-# такими — риск цементирования смещения.
-IDENTITY_ANCHOR_BANK_REFRESH_MIN_SCORE = 0.70
+# обновлять банк. Порог 0.55 (разбор логов 2022dfe: при изменении
+# ракурса live score падает 0.83→0.44 за ~5с, старый порог 0.70
+# отсекал именно переходные моменты, где нужно запомнить новый вид
+# для следующего ракурса — банк оставался пустым и не помогал).
+# Защита от шумного crop'а: anchor_offset должен быть малый
+# (<=IDENTITY_ANCHOR_BANK_REFRESH_MAX_ANCHOR_OFFSET) И anchor должен
+# СОГЛАСИТЬСЯ (anchor_score передаётся и проверяется>=0.40).
+IDENTITY_ANCHOR_BANK_REFRESH_MIN_SCORE = 0.55
 # Макс. offset от last-confirmed anchor-pos, при котором разрешаем
 # обновление: если lock подпрыгнул далеко от anchor-pos, это не момент
 # для нового view (может быть переход на A/B decoy).
 IDENTITY_ANCHOR_BANK_REFRESH_MAX_ANCHOR_OFFSET = 3.0
+# Минимальный anchor-score для разрешения обновления — anchor
+# СОГЛАСЕН что это та же identity (просто с меньшей уверенностью).
+# Защита от пачкания банка кадром, где live сам думает это цель,
+# а anchor категорически против.
+IDENTITY_ANCHOR_BANK_REFRESH_MIN_ANCHOR_SCORE = 0.40
 _identity_anchor_bank = []
 _identity_anchor_bank_next_slot = 1
 _identity_anchor_bank_last_refresh_t = 0.0
@@ -7254,7 +7269,7 @@ def _anchor_bank_match_best(gray, pred_cx, pred_cy, flow_motion,
 
 
 def _anchor_bank_maybe_refresh(gray, cx, cy, w, h, live_score,
-                                anchor_offset):
+                                anchor_offset, anchor_score=0.0):
     """Round-robin обновление слотов 1..N-1 банка. Slot 0 неприкосновенный.
 
     Условия обновления (все одновременно):
@@ -7278,6 +7293,8 @@ def _anchor_bank_maybe_refresh(gray, cx, cy, w, h, live_score,
     if _identity_soft_distrust:
         return False
     if live_score < IDENTITY_ANCHOR_BANK_REFRESH_MIN_SCORE:
+        return False
+    if anchor_score < IDENTITY_ANCHOR_BANK_REFRESH_MIN_ANCHOR_SCORE:
         return False
     if anchor_offset > IDENTITY_ANCHOR_BANK_REFRESH_MAX_ANCHOR_OFFSET:
         return False
@@ -12786,7 +12803,8 @@ def process_locked_tracker(gray, cb_t0=None):
                     _anc_off = math.hypot(_iac_mx - new_cx, _iac_my - new_cy)
                     _anchor_bank_maybe_refresh(
                         gray, new_cx, new_cy, tmpl_w, tmpl_h,
-                        score if match_ok else 0.0, _anc_off)
+                        score if match_ok else 0.0, _anc_off,
+                        anchor_score=_iac_score)
             else:
                 _match_dbg["identity_anchor_check_ran"] = 0
         else:
@@ -14087,6 +14105,7 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("identity_anchor_check_offset"),
             _match_dbg.get("identity_anchor_snap_dx"),
             _match_dbg.get("identity_anchor_snap_dy"),
+            _match_dbg.get("identity_anchor_bank_slot"),
             _match_dbg.get("identity_anchor_check_streak"),
             _match_dbg.get("identity_dual_signal_gap_frames"),
             _match_dbg.get("identity_soft_distrust"),
