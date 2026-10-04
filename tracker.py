@@ -558,6 +558,29 @@ TEMPLATE_APODIZATION_SIGMA_DIV = 3.5
 # держимся на initial anchor пока цель не вырастет в кадре. Порог
 # TEMPLATE_FREEZE_SMALL_PX: ниже = freeze.
 TEMPLATE_FREEZE_SMALL_PX = 16
+# BLOB VERIFICATION GATE: template matching не отличает "цель + много
+# фона" от "просто фон той же текстуры" (разбор видео 2026-10-04
+# "Без названия.mov"). Простая независимая проверка: в центре lock-
+# рамки должен быть компактный объект, отличимый от окружающего
+# кольца. Признаки:
+#   contrast = |mean(center) - mean(ring)| — brightness
+#   edge_strength = std(center) - std(ring) * ratio
+# Если ни один сигнал не говорит "в центре что-то есть" — рамка
+# скорее всего на однородном фоне (куска дороги/обочины).
+# На этом этапе ТОЛЬКО ДИАГНОСТИКА (пишет blob_verify_* в CSV),
+# действия на треке нет — чтобы оператор мог сверить с видео,
+# действительно ли gate ловит момент съезда.
+BLOB_VERIFY_ENABLED = True
+# Patch вокруг lock-центра — box_size * этот множитель. Центр и
+# кольцо считаются внутри этого patch'а.
+BLOB_VERIFY_PATCH_SCALE = 2.2
+# Минимальный brightness-контраст центра vs кольца, при котором
+# считаем что в центре "есть что-то". Шкала 0-255. 10-15 — обычное
+# для цели на фоне (светлый грузовик на тёмной дороге легко >30).
+BLOB_VERIFY_MIN_CONTRAST = 10.0
+# Или edge-strength: центр заметно структурнее кольца (значит в
+# центре градиент локального объекта).
+BLOB_VERIFY_MIN_EDGE_RATIO = 1.2
 # Был 58, и это оказалось той самой преградой, из-за которой рамка уезжала с
 # однородного предмета. Эталон 58x58 внутри чёрной точки 96 px — ровный
 # квадрат без признаков, разброс яркости РОВНО НОЛЬ. Расширение коробки не
@@ -2434,6 +2457,11 @@ _FLIGHT_LOG_COLUMNS = (
     # slots 1..3 — round-robin обновляемые виды для устойчивости к
     # изменению ракурса.
     "identity_anchor_bank_slot,"
+    # BLOB VERIFICATION — независимая от template matching проверка
+    # "в центре lock-рамки есть компактный объект, не ровная текстура
+    # фона". ok=1 — да, 0 — нет. contrast = |mean(center) - mean(ring)|,
+    # edge_ratio = std(center) / std(ring). Пока только диагностика.
+    "blob_verify_ok,blob_verify_contrast,blob_verify_edge_ratio,"
     "identity_anchor_check_streak,identity_dual_signal_gap_frames,"
     # identity_soft_distrust=1 — controllable уже снят ЭТИМ кадром из-за
     # первого anchor mismatch/начала долгого разрыва, ХОТЯ track_state
@@ -6999,6 +7027,54 @@ def _apodize_patch(patch):
     mean_val = float(patch.mean())
     patch_f = (patch.astype(np.float32) - mean_val) * win + mean_val
     return np.clip(patch_f, 0.0, 255.0).astype(np.uint8)
+
+
+def _lock_blob_verify(gray, cx, cy, box_w, box_h):
+    """Проверка что в центре lock-рамки компактный объект, отличимый
+    от окружающего фона. Возвращает (ok, contrast, edge_ratio).
+
+    Berём patch вокруг (cx,cy) размером box*BLOB_VERIFY_PATCH_SCALE.
+    Центр = box_w × box_h в центре patch. Кольцо = остаток patch.
+    Два независимых признака "в центре что-то есть":
+    - contrast = |mean(center) - mean(ring)| — цель отличается от
+      фона по яркости.
+    - edge_ratio = std(center) / std(ring) — цель даёт более
+      выраженный локальный градиент чем ровная фоновая текстура.
+
+    ok = True если хоть один признак срабатывает. На однородной
+    текстуре фона оба близки к единице/нулю соответственно.
+    """
+    if not BLOB_VERIFY_ENABLED:
+        return True, 0.0, 1.0
+    try:
+        pw = max(8, int(box_w * BLOB_VERIFY_PATCH_SCALE))
+        ph = max(8, int(box_h * BLOB_VERIFY_PATCH_SCALE))
+        patch, _ = crop_center(gray, cx, cy, pw, ph)
+        hh, hw = patch.shape[:2]
+        if hh < 8 or hw < 8:
+            return True, 0.0, 1.0
+        half_w = max(2, int(box_w) // 2)
+        half_h = max(2, int(box_h) // 2)
+        cx_p, cy_p = hw // 2, hh // 2
+        cx1, cx2 = max(0, cx_p - half_w), min(hw, cx_p + half_w + 1)
+        cy1, cy2 = max(0, cy_p - half_h), min(hh, cy_p + half_h + 1)
+        center = patch[cy1:cy2, cx1:cx2].astype(np.float32)
+        mask = np.ones(patch.shape[:2], dtype=bool)
+        mask[cy1:cy2, cx1:cx2] = False
+        ring = patch[mask].astype(np.float32)
+        if center.size < 4 or ring.size < 4:
+            return True, 0.0, 1.0
+        c_mean = float(center.mean())
+        r_mean = float(ring.mean())
+        c_std = float(center.std())
+        r_std = float(ring.std())
+        contrast = abs(c_mean - r_mean)
+        edge_ratio = c_std / r_std if r_std > 1e-3 else 1.0
+        ok = (contrast >= BLOB_VERIFY_MIN_CONTRAST
+              or edge_ratio >= BLOB_VERIFY_MIN_EDGE_RATIO)
+        return ok, contrast, edge_ratio
+    except Exception:
+        return True, 0.0, 1.0
 
 
 def build_template(gray, cx, cy, box_w, box_h):
@@ -12883,6 +12959,20 @@ def process_locked_tracker(gray, cb_t0=None):
         else:
             _match_dbg["identity_anchor_check_ran"] = 0
         _match_dbg["identity_anchor_check_streak"] = _identity_anchor_check_streak
+        # BLOB VERIFICATION (диагностика, см. BLOB_VERIFY_ENABLED выше).
+        # Независимая от template matching проверка: в центре lock-рамки
+        # должен быть компактный объект, не однородный фон.
+        if (BLOB_VERIFY_ENABLED and tracked_ok
+                and lock_w is not None and lock_h is not None):
+            _bv_ok, _bv_contrast, _bv_edge = _lock_blob_verify(
+                gray, new_cx, new_cy, lock_w, lock_h)
+            _match_dbg["blob_verify_ok"] = 1 if _bv_ok else 0
+            _match_dbg["blob_verify_contrast"] = _bv_contrast
+            _match_dbg["blob_verify_edge_ratio"] = _bv_edge
+        else:
+            _match_dbg["blob_verify_ok"] = 1
+            _match_dbg["blob_verify_contrast"] = 0.0
+            _match_dbg["blob_verify_edge_ratio"] = 1.0
 
         # SOFT DISTRUST (найдено оператором на реальном коде, см. докстроку
         # IDENTITY_SOFT_DISTRUST_ENABLED у объявления) — НЕ ждём, пока
@@ -14179,6 +14269,9 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("identity_anchor_snap_dx"),
             _match_dbg.get("identity_anchor_snap_dy"),
             _match_dbg.get("identity_anchor_bank_slot"),
+            _match_dbg.get("blob_verify_ok"),
+            _match_dbg.get("blob_verify_contrast"),
+            _match_dbg.get("blob_verify_edge_ratio"),
             _match_dbg.get("identity_anchor_check_streak"),
             _match_dbg.get("identity_dual_signal_gap_frames"),
             _match_dbg.get("identity_soft_distrust"),
