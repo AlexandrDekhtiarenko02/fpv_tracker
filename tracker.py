@@ -601,8 +601,19 @@ BLOB_VERIFY_FAIL_CONFIRM_FRAMES = 30
 #   AND anchor_check_offset медиана в окне > ANCHOR_OFFSET_THR
 # → ловит 42% съездов при 0.1% ложных (2 из 2080).
 BLOB_ROLL_WINDOW_FRAMES = 30
-BLOB_ROLL_OK_RATE_THR = 0.20
-BLOB_ROLL_ANCHOR_OFFSET_THR = 2.0
+# Разбор прогона c62534e zahvat03 (18 сек с явным длинным съездом,
+# dist=15-32 px стабильно): blob_verify_ok был =1 на съезде (рамка
+# на другом объекте с хорошим контрастом), rate=0.9-1.0 → старый
+# combined gate (rate<0.2 AND aoff>2) пропускал съезд полностью.
+# Пересчёт на всех данных (c62534e + 3bc75e6):
+#   DRIFT (dist>20): aoff_med p25=1.89 med=2.01 p75=2.14
+#   ON    (dist<10): aoff_med p25=0.17 med=0.27 p75=0.63
+# aoff_med>1.75 даёт TP=78% FP=6% — namного лучше.
+# Условие rate убрано: оно работало на 3bc75e6 где drift шёл по
+# пустой текстуре (rate=0), но ломается когда drift попадает на
+# другой объект (rate=1.0, но aoff всё равно показывает смещение).
+BLOB_ROLL_OK_RATE_THR = 0.20          # оставлен для диагностики
+BLOB_ROLL_ANCHOR_OFFSET_THR = 1.75
 # AUTO-SNAP при обнаружении съезда: ищем slot 0 (immutable original
 # anchor) в расширенной зоне, если нашли уверенный peak далеко от
 # текущего lock — snap туда и сбросим soft_distrust. Без этого gate
@@ -13106,16 +13117,15 @@ def process_locked_tracker(gray, cb_t0=None):
         _bv_warmup = (_last_capture_t > 0
                       and (time.monotonic() - _last_capture_t)
                           < BLOB_VERIFY_WARMUP_S)
-        # NEW: Combined rolling-window gate (откалиброван на cursor-truth,
-        # коммит 3bc75e6-данные). Прежний N-подряд debounce заменён —
-        # распределение consecutive ok=0 на цели и на съезде оказалось
-        # почти идентичным, одиночный debounce не работал. Rolling rate
-        # + anchor_offset дают чистое разделение (TP 42%, FP 0.1%).
+        # NEW: Rolling anchor-offset gate (откалиброван на двух прогонах
+        # с cursor-truth, 3bc75e6 + c62534e). Только aoff_med>1.75 —
+        # ранее добавленное условие rate<0.2 пропускало длинные съезды
+        # на похожий объект (rate=1.0 вводил в заблуждение). aoff_med
+        # честно показывает что anchor находит peak не на lock-pos даже
+        # когда live-matcher уверен.
         if (BLOB_VERIFY_ENABLED
                 and not _bv_warmup
-                and _blob_roll_rate is not None
                 and _blob_roll_aoff_med is not None
-                and _blob_roll_rate < BLOB_ROLL_OK_RATE_THR
                 and _blob_roll_aoff_med > BLOB_ROLL_ANCHOR_OFFSET_THR
                 and tracked_ok):
             # SOFT distrust вместо прямого UNCERTAIN: controllable снимется,
@@ -13166,8 +13176,9 @@ def process_locked_tracker(gray, cb_t0=None):
                     pass
             if not _autosnap_done:
                 flight_log.event(
-                    "BLOB ROLL FAIL: ok_rate=%.2f aoff_med=%.2f → soft_distrust"
-                    % (_blob_roll_rate, _blob_roll_aoff_med))
+                    "BLOB ROLL FAIL: aoff_med=%.2f rate=%.2f → soft_distrust"
+                    % (_blob_roll_aoff_med,
+                       _blob_roll_rate if _blob_roll_rate is not None else -1.0))
 
         # SOFT DISTRUST (найдено оператором на реальном коде, см. докстроку
         # IDENTITY_SOFT_DISTRUST_ENABLED у объявления) — НЕ ждём, пока
