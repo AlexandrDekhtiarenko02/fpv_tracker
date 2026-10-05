@@ -2477,6 +2477,12 @@ _FLIGHT_LOG_COLUMNS = (
     # фона". ok=1 — да, 0 — нет. contrast = |mean(center) - mean(ring)|,
     # edge_ratio = std(center) / std(ring). Пока только диагностика.
     "blob_verify_ok,blob_verify_contrast,blob_verify_edge_ratio,"
+    # STAND GROUND TRUTH (только на стенде; на борту всегда None/пустое):
+    # позиция курсора оператора в main-view = где цель на самом деле.
+    # stand_cursor_lock_dist_px = расстояние от lock-центра (box_cx/cy) до
+    # курсора в main-пикселях. Если оператор держит мышь на цели — это
+    # прямой индикатор съезда рамки.
+    "stand_cursor_main_x,stand_cursor_main_y,stand_cursor_lock_dist_px,"
     "identity_anchor_check_streak,identity_dual_signal_gap_frames,"
     # identity_soft_distrust=1 — controllable уже снят ЭТИМ кадром из-за
     # первого anchor mismatch/начала долгого разрыва, ХОТЯ track_state
@@ -9098,6 +9104,18 @@ def _update_control_from_target_impl():
     # --- Геометрия. РАЗДЕЛЬНЫЕ dy для pitch и для газа. ---
     box_cx = (box[0] + box[2]) / 2.0
     box_cy = (box[1] + box[3]) / 2.0
+    # STAND GROUND TRUTH (только когда работает video_tester_engine):
+    # distance от lock-центра до курсора оператора в main-пикселях.
+    # Если оператор держит мышь на реальной цели — это объективная
+    # мера съезда рамки независимо от template score. На борту
+    # cursor_main=None → dist=None, диагностика пуста.
+    _cur_x = _match_dbg.get("stand_cursor_main_x")
+    _cur_y = _match_dbg.get("stand_cursor_main_y")
+    if _cur_x is not None and _cur_y is not None:
+        _match_dbg["stand_cursor_lock_dist_px"] = math.hypot(
+            box_cx - float(_cur_x), box_cy - float(_cur_y))
+    else:
+        _match_dbg["stand_cursor_lock_dist_px"] = None
 
     # --- РАЗГОН: ПО СОСТОЯНИЮ ЗАХОДА, А НЕ ПО СЕКУНДОМЕРУ ---
     #
@@ -14329,6 +14347,9 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("blob_verify_ok"),
             _match_dbg.get("blob_verify_contrast"),
             _match_dbg.get("blob_verify_edge_ratio"),
+            _match_dbg.get("stand_cursor_main_x"),
+            _match_dbg.get("stand_cursor_main_y"),
+            _match_dbg.get("stand_cursor_lock_dist_px"),
             _match_dbg.get("identity_anchor_check_streak"),
             _match_dbg.get("identity_dual_signal_gap_frames"),
             _match_dbg.get("identity_soft_distrust"),
