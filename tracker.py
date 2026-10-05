@@ -656,6 +656,17 @@ BLOB_ROLL_AUTOSNAP_MAX_MOVE_PX = 25.0
 # пошёл не на цель. С margin 0.10 slot 0 должен превосходить live
 # на 0.10+ — это "live реально потерял цель, а slot 0 знает где".
 BLOB_ROLL_AUTOSNAP_SLOT0_LEADS_MARGIN = 0.10
+# THROTTLE (разбор реальных бортовых логов daaa75f: ms_blob_block
+# p95=38.8мс, max=52.1мс — попытка snap через _shadow_match_against_
+# template с extra_margin_px=80 (большое окно поиска) звонилась КАЖДЫЙ
+# кадр без ограничения частоты, пока держится дрейф (_blob_roll_
+# trigger_streak >= HOLD). Реальные drift-эпизоды длятся сотни кадров
+# подряд (zahvat03_105709: 240+ кадров) — то есть это не редкий
+# всплеск, а устойчивая нагрузка на всю длительность дрейфа.
+# Пробуем не каждый кадр, а не чаще раза в этот период: сохраняет
+# способность поймать snap (цель может появиться в расширенной зоне в
+# любой момент), но делит стоимость на RETRY_PERIOD_S/frame_period раз.
+BLOB_ROLL_AUTOSNAP_RETRY_PERIOD_S = 0.3
 # Через сколько секунд ПОСЛЕ захвата впервые разрешаем trigger.
 # Blob verify нестабилен в первые кадры лока (template ещё
 # не адаптировался к сцене, box может быть неоптимальным).
@@ -7438,7 +7449,7 @@ def _shadow_match_against_template(gray, tmpl, tmpl_w, tmpl_h, tmpl_std,
 
 
 def _anchor_bank_match_best(gray, pred_cx, pred_cy, flow_motion,
-                            extra_margin_px=0):
+                            extra_margin_px=0, cb_t0=None):
     """Пробегает по всем занятым слотам anchor-банка и возвращает
     результат с наибольшим raw_score. Если банк не инициализирован или
     пуст, падает обратно на одиночный _identity_anchor_gray — поведение
@@ -7450,6 +7461,18 @@ def _anchor_bank_match_best(gray, pred_cx, pred_cy, flow_motion,
 
     Smart loop: если первый же сильный score встречен (>= MATCH_GOOD_SCORE
     AND offset<=small), ранний выход — экономия CPU на RPi.
+
+    BUDGET-GATE (разбор реальных бортовых логов daaa75f: anchor-check
+    блок достигал 91.5 мс — почти 2.2x бюджета кадра 41.7мс. Early-exit
+    не всегда срабатывает на slot 0 (мелкая цель, score нестабилен), и
+    тогда перебираются ВСЕ 4 слота — 4 полных matchTemplate подряд.
+    Та же философия, что уже у "примерки"/"shadow": ядро (slot 0,
+    обязателен — это единственный immutable safety-net) всегда
+    пробуется, но ДОПОЛНИТЕЛЬНЫЕ слоты (1..N-1) только если в кадре
+    ещё есть время. Деградация качества мягкая: slot 0 — самый
+    надёжный источник (snapshot исходного захвата), banк 1..N-1 нужен
+    для покрытия смены ракурса — пропуск части из них под нагрузкой
+    снижает покрытие ракурсов, но не ломает базовую защиту identity.
     """
     best = None
     best_slot = -1
@@ -7478,6 +7501,13 @@ def _anchor_bank_match_best(gray, pred_cx, pred_cy, flow_motion,
     for idx, slot in enumerate(bank):
         if slot is None:
             continue
+        # Budget-gate: slot 0 (idx==0) — обязательный safety-net,
+        # пробуется всегда. Для idx>=1 — только если в кадре реально
+        # осталось время (та же проверка, что у "примерки").
+        if (idx > 0 and cb_t0 is not None
+                and (time.monotonic() - cb_t0) * 1000.0
+                    > FRAME_BUDGET_MS * FRAME_BUDGET_SECONDARY_FRAC):
+            break
         res = _call_shadow(slot["gray"], slot["w"], slot["h"], slot["std"])
         if not res[0]:
             continue
@@ -8004,6 +8034,7 @@ def reset_tracking(to_acq=False):
     global _blob_verify_fail_streak
     global _blob_roll_ok, _blob_roll_anchor_off
     global _blob_roll_trigger_streak
+    global _blob_roll_autosnap_last_try_t
     global _dual_signal_gap_frames
     global _identity_soft_distrust
     global _shadow_track_dbg
@@ -8144,6 +8175,7 @@ def reset_tracking(to_acq=False):
     _blob_roll_ok = []
     _blob_roll_anchor_off = []
     _blob_roll_trigger_streak = 0
+    _blob_roll_autosnap_last_try_t = 0.0
     _dual_signal_gap_frames = 0
     _identity_soft_distrust = False
 
@@ -11796,6 +11828,8 @@ _blob_roll_anchor_off = []
 # Счётчик подряд идущих кадров где aoff_med > порога — защита от
 # одиночных выбросов аnchor-check offset'а.
 _blob_roll_trigger_streak = 0
+# Throttle для autosnap-попытки (см. BLOB_ROLL_AUTOSNAP_RETRY_PERIOD_S).
+_blob_roll_autosnap_last_try_t = 0.0
 # Отметка ВРЕМЕНИ последнего успешного anchor-подтверждения (см. ниже блок
 # ANCHOR ARBITER). Не путать с _identity_anchor_check_last_t (тот — время
 # последней ПОПЫТКИ, успешной или нет; это — только успехи).
@@ -11990,6 +12024,7 @@ def process_locked_tracker(gray, cb_t0=None):
     global _blob_verify_fail_streak
     global _blob_roll_ok, _blob_roll_anchor_off
     global _blob_roll_trigger_streak
+    global _blob_roll_autosnap_last_try_t
     global _dual_signal_gap_frames
     global _identity_soft_distrust
     global _shadow_track_dbg
@@ -12930,7 +12965,7 @@ def process_locked_tracker(gray, cb_t0=None):
                  _iac_mx, _iac_my, _iac_slot
                  ) = _anchor_bank_match_best(
                     gray, new_cx, new_cy, flow_motion,
-                    extra_margin_px=_iac_extra_margin)
+                    extra_margin_px=_iac_extra_margin, cb_t0=cb_t0)
                 # Если банк пуст (ещё не инициализирован — например тесты
                 # используют _identity_anchor_gray напрямую), падаем на
                 # исходный путь с ресайзнутым scale-template.
@@ -13197,11 +13232,30 @@ def process_locked_tracker(gray, cb_t0=None):
             # реальная цель, snap туда и сбросим distrust. Иначе
             # оставляем soft_distrust и пишем диагностику результата
             # trial'а (что реально возвращает slot 0 на этом съезде).
+            #
+            # THROTTLE + BUDGET-GATE (разбор реальных бортовых логов
+            # daaa75f: ms_blob_block p95=38.8мс, max=52.1мс — этот
+            # trial с extra_margin_px=80 звонился КАЖДЫЙ кадр, пока
+            # держится дрейф, а дрейф длится сотни кадров подряд —
+            # устойчивая нагрузка на всю длительность, не редкий
+            # всплеск). Не чаще раза в RETRY_PERIOD_S, и пропускаем
+            # полностью если в кадре уже нет бюджета (та же защита,
+            # что у anchor-bank выше).
             _autosnap_done = False
             _as_score = -1.0; _as_psr = -1.0; _as_move = -1.0
+            _autosnap_throttled = (
+                (time.monotonic() - _blob_roll_autosnap_last_try_t)
+                < BLOB_ROLL_AUTOSNAP_RETRY_PERIOD_S)
+            _autosnap_budget_ok = (
+                cb_t0 is None
+                or (time.monotonic() - cb_t0) * 1000.0
+                    <= FRAME_BUDGET_MS * FRAME_BUDGET_SECONDARY_FRAC)
             if (BLOB_ROLL_AUTOSNAP_ENABLED
+                    and not _autosnap_throttled
+                    and _autosnap_budget_ok
                     and _identity_anchor_bank
                     and _identity_anchor_bank[0] is not None):
+                _blob_roll_autosnap_last_try_t = time.monotonic()
                 _slot0 = _identity_anchor_bank[0]
                 try:
                     (_as_ok, _as_score, _as_psr, _as_second,
