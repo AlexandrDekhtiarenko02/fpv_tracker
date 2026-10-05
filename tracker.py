@@ -603,6 +603,17 @@ BLOB_VERIFY_FAIL_CONFIRM_FRAMES = 30
 BLOB_ROLL_WINDOW_FRAMES = 30
 BLOB_ROLL_OK_RATE_THR = 0.20
 BLOB_ROLL_ANCHOR_OFFSET_THR = 2.0
+# AUTO-SNAP при обнаружении съезда: ищем slot 0 (immutable original
+# anchor) в расширенной зоне, если нашли уверенный peak далеко от
+# текущего lock — snap туда и сбросим soft_distrust. Без этого gate
+# только снимает controllable, но рамка остаётся на фоне.
+BLOB_ROLL_AUTOSNAP_ENABLED = True
+BLOB_ROLL_AUTOSNAP_EXTRA_MARGIN_PX = 80
+BLOB_ROLL_AUTOSNAP_MIN_SCORE = 0.55
+BLOB_ROLL_AUTOSNAP_MIN_PSR = 2.5
+# Минимальное расстояние от текущего lock до snap-кандидата —
+# если ближе этого, это "подтверждение текущего места" а не коррекция.
+BLOB_ROLL_AUTOSNAP_MIN_MOVE_PX = 8.0
 # Через сколько секунд ПОСЛЕ захвата впервые разрешаем trigger.
 # Blob verify нестабилен в первые кадры лока (template ещё
 # не адаптировался к сцене, box может быть неоптимальным).
@@ -13095,10 +13106,51 @@ def process_locked_tracker(gray, cb_t0=None):
             # остаётся TRACKED — пилот сам решает ждать восстановления
             # или перехватить.
             _identity_soft_distrust = True
-            flight_log.event(
-                "BLOB ROLL FAIL: ok_rate=%.2f aoff_med=%.2f → soft_distrust"
-                % (_blob_roll_rate, _blob_roll_aoff_med))
             _match_dbg["blob_verify_triggered_soft_distrust"] = 1
+            # AUTO-SNAP: ищем slot 0 (immutable original) в расширенной
+            # зоне. Если нашли уверенный peak далеко от lock — это
+            # реальная цель, snap туда и сбросим distrust. Иначе
+            # оставляем soft_distrust, ждём пилота.
+            _autosnap_done = False
+            if (BLOB_ROLL_AUTOSNAP_ENABLED
+                    and _identity_anchor_bank
+                    and _identity_anchor_bank[0] is not None):
+                _slot0 = _identity_anchor_bank[0]
+                try:
+                    (_as_ok, _as_score, _as_psr, _as_second,
+                     _as_mx, _as_my) = _shadow_match_against_template(
+                        gray, _slot0["gray"], _slot0["w"], _slot0["h"],
+                        _slot0["std"], new_cx, new_cy, 0.0,
+                        extra_margin_px=BLOB_ROLL_AUTOSNAP_EXTRA_MARGIN_PX)
+                    _as_move = math.hypot(_as_mx - new_cx,
+                                           _as_my - new_cy)
+                    if (_as_ok
+                            and _as_score >= BLOB_ROLL_AUTOSNAP_MIN_SCORE
+                            and _as_psr >= BLOB_ROLL_AUTOSNAP_MIN_PSR
+                            and _as_move >= BLOB_ROLL_AUTOSNAP_MIN_MOVE_PX):
+                        _snap_dx = _as_mx - new_cx
+                        _snap_dy = _as_my - new_cy
+                        new_cx = _as_mx
+                        new_cy = _as_my
+                        _match_dbg["blob_roll_autosnap_dx"] = _snap_dx
+                        _match_dbg["blob_roll_autosnap_dy"] = _snap_dy
+                        flight_log.event(
+                            "BLOB ROLL AUTOSNAP: dx=%.1f dy=%.1f "
+                            "score=%.2f psr=%.2f"
+                            % (_snap_dx, _snap_dy, _as_score, _as_psr))
+                        # Нашли реальную цель — сбрасываем rolling
+                        # buffers (пусть набирают заново уже на правильном
+                        # месте) и снимаем soft_distrust.
+                        _blob_roll_ok = []
+                        _blob_roll_anchor_off = []
+                        _identity_soft_distrust = False
+                        _autosnap_done = True
+                except Exception:
+                    pass
+            if not _autosnap_done:
+                flight_log.event(
+                    "BLOB ROLL FAIL: ok_rate=%.2f aoff_med=%.2f → soft_distrust"
+                    % (_blob_roll_rate, _blob_roll_aoff_med))
 
         # SOFT DISTRUST (найдено оператором на реальном коде, см. докстроку
         # IDENTITY_SOFT_DISTRUST_ENABLED у объявления) — НЕ ждём, пока
