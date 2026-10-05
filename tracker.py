@@ -5644,12 +5644,22 @@ def flow_predict(prev_g, cur_g, pts, cx, cy):
         pts_win[:, 0, 0] -= wx1
         pts_win[:, 0, 1] -= wy1
 
+        # SCOPED MULTI-THREADING (разбор бенчмарка на реальном борту,
+        # Monolith: calcOpticalFlowPyrLK с winSize=15/maxLevel=1 — ровно
+        # наши параметры — ускоряется ПОЧТИ В 3 РАЗА на 4 потоках
+        # (21.4мс -> 7.3мс), в отличие от matchTemplate, который от
+        # потоков вообще не выигрывает на наших размерах (не трогаем
+        # cv2.setNumThreads(1) глобально — он там верен). Overhead
+        # самого переключения setNumThreads() — 0.0035мс/вызов,
+        # пренебрежимо мал. Включаем только вокруг ЭТОГО вызова.
+        cv2.setNumThreads(4)
         nxt, st, err = cv2.calcOpticalFlowPyrLK(
             prev_win, cur_win, pts_win, None,
             winSize=(FLOW_WIN, FLOW_WIN), maxLevel=FLOW_LEVELS,
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
                       FLOW_ITERS, 0.03),
         )
+        cv2.setNumThreads(1)
         if nxt is not None:
             nxt = nxt.copy()
             nxt[:, 0, 0] += wx1
@@ -6536,6 +6546,10 @@ def motion_penalty_map(prev_g, cur_g, sx1, sy1, sx2, sy2, tw, th, shape,
         pw = pts.copy()
         pw[:, 0, 0] -= gx1
         pw[:, 0, 1] -= gy1
+        # SCOPED MULTI-THREADING (см. докстроку у аналогичного переключения
+        # в flow_predict) — те же winSize=15/maxLevel=1, тот же ~3x выигрыш
+        # на реальном борту.
+        cv2.setNumThreads(4)
         nxt, st, _ = cv2.calcOpticalFlowPyrLK(
             prev_g[gy1:gy2, gx1:gx2], cur_g[gy1:gy2, gx1:gx2], pw, None,
             # Одного уровня пирамиды достаточно: оценивается движение ФОНА,
@@ -6543,6 +6557,7 @@ def motion_penalty_map(prev_g, cur_g, sx1, sy1, sx2, sy2, tw, th, shape,
             # цену ради запаса, который здесь не нужен.
             winSize=(15, 15), maxLevel=1,
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+        cv2.setNumThreads(1)
         if nxt is not None:
             nxt = nxt.copy()
             nxt[:, 0, 0] += gx1
@@ -7042,11 +7057,16 @@ def estimate_ground_speed(gray, now_mono):
             _gs_prev_gray = band.copy()
             _gs_prev_t = now_mono
             return None
+        # SCOPED MULTI-THREADING (см. докстроку у аналогичного переключения
+        # в flow_predict) — те же winSize=15/maxLevel=1, тот же ~3x выигрыш
+        # на реальном борту.
+        cv2.setNumThreads(4)
         nxt, st, _err = cv2.calcOpticalFlowPyrLK(
             _gs_prev_gray, band, _gs_prev_pts.astype(np.float32), None,
             winSize=(FLOW_WIN, FLOW_WIN), maxLevel=FLOW_LEVELS,
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
                       FLOW_ITERS, 0.03))
+        cv2.setNumThreads(1)
         speed = None
         if nxt is not None and st is not None:
             ok = st.reshape(-1).astype(bool)
