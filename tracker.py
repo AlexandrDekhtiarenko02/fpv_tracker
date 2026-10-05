@@ -656,6 +656,18 @@ BLOB_ROLL_AUTOSNAP_MAX_MOVE_PX = 25.0
 # пошёл не на цель. С margin 0.10 slot 0 должен превосходить live
 # на 0.10+ — это "live реально потерял цель, а slot 0 знает где".
 BLOB_ROLL_AUTOSNAP_SLOT0_LEADS_MARGIN = 0.10
+# ПОДОЗРЕНИЕ ПО РОСТУ (разбор стенд-видео 05.10, zahvat с дорогой):
+# рамка съехала с приближающегося грузовика на статичный край дороги —
+# score у live остался высоким (0.79-0.86), margin его защищал. Но
+# box_growth_smoothed — ОТДЕЛЬНЫЙ, уже посчитанный сигнал (из скорости
+# роста площади рамки, см. _estimate_closure) — в этот же момент был
+# отрицательным: настоящая приближающаяся цель обязана расти, а
+# статичный фон на сближении — нет. live score тут врёт (измеряет
+# "насколько ровно совпадает шаблон", а не "та ли это цель"), а рост —
+# не врёт. Если live явно не растёт, margin снижается — slot 0 может
+# перебить его не полным запасом уверенности, а почти наравне.
+BLOB_ROLL_AUTOSNAP_GROWTH_SUSPECT_THR = -0.05
+BLOB_ROLL_AUTOSNAP_GROWTH_RELAX_MARGIN = -0.15
 # THROTTLE (разбор реальных бортовых логов daaa75f: ms_blob_block
 # p95=38.8мс, max=52.1мс — попытка snap через _shadow_match_against_
 # template с extra_margin_px=80 (большое окно поиска) звонилась КАЖДЫЙ
@@ -2585,6 +2597,10 @@ _FLIGHT_LOG_COLUMNS = (
     "blob_roll_autosnap_trial_score,blob_roll_autosnap_trial_psr,"
     "blob_roll_autosnap_trial_move,blob_roll_autosnap_trial_mx,"
     "blob_roll_autosnap_trial_my,"
+    # growth_suspect: live box_growth_smoothed < THR на этом trial'е (живой
+    # лок не растёт как приближающаяся цель — margin снижен, см. GROWTH_
+    # SUSPECT_THR/RELAX_MARGIN). margin_used — реально применённый margin.
+    "blob_roll_autosnap_growth_suspect,blob_roll_autosnap_margin_used,"
     # STAND GROUND TRUTH (только на стенде; на борту всегда None/пустое):
     # позиция курсора оператора в main-view = где цель на самом деле.
     # stand_cursor_lock_dist_px = расстояние от lock-центра (box_cx/cy) до
@@ -12143,6 +12159,8 @@ def process_locked_tracker(gray, cb_t0=None):
     _match_dbg["blob_roll_autosnap_trial_move"] = None
     _match_dbg["blob_roll_autosnap_trial_mx"] = None
     _match_dbg["blob_roll_autosnap_trial_my"] = None
+    _match_dbg["blob_roll_autosnap_growth_suspect"] = None
+    _match_dbg["blob_roll_autosnap_margin_used"] = None
 
     # _identity_soft_distrust — ПРЕДВАРИТЕЛЬНОЕ значение из persistent-
     # счётчиков ПРОШЛОГО кадра (streak / gap / anchor_check_streak):
@@ -13323,10 +13341,27 @@ def process_locked_tracker(gray, cb_t0=None):
                     # Snap только если slot 0 ЯВНО уверенее live-matcher'а
                     # (разница ≥ MARGIN). Защищает от прыжка на похожий
                     # объект когда live уже близко к цели.
+                    #
+                    # ИСКЛЮЧЕНИЕ: live score уверенно совпадает с шаблоном,
+                    # даже когда шаблон тихо уехал на статичный фон — он не
+                    # знает, ТА ли это цель. box_growth_smoothed знает: цель
+                    # приближается — обязана расти. Если рост явно
+                    # отрицательный (сжимается / статика на сближении),
+                    # live скорее всего не на цели — margin снижаем, почти
+                    # до паритета, а не отменяем совсем (slot 0 всё ещё
+                    # обязан быть НЕ ХУЖЕ live, просто без полного запаса).
                     _live_sc_val = (float(score) if match_ok and score is not None
                                     else 0.0)
-                    _slot0_leads = (_as_score
-                                    >= _live_sc_val + BLOB_ROLL_AUTOSNAP_SLOT0_LEADS_MARGIN)
+                    _live_growth_suspect = (
+                        box_growth_smoothed is not None
+                        and box_growth_smoothed < BLOB_ROLL_AUTOSNAP_GROWTH_SUSPECT_THR)
+                    _slot0_margin = (BLOB_ROLL_AUTOSNAP_GROWTH_RELAX_MARGIN
+                                      if _live_growth_suspect
+                                      else BLOB_ROLL_AUTOSNAP_SLOT0_LEADS_MARGIN)
+                    _slot0_leads = (_as_score >= _live_sc_val + _slot0_margin)
+                    _match_dbg["blob_roll_autosnap_growth_suspect"] = (
+                        1 if _live_growth_suspect else 0)
+                    _match_dbg["blob_roll_autosnap_margin_used"] = _slot0_margin
                     if (_as_ok
                             and _as_score >= BLOB_ROLL_AUTOSNAP_MIN_SCORE
                             and _as_psr >= BLOB_ROLL_AUTOSNAP_MIN_PSR
@@ -14673,6 +14708,8 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("blob_roll_autosnap_trial_move"),
             _match_dbg.get("blob_roll_autosnap_trial_mx"),
             _match_dbg.get("blob_roll_autosnap_trial_my"),
+            _match_dbg.get("blob_roll_autosnap_growth_suspect"),
+            _match_dbg.get("blob_roll_autosnap_margin_used"),
             _match_dbg.get("stand_cursor_main_x"),
             _match_dbg.get("stand_cursor_main_y"),
             _match_dbg.get("stand_cursor_lock_dist_px"),
