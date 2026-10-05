@@ -7202,6 +7202,7 @@ def _commit_confirmed_identity(fresh_tmpl, cx, cy, reason):
     global _identity_anchor_gray, _identity_anchor_w, _identity_anchor_h
     global _identity_anchor_std
     global _identity_anchor_last_confirm_t
+    global _last_capture_t
     global _identity_anchor_bank, _identity_anchor_bank_next_slot
     global _identity_anchor_bank_last_refresh_t
     anchor = fresh_tmpl.copy()
@@ -7231,6 +7232,7 @@ def _commit_confirmed_identity(fresh_tmpl, cx, cy, reason):
     # capture ambiguous+flow_gap, через 6 кадров — UNCERTAIN, за это окно
     # anchor-check даже не успевает запуститься.
     _identity_anchor_last_confirm_t = time.monotonic()
+    _last_capture_t = _identity_anchor_last_confirm_t
     _match_dbg["identity_anchor_changed"] = 1
     _match_dbg["identity_anchor_change_reason"] = reason
     flight_log.event(
@@ -7948,6 +7950,7 @@ def reset_tracking(to_acq=False):
     global _identity_uncertain_pending, _identity_uncertain_streak
     global _identity_anchor_check_streak, _identity_anchor_check_last_t
     global _identity_anchor_last_confirm_t
+    global _last_capture_t
     global _blob_verify_fail_streak
     global _blob_roll_ok, _blob_roll_anchor_off
     global _dual_signal_gap_frames
@@ -8085,6 +8088,7 @@ def reset_tracking(to_acq=False):
     _identity_anchor_check_streak = 0
     _identity_anchor_check_last_t = 0.0
     _identity_anchor_last_confirm_t = 0.0
+    _last_capture_t = 0.0
     _blob_verify_fail_streak = 0
     _blob_roll_ok = []
     _blob_roll_anchor_off = []
@@ -11741,6 +11745,13 @@ _blob_roll_anchor_off = []
 # ANCHOR ARBITER). Не путать с _identity_anchor_check_last_t (тот — время
 # последней ПОПЫТКИ, успешной или нет; это — только успехи).
 _identity_anchor_last_confirm_t = 0.0
+# Отдельный timestamp именно момента ЯВНОГО захвата через _commit_
+# confirmed_identity. Используется для blob verify warmup: _identity_
+# anchor_last_confirm_t обновляется на КАЖДОМ успешном anchor-check
+# (каждые 0.5s), из-за чего warmup по нему был всегда активен и
+# rolling-gate trigger никогда не срабатывал. Разбор прогона 42f3521:
+# gate был готов 28 раз, но каждый раз warmup его подавлял.
+_last_capture_t = 0.0
 
 # PROLONGED SINGLE-SIGNAL BYPASS (разбор оператора, п.7/8): "система может
 # бесконечно жить только на flow или только на matcher, оставаясь TRACKED —
@@ -11920,6 +11931,7 @@ def process_locked_tracker(gray, cb_t0=None):
     global _identity_uncertain_pending, _identity_uncertain_streak
     global _identity_anchor_check_streak, _identity_anchor_check_last_t
     global _identity_anchor_last_confirm_t
+    global _last_capture_t
     global _blob_verify_fail_streak
     global _blob_roll_ok, _blob_roll_anchor_off
     global _dual_signal_gap_frames
@@ -13084,10 +13096,15 @@ def process_locked_tracker(gray, cb_t0=None):
         # текстуре. Разбор прогона f3b9c4a zahvat03: ok=0 держалось
         # 200+ кадров — реальный съезд легко переживает 15-кадровый
         # debounce.
-        # Warmup: пропустить trigger в первую секунду после захвата —
-        # blob verify нестабилен пока template и lock не устоялись.
-        _bv_warmup = (_identity_anchor_last_confirm_t > 0
-                      and (time.monotonic() - _identity_anchor_last_confirm_t)
+        # Warmup: пропустить trigger в первую секунду после ЯВНОГО
+        # захвата — blob verify нестабилен пока template и lock не
+        # устоялись. ВАЖНО: смотрим на _last_capture_t (ставится только
+        # в _commit_confirmed_identity), а не на _identity_anchor_last_
+        # confirm_t (обновляется каждые 0.5s при anchor-check success).
+        # На прогоне 42f3521 второй вариант был всегда свежим и warmup
+        # не отпускал trigger никогда.
+        _bv_warmup = (_last_capture_t > 0
+                      and (time.monotonic() - _last_capture_t)
                           < BLOB_VERIFY_WARMUP_S)
         # NEW: Combined rolling-window gate (откалиброван на cursor-truth,
         # коммит 3bc75e6-данные). Прежний N-подряд debounce заменён —
