@@ -658,14 +658,18 @@ BLOB_ROLL_AUTOSNAP_MAX_MOVE_PX = 25.0
 BLOB_ROLL_AUTOSNAP_SLOT0_LEADS_MARGIN = 0.10
 # ПОДОЗРЕНИЕ ПО РОСТУ (разбор стенд-видео 05.10, zahvat с дорогой):
 # рамка съехала с приближающегося грузовика на статичный край дороги —
-# score у live остался высоким (0.79-0.86), margin его защищал. Но
-# box_growth_smoothed — ОТДЕЛЬНЫЙ, уже посчитанный сигнал (из скорости
-# роста площади рамки, см. _estimate_closure) — в этот же момент был
-# отрицательным: настоящая приближающаяся цель обязана расти, а
-# статичный фон на сближении — нет. live score тут врёт (измеряет
-# "насколько ровно совпадает шаблон", а не "та ли это цель"), а рост —
-# не врёт. Если live явно не растёт, margin снижается — slot 0 может
-# перебить его не полным запасом уверенности, а почти наравне.
+# score у live остался высоким (0.79-0.86), margin его защищал. Настоящая
+# приближающаяся цель обязана расти, а статичный фон на сближении — нет.
+# live score тут врёт (измеряет "насколько ровно совпадает шаблон", а не
+# "та ли это цель"), а рост — нет.
+#
+# ПЕРВАЯ ПОПЫТКА через box_growth_smoothed (EMA в _estimate_closure)
+# провалилась на том же видео: сигнал сглажен под масштаб времени tau_s
+# (секунды) и ни разу не вышел за ±0.01 за весь съезд — порог -0.05 был
+# физически недостижим. Взят ПРЯМОЙ sqrt(w*h) за BLOB_ROLL_WINDOW_FRAMES
+# (_blob_roll_size, считается рядом с _blob_roll_ok/_blob_roll_anchor_off)
+# — на реальных данных здоровый подлёт не хуже -0.02 за окно, съезд на
+# статику — от -0.08 (рамка усохла 26->21px). THR=-0.05 лежит чисто между.
 BLOB_ROLL_AUTOSNAP_GROWTH_SUSPECT_THR = -0.05
 BLOB_ROLL_AUTOSNAP_GROWTH_RELAX_MARGIN = -0.15
 # THROTTLE (разбор реальных бортовых логов daaa75f: ms_blob_block
@@ -2597,10 +2601,13 @@ _FLIGHT_LOG_COLUMNS = (
     "blob_roll_autosnap_trial_score,blob_roll_autosnap_trial_psr,"
     "blob_roll_autosnap_trial_move,blob_roll_autosnap_trial_mx,"
     "blob_roll_autosnap_trial_my,"
-    # growth_suspect: live box_growth_smoothed < THR на этом trial'е (живой
+    # growth_suspect: _blob_roll_size_ratio < THR на этом trial'е (живой
     # лок не растёт как приближающаяся цель — margin снижен, см. GROWTH_
     # SUSPECT_THR/RELAX_MARGIN). margin_used — реально применённый margin.
+    # size_ratio пишется каждый кадр (не только на trial) — во сколько раз
+    # рамка крупнее/мельче себя же BLOB_ROLL_WINDOW_FRAMES кадров назад.
     "blob_roll_autosnap_growth_suspect,blob_roll_autosnap_margin_used,"
+    "blob_roll_size_ratio,"
     # STAND GROUND TRUTH (только на стенде; на борту всегда None/пустое):
     # позиция курсора оператора в main-view = где цель на самом деле.
     # stand_cursor_lock_dist_px = расстояние от lock-центра (box_cx/cy) до
@@ -8089,7 +8096,7 @@ def reset_tracking(to_acq=False):
     global _identity_anchor_last_confirm_t
     global _last_capture_t
     global _blob_verify_fail_streak
-    global _blob_roll_ok, _blob_roll_anchor_off
+    global _blob_roll_ok, _blob_roll_anchor_off, _blob_roll_size
     global _blob_roll_trigger_streak
     global _blob_roll_autosnap_last_try_t
     global _dual_signal_gap_frames
@@ -8231,6 +8238,7 @@ def reset_tracking(to_acq=False):
     _blob_verify_fail_streak = 0
     _blob_roll_ok = []
     _blob_roll_anchor_off = []
+    _blob_roll_size = []
     _blob_roll_trigger_streak = 0
     _blob_roll_autosnap_last_try_t = 0.0
     _dual_signal_gap_frames = 0
@@ -11882,6 +11890,9 @@ _blob_verify_fail_streak = 0
 # Храним последние N кадров blob_verify_ok (0/1) и anchor_check_offset.
 _blob_roll_ok = []
 _blob_roll_anchor_off = []
+# Та же window, но размер рамки (sqrt(w*h)) — чтобы ловить "лок не растёт
+# как приближающаяся цель" (см. BLOB_ROLL_AUTOSNAP_GROWTH_SUSPECT_THR).
+_blob_roll_size = []
 # Счётчик подряд идущих кадров где aoff_med > порога — защита от
 # одиночных выбросов аnchor-check offset'а.
 _blob_roll_trigger_streak = 0
@@ -12079,7 +12090,7 @@ def process_locked_tracker(gray, cb_t0=None):
     global _identity_anchor_last_confirm_t
     global _last_capture_t
     global _blob_verify_fail_streak
-    global _blob_roll_ok, _blob_roll_anchor_off
+    global _blob_roll_ok, _blob_roll_anchor_off, _blob_roll_size
     global _blob_roll_trigger_streak
     global _blob_roll_autosnap_last_try_t
     global _dual_signal_gap_frames
@@ -13242,13 +13253,17 @@ def process_locked_tracker(gray, cb_t0=None):
             _aoff_now = _match_dbg.get("identity_anchor_check_offset")
             if _aoff_now is not None:
                 _blob_roll_anchor_off.append(float(_aoff_now))
+            _blob_roll_size.append(math.sqrt(float(lock_w) * float(lock_h)))
             if len(_blob_roll_ok) > BLOB_ROLL_WINDOW_FRAMES:
                 _blob_roll_ok = _blob_roll_ok[-BLOB_ROLL_WINDOW_FRAMES:]
             if len(_blob_roll_anchor_off) > BLOB_ROLL_WINDOW_FRAMES:
                 _blob_roll_anchor_off = _blob_roll_anchor_off[-BLOB_ROLL_WINDOW_FRAMES:]
+            if len(_blob_roll_size) > BLOB_ROLL_WINDOW_FRAMES:
+                _blob_roll_size = _blob_roll_size[-BLOB_ROLL_WINDOW_FRAMES:]
         else:
             _blob_roll_ok = []
             _blob_roll_anchor_off = []
+            _blob_roll_size = []
         _blob_roll_rate = None
         _blob_roll_aoff_med = None
         if (len(_blob_roll_ok) >= BLOB_ROLL_WINDOW_FRAMES
@@ -13257,6 +13272,20 @@ def process_locked_tracker(gray, cb_t0=None):
             _sorted_off = sorted(_blob_roll_anchor_off)
             _blob_roll_aoff_med = _sorted_off[len(_sorted_off) // 2]
         _match_dbg["blob_roll_rate"] = _blob_roll_rate
+        # size_ratio: насколько рамка сейчас крупнее/мельче себя же
+        # BLOB_ROLL_WINDOW_FRAMES кадров назад. Калибровано на реальном
+        # стенд-видео (05.10, съезд на край дороги): здоровый подлёт даёт
+        # не хуже -0.02 за окно, реальный съезд на статику — от -0.08 и
+        # ниже (рамка усохла 26->21px пока цель должна расти). Первая
+        # попытка через box_growth_smoothed (EMA в _estimate_closure)
+        # провалилась — тот сигнал сглажен для совсем другого масштаба
+        # времени (tau_s) и ни разу не вышел за ±0.01 на этих же данных.
+        _blob_roll_size_ratio = None
+        if len(_blob_roll_size) >= BLOB_ROLL_WINDOW_FRAMES:
+            _sz0 = _blob_roll_size[0]
+            if _sz0 > 1e-6:
+                _blob_roll_size_ratio = _blob_roll_size[-1] / _sz0 - 1.0
+        _match_dbg["blob_roll_size_ratio"] = _blob_roll_size_ratio
         _match_dbg["blob_roll_aoff_med"] = _blob_roll_aoff_med
         # BLOB VERIFY TRIGGER: N кадров подряд "в центре нет компактного
         # объекта" → форсим IDENTITY_UNCERTAIN. Независимый сигнал от
@@ -13344,17 +13373,17 @@ def process_locked_tracker(gray, cb_t0=None):
                     #
                     # ИСКЛЮЧЕНИЕ: live score уверенно совпадает с шаблоном,
                     # даже когда шаблон тихо уехал на статичный фон — он не
-                    # знает, ТА ли это цель. box_growth_smoothed знает: цель
-                    # приближается — обязана расти. Если рост явно
-                    # отрицательный (сжимается / статика на сближении),
+                    # знает, ТА ли это цель. _blob_roll_size_ratio знает: цель
+                    # приближается — обязана расти. Если рамка явно
+                    # усохла за окно (сжимается / статика на сближении),
                     # live скорее всего не на цели — margin снижаем, почти
                     # до паритета, а не отменяем совсем (slot 0 всё ещё
                     # обязан быть НЕ ХУЖЕ live, просто без полного запаса).
                     _live_sc_val = (float(score) if match_ok and score is not None
                                     else 0.0)
                     _live_growth_suspect = (
-                        box_growth_smoothed is not None
-                        and box_growth_smoothed < BLOB_ROLL_AUTOSNAP_GROWTH_SUSPECT_THR)
+                        _blob_roll_size_ratio is not None
+                        and _blob_roll_size_ratio < BLOB_ROLL_AUTOSNAP_GROWTH_SUSPECT_THR)
                     _slot0_margin = (BLOB_ROLL_AUTOSNAP_GROWTH_RELAX_MARGIN
                                       if _live_growth_suspect
                                       else BLOB_ROLL_AUTOSNAP_SLOT0_LEADS_MARGIN)
@@ -13380,6 +13409,7 @@ def process_locked_tracker(gray, cb_t0=None):
                             % (_snap_dx, _snap_dy, _as_score, _as_psr))
                         _blob_roll_ok = []
                         _blob_roll_anchor_off = []
+                        _blob_roll_size = []
                         _identity_soft_distrust = False
                         _autosnap_done = True
                 except Exception:
@@ -14710,6 +14740,7 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("blob_roll_autosnap_trial_my"),
             _match_dbg.get("blob_roll_autosnap_growth_suspect"),
             _match_dbg.get("blob_roll_autosnap_margin_used"),
+            _match_dbg.get("blob_roll_size_ratio"),
             _match_dbg.get("stand_cursor_main_x"),
             _match_dbg.get("stand_cursor_main_y"),
             _match_dbg.get("stand_cursor_lock_dist_px"),
