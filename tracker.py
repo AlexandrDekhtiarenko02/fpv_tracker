@@ -2576,6 +2576,15 @@ _FLIGHT_LOG_COLUMNS = (
     # offset медиана за последние 30 кадров. Если rate<0.20 И aoff_med>2.0 →
     # soft_distrust. Откалибровано на стенд-данных 3bc75e6 с cursor truth.
     "blob_roll_rate,blob_roll_aoff_med,"
+    # blob_roll_autosnap_trial_*: диагностика попытки slot 0 (даже
+    # провалившейся) — иначе из CSV не видно, почему autosnap молчит
+    # (throttle / score ниже MIN_SCORE / move вне диапазона). mx/my — это
+    # LORES-координаты кандидата slot 0, сверяются со stand_cursor_main_*
+    # (через lores_box_to_main) чтобы понять — slot 0 целится в реальную
+    # цель с низкой уверенностью, или в постороннее пятно фона.
+    "blob_roll_autosnap_trial_score,blob_roll_autosnap_trial_psr,"
+    "blob_roll_autosnap_trial_move,blob_roll_autosnap_trial_mx,"
+    "blob_roll_autosnap_trial_my,"
     # STAND GROUND TRUTH (только на стенде; на борту всегда None/пустое):
     # позиция курсора оператора в main-view = где цель на самом деле.
     # stand_cursor_lock_dist_px = расстояние от lock-центра (box_cx/cy) до
@@ -12125,6 +12134,15 @@ def process_locked_tracker(gray, cb_t0=None):
     # 1-кадровых диагностик).
     _match_dbg["identity_anchor_snap_dx"] = 0.0
     _match_dbg["identity_anchor_snap_dy"] = 0.0
+    # BLOB ROLL AUTOSNAP TRIAL: score/psr/move слота 0 на этом кадре, даже
+    # если snap не применён — иначе из CSV не видно, ПОЧЕМУ autosnap молчит
+    # (throttle съедает кадр / score ниже порога / move вне диапазона).
+    # None = попытки не было (throttle, budget-gate, нет soft_distrust).
+    _match_dbg["blob_roll_autosnap_trial_score"] = None
+    _match_dbg["blob_roll_autosnap_trial_psr"] = None
+    _match_dbg["blob_roll_autosnap_trial_move"] = None
+    _match_dbg["blob_roll_autosnap_trial_mx"] = None
+    _match_dbg["blob_roll_autosnap_trial_my"] = None
 
     # _identity_soft_distrust — ПРЕДВАРИТЕЛЬНОЕ значение из persistent-
     # счётчиков ПРОШЛОГО кадра (streak / gap / anchor_check_streak):
@@ -13297,6 +13315,11 @@ def process_locked_tracker(gray, cb_t0=None):
                         extra_margin_px=BLOB_ROLL_AUTOSNAP_EXTRA_MARGIN_PX)
                     _as_move = math.hypot(_as_mx - new_cx,
                                            _as_my - new_cy)
+                    _match_dbg["blob_roll_autosnap_trial_score"] = _as_score
+                    _match_dbg["blob_roll_autosnap_trial_psr"] = _as_psr
+                    _match_dbg["blob_roll_autosnap_trial_move"] = _as_move
+                    _match_dbg["blob_roll_autosnap_trial_mx"] = _as_mx
+                    _match_dbg["blob_roll_autosnap_trial_my"] = _as_my
                     # Snap только если slot 0 ЯВНО уверенее live-matcher'а
                     # (разница ≥ MARGIN). Защищает от прыжка на похожий
                     # объект когда live уже близко к цели.
@@ -14645,6 +14668,11 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("blob_verify_edge_ratio"),
             _match_dbg.get("blob_roll_rate"),
             _match_dbg.get("blob_roll_aoff_med"),
+            _match_dbg.get("blob_roll_autosnap_trial_score"),
+            _match_dbg.get("blob_roll_autosnap_trial_psr"),
+            _match_dbg.get("blob_roll_autosnap_trial_move"),
+            _match_dbg.get("blob_roll_autosnap_trial_mx"),
+            _match_dbg.get("blob_roll_autosnap_trial_my"),
             _match_dbg.get("stand_cursor_main_x"),
             _match_dbg.get("stand_cursor_main_y"),
             _match_dbg.get("stand_cursor_lock_dist_px"),
