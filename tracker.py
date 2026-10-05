@@ -621,7 +621,14 @@ BLOB_ROLL_ANCHOR_OFFSET_THR = 1.75
 BLOB_ROLL_AUTOSNAP_ENABLED = True
 BLOB_ROLL_AUTOSNAP_EXTRA_MARGIN_PX = 80
 BLOB_ROLL_AUTOSNAP_MIN_SCORE = 0.55
-BLOB_ROLL_AUTOSNAP_MIN_PSR = 2.5
+# PSR 2.5 → 2.0 (разбор прогона 9f0115c, flight_log_110942: slot 0
+# стабильно возвращал score=0.76-0.77 move=12-16 px (отличные
+# показатели, настоящая цель в расширенной зоне), но PSR=2.21-2.32 —
+# чуть ниже прежнего порога. На мелкой цели PSR 2.0-2.3 — норма,
+# она коррелирует с matchTemplate TM_CCOEFF_NORMED плоским фоном
+# вокруг небольшой фигуры. Score уже защищает от шума; PSR здесь
+# избыточно строгий.
+BLOB_ROLL_AUTOSNAP_MIN_PSR = 2.0
 # Минимальное расстояние от текущего lock до snap-кандидата —
 # если ближе этого, это "подтверждение текущего места" а не коррекция.
 BLOB_ROLL_AUTOSNAP_MIN_MOVE_PX = 8.0
