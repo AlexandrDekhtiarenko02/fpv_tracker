@@ -2430,7 +2430,7 @@ _FLIGHT_LOG_COLUMNS = (
     # _etap()). anchor_check_block — periodic сверка с anchor (вкл.
     # anchor bank до 4 слотов); blob_block — blob verify + rolling
     # gate + autosnap-пробный matchTemplate.
-    "ms_anchor_check_block,ms_blob_block,armed,"
+    "ms_anchor_check_block,ms_blob_block,ms_ground_speed,armed,"
     "launch_target_deg,launch_reached,k,match_psr,match_second,search_margin,"
     "match_flow_gap,size_est,size_skip,size_why,size_R,size_scale,motion_sep,motion_on,"
     "color_on,color_pen,color_best,chroma_sat,"
@@ -14545,6 +14545,7 @@ def _capture_flight_row(cb_t0):
             _etap_ms.get("upravlenie"), _etap_ms.get("diagnostika"),
             _etap_ms.get("overlay"),
             _etap_ms.get("anchor_check_block"), _etap_ms.get("blob_block"),
+            _etap_ms.get("ground_speed"),
             armed,
             g("launch_target_deg"), g("launch_reached"), g("k"),
             _match_dbg.get("psr"), _match_dbg.get("second"),
@@ -15117,7 +15118,17 @@ def camera_callback(request):
         # результат — только реже обновляет.
         _gs_n += 1
         if GROUND_SPEED_ENABLED and _gs_n % GROUND_EVERY_N == 0:
+            # ИЗМЕРЕНИЕ СТОИМОСТИ (разбор реальных бортовых логов
+            # daaa75f: после фикса anchor-bank/autosnap остаётся
+            # ~10-11мс/кадр неучтённого разрыва между cb_wall_ms и
+            # суммой всех именованных стадий. estimate_ground_speed
+            # делает cv2.goodFeaturesToTrack + optical flow по полосе
+            # кадра на КАЖДОМ ВТОРОМ кадре — реальный CV, ни разу не
+            # обёрнутый в _etap). Измеряем, чтобы подтвердить или
+            # исключить как источник разрыва.
+            _t_ground_speed = time.monotonic()
             estimate_ground_speed(gray, _cb_t0)
+            _etap("ground_speed", _t_ground_speed)
 
         process_locked_tracker(gray, _cb_t0)
         # Запись начинается при первом TRACKED и после этого пишет КАЖДЫЙ кадр
