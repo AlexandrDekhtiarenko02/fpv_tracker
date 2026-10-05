@@ -614,6 +614,15 @@ BLOB_ROLL_WINDOW_FRAMES = 30
 # другой объект (rate=1.0, но aoff всё равно показывает смещение).
 BLOB_ROLL_OK_RATE_THR = 0.20          # оставлен для диагностики
 BLOB_ROLL_ANCHOR_OFFSET_THR = 1.75
+# Debounce — gate срабатывает только если условие держится N кадров
+# подряд. Разбор прогона 50c2408 zahvat01 кадры 255-274: aoff_med
+# держался 0.37-0.93 (ниже порога) 20+ кадров, рамка была на цели
+# dist=2-5 px. На кадре 274 один anchor-check дал выброс, aoff_med
+# подскочил до 1.91 — gate ложно triggered, snap переместил рамку
+# с правильной позиции на похожий объект. На реальных съездах
+# (zahvat03_105709) aoff_med держался >1.75 240+ кадров — N=4 легко
+# проходит, но одиночные выбросы отсекаются.
+BLOB_ROLL_TRIGGER_HOLD_FRAMES = 4
 # AUTO-SNAP при обнаружении съезда: ищем slot 0 (immutable original
 # anchor) в расширенной зоне, если нашли уверенный peak далеко от
 # текущего lock — snap туда и сбросим soft_distrust. Без этого gate
@@ -638,11 +647,15 @@ BLOB_ROLL_AUTOSNAP_MIN_MOVE_PX = 8.0
 # прогона 00a7684 zahvat03: snap на +26 px увёл рамку на похожий
 # объект, пилот жаловался "ложно срабатывает на объекты вдалеке".
 BLOB_ROLL_AUTOSNAP_MAX_MOVE_PX = 25.0
-# Trust-weighted: если live match_score ВЫШЕ score slot 0 с запасом,
-# значит live-matcher уверенее — snap блокировать. Это защищает
-# когда рамка почти на цели, а slot 0 нашёл похожий объект чуть
-# в стороне с чуть меньшим score.
-BLOB_ROLL_AUTOSNAP_LIVE_LEADS_MARGIN = 0.03
+# Snap только когда slot 0 ЯВНО уверенее live-matcher'а. Это
+# принципиальное условие: slot 0 находит ЛЮБУЮ похожую фигуру в
+# расширенной зоне, не обязательно настоящую цель. Если live score
+# близко к slot 0 score — live уже на реальной цели (или близко),
+# snap через похожий объект только испортит. Разбор прогона 50c2408
+# zahvat01 кадр 274: live=0.73 slot0=0.75 (разница 0.02) — snap
+# пошёл не на цель. С margin 0.10 slot 0 должен превосходить live
+# на 0.10+ — это "live реально потерял цель, а slot 0 знает где".
+BLOB_ROLL_AUTOSNAP_SLOT0_LEADS_MARGIN = 0.10
 # Через сколько секунд ПОСЛЕ захвата впервые разрешаем trigger.
 # Blob verify нестабилен в первые кадры лока (template ещё
 # не адаптировался к сцене, box может быть неоптимальным).
@@ -7982,6 +7995,7 @@ def reset_tracking(to_acq=False):
     global _last_capture_t
     global _blob_verify_fail_streak
     global _blob_roll_ok, _blob_roll_anchor_off
+    global _blob_roll_trigger_streak
     global _dual_signal_gap_frames
     global _identity_soft_distrust
     global _shadow_track_dbg
@@ -8121,6 +8135,7 @@ def reset_tracking(to_acq=False):
     _blob_verify_fail_streak = 0
     _blob_roll_ok = []
     _blob_roll_anchor_off = []
+    _blob_roll_trigger_streak = 0
     _dual_signal_gap_frames = 0
     _identity_soft_distrust = False
 
@@ -11770,6 +11785,9 @@ _blob_verify_fail_streak = 0
 # Храним последние N кадров blob_verify_ok (0/1) и anchor_check_offset.
 _blob_roll_ok = []
 _blob_roll_anchor_off = []
+# Счётчик подряд идущих кадров где aoff_med > порога — защита от
+# одиночных выбросов аnchor-check offset'а.
+_blob_roll_trigger_streak = 0
 # Отметка ВРЕМЕНИ последнего успешного anchor-подтверждения (см. ниже блок
 # ANCHOR ARBITER). Не путать с _identity_anchor_check_last_t (тот — время
 # последней ПОПЫТКИ, успешной или нет; это — только успехи).
@@ -11963,6 +11981,7 @@ def process_locked_tracker(gray, cb_t0=None):
     global _last_capture_t
     global _blob_verify_fail_streak
     global _blob_roll_ok, _blob_roll_anchor_off
+    global _blob_roll_trigger_streak
     global _dual_signal_gap_frames
     global _identity_soft_distrust
     global _shadow_track_dbg
@@ -13136,15 +13155,18 @@ def process_locked_tracker(gray, cb_t0=None):
                       and (time.monotonic() - _last_capture_t)
                           < BLOB_VERIFY_WARMUP_S)
         # NEW: Rolling anchor-offset gate (откалиброван на двух прогонах
-        # с cursor-truth, 3bc75e6 + c62534e). Только aoff_med>1.75 —
-        # ранее добавленное условие rate<0.2 пропускало длинные съезды
-        # на похожий объект (rate=1.0 вводил в заблуждение). aoff_med
-        # честно показывает что anchor находит peak не на lock-pos даже
-        # когда live-matcher уверен.
+        # с cursor-truth, 3bc75e6 + c62534e). Только aoff_med>1.75 с
+        # debounce N кадров подряд — одиночные выбросы anchor-check
+        # (разбор 50c2408) больше не триггерят ложный snap.
+        if (BLOB_VERIFY_ENABLED
+                and _blob_roll_aoff_med is not None
+                and _blob_roll_aoff_med > BLOB_ROLL_ANCHOR_OFFSET_THR):
+            _blob_roll_trigger_streak += 1
+        else:
+            _blob_roll_trigger_streak = 0
         if (BLOB_VERIFY_ENABLED
                 and not _bv_warmup
-                and _blob_roll_aoff_med is not None
-                and _blob_roll_aoff_med > BLOB_ROLL_ANCHOR_OFFSET_THR
+                and _blob_roll_trigger_streak >= BLOB_ROLL_TRIGGER_HOLD_FRAMES
                 and tracked_ok):
             # SOFT distrust вместо прямого UNCERTAIN: controllable снимется,
             # пилот увидит что identity сомнительна, но track_state
@@ -13171,15 +13193,19 @@ def process_locked_tracker(gray, cb_t0=None):
                         extra_margin_px=BLOB_ROLL_AUTOSNAP_EXTRA_MARGIN_PX)
                     _as_move = math.hypot(_as_mx - new_cx,
                                            _as_my - new_cy)
-                    # Trust-weighted защита: live уверенее slot 0 → не snap.
-                    _live_leads = (match_ok and score is not None
-                                   and score >= _as_score + BLOB_ROLL_AUTOSNAP_LIVE_LEADS_MARGIN)
+                    # Snap только если slot 0 ЯВНО уверенее live-matcher'а
+                    # (разница ≥ MARGIN). Защищает от прыжка на похожий
+                    # объект когда live уже близко к цели.
+                    _live_sc_val = (float(score) if match_ok and score is not None
+                                    else 0.0)
+                    _slot0_leads = (_as_score
+                                    >= _live_sc_val + BLOB_ROLL_AUTOSNAP_SLOT0_LEADS_MARGIN)
                     if (_as_ok
                             and _as_score >= BLOB_ROLL_AUTOSNAP_MIN_SCORE
                             and _as_psr >= BLOB_ROLL_AUTOSNAP_MIN_PSR
                             and _as_move >= BLOB_ROLL_AUTOSNAP_MIN_MOVE_PX
                             and _as_move <= BLOB_ROLL_AUTOSNAP_MAX_MOVE_PX
-                            and not _live_leads):
+                            and _slot0_leads):
                         _snap_dx = _as_mx - new_cx
                         _snap_dy = _as_my - new_cy
                         new_cx = _as_mx
@@ -13202,14 +13228,14 @@ def process_locked_tracker(gray, cb_t0=None):
                     "BLOB ROLL FAIL: aoff_med=%.2f slot0 score=%.2f "
                     "psr=%.2f move=%.1f live_score=%.2f "
                     "(thr score>=%.2f psr>=%.2f move∈[%.1f,%.1f] "
-                    "live<slot0+%.2f)"
+                    "slot0>=live+%.2f)"
                     % (_blob_roll_aoff_med, _as_score, _as_psr, _as_move,
                        _live_sc,
                        BLOB_ROLL_AUTOSNAP_MIN_SCORE,
                        BLOB_ROLL_AUTOSNAP_MIN_PSR,
                        BLOB_ROLL_AUTOSNAP_MIN_MOVE_PX,
                        BLOB_ROLL_AUTOSNAP_MAX_MOVE_PX,
-                       BLOB_ROLL_AUTOSNAP_LIVE_LEADS_MARGIN))
+                       BLOB_ROLL_AUTOSNAP_SLOT0_LEADS_MARGIN))
 
         # SOFT DISTRUST (найдено оператором на реальном коде, см. докстроку
         # IDENTITY_SOFT_DISTRUST_ENABLED у объявления) — НЕ ждём, пока
