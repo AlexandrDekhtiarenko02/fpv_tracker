@@ -13137,8 +13137,10 @@ def process_locked_tracker(gray, cb_t0=None):
             # AUTO-SNAP: ищем slot 0 (immutable original) в расширенной
             # зоне. Если нашли уверенный peak далеко от lock — это
             # реальная цель, snap туда и сбросим distrust. Иначе
-            # оставляем soft_distrust, ждём пилота.
+            # оставляем soft_distrust и пишем диагностику результата
+            # trial'а (что реально возвращает slot 0 на этом съезде).
             _autosnap_done = False
+            _as_score = -1.0; _as_psr = -1.0; _as_move = -1.0
             if (BLOB_ROLL_AUTOSNAP_ENABLED
                     and _identity_anchor_bank
                     and _identity_anchor_bank[0] is not None):
@@ -13165,9 +13167,6 @@ def process_locked_tracker(gray, cb_t0=None):
                             "BLOB ROLL AUTOSNAP: dx=%.1f dy=%.1f "
                             "score=%.2f psr=%.2f"
                             % (_snap_dx, _snap_dy, _as_score, _as_psr))
-                        # Нашли реальную цель — сбрасываем rolling
-                        # buffers (пусть набирают заново уже на правильном
-                        # месте) и снимаем soft_distrust.
                         _blob_roll_ok = []
                         _blob_roll_anchor_off = []
                         _identity_soft_distrust = False
@@ -13176,9 +13175,12 @@ def process_locked_tracker(gray, cb_t0=None):
                     pass
             if not _autosnap_done:
                 flight_log.event(
-                    "BLOB ROLL FAIL: aoff_med=%.2f rate=%.2f → soft_distrust"
-                    % (_blob_roll_aoff_med,
-                       _blob_roll_rate if _blob_roll_rate is not None else -1.0))
+                    "BLOB ROLL FAIL: aoff_med=%.2f slot0 score=%.2f "
+                    "psr=%.2f move=%.1f (thr score>=%.2f psr>=%.2f move>=%.1f)"
+                    % (_blob_roll_aoff_med, _as_score, _as_psr, _as_move,
+                       BLOB_ROLL_AUTOSNAP_MIN_SCORE,
+                       BLOB_ROLL_AUTOSNAP_MIN_PSR,
+                       BLOB_ROLL_AUTOSNAP_MIN_MOVE_PX))
 
         # SOFT DISTRUST (найдено оператором на реальном коде, см. докстроку
         # IDENTITY_SOFT_DISTRUST_ENABLED у объявления) — НЕ ждём, пока
