@@ -592,6 +592,17 @@ BLOB_VERIFY_CENTER_FRAC = 0.3
 # Разбор 5f68fc6: 15 кадров давали ложные срабатывания в первые
 # 0.5s после захвата; 30 даёт live-matcher'у время успокоиться.
 BLOB_VERIFY_FAIL_CONFIRM_FRAMES = 30
+# ROLLING WINDOW GATE (откалиброван на стендовых данных 3bc75e6 с
+# cursor-ground-truth, 10 захватов, 2080 "на-цели" vs 354 "съезд"
+# окна). Разбор показал: ни одна метрика в одиночку не отличает
+# постепенный съезд (match_score стабильно 0.85-0.91 при dist=30 px);
+# combined gate работает:
+#   blob_verify_ok rate в окне < BLOB_RATE_THR
+#   AND anchor_check_offset медиана в окне > ANCHOR_OFFSET_THR
+# → ловит 42% съездов при 0.1% ложных (2 из 2080).
+BLOB_ROLL_WINDOW_FRAMES = 30
+BLOB_ROLL_OK_RATE_THR = 0.20
+BLOB_ROLL_ANCHOR_OFFSET_THR = 2.0
 # Через сколько секунд ПОСЛЕ захвата впервые разрешаем trigger.
 # Blob verify нестабилен в первые кадры лока (template ещё
 # не адаптировался к сцене, box может быть неоптимальным).
@@ -2477,6 +2488,10 @@ _FLIGHT_LOG_COLUMNS = (
     # фона". ok=1 — да, 0 — нет. contrast = |mean(center) - mean(ring)|,
     # edge_ratio = std(center) / std(ring). Пока только диагностика.
     "blob_verify_ok,blob_verify_contrast,blob_verify_edge_ratio,"
+    # ROLLING-WINDOW combined gate (BLOB_ROLL_*): blob_ok rate и anchor_
+    # offset медиана за последние 30 кадров. Если rate<0.20 И aoff_med>2.0 →
+    # soft_distrust. Откалибровано на стенд-данных 3bc75e6 с cursor truth.
+    "blob_roll_rate,blob_roll_aoff_med,"
     # STAND GROUND TRUTH (только на стенде; на борту всегда None/пустое):
     # позиция курсора оператора в main-view = где цель на самом деле.
     # stand_cursor_lock_dist_px = расстояние от lock-центра (box_cx/cy) до
@@ -7923,6 +7938,7 @@ def reset_tracking(to_acq=False):
     global _identity_anchor_check_streak, _identity_anchor_check_last_t
     global _identity_anchor_last_confirm_t
     global _blob_verify_fail_streak
+    global _blob_roll_ok, _blob_roll_anchor_off
     global _dual_signal_gap_frames
     global _identity_soft_distrust
     global _shadow_track_dbg
@@ -8059,6 +8075,8 @@ def reset_tracking(to_acq=False):
     _identity_anchor_check_last_t = 0.0
     _identity_anchor_last_confirm_t = 0.0
     _blob_verify_fail_streak = 0
+    _blob_roll_ok = []
+    _blob_roll_anchor_off = []
     _dual_signal_gap_frames = 0
     _identity_soft_distrust = False
 
@@ -11704,6 +11722,10 @@ IDENTITY_ANCHOR_CHECK_CONFIRM_N = 6
 _identity_anchor_check_streak = 0
 _identity_anchor_check_last_t = 0.0
 _blob_verify_fail_streak = 0
+# Rolling-window буферы для combined gate (см. BLOB_ROLL_* выше).
+# Храним последние N кадров blob_verify_ok (0/1) и anchor_check_offset.
+_blob_roll_ok = []
+_blob_roll_anchor_off = []
 # Отметка ВРЕМЕНИ последнего успешного anchor-подтверждения (см. ниже блок
 # ANCHOR ARBITER). Не путать с _identity_anchor_check_last_t (тот — время
 # последней ПОПЫТКИ, успешной или нет; это — только успехи).
@@ -11888,6 +11910,7 @@ def process_locked_tracker(gray, cb_t0=None):
     global _identity_anchor_check_streak, _identity_anchor_check_last_t
     global _identity_anchor_last_confirm_t
     global _blob_verify_fail_streak
+    global _blob_roll_ok, _blob_roll_anchor_off
     global _dual_signal_gap_frames
     global _identity_soft_distrust
     global _shadow_track_dbg
@@ -13018,6 +13041,31 @@ def process_locked_tracker(gray, cb_t0=None):
             _match_dbg["blob_verify_edge_ratio"] = 1.0
             _blob_verify_fail_streak = 0
         _match_dbg["blob_verify_fail_streak"] = _blob_verify_fail_streak
+        # ROLLING-WINDOW combined gate (откалиброван на стендовых данных
+        # 3bc75e6, см. BLOB_ROLL_* выше). blob_ok rate < 20% AND
+        # anchor_offset медиана > 2.0 px в окне 30 кадров → съезд.
+        # Ловит 42% съездов при 0.1% ложных.
+        if BLOB_VERIFY_ENABLED and tracked_ok and lock_w is not None:
+            _blob_roll_ok.append(1 if _match_dbg.get("blob_verify_ok") else 0)
+            _aoff_now = _match_dbg.get("identity_anchor_check_offset")
+            if _aoff_now is not None:
+                _blob_roll_anchor_off.append(float(_aoff_now))
+            if len(_blob_roll_ok) > BLOB_ROLL_WINDOW_FRAMES:
+                _blob_roll_ok = _blob_roll_ok[-BLOB_ROLL_WINDOW_FRAMES:]
+            if len(_blob_roll_anchor_off) > BLOB_ROLL_WINDOW_FRAMES:
+                _blob_roll_anchor_off = _blob_roll_anchor_off[-BLOB_ROLL_WINDOW_FRAMES:]
+        else:
+            _blob_roll_ok = []
+            _blob_roll_anchor_off = []
+        _blob_roll_rate = None
+        _blob_roll_aoff_med = None
+        if (len(_blob_roll_ok) >= BLOB_ROLL_WINDOW_FRAMES
+                and len(_blob_roll_anchor_off) >= BLOB_ROLL_WINDOW_FRAMES // 2):
+            _blob_roll_rate = sum(_blob_roll_ok) / float(len(_blob_roll_ok))
+            _sorted_off = sorted(_blob_roll_anchor_off)
+            _blob_roll_aoff_med = _sorted_off[len(_sorted_off) // 2]
+        _match_dbg["blob_roll_rate"] = _blob_roll_rate
+        _match_dbg["blob_roll_aoff_med"] = _blob_roll_aoff_med
         # BLOB VERIFY TRIGGER: N кадров подряд "в центре нет компактного
         # объекта" → форсим IDENTITY_UNCERTAIN. Независимый сигнал от
         # template matching: tracker может быть уверен (score=0.8) что
@@ -13030,23 +13078,26 @@ def process_locked_tracker(gray, cb_t0=None):
         _bv_warmup = (_identity_anchor_last_confirm_t > 0
                       and (time.monotonic() - _identity_anchor_last_confirm_t)
                           < BLOB_VERIFY_WARMUP_S)
+        # NEW: Combined rolling-window gate (откалиброван на cursor-truth,
+        # коммит 3bc75e6-данные). Прежний N-подряд debounce заменён —
+        # распределение consecutive ok=0 на цели и на съезде оказалось
+        # почти идентичным, одиночный debounce не работал. Rolling rate
+        # + anchor_offset дают чистое разделение (TP 42%, FP 0.1%).
         if (BLOB_VERIFY_ENABLED
                 and not _bv_warmup
-                and _blob_verify_fail_streak >= BLOB_VERIFY_FAIL_CONFIRM_FRAMES
+                and _blob_roll_rate is not None
+                and _blob_roll_aoff_med is not None
+                and _blob_roll_rate < BLOB_ROLL_OK_RATE_THR
+                and _blob_roll_aoff_med > BLOB_ROLL_ANCHOR_OFFSET_THR
                 and tracked_ok):
             # SOFT distrust вместо прямого UNCERTAIN: controllable снимется,
             # пилот увидит что identity сомнительна, но track_state
             # остаётся TRACKED — пилот сам решает ждать восстановления
-            # или перехватить. Циклический reset-reacq (который был на
-            # 5f68fc6 с прямым UNCERTAIN) этим путём невозможен.
+            # или перехватить.
             _identity_soft_distrust = True
             flight_log.event(
-                "BLOB VERIFY FAIL: contrast=%.1f edge_ratio=%.2f "
-                "streak=%d → soft_distrust"
-                % (_match_dbg.get("blob_verify_contrast") or 0.0,
-                   _match_dbg.get("blob_verify_edge_ratio") or 0.0,
-                   _blob_verify_fail_streak))
-            _blob_verify_fail_streak = 0
+                "BLOB ROLL FAIL: ok_rate=%.2f aoff_med=%.2f → soft_distrust"
+                % (_blob_roll_rate, _blob_roll_aoff_med))
             _match_dbg["blob_verify_triggered_soft_distrust"] = 1
 
         # SOFT DISTRUST (найдено оператором на реальном коде, см. докстроку
@@ -14347,6 +14398,8 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("blob_verify_ok"),
             _match_dbg.get("blob_verify_contrast"),
             _match_dbg.get("blob_verify_edge_ratio"),
+            _match_dbg.get("blob_roll_rate"),
+            _match_dbg.get("blob_roll_aoff_med"),
             _match_dbg.get("stand_cursor_main_x"),
             _match_dbg.get("stand_cursor_main_y"),
             _match_dbg.get("stand_cursor_lock_dist_px"),
