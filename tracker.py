@@ -632,6 +632,17 @@ BLOB_ROLL_AUTOSNAP_MIN_PSR = 2.0
 # Минимальное расстояние от текущего lock до snap-кандидата —
 # если ближе этого, это "подтверждение текущего места" а не коррекция.
 BLOB_ROLL_AUTOSNAP_MIN_MOVE_PX = 8.0
+# Максимальное расстояние от текущего lock до snap-кандидата. Если
+# дальше — это скорее другой похожий объект, а не настоящая цель
+# (которая не могла уехать так далеко от lock за одно окно). Разбор
+# прогона 00a7684 zahvat03: snap на +26 px увёл рамку на похожий
+# объект, пилот жаловался "ложно срабатывает на объекты вдалеке".
+BLOB_ROLL_AUTOSNAP_MAX_MOVE_PX = 25.0
+# Trust-weighted: если live match_score ВЫШЕ score slot 0 с запасом,
+# значит live-matcher уверенее — snap блокировать. Это защищает
+# когда рамка почти на цели, а slot 0 нашёл похожий объект чуть
+# в стороне с чуть меньшим score.
+BLOB_ROLL_AUTOSNAP_LIVE_LEADS_MARGIN = 0.03
 # Через сколько секунд ПОСЛЕ захвата впервые разрешаем trigger.
 # Blob verify нестабилен в первые кадры лока (template ещё
 # не адаптировался к сцене, box может быть неоптимальным).
@@ -13160,10 +13171,15 @@ def process_locked_tracker(gray, cb_t0=None):
                         extra_margin_px=BLOB_ROLL_AUTOSNAP_EXTRA_MARGIN_PX)
                     _as_move = math.hypot(_as_mx - new_cx,
                                            _as_my - new_cy)
+                    # Trust-weighted защита: live уверенее slot 0 → не snap.
+                    _live_leads = (match_ok and score is not None
+                                   and score >= _as_score + BLOB_ROLL_AUTOSNAP_LIVE_LEADS_MARGIN)
                     if (_as_ok
                             and _as_score >= BLOB_ROLL_AUTOSNAP_MIN_SCORE
                             and _as_psr >= BLOB_ROLL_AUTOSNAP_MIN_PSR
-                            and _as_move >= BLOB_ROLL_AUTOSNAP_MIN_MOVE_PX):
+                            and _as_move >= BLOB_ROLL_AUTOSNAP_MIN_MOVE_PX
+                            and _as_move <= BLOB_ROLL_AUTOSNAP_MAX_MOVE_PX
+                            and not _live_leads):
                         _snap_dx = _as_mx - new_cx
                         _snap_dy = _as_my - new_cy
                         new_cx = _as_mx
@@ -13181,13 +13197,19 @@ def process_locked_tracker(gray, cb_t0=None):
                 except Exception:
                     pass
             if not _autosnap_done:
+                _live_sc = float(score) if match_ok and score is not None else -1.0
                 flight_log.event(
                     "BLOB ROLL FAIL: aoff_med=%.2f slot0 score=%.2f "
-                    "psr=%.2f move=%.1f (thr score>=%.2f psr>=%.2f move>=%.1f)"
+                    "psr=%.2f move=%.1f live_score=%.2f "
+                    "(thr score>=%.2f psr>=%.2f move∈[%.1f,%.1f] "
+                    "live<slot0+%.2f)"
                     % (_blob_roll_aoff_med, _as_score, _as_psr, _as_move,
+                       _live_sc,
                        BLOB_ROLL_AUTOSNAP_MIN_SCORE,
                        BLOB_ROLL_AUTOSNAP_MIN_PSR,
-                       BLOB_ROLL_AUTOSNAP_MIN_MOVE_PX))
+                       BLOB_ROLL_AUTOSNAP_MIN_MOVE_PX,
+                       BLOB_ROLL_AUTOSNAP_MAX_MOVE_PX,
+                       BLOB_ROLL_AUTOSNAP_LIVE_LEADS_MARGIN))
 
         # SOFT DISTRUST (найдено оператором на реальном коде, см. докстроку
         # IDENTITY_SOFT_DISTRUST_ENABLED у объявления) — НЕ ждём, пока
