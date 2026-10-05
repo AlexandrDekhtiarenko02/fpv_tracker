@@ -2411,7 +2411,15 @@ _FLIGHT_LOG_COLUMNS = (
     # update_control_from_target(); diagnostika — MEAN/TOPMEAN (теперь раз
     # в секунду, см. _diag_1hz_tick); overlay — draw_overlay_on_frame(),
     # САМ overlay не менялся, только замер вокруг него.
-    "ms_upravlenie,ms_diagnostika,ms_overlay,armed,"
+    "ms_upravlenie,ms_diagnostika,ms_overlay,"
+    # anchor_check_block/blob_block (разбор реальных бортовых логов
+    # 2d83a09: 13.7мс/кадр неучтённого разрыва между cb_wall_ms и
+    # суммой именованных ms_* стадий — это anchor-check с банком,
+    # blob verify, rolling gate, autosnap, ни разу не обёрнутые в
+    # _etap()). anchor_check_block — periodic сверка с anchor (вкл.
+    # anchor bank до 4 слотов); blob_block — blob verify + rolling
+    # gate + autosnap-пробный matchTemplate.
+    "ms_anchor_check_block,ms_blob_block,armed,"
     "launch_target_deg,launch_reached,k,match_psr,match_second,search_margin,"
     "match_flow_gap,size_est,size_skip,size_why,size_R,size_scale,motion_sep,motion_on,"
     "color_on,color_pen,color_best,chroma_sat,"
@@ -12842,6 +12850,14 @@ def process_locked_tracker(gray, cb_t0=None):
             new_cx = lock_cx + (new_cx - lock_cx) * k
             new_cy = lock_cy + (new_cy - lock_cy) * k
 
+        # ИЗМЕРЕНИЕ СТОИМОСТИ (разбор реальных бортовых логов 2d83a09:
+        # cb_wall_ms медиана 37.2мс при бюджете 41.7мс, но сумма
+        # именованных ms_* стадий — только 23.5мс. 13.7мс (37%)
+        # неучтены — это ровно то, что добавлено в эту сессию:
+        # anchor-check (с банком 4 слота), blob verify, rolling gate,
+        # autosnap. Ни разу не обёрнуто в _etap(). Оборачиваем, чтобы
+        # увидеть разбивку вместо единой "дыры").
+        _t_anchor_block = time.monotonic()
         # ПЕРИОДИЧЕСКАЯ СВЕРКА С ANCHOR (разбор оператора, оставшийся
         # hard-lock bypass в обычном TRACKED->TRACKED: "flow и matcher
         # СОГЛАСНЫ друг с другом на B, dist_fm маленький, ambiguity нет,
@@ -13090,6 +13106,8 @@ def process_locked_tracker(gray, cb_t0=None):
         else:
             _match_dbg["identity_anchor_check_ran"] = 0
         _match_dbg["identity_anchor_check_streak"] = _identity_anchor_check_streak
+        _etap("anchor_check_block", _t_anchor_block)
+        _t_blob_block = time.monotonic()
         # BLOB VERIFICATION (см. BLOB_VERIFY_ENABLED выше). Независимая
         # от template matching проверка: в центре lock-рамки должен
         # быть компактный объект, не однородный фон. При N подряд
@@ -13236,6 +13254,8 @@ def process_locked_tracker(gray, cb_t0=None):
                        BLOB_ROLL_AUTOSNAP_MIN_MOVE_PX,
                        BLOB_ROLL_AUTOSNAP_MAX_MOVE_PX,
                        BLOB_ROLL_AUTOSNAP_SLOT0_LEADS_MARGIN))
+
+        _etap("blob_block", _t_blob_block)
 
         # SOFT DISTRUST (найдено оператором на реальном коде, см. докстроку
         # IDENTITY_SOFT_DISTRUST_ENABLED у объявления) — НЕ ждём, пока
@@ -14470,6 +14490,7 @@ def _capture_flight_row(cb_t0):
             _etap_ms.get("primerka"),
             _etap_ms.get("upravlenie"), _etap_ms.get("diagnostika"),
             _etap_ms.get("overlay"),
+            _etap_ms.get("anchor_check_block"), _etap_ms.get("blob_block"),
             armed,
             g("launch_target_deg"), g("launch_reached"), g("k"),
             _match_dbg.get("psr"), _match_dbg.get("second"),
