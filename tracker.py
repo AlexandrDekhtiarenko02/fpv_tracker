@@ -946,10 +946,18 @@ ADAPT_SCORE_WINDOW_S = 1.0
 TREF_MIN_LIVE_SCORE = 0.65
 # Шаг рамки за кадр, когда лок нечем подтвердить. Дорога t=6.49: lead<=0,
 # поток −4.6 px, рамка прыгнула на 9 px. Машина t=4.88: score 0.53,
-# поток +7 px, рамка ушла на 14 px. 3 px при ~20 кадр/с — это 60 px/с,
-# дальняя цель столько не бегает; всплеск потока — бегает.
+# поток +7 px, рамка ушла на 14 px. 3 px при ~20 кадр/с — это 60 px/с
+# в координатах трекера (на экране 640 вдвое больше: кадр считается
+# в 320). Потолок ловит всплеск, но не ползание.
+# Дорога 204137 на 94941ff: lead < 0.15 все 12 с, из +26 px потока по x
+# двадцать пришли шагами меньше 1 px — порог 3 px их не видел, рамка
+# ушла на +52 px экрана. Машина 204048: lead уже был ≤ 0, поток 2–6 px
+# при flow_gap ~10 (вес матча 0) за секунду утащил рамку вниз. Пока пик
+# не уникален, берём четверть шага. Обычный кадр (lead ≥ 0.15, см.
+# ADAPT_UNIQUE_LEAD) идёт целиком.
 WEAK_LOCK_STEP_MAX_PX = 3.0
 WEAK_SCORE_STEP_THR = 0.60
+AMBIGUOUS_STEP_GAIN = 0.25
 MATCH_GOOD_SCORE = 0.40    # было 0.34 — выше планка «уверенного» матча
 # Штраф за то, что совпадение найдено ДАЛЕКО от предсказания потока.
 #
@@ -13228,19 +13236,26 @@ def process_locked_tracker(gray, cb_t0=None):
             k = MAX_LOCK_STEP / max(step, 1e-6)
             new_cx = lock_cx + (new_cx - lock_cx) * k
             new_cy = lock_cy + (new_cy - lock_cy) * k
-        # Всплеск потока, когда лок не подтверждён. Дорога 201356 t=6.49:
-        # lead<=0, поток −4.6 px, рамка +9 px на обочину. Машина 201219
-        # t=4.88: score 0.53, поток +7 px, рамка +14 px вниз с машины.
-        # Уникальный пик при score>=0.60 этот предел не трогает.
+        # Всплеск и ползание, когда пик не подтверждает цель.
+        # Потолок 3 px режет один кадр (дорога 201356: +9 px, машина
+        # 201219: +14 px). Он не видит шаги меньше себя: дорога 204137
+        # ушла на +26 px потоком по 0.1–1 px, машина 204048 — секундой
+        # потока 2–6 px при lead ≤ 0. Пока lead < 0.15, шаг только
+        # четверть, и всё равно не больше потолка. Уникальный пик
+        # при score >= 0.60 этот предел не трогает.
         if track_state == TRACK_STATE_TRACKED:
-            _step_cap = None
-            if score < WEAK_SCORE_STEP_THR:
-                _step_cap = WEAK_LOCK_STEP_MAX_PX
+            _lead_now = None
             _sec_now = _match_dbg.get("second")
             if _sec_now is not None and score > 0.0:
                 _lead_now = (score - float(_sec_now)) / max(score, 1e-6)
-                if _lead_now <= 0.0:
-                    _step_cap = WEAK_LOCK_STEP_MAX_PX
+            if _lead_now is not None and _lead_now < ADAPT_UNIQUE_LEAD:
+                new_cx = lock_cx + (new_cx - lock_cx) * AMBIGUOUS_STEP_GAIN
+                new_cy = lock_cy + (new_cy - lock_cy) * AMBIGUOUS_STEP_GAIN
+            _step_cap = None
+            if score < WEAK_SCORE_STEP_THR:
+                _step_cap = WEAK_LOCK_STEP_MAX_PX
+            if _lead_now is not None and _lead_now < ADAPT_UNIQUE_LEAD:
+                _step_cap = WEAK_LOCK_STEP_MAX_PX
             if _step_cap is not None:
                 step = math.hypot(new_cx - lock_cx, new_cy - lock_cy)
                 if step > _step_cap:
@@ -13726,7 +13741,22 @@ def process_locked_tracker(gray, cb_t0=None):
                         and _as_psr >= PATH_RETURN_MIN_PSR
                         and _lock_is_stripe(
                             gray, new_cx, new_cy, lock_w or 8, lock_h or 8))
+                    # Живой пик не уникален — соседняя колея выглядит так же.
+                    # Дорога 204137 t=8.09: lead=-0.06, слот 0 score 0.75
+                    # против live 0.73, autosnap +5 px (на экране +10) в
+                    # соседнюю колею. Пока lead ниже порога обучения, snap
+                    # не голосует. Второго пика нет — нечем запретить, snap
+                    # как раньше.
+                    _as_lead = None
+                    _as_sec = _match_dbg.get("second")
+                    if (match_ok and score is not None and score > 0.0
+                            and _as_sec is not None):
+                        _as_lead = ((float(score) - float(_as_sec))
+                                    / max(float(score), 1e-6))
+                    _as_peak_unique = (
+                        _as_lead is None or _as_lead >= ADAPT_UNIQUE_LEAD)
                     if (_as_ok
+                            and _as_peak_unique
                             and _as_score >= BLOB_ROLL_AUTOSNAP_MIN_SCORE
                             and _as_move >= BLOB_ROLL_AUTOSNAP_MIN_MOVE_PX
                             and _as_move <= BLOB_ROLL_AUTOSNAP_MAX_MOVE_PX
