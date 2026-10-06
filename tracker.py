@@ -1648,7 +1648,7 @@ CLOSING_FF_MULTIPLIER = 1.3         # FF тоже приподнимаем — �
 # иначе цель может выскочить за окно за один кадр.
 ADAPTIVE_SEARCH_MARGIN = True
 SEARCH_MARGIN_MIN = 14 * TRACK_SCALE               # при неподвижной цели
-SEARCH_MARGIN_MAX = 36 * TRACK_SCALE               # при цели на полной скорости трекера
+SEARCH_MARGIN_MAX = 26 * TRACK_SCALE               # было 36 — сужаем, меньше фона в окне
 SEARCH_MARGIN_VEL_REF = 12.0 * TRACK_SCALE         # flow-motion (px/кадр) для перехода к MAX
 
 # --- АДАПТАЦИЯ РАЗМЕРА КОРОБКИ ---
