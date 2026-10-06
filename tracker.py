@@ -7513,7 +7513,7 @@ def _shadow_match_against_template(gray, tmpl, tmpl_w, tmpl_h, tmpl_std,
 
 
 def _anchor_bank_match_best(gray, pred_cx, pred_cy, flow_motion,
-                            extra_margin_px=0, cb_t0=None):
+                            extra_margin_px=0, cb_t0=None, scale_acc=1.0):
     """Пробегает по всем занятым слотам anchor-банка и возвращает
     результат с наибольшим raw_score. Если банк не инициализирован или
     пуст, падает обратно на одиночный _identity_anchor_gray — поведение
@@ -7525,6 +7525,19 @@ def _anchor_bank_match_best(gray, pred_cx, pred_cy, flow_motion,
 
     Smart loop: если первый же сильный score встречен (>= MATCH_GOOD_SCORE
     AND offset<=small), ранний выход — экономия CPU на RPi.
+
+    scale_acc: накопленный множитель роста рамки (template_scale_acc) с
+    момента когда соответствующий slot был снят. БЕЗ этого — реальный
+    баг, найденный на борту 06.10 (flight_20261006_132639: offset первой
+    же anchor-проверки стабильно 15-20px на ВСЕХ трёх последних локах,
+    притом live score 0.5-0.85 — цель держится отлично). Причина:
+    компенсация роста (видна ниже по коду, _iac_tmpl) писалась только
+    для ветки "банк пуст", а банк заполняется СРАЗУ при захвате — эта
+    ветка почти никогда не используется. Slot 0 (immutable, снят в 24x24
+    в момент захвата) сравнивался с текущей картинкой БЕЗ поправки на
+    то, что рамка уже выросла до 27px — рассинхром размера эталона и
+    цели систематически сдвигает найденный пик корреляции, anchor не
+    подтверждает позицию, soft_distrust рубит control с одного замера.
 
     BUDGET-GATE (разбор реальных бортовых логов daaa75f: anchor-check
     блок достигал 91.5 мс — почти 2.2x бюджета кадра 41.7мс. Early-exit
@@ -7555,12 +7568,27 @@ def _anchor_bank_match_best(gray, pred_cx, pred_cy, flow_motion,
         return _shadow_match_against_template(
             gray, tmpl, w, h, std,
             pred_cx, pred_cy, flow_motion)
+    def _scaled(tmpl, w, h, std):
+        if tmpl is None or abs(scale_acc - 1.0) <= 1e-3:
+            return tmpl, w, h, std
+        try:
+            nw = max(1, int(round(w * scale_acc)))
+            nh = max(1, int(round(h * scale_acc)))
+            if (nw, nh) == (w, h):
+                return tmpl, w, h, std
+            rs = cv2.resize(tmpl, (nw, nh), interpolation=cv2.INTER_LINEAR)
+            rs_std = float(np.std(rs)) if rs.size else std
+            return rs, nw, nh, rs_std
+        except Exception:
+            return tmpl, w, h, std
     if not bank:
         # Fallback: пустой банк, используем старую одиночную ссылку.
         if _identity_anchor_gray is None:
             return False, 0.0, 0.0, 0.0, pred_cx, pred_cy, -1
-        res = _call_shadow(_identity_anchor_gray, _identity_anchor_w,
-                           _identity_anchor_h, _identity_anchor_std)
+        s_gray, s_w, s_h, s_std = _scaled(
+            _identity_anchor_gray, _identity_anchor_w,
+            _identity_anchor_h, _identity_anchor_std)
+        res = _call_shadow(s_gray, s_w, s_h, s_std)
         return (res[0], res[1], res[2], res[3], res[4], res[5], 0)
     for idx, slot in enumerate(bank):
         if slot is None:
@@ -7572,7 +7600,17 @@ def _anchor_bank_match_best(gray, pred_cx, pred_cy, flow_motion,
                 and (time.monotonic() - cb_t0) * 1000.0
                     > FRAME_BUDGET_MS * FRAME_BUDGET_SECONDARY_FRAC):
             break
-        res = _call_shadow(slot["gray"], slot["w"], slot["h"], slot["std"])
+        # Масштаб применяем только к slot 0: он immutable с момента
+        # захвата, остальные слоты периодически обновляются свежими
+        # patch'ами ПОД ТЕКУЩИЙ размер (_anchor_bank_maybe_refresh) — их
+        # повторно масштабировать значит исказить уже верный размер.
+        if idx == 0:
+            s_gray, s_w, s_h, s_std = _scaled(
+                slot["gray"], slot["w"], slot["h"], slot["std"])
+        else:
+            s_gray, s_w, s_h, s_std = (slot["gray"], slot["w"], slot["h"],
+                                        slot["std"])
+        res = _call_shadow(s_gray, s_w, s_h, s_std)
         if not res[0]:
             continue
         if best is None or res[1] > best[1]:
@@ -13044,7 +13082,8 @@ def process_locked_tracker(gray, cb_t0=None):
                  _iac_mx, _iac_my, _iac_slot
                  ) = _anchor_bank_match_best(
                     gray, new_cx, new_cy, flow_motion,
-                    extra_margin_px=_iac_extra_margin, cb_t0=cb_t0)
+                    extra_margin_px=_iac_extra_margin, cb_t0=cb_t0,
+                    scale_acc=template_scale_acc)
                 # Если банк пуст (ещё не инициализирован — например тесты
                 # используют _identity_anchor_gray напрямую), падаем на
                 # исходный путь с ресайзнутым scale-template.
