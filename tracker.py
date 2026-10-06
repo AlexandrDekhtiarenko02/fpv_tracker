@@ -2109,7 +2109,9 @@ TAU_UBYV_MIN_TOCHEK = 12       # предел поправки по времен
 # Время меняется медленно и предсказуемо: каждую секунду оно убывает на
 # секунду. Поэтому пропажу переживаем экстраполяцией, а не обнулением. Но
 # недолго: через TAU_HOLD_S оценка признаётся протухшей и газ отпускается.
-TAU_HOLD_S = 1.5
+# 1.5 с не перекрывало типичный провал на пологом заходе (заполненность
+# ~51%). 3 с — ещё экстраполяция, не закон: доверие падает с возрастом.
+TAU_HOLD_S = 3.0
 DY_INTEGRAL_RATE = 0.04
 DY_INTEGRAL_MAX = 60.0
 DY_INTEGRAL_DECAY = 0.985
@@ -2297,6 +2299,12 @@ TAU_FIT_MIN_SPAN_S = 0.8
 # Порог по наклону, 1/с. Прежний TAU_MIN_GROWTH задан на кадр и здесь не
 # годится: 0.002/кадр при 30 к/с это 0.06 1/с.
 TAU_MIN_GROWTH_PER_S = 0.01
+# Гистерезис. Порог 0.01 гасит оценку, как только рост проседает в шум,
+# и tau мигает. Если наклон только что был годным, держим его до 0.004
+# ещё TAU_SLOPE_FRESH_S секунд — это не новый замер, а отказ бросать
+# уже принятую оценку из-за одного тихого окна.
+TAU_MIN_GROWTH_KEEP = 0.004
+TAU_SLOPE_FRESH_S = 2.5
 
 # --- КАСКАДНЫЙ ГАЗ ПО ВАРИОМЕТРУ ---
 # Между ручкой газа и тем, что регулятор измеряет, стоит цепочка:
@@ -4601,6 +4609,7 @@ _growth_raw = collections.deque(maxlen=24)
 box_growth_smoothed = 0.0
 _tau_hold_val = None           # последнее годное время до контакта
 _tau_hold_t = 0.0              # когда оно было замерено
+_tau_slope_fresh_t = 0.0       # когда наклон роста последний раз прошёл порог
 # Хвост (время, размер рамки) для оценки времени до контакта по окну.
 _size_hist = collections.deque(maxlen=256)
 # Коэффициент расширения цели за кадр по точкам потока и когда он получен.
@@ -8589,7 +8598,7 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
     нет высоты, слишком малый угол. Смешивать эти случаи с нулём нельзя —
     ноль дальности означал бы «мы в цели».
     """
-    global prev_box_size_px, box_growth_smoothed
+    global prev_box_size_px, box_growth_smoothed, _tau_slope_fresh_t
     out = {"size_px": None, "growth": None, "tau_s": None,
            "range_m": None, "depression_deg": None, "alt_min_m": None,
            "range_gain": None, "range_sigma_m": None,
@@ -8667,7 +8676,10 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
         den = sum((x - mx) ** 2 for x in xs)
         if den > 1e-6:
             naklon = sum((xs[i] - mx) * (ys[i] - my) for i in range(m)) / den
-            if naklon > TAU_MIN_GROWTH_PER_S:
+            porog = TAU_MIN_GROWTH_PER_S
+            if (now_mono - _tau_slope_fresh_t) <= TAU_SLOPE_FRESH_S:
+                porog = TAU_MIN_GROWTH_KEEP
+            if naklon > porog:
                 # ПОПРАВКА НА ЗАПАЗДЫВАНИЕ ОКНА. Наклон по окну — это средняя
                 # скорость роста в его середине, а не сейчас; время до
                 # контакта убывает секунда за секунду, поэтому от оценки
@@ -8676,6 +8688,7 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
                 tau = 1.0 / naklon - (now_mono - mx)
                 if tau > 0.0:
                     out["tau_s"] = tau
+                    _tau_slope_fresh_t = now_mono
                     # Погрешность времени равна относительной погрешности
                     # наклона — это та же дробь, только числитель и
                     # знаменатель поменялись местами.
@@ -8776,6 +8789,24 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
         otn_ugol = 2.0 * math.radians(RANGE_ANGLE_SIGMA_DEG) * usilenie
         otn_vys = (sigma / 100.0 / alt_m) if sigma is not None else 0.0
         out["range_sigma_m"] = R * math.hypot(otn_ugol, otn_vys)
+    # Запасное время, когда рост рамки в шуме, а геометрия уже есть.
+    # tau = R/V. Это не замена наклону коробки: сигма намеренно большая,
+    # газ по доверию сам ослабит поправку. Без скорости запасного нет.
+    if out.get("tau_s") is None and out.get("range_m"):
+        skorost_fb = None
+        with state_lock:
+            _sp_cms = app_state.get("gps_speed_cms")
+            _gps_zh = _gps_zhivoy(app_state)
+        if _gps_zh and _sp_cms is not None and _sp_cms > 50:
+            skorost_fb = _sp_cms / 100.0
+        elif ground_speed_mps is not None and ground_speed_mps > 0.5:
+            skorost_fb = ground_speed_mps
+        if skorost_fb:
+            tau_fb = out["range_m"] / skorost_fb
+            if 0.3 < tau_fb < 40.0:
+                out["tau_s"] = tau_fb
+                out["tau_sigma_s"] = tau_fb
+                _tau_slope_fresh_t = now_mono
     return out
 
 
@@ -8994,7 +9025,7 @@ def _reset_geometry_history(reason):
     global _los_ugol, _los_skorost, _los_skorost_ts
     global prev_box_size_px, box_growth_smoothed
     global _rassh_nakop, _flow_rasshirenie
-    global _score_do_rosta, _tau_hold_val, _tau_hold_t
+    global _score_do_rosta, _tau_hold_val, _tau_hold_t, _tau_slope_fresh_t
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed
     global stable_track_frames
     global _dover_score_ema, _dover_psr_ema
@@ -9026,6 +9057,7 @@ def _reset_geometry_history(reason):
     _score_do_rosta = None
     _tau_hold_val = None
     _tau_hold_t = 0.0
+    _tau_slope_fresh_t = 0.0
     prev_box_cx = None
     prev_box_cy = None
     target_vx_smoothed = 0.0
@@ -9135,7 +9167,7 @@ def _update_control_from_target_impl():
     global launch_phase, launch_counter, prev_controllable_for_launch
     global overlay_text, overlay_color, _ctl_dbg, prev_control_mono
     global prev_launch_pitch_deg, prev_box_size_px, box_growth_smoothed
-    global _score_do_rosta, _tau_hold_val, _tau_hold_t, _size_R_boost
+    global _score_do_rosta, _tau_hold_val, _tau_hold_t, _tau_slope_fresh_t, _size_R_boost
     global _tracked_since_t, _pid_last_lock_seq
     global _shadow_roll_integral, _shadow_pitch_integral, _shadow_yaw_integral
     global _shadow_slew_roll, _shadow_slew_pitch, _shadow_slew_yaw
@@ -9212,6 +9244,7 @@ def _update_control_from_target_impl():
         _pid_last_lock_seq = _cur_lock_seq
         _tau_hold_val = None
         _tau_hold_t = 0.0
+        _tau_slope_fresh_t = 0.0
         _tracked_since_t = None
         # Та же причина, что и остальной сброс здесь: заморозка control
         # относится к ПРОШЛОМУ локу, новый лок обязан лететь по своему
