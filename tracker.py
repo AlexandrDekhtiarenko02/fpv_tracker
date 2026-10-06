@@ -2601,6 +2601,11 @@ _FLIGHT_LOG_COLUMNS = (
     "blob_roll_autosnap_trial_score,blob_roll_autosnap_trial_psr,"
     "blob_roll_autosnap_trial_move,blob_roll_autosnap_trial_mx,"
     "blob_roll_autosnap_trial_my,"
+    # snap_budget_mag: суммарная длина автоматической коррекции,
+    # накопленная с последнего подтверждённого anchor-check (см.
+    # MAX_CORRECTION_TOTAL_PX) — должна оставаться в пределах бюджета,
+    # не расти неограниченно даже при серии снапов подряд в одну сторону.
+    "snap_budget_mag,"
     # growth_suspect: _blob_roll_size_ratio < THR на этом trial'е (живой
     # лок не растёт как приближающаяся цель — margin снижен, см. GROWTH_
     # SUSPECT_THR/RELAX_MARGIN). margin_used — реально применённый margin.
@@ -5445,6 +5450,49 @@ def clamp_correction(dx, dy, max_px=MAX_CORRECTION_STEP_PX):
         return dx, dy
     k = max_px / d
     return dx * k, dy * k
+
+
+# БЮДЖЕТ СУММАРНОЙ КОРРЕКЦИИ — "в границах пятна, которое было в момент
+# лока" (прямая формулировка оператора, разбор 06.10: рамка трекалась
+# правильно, но несколько ANCHOR SNAP подряд в одну сторону — streak=6,
+# 7, 8, каждый ~5px, но в сумме ~15px за секунду — утащили её прочь).
+# MAX_CORRECTION_STEP_PX защищает только ОДИН шаг; этого бюджета не
+# было — несколько снапов подряд в одну сторону спокойно обходили его.
+# Теперь суммарное смещение, накопленное snap/pull-механизмами с
+# момента последнего НАСТОЯЩЕГО подтверждения (anchor реально согласен
+# с позицией — см. _identity_anchor_check_streak = 0 ниже по коду),
+# не может превышать этот бюджет. Live/flow-трекинг ЦЕЛИ (которая
+# реально движется в кадре на сближении) бюджетом не ограничен —
+# только автоматические snap/pull поправки.
+MAX_CORRECTION_TOTAL_PX = 15.0
+_snap_budget_dx = 0.0
+_snap_budget_dy = 0.0
+
+
+def _apply_snap_budget(dx, dy):
+    """Применяет (dx, dy) к бюджету MAX_CORRECTION_TOTAL_PX и возвращает
+    ФАКТИЧЕСКИ разрешённую часть — остаток до потолка суммарного сдвига.
+    Вызывать ПОСЛЕ clamp_correction (по-кадровый лимит), но ДО применения
+    к new_cx/new_cy."""
+    global _snap_budget_dx, _snap_budget_dy
+    _tot_x = _snap_budget_dx + dx
+    _tot_y = _snap_budget_dy + dy
+    _mag = math.hypot(_tot_x, _tot_y)
+    if _mag > MAX_CORRECTION_TOTAL_PX and _mag > 1e-9:
+        k = MAX_CORRECTION_TOTAL_PX / _mag
+        _tot_x *= k
+        _tot_y *= k
+    _allowed_dx = _tot_x - _snap_budget_dx
+    _allowed_dy = _tot_y - _snap_budget_dy
+    _snap_budget_dx = _tot_x
+    _snap_budget_dy = _tot_y
+    return _allowed_dx, _allowed_dy
+
+
+def _reset_snap_budget():
+    global _snap_budget_dx, _snap_budget_dy
+    _snap_budget_dx = 0.0
+    _snap_budget_dy = 0.0
 
 
 def clamp_rect_center(cx, cy, w, h, max_w, max_h):
@@ -8294,6 +8342,7 @@ def reset_tracking(to_acq=False):
     _identity_anchor_check_last_t = 0.0
     _identity_anchor_last_confirm_t = 0.0
     _last_capture_t = 0.0
+    _reset_snap_budget()
     _blob_verify_fail_streak = 0
     _blob_roll_ok = []
     _blob_roll_anchor_off = []
@@ -11650,16 +11699,19 @@ MANUAL_NUDGE_RC_FRESH_S = RC_FRESH_WINDOW
 # ПО ПРЯМОМУ ТРЕБОВАНИЮ ОПЕРАТОРА (разбор 06.10): коррекция больше НЕ
 # пропорциональна отклонению стика (раньше "чуть отвёл — чуть поехала,
 # сильно отвёл — быстро поехала" — именно это оператор назвал
-# неудобным). Теперь бинарно: внутри дедбенда — ноль, у самого края —
+# неудобным). Теперь бинарно: внутри дедбенда — ноль, за ним —
 # ФИКСИРОВАННАЯ скорость MANUAL_NUDGE_FIXED_PX_S, ничего посередине.
-# Дедбенд расширен до 425 из 500 (85% хода от центра) — коррекция
-# включается только у самого упора стика, случайно не заденешь.
-MANUAL_NUDGE_DEADBAND_US = 425.0
-# Фиксированная скорость рамки, когда стик у края (px/с, LORES). Не
-# зависит от того, насколько именно у края стик — либо 0, либо это
-# число. Подобрано как разумное по умолчанию (по образцу запроса
-# оператора "10 пикселей в секунду") — меняется на месте под руку
-# пилота.
+#
+# ПЕРВАЯ ПОПЫТКА (425 из 500, 85%) оказалась неудобной с другой стороны
+# — отзыв оператора "сильно быстро и как-то с запозданием": почти весь
+# ход стика давал 0, а у самого упора — сразу полная скорость, без
+# перехода. 300 из 500 (60%) — требует решительного, не случайного
+# отклонения, но реагирует заметно раньше упора. Это ровно тот параметр,
+# который имеет смысл подстроить под руку конкретного пилота на месте.
+MANUAL_NUDGE_DEADBAND_US = 300.0
+# Фиксированная скорость рамки за дедбендом (px/с, LORES). Не зависит
+# от того, насколько именно за дедбендом стик — либо 0, либо это число.
+# Если всё ещё быстро/медленно — это первое, что стоит подстроить.
 MANUAL_NUDGE_FIXED_PX_S = 10.0
 # Знаки осей — как ROLL_SIGN/PITCH_SIGN у самого управления: физическая
 # ориентация приёмника и камеры не гарантирует «стик вправо/вверх = рамка
@@ -12219,6 +12271,7 @@ def process_locked_tracker(gray, cb_t0=None):
     _match_dbg["blob_roll_autosnap_trial_move"] = None
     _match_dbg["blob_roll_autosnap_trial_mx"] = None
     _match_dbg["blob_roll_autosnap_trial_my"] = None
+    _match_dbg["snap_budget_mag"] = math.hypot(_snap_budget_dx, _snap_budget_dy)
     _match_dbg["blob_roll_autosnap_growth_suspect"] = None
     _match_dbg["blob_roll_autosnap_margin_used"] = None
 
@@ -13133,6 +13186,7 @@ def process_locked_tracker(gray, cb_t0=None):
                         _iac_ok, _iac_score, _iac_psr,
                         _iac_mx, _iac_my, new_cx, new_cy):
                     _identity_anchor_check_streak = 0
+                    _reset_snap_budget()
                     # Отметка ВРЕМЕНИ последнего успешного подтверждения —
                     # используется ANCHOR ARBITER ниже (см. блок IDENTITY_
                     # ANCHOR_ARBITER_ENABLED): пока это подтверждение свежее,
@@ -13186,6 +13240,7 @@ def process_locked_tracker(gray, cb_t0=None):
                         _pull_dx = (_iac_mx - new_cx) * 0.5
                         _pull_dy = (_iac_my - new_cy) * 0.5
                         _pull_dx, _pull_dy = clamp_correction(_pull_dx, _pull_dy)
+                        _pull_dx, _pull_dy = _apply_snap_budget(_pull_dx, _pull_dy)
                         new_cx = new_cx + _pull_dx
                         new_cy = new_cy + _pull_dy
                         _match_dbg["identity_anchor_snap_dx"] = _pull_dx
@@ -13261,6 +13316,7 @@ def process_locked_tracker(gray, cb_t0=None):
                         _snap_dx = (_iac_mx - new_cx) * 0.5
                         _snap_dy = (_iac_my - new_cy) * 0.5
                         _snap_dx, _snap_dy = clamp_correction(_snap_dx, _snap_dy)
+                        _snap_dx, _snap_dy = _apply_snap_budget(_snap_dx, _snap_dy)
                         new_cx = new_cx + _snap_dx
                         new_cy = new_cy + _snap_dy
                         _match_dbg["identity_anchor_snap_dx"] = _snap_dx
@@ -13475,6 +13531,7 @@ def process_locked_tracker(gray, cb_t0=None):
                         _snap_dx = _as_mx - new_cx
                         _snap_dy = _as_my - new_cy
                         _snap_dx, _snap_dy = clamp_correction(_snap_dx, _snap_dy)
+                        _snap_dx, _snap_dy = _apply_snap_budget(_snap_dx, _snap_dy)
                         new_cx = new_cx + _snap_dx
                         new_cy = new_cy + _snap_dy
                         _match_dbg["blob_roll_autosnap_dx"] = _snap_dx
@@ -14817,6 +14874,7 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("blob_roll_autosnap_trial_move"),
             _match_dbg.get("blob_roll_autosnap_trial_mx"),
             _match_dbg.get("blob_roll_autosnap_trial_my"),
+            _match_dbg.get("snap_budget_mag"),
             _match_dbg.get("blob_roll_autosnap_growth_suspect"),
             _match_dbg.get("blob_roll_autosnap_margin_used"),
             _match_dbg.get("blob_roll_size_ratio"),
