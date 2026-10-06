@@ -656,6 +656,13 @@ BLOB_ROLL_AUTOSNAP_MAX_MOVE_PX = 25.0
 # пошёл не на цель. С margin 0.10 slot 0 должен превосходить live
 # на 0.10+ — это "live реально потерял цель, а slot 0 знает где".
 BLOB_ROLL_AUTOSNAP_SLOT0_LEADS_MARGIN = 0.10
+# Возврат с полосы (тропинка, край дороги). Борт 06.10, e101950: якорь
+# машины лежал в 16 px, score 0.70, PSR 1.99, а живой матч на тропинке
+# давал 0.82–0.88. Прежний snap молчал: PSR не дотягивал до 2.0, и
+# якорь был хуже живого. Полоска — сильный градиент вдоль одной оси.
+PATH_ANCHOR_OFFSET_PX = 8.0
+PATH_RETURN_MIN_PSR = 1.6
+PATH_STRIPE_RATIO = 2.2
 # ПОДОЗРЕНИЕ ПО РОСТУ (разбор стенд-видео 05.10, zahvat с дорогой):
 # рамка съехала с приближающегося грузовика на статичный край дороги —
 # score у live остался высоким (0.79-0.86), margin его защищал. Настоящая
@@ -1650,6 +1657,10 @@ ADAPTIVE_SEARCH_MARGIN = True
 SEARCH_MARGIN_MIN = 14 * TRACK_SCALE               # при неподвижной цели
 SEARCH_MARGIN_MAX = 26 * TRACK_SCALE               # было 36 — сужаем, меньше фона в окне
 SEARCH_MARGIN_VEL_REF = 12.0 * TRACK_SCALE         # flow-motion (px/кадр) для перехода к MAX
+# Сторона живого окна поиска. На борту 06.10 коробка 36–40 px раздувала
+# окно до 67 px и роняла FPS с 21 до 18, хотя дальность была ни при чём.
+# Крупную цель уже ведёт поток; совпадению хватает узкого уточнения.
+SEARCH_SIDE_MAX = 56
 
 # --- АДАПТАЦИЯ РАЗМЕРА КОРОБКИ ---
 # Раз в N кадров при высоком матч-скоре заново оцениваем связную компоненту
@@ -1784,6 +1795,10 @@ SIZE_ADAPT_EVERY_FRAMES = 8          # период проверки
 # меняется вовсе.
 SIZE_ADAPT_BIG_PX = 100          # с какой рамки считаем эталон дорогим
 SIZE_ADAPT_BIG_EVERY = 24        # период проверки для дорогого эталона
+# Промежуточный порог. 100 px на борту не наступал, а FPS уже падал
+# на коробке 32–40 px: примерку в этот момент режем первой.
+SIZE_ADAPT_MID_PX = 32
+SIZE_ADAPT_MID_EVERY = 16
 
 # --- БЮДЖЕТ КАДРА ДЛЯ ДОРОГИХ ВТОРИЧНЫХ ЭТАПОВ (ТЗ next-commit spec §4) ---
 #
@@ -6782,6 +6797,8 @@ def _period_primerki():
     try:
         if min(template_gray.shape[:2]) >= SIZE_ADAPT_BIG_PX:
             return SIZE_ADAPT_BIG_EVERY
+        if min(template_gray.shape[:2]) >= SIZE_ADAPT_MID_PX:
+            return SIZE_ADAPT_MID_EVERY
     except Exception:
         pass
     return SIZE_ADAPT_EVERY_FRAMES
@@ -7316,6 +7333,28 @@ def _lock_blob_verify(gray, cx, cy, box_w, box_h):
         return ok, contrast, edge_ratio
     except Exception:
         return True, 0.0, 1.0
+
+
+def _lock_is_stripe(gray, cx, cy, box_w, box_h):
+    """Полоска, а не пятно: градиент вдоль одной оси сильно сильнее другой.
+
+    Тропинка и край дороги так и выглядят. Компактная машина даёт
+    перепады в обе стороны, и отношение близко к единице.
+    """
+    try:
+        pw = max(8, int(max(box_w, 8) * 1.6))
+        ph = max(8, int(max(box_h, 8) * 1.6))
+        patch, _ = crop_center(gray, cx, cy, pw, ph)
+        if patch.shape[0] < 6 or patch.shape[1] < 6:
+            return False
+        f = patch.astype(np.float32)
+        gx = float(np.abs(np.diff(f, axis=1)).mean())
+        gy = float(np.abs(np.diff(f, axis=0)).mean())
+        hi = max(gx, gy)
+        lo = max(min(gx, gy), 1e-3)
+        return hi >= 4.0 and (hi / lo) >= PATH_STRIPE_RATIO
+    except Exception:
+        return False
 
 
 def build_template(gray, cx, cy, box_w, box_h):
@@ -7931,6 +7970,13 @@ def template_match_locked(gray, pred_cx, pred_cy, flow_motion=0.0,
             and flow_motion <= SEARCH_MARGIN_MIN - MATCH_BIG_ZAPAS_PX):
         if margin > SEARCH_MARGIN_MIN:
             margin = int(SEARCH_MARGIN_MIN)
+    # Потолок стороны окна. Margin уже сужается у эталона >= 70 px, но
+    # FPS на борту падает раньше, на 36 px. Окно якоря с extra_margin
+    # сюда не попадает: это только живой матч.
+    for _side in (int(tmpl_w), int(tmpl_h)):
+        _room = SEARCH_SIDE_MAX - _side
+        if _room < margin * 2:
+            margin = max(4, _room // 2)
     sw = int(tmpl_w + margin * 2)
     sh = int(tmpl_h + margin * 2)
     # Геометрия рабочих массивов — для профилирования стоимости кадра
@@ -8191,6 +8237,12 @@ def _template_adaptation_gate(score, flow_ok):
         bok = _match_dbg.get("blob_verify_ok")
         if bc is not None and bok in (0, False) and float(bc) < BLOB_VERIFY_MIN_CONTRAST:
             return False, "flat_background"
+    # Якорь машины в стороне, а живой score на тропинке высокий.
+    # Учить шаблон в этом кадре — запомнить тропинку. Медиана за окно,
+    # не один кадр: порог 8 px выше шума на цели (p75 около 0.6 px).
+    aoff = _match_dbg.get("blob_roll_aoff_med")
+    if aoff is not None and float(aoff) >= PATH_ANCHOR_OFFSET_PX:
+        return False, "anchor_offset"
     return True, ""
 
 
@@ -12163,23 +12215,31 @@ def reanchor_tracker_at_current_box(gray, reason):
     """
     global prev_pts, prev_gray, _flow_reference_t, _adapt_frozen_posle_reanchor
     global template_gray, template_base, template_scale_acc
+    global _blob_roll_anchor_off
     _reset_geometry_history(reason)
-    _cur_tmpl = build_template(gray, lock_cx, lock_cy, lock_w, lock_h)
-    template_gray = _cur_tmpl
-    sync_template_metadata()
-    template_base = _cur_tmpl.copy()
-    # Накопленный множитель масштаба — относительно template_base. Он
-    # только что пересобран РОВНО под текущий lock_w/lock_h, поэтому
-    # накопление начинается заново с единицы; старое значение считало бы
-    # рост от давно устаревшего размера при захвате.
-    template_scale_acc = 1.0
+    _aoff = None
+    if len(_blob_roll_anchor_off) >= 4:
+        _sord = sorted(_blob_roll_anchor_off)
+        _aoff = _sord[len(_sord) // 2]
+    # Отпускание стика на тропинке пересобирало эталон из текущего кадра,
+    # и полоса становилась целью (борт 06.10, REANCHOR при aoff 16 px).
+    # Пока якорь в стороне, пиксели под рамкой в эталон не берём.
+    if _aoff is None or _aoff < PATH_ANCHOR_OFFSET_PX:
+        _cur_tmpl = build_template(gray, lock_cx, lock_cy, lock_w, lock_h)
+        template_gray = _cur_tmpl
+        sync_template_metadata()
+        template_base = _cur_tmpl.copy()
+        template_scale_acc = 1.0
+        _re_note = "template=rebuilt"
+    else:
+        _re_note = "template=kept offset=%.1f" % _aoff
     prev_pts = refresh_flow_points(gray, lock_cx, lock_cy, lock_w, lock_h)
     prev_gray = gray.copy()
     _flow_reference_t = time.monotonic()
     _adapt_frozen_posle_reanchor = True
     flight_log.event(
-        "REANCHOR epoch=%d after=(%.1f,%.1f,%.1f,%.1f) template=rebuilt"
-        % (geometry_epoch, lock_cx, lock_cy, lock_w, lock_h))
+        "REANCHOR epoch=%d after=(%.1f,%.1f,%.1f,%.1f) %s"
+        % (geometry_epoch, lock_cx, lock_cy, lock_w, lock_h, _re_note))
 
 
 # =========================================================
@@ -13106,9 +13166,21 @@ def process_locked_tracker(gray, cb_t0=None):
         # что уже используют LOST->AUTO_REACQ и AUTO_TEMPLATE_REFRESH (не
         # новый matcher). Только по времени (IDENTITY_ANCHOR_CHECK_PERIOD_S)
         # — см. её докстроку у объявления константы про стоимость кадра.
+        _anchor_due = (
+            (time.monotonic() - _identity_anchor_check_last_t)
+            >= IDENTITY_ANCHOR_CHECK_PERIOD_S)
+        _anchor_budget_ok = (
+            cb_t0 is None
+            or (time.monotonic() - cb_t0) * 1000.0
+            <= FRAME_BUDGET_MS * FRAME_BUDGET_SECONDARY_FRAC)
         if (IDENTITY_ANCHOR_CHECK_ENABLED and _identity_anchor_gray is not None
-                and (time.monotonic() - _identity_anchor_check_last_t)
-                >= IDENTITY_ANCHOR_CHECK_PERIOD_S):
+                and _anchor_due and not _anchor_budget_ok):
+            # Кадр уже опоздал. Не двигаем метку времени: проверка
+            # пройдёт на следующем кадре, где бюджет ещё есть, а не
+            # добавит 50 мс к и без того тяжёлому.
+            _match_dbg["identity_anchor_check_ran"] = 0
+        elif (IDENTITY_ANCHOR_CHECK_ENABLED and _identity_anchor_gray is not None
+                and _anchor_due and _anchor_budget_ok):
             _identity_anchor_check_last_t = time.monotonic()
             _iac_ran_ok = True
             # SCALED ANCHOR VERIFICATION (найдено оператором на реальных
@@ -13548,12 +13620,19 @@ def process_locked_tracker(gray, cb_t0=None):
                     _match_dbg["blob_roll_autosnap_growth_suspect"] = (
                         1 if _live_growth_suspect else 0)
                     _match_dbg["blob_roll_autosnap_margin_used"] = _slot0_margin
+                    _path_return = (
+                        _blob_roll_aoff_med is not None
+                        and _blob_roll_aoff_med >= PATH_ANCHOR_OFFSET_PX
+                        and _as_psr >= PATH_RETURN_MIN_PSR
+                        and _lock_is_stripe(
+                            gray, new_cx, new_cy, lock_w or 8, lock_h or 8))
                     if (_as_ok
                             and _as_score >= BLOB_ROLL_AUTOSNAP_MIN_SCORE
-                            and _as_psr >= BLOB_ROLL_AUTOSNAP_MIN_PSR
                             and _as_move >= BLOB_ROLL_AUTOSNAP_MIN_MOVE_PX
                             and _as_move <= BLOB_ROLL_AUTOSNAP_MAX_MOVE_PX
-                            and _slot0_leads):
+                            and ((_as_psr >= BLOB_ROLL_AUTOSNAP_MIN_PSR
+                                  and _slot0_leads)
+                                 or _path_return)):
                         _snap_dx = _as_mx - new_cx
                         _snap_dy = _as_my - new_cy
                         _snap_dx, _snap_dy = clamp_correction(_snap_dx, _snap_dy)
