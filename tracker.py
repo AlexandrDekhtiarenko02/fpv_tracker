@@ -7784,6 +7784,13 @@ IDENTITY_ANCHOR_MATCH_MAX_OFFSET_FRAC = 0.5
 # anchor конфиденциально знает где цель. 4.0 отделяет уверенный peak
 # от размазанного фонового.
 IDENTITY_ANCHOR_MIN_PSR = 4.0
+# Sustained snap (PSR не проверяется) раньше сдвигал рамку, если якорь
+# был лишь чуть выше живого матча: борт 06.10, score 0.60 против live 0.55,
+# PSR 1.8, путь sustained — рамка ушла на соседний пик фона. Нужен запас.
+ANCHOR_SNAP_MIN_LEAD = 0.15
+# Если матч уже разошёлся с потоком сильнее этого, sustained snap молчит:
+# пик якоря в таком кадре часто и есть фон.
+ANCHOR_SNAP_MAX_FLOW_GAP_PX = 8.0
 
 # МЕЛКАЯ ЦЕЛЬ (разбор реальных стендовых логов a41feb4). На мелкой цели
 # matchTemplate TM_CCOEFF_NORMED даёт АБСОЛЮТНЫЙ score в районе 0.3-0.5
@@ -8176,6 +8183,14 @@ def _template_adaptation_gate(score, flow_ok):
         gap = _match_dbg.get("flow_gap")
         if gap is not None and gap > MATCH_GAP_SOFT and not _anchor_fresh:
             return False, "flow_gap"
+    # Высокий score на пустом фоне — не успех. Борт 06.10: score 0.98–1.00
+    # при контрасте блоба < 1 и identity_ambiguous = 100%. Учить шаблон
+    # на таком кадре значит запомнить фон.
+    if score >= 0.85:
+        bc = _match_dbg.get("blob_verify_contrast")
+        bok = _match_dbg.get("blob_verify_ok")
+        if bc is not None and bok in (0, False) and float(bc) < BLOB_VERIFY_MIN_CONTRAST:
+            return False, "flat_background"
     return True, ""
 
 
@@ -13311,10 +13326,18 @@ def process_locked_tracker(gray, cb_t0=None):
                         match_ok and score is not None
                         and score >= _iac_score
                         and score >= MATCH_GOOD_SCORE)
+                    _snap_lead = _iac_score - (
+                        float(score) if score is not None else 0.0)
+                    _gap_now = _match_dbg.get("flow_gap")
+                    _gap_ok = (
+                        _gap_now is None
+                        or float(_gap_now) <= ANCHOR_SNAP_MAX_FLOW_GAP_PX)
                     _snap_sustained = (_iac_ok
                             and _iac_score >= MATCH_GOOD_SCORE
                             and _identity_anchor_check_streak >= 2
-                            and not _live_leads_sustained_snap)
+                            and not _live_leads_sustained_snap
+                            and _snap_lead >= ANCHOR_SNAP_MIN_LEAD
+                            and _gap_ok)
                     if _snap_strong or _snap_sustained:
                         _snap_dx = (_iac_mx - new_cx) * 0.5
                         _snap_dy = (_iac_my - new_cy) * 0.5
