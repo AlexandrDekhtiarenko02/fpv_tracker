@@ -926,6 +926,30 @@ MATCH_WEIGHT_MIN = 0.02      # почти полностью доверяем п
 # Порог 10% разделяет эти случаи и НЕ задевает обычные кадры: при 25%
 # (первая прикидка) вес срезался бы и в нормальной работе.
 MATCH_LEAD_FULL = 0.10
+# Учить шаблон можно только при более уникальном пике, чем двигать рамку.
+# Стенд 06.10, дорога (201356): весь захват second≈score (lead≈0), PSR
+# 1.7–2.2, а якорь «свежий» — он сидит на той же колее, aoff около 1 px.
+# Прежний обход `not _anchor_fresh` как раз и открывал обучение тропинке.
+# Порог 0.15 не задевает обычный запас (~+15% и выше, см. комментарий
+# MATCH_LEAD_FULL). PSR < 2.5 САМ ПО СЕБЕ адаптацию не режет: на той же
+# дороге правильный лок (dist<10 px) имел PSR медиану 2.01.
+ADAPT_UNIQUE_LEAD = 0.15
+# Score просел относительно своего пика за последнюю секунду — вид под
+# рамкой уже не тот, что мы только что уверенно держали. Белая машина
+# (201219): за 0.5 с score 0.84→0.65, рамка при этом уползла на 10 px,
+# и шаблон продолжал учиться. 0.18 отделяет этот сход от дрожи кадра.
+ADAPT_SCORE_DROP = 0.18
+ADAPT_SCORE_WINDOW_S = 1.0
+# Refresh живого шаблона. В 6.17 с той же машины score был 0.57, а
+# свежий кандидат, вырезанный из текущей рамки, честно «выиграл» PSR
+# и зацементировал обочину. Ниже этого score refresh не голосует.
+TREF_MIN_LIVE_SCORE = 0.65
+# Шаг рамки за кадр, когда лок нечем подтвердить. Дорога t=6.49: lead<=0,
+# поток −4.6 px, рамка прыгнула на 9 px. Машина t=4.88: score 0.53,
+# поток +7 px, рамка ушла на 14 px. 3 px при ~20 кадр/с — это 60 px/с,
+# дальняя цель столько не бегает; всплеск потока — бегает.
+WEAK_LOCK_STEP_MAX_PX = 3.0
+WEAK_SCORE_STEP_THR = 0.60
 MATCH_GOOD_SCORE = 0.40    # было 0.34 — выше планка «уверенного» матча
 # Штраф за то, что совпадение найдено ДАЛЕКО от предсказания потока.
 #
@@ -8211,14 +8235,12 @@ def _template_adaptation_gate(score, flow_ok):
     if (tmpl_w is not None
             and tmpl_w < TEMPLATE_FREEZE_SMALL_PX):
         return False, "small_target_frozen"
-    # ANCHOR ARBITER для adaptation gate (разбор стендовых логов 6c47ef6:
-    # на дальних размазанных целях второй кандидат matcher'а всегда
-    # близок к первому — lead низкий, ambiguous_peak блокирует обучение,
-    # live template застревает на старом виде → при смене ракурса score
-    # падает → всё строже блокируется → полный коллапс. Если anchor-
-    # check недавно подтвердил позицию, ambiguity — норма для
-    # размазанной цели, template разрешено учить. Та же логика, что уже
-    # защищает uncertain_streak от persistent UNCERTAIN).
+    # Пик не уникален — не учим, даже если якорь только что подтвердил
+    # позицию. На дороге (201356) якорь подтверждал колею: aoff ~1 px,
+    # lead≈0, и прежний обход через _anchor_fresh как раз открывал
+    # addWeighted. Свежий якорь по-прежнему имеет право не считать
+    # расхождение с потоком поводом для запрета (ветка flow_gap ниже) —
+    # там он отличает дрожь предсказания от чужого объекта.
     _anchor_fresh = (
         _identity_anchor_last_confirm_t > 0.0
         and (time.monotonic() - _identity_anchor_last_confirm_t)
@@ -8227,8 +8249,10 @@ def _template_adaptation_gate(score, flow_ok):
         second = _match_dbg.get("second")
         if second is not None and score > 0.0:
             lead = (score - float(second)) / max(score, 1e-6)
-            if lead < MATCH_LEAD_FULL and not _anchor_fresh:
+            if lead < ADAPT_UNIQUE_LEAD:
                 return False, "ambiguous_peak"
+    if _match_score_dropped(score):
+        return False, "score_drop"
     if MATCH_GAP_SOFT > 0.0:
         gap = _match_dbg.get("flow_gap")
         if gap is not None and gap > MATCH_GAP_SOFT and not _anchor_fresh:
@@ -8367,6 +8391,7 @@ def reset_tracking(to_acq=False):
     _flow_reference_t = None
     lost_frames = 0
     last_match_score = 0.0
+    _reset_match_score_hist()
     _stand_reset_metrics()
     last_flow_ok = False
     acq_wait_left = 0
@@ -12184,6 +12209,42 @@ IDENTITY_ANCHOR_FRESH_S = 1.5
 # полёте), а после короткой серии.
 IDENTITY_SOFT_DISTRUST_ENABLED = True
 _identity_soft_distrust = False
+# (t, score) реальных матчей за ADAPT_SCORE_WINDOW_S. Не путать с
+# last_match_score=1.0 на кадре захвата — туда синтетическая единица
+# не пишется.
+_adapt_score_hist = []
+
+
+def _reset_match_score_hist():
+    global _adapt_score_hist
+    _adapt_score_hist = []
+
+
+def _note_match_score(score):
+    """Запомнить score этого кадра. Вызывать один раз, с живого матча."""
+    global _adapt_score_hist
+    if score is None:
+        return
+    now = time.monotonic()
+    _adapt_score_hist.append((now, float(score)))
+    cut = now - ADAPT_SCORE_WINDOW_S
+    if len(_adapt_score_hist) > 90:
+        _adapt_score_hist = [(ts, s) for ts, s in _adapt_score_hist if ts >= cut]
+
+
+def _match_score_dropped(score):
+    """True, если за последнюю секунду score был заметно выше текущего."""
+    if score is None or not _adapt_score_hist:
+        return False
+    now = time.monotonic()
+    cut = now - ADAPT_SCORE_WINDOW_S
+    peak = None
+    for ts, s in _adapt_score_hist:
+        if ts >= cut and (peak is None or s > peak):
+            peak = s
+    if peak is None:
+        return False
+    return float(score) < peak - ADAPT_SCORE_DROP
 
 
 def reanchor_tracker_at_current_box(gray, reason):
@@ -13029,6 +13090,7 @@ def process_locked_tracker(gray, cb_t0=None):
         tgt_dx=pred_cx - lock_cx, tgt_dy=pred_cy - lock_cy)
     _etap("sovpadenie", _t_sovp)
     last_match_score = score
+    _note_match_score(score)
     _stand_score_sample("match")
     last_flow_ok = flow_ok
 
@@ -13067,7 +13129,10 @@ def process_locked_tracker(gray, cb_t0=None):
                     # нельзя, ведём по потоку.
                     lead = (score - float(second)) / max(score, 1e-6)
                     if lead <= 0.0:
-                        w_m = MATCH_WEIGHT_MIN
+                        # Конкурент не слабее выбранного пика. MATCH_WEIGHT_MIN
+                        # (0.02) всё равно подтаскивал рамку вдоль тропинки
+                        # кадр за кадром. Здесь матчу не верят совсем.
+                        w_m = 0.0
                         _identity_ambiguous = True
                     elif lead < MATCH_LEAD_FULL:
                         # Плавный переход, чтобы не дёргать вес туда-сюда на
@@ -13163,6 +13228,25 @@ def process_locked_tracker(gray, cb_t0=None):
             k = MAX_LOCK_STEP / max(step, 1e-6)
             new_cx = lock_cx + (new_cx - lock_cx) * k
             new_cy = lock_cy + (new_cy - lock_cy) * k
+        # Всплеск потока, когда лок не подтверждён. Дорога 201356 t=6.49:
+        # lead<=0, поток −4.6 px, рамка +9 px на обочину. Машина 201219
+        # t=4.88: score 0.53, поток +7 px, рамка +14 px вниз с машины.
+        # Уникальный пик при score>=0.60 этот предел не трогает.
+        if track_state == TRACK_STATE_TRACKED:
+            _step_cap = None
+            if score < WEAK_SCORE_STEP_THR:
+                _step_cap = WEAK_LOCK_STEP_MAX_PX
+            _sec_now = _match_dbg.get("second")
+            if _sec_now is not None and score > 0.0:
+                _lead_now = (score - float(_sec_now)) / max(score, 1e-6)
+                if _lead_now <= 0.0:
+                    _step_cap = WEAK_LOCK_STEP_MAX_PX
+            if _step_cap is not None:
+                step = math.hypot(new_cx - lock_cx, new_cy - lock_cy)
+                if step > _step_cap:
+                    k = _step_cap / step
+                    new_cx = lock_cx + (new_cx - lock_cx) * k
+                    new_cy = lock_cy + (new_cy - lock_cy) * k
 
         # ИЗМЕРЕНИЕ СТОИМОСТИ (разбор реальных бортовых логов 2d83a09:
         # cb_wall_ms медиана 37.2мс при бюджете 41.7мс, но сумма
@@ -14391,7 +14475,16 @@ def process_locked_tracker(gray, cb_t0=None):
                                         # свежего подтверждения — недоверенный
                                         # период не должен цементировать
                                         # новую visual память.
-                                        and not _identity_soft_distrust)
+                                        and not _identity_soft_distrust
+                                        # Свежий кандидат вырезан из ТЕКУЩЕЙ
+                                        # рамки, поэтому он почти всегда
+                                        # выигрывает PSR у живого шаблона —
+                                        # в том числе когда рамка уже не на
+                                        # цели. Машина 201219, t=6.17:
+                                        # score 0.57, refresh поднял PSR
+                                        # 3.09→4.55 и запомнил обочину.
+                                        and score >= TREF_MIN_LIVE_SCORE
+                                        and not _match_score_dropped(score))
                                     # ДЛЯ CSV (отчёт 25.09, п.J): голос ЭТОГО
                                     # fresh-слота — не то же самое, что сам
                                     # факт срабатывания refresh'а (тот ещё и
