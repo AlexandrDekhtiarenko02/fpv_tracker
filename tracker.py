@@ -5426,6 +5426,27 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
+# MAX_CORRECTION_STEP_PX: по прямому требованию оператора (разбор 06.10,
+# цепочка автоматических "прыжков" рамки измотала доверие ко всем snap/
+# pull-механизмам сразу — passive pull, active snap, blob roll autosnap).
+# Ни один из них больше не имеет права сдвинуть рамку дальше этого
+# расстояния ЗА ОДИН РАЗ, какой бы ни была "правота" найденного кандидата.
+# Лучше несколько мелких, видимых шагов к реальной цели (или к фону —
+# тогда это видно и обратимо), чем один большой прыжок на похожий объект.
+MAX_CORRECTION_STEP_PX = 5.0
+
+
+def clamp_correction(dx, dy, max_px=MAX_CORRECTION_STEP_PX):
+    """Масштабирует (dx, dy) так, чтобы длина не превышала max_px,
+    сохраняя направление. Общая точка для всех snap/pull-коррекций
+    lock-позиции — см. MAX_CORRECTION_STEP_PX."""
+    d = math.hypot(dx, dy)
+    if d <= max_px or d <= 1e-9:
+        return dx, dy
+    k = max_px / d
+    return dx * k, dy * k
+
+
 def clamp_rect_center(cx, cy, w, h, max_w, max_h):
     w = max(2, int(round(w)))
     h = max(2, int(round(h)))
@@ -9111,28 +9132,15 @@ def _update_control_from_target_impl():
         with state_lock:
             target_controllable = False
 
-    # ТОТ ЖЕ ПРИНЦИП, ДРУГАЯ ПРИЧИНА (отчёт 25.09, п.2, см. докстрока у
-    # _identity_uncertain_pending): пока пилот явно не сбросил флаг через
-    # reset_tracking(), controllable принудительно False независимо от
-    # того, что решил бы process_locked_tracker на очередном кадре.
-    if _identity_uncertain_pending and controllable:
-        controllable = False
-        with state_lock:
-            target_controllable = False
-
-    # ТОТ ЖЕ ПРИНЦИП, ТРЕТЬЯ ПРИЧИНА, НО НЕ PERSISTENT (найдено оператором
-    # на реальном коде, см. докстроку IDENTITY_SOFT_DISTRUST_ENABLED):
-    # первый реально измеренный anchor mismatch / начало долгого разрыва
-    # без dual-signal — снимает controllable УЖЕ СЕЙЧАС, не дожидаясь,
-    # пока debounce наберёт полный persistent IDENTITY_UNCERTAIN (1.5-2.5с
-    # по умолчанию). В отличие от _identity_uncertain_pending выше —
-    # _identity_soft_distrust НЕ sticky: пересчитывается process_locked_
-    # tracker заново каждый TRACKED-кадр и снимается сам, как только
-    # anchor/dual-signal снова подтвердились, без reset_tracking().
-    if _identity_soft_distrust and controllable:
-        controllable = False
-        with state_lock:
-            target_controllable = False
+    # ПО ПРЯМОМУ ТРЕБОВАНИЮ ОПЕРАТОРА (разбор 06.10): оба автоматических
+    # гейта ниже (_identity_uncertain_pending и _identity_soft_distrust)
+    # раньше снимали controllable сами, без участия пилота, на основании
+    # одного-двух неоднозначных сигналов — то же самое "замораживание",
+    # что убрано выше в process_locked_tracker. Сами флаги по-прежнему
+    # считаются и пишутся в CSV (диагностика не потеряна), но управление
+    # больше не отбирают — snap/pull-коррекции уже ограничены
+    # MAX_CORRECTION_STEP_PX, этого достаточно как защиты. _nudge_abort_
+    # pending НЕ трогаем — это явное действие пилота, не автоматика.
 
     # ЗАДЕРЖКА УПРАВЛЕНИЯ НА ВРЕМЯ РУЧНОЙ КОРРЕКЦИИ (см. константы и
     # обоснование у MANUAL_NUDGE_CONTROL_DELAY_ENABLED). _nudge_frozen_box
@@ -11639,17 +11647,20 @@ MANUAL_NUDGE_PITCH_AUX_IDX = 6
 # основного приёмника (RC_FRESH_WINDOW) — величина одна и та же по
 # смыслу: сколько без нового опроса допустимо считать канал живым.
 MANUAL_NUDGE_RC_FRESH_S = RC_FRESH_WINDOW
-# Мёртвая зона вокруг центра стика (в единицах RC, центр 1500). Меньше — и
-# обычное дрожание пальца на стике во время обычного полёта с override
-# постоянно чуть двигало бы рамку. Взято долей от полного хода (500 от
-# центра до края): 60 из 500 — это 12%, заметно шире обычного шума канала,
-# но оставляет достаточно хода для самой коррекции.
-MANUAL_NUDGE_DEADBAND_US = 60.0
-# Скорость рамки при полном отклонении стика, px/с (в координатах LORES).
-# БЫЛО 60 — на стенде ощутимо быстро для аккуратной коррекции; убавлено
-# втрое по прямой обратной связи с борта. 20 px/с пересекает весь кадр
-# 320 px примерно за 16 секунд при полном стике — управляемо, не резко.
-MANUAL_NUDGE_MAX_PX_S = 20.0
+# ПО ПРЯМОМУ ТРЕБОВАНИЮ ОПЕРАТОРА (разбор 06.10): коррекция больше НЕ
+# пропорциональна отклонению стика (раньше "чуть отвёл — чуть поехала,
+# сильно отвёл — быстро поехала" — именно это оператор назвал
+# неудобным). Теперь бинарно: внутри дедбенда — ноль, у самого края —
+# ФИКСИРОВАННАЯ скорость MANUAL_NUDGE_FIXED_PX_S, ничего посередине.
+# Дедбенд расширен до 425 из 500 (85% хода от центра) — коррекция
+# включается только у самого упора стика, случайно не заденешь.
+MANUAL_NUDGE_DEADBAND_US = 425.0
+# Фиксированная скорость рамки, когда стик у края (px/с, LORES). Не
+# зависит от того, насколько именно у края стик — либо 0, либо это
+# число. Подобрано как разумное по умолчанию (по образцу запроса
+# оператора "10 пикселей в секунду") — меняется на месте под руку
+# пилота.
+MANUAL_NUDGE_FIXED_PX_S = 10.0
 # Знаки осей — как ROLL_SIGN/PITCH_SIGN у самого управления: физическая
 # ориентация приёмника и камеры не гарантирует «стик вправо/вверх = рамка
 # туда же» без проверки на конкретном борту. Меняются на месте так же, как
@@ -12531,7 +12542,6 @@ def process_locked_tracker(gray, cb_t0=None):
         if _have_aux and _nudge_rc_fresh:
             _aux2_raw = float(_rc_raw[MANUAL_NUDGE_ROLL_AUX_IDX])
             _aux3_raw = float(_rc_raw[MANUAL_NUDGE_PITCH_AUX_IDX])
-            _half = 500.0 - MANUAL_NUDGE_DEADBAND_US
             # Избыток отклонения СВЕРХ мёртвой зоны, со знаком — 0, если
             # внутри зоны. Считаем ОДИН раз: и для решения «активен ли
             # nudge», и для самой величины сдвига — нет риска разойтись
@@ -12566,12 +12576,17 @@ def process_locked_tracker(gray, cb_t0=None):
                 _nudge_dt = min(_nudge_dt, 3.0 / CAM_FPS)
                 _nudge_prev_t = _now_nudge
 
-                _roll_norm = clamp(_roll_exc / _half, -1.0, 1.0)
-                _pitch_norm = clamp(_pitch_exc / _half, -1.0, 1.0)
-                _nudge_dx = (MANUAL_NUDGE_ROLL_SIGN * _roll_norm
-                            * MANUAL_NUDGE_MAX_PX_S * _nudge_dt)
-                _nudge_dy = (MANUAL_NUDGE_PITCH_SIGN * _pitch_norm
-                            * MANUAL_NUDGE_MAX_PX_S * _nudge_dt)
+                # ФИКСИРОВАННАЯ скорость, не пропорциональная отклонению
+                # (по требованию оператора) — либо 0 (внутри дедбенда,
+                # уже решено выше в _roll_exc/_pitch_exc), либо ровно
+                # MANUAL_NUDGE_FIXED_PX_S в сторону отклонения, без
+                # промежуточных значений.
+                _roll_dir = math.copysign(1.0, _roll_exc) if _roll_exc != 0.0 else 0.0
+                _pitch_dir = math.copysign(1.0, _pitch_exc) if _pitch_exc != 0.0 else 0.0
+                _nudge_dx = (MANUAL_NUDGE_ROLL_SIGN * _roll_dir
+                            * MANUAL_NUDGE_FIXED_PX_S * _nudge_dt)
+                _nudge_dy = (MANUAL_NUDGE_PITCH_SIGN * _pitch_dir
+                            * MANUAL_NUDGE_FIXED_PX_S * _nudge_dt)
 
     # НАЙДЕНО (ревью по a2f5fe0 — SAFETY, обобщение фикса по c6fb464
     # п.3). Настоящим отпусканием стика считается ТОЛЬКО track_state
@@ -13170,6 +13185,7 @@ def process_locked_tracker(gray, cb_t0=None):
                     if _pull_offset >= 2.0 and not _live_leads_anchor:
                         _pull_dx = (_iac_mx - new_cx) * 0.5
                         _pull_dy = (_iac_my - new_cy) * 0.5
+                        _pull_dx, _pull_dy = clamp_correction(_pull_dx, _pull_dy)
                         new_cx = new_cx + _pull_dx
                         new_cy = new_cy + _pull_dy
                         _match_dbg["identity_anchor_snap_dx"] = _pull_dx
@@ -13244,6 +13260,7 @@ def process_locked_tracker(gray, cb_t0=None):
                     if _snap_strong or _snap_sustained:
                         _snap_dx = (_iac_mx - new_cx) * 0.5
                         _snap_dy = (_iac_my - new_cy) * 0.5
+                        _snap_dx, _snap_dy = clamp_correction(_snap_dx, _snap_dy)
                         new_cx = new_cx + _snap_dx
                         new_cy = new_cy + _snap_dy
                         _match_dbg["identity_anchor_snap_dx"] = _snap_dx
@@ -13457,8 +13474,9 @@ def process_locked_tracker(gray, cb_t0=None):
                             and _slot0_leads):
                         _snap_dx = _as_mx - new_cx
                         _snap_dy = _as_my - new_cy
-                        new_cx = _as_mx
-                        new_cy = _as_my
+                        _snap_dx, _snap_dy = clamp_correction(_snap_dx, _snap_dy)
+                        new_cx = new_cx + _snap_dx
+                        new_cy = new_cy + _snap_dy
                         _match_dbg["blob_roll_autosnap_dx"] = _snap_dx
                         _match_dbg["blob_roll_autosnap_dy"] = _snap_dy
                         flight_log.event(
@@ -13606,6 +13624,16 @@ def process_locked_tracker(gray, cb_t0=None):
                 and not _anchor_recently_confirmed):
             _iu_reason = "ambiguous_or_gap"
 
+        # ПО ПРЯМОМУ ТРЕБОВАНИЮ ОПЕРАТОРА (разбор 06.10): лок больше НЕ
+        # замораживается и НЕ теряется из-за этих сигналов. Раньше здесь
+        # lock_cx/lock_cy переставали обновляться НАВСЕГДА (early return
+        # перед их апдейтом ниже), controllable обнулялся, и состояние
+        # залипало в IDENTITY_UNCERTAIN до ручного re-acq — то есть "лучше
+        # полностью потерять цель, чем рискнуть одним неточным кадром".
+        # Теперь наоборот: диагностика пишется как прежде (видно в логах),
+        # но lock продолжает обновляться как обычно — пусть лучше промажет
+        # на несколько пикселей, чем зависнет совсем. Снапы, которые могли
+        # бы этим пользоваться, уже ограничены MAX_CORRECTION_STEP_PX.
         if _iu_reason is not None:
             if _iu_reason == "ambiguous_or_gap":
                 _age_ms = ((time.monotonic() - _identity_anchor_last_confirm_t)
@@ -13631,17 +13659,10 @@ def process_locked_tracker(gray, cb_t0=None):
                 flight_log.event(
                     "IDENTITY_UNCERTAIN dual_signal_gap=%d frames"
                     % _dual_signal_gap_frames)
-            _identity_uncertain_pending = True
-            box = lores_box_to_main(lock_cx, lock_cy, lock_w, lock_h)
-            with state_lock:
-                track_state = TRACK_STATE_IDENTITY_UNCERTAIN
-                target_visible = True
-                target_controllable = False
-                target_box_main = box
-                overlay_text = "UNCERTAIN"
-                overlay_color = COLOR_YELLOW
-            update_control_from_target()
-            return
+            _match_dbg["identity_uncertain_would_have_frozen"] = 1
+            # Раньше здесь был early return, замораживающий lock_cx/cy и
+            # обнуляющий controllable — убрано, см. комментарий выше.
+            # Выполнение идёт дальше, в обычный путь обновления lock'а.
 
         lock_cx = float(clamp(new_cx, 0, LORES_W - 1))
         lock_cy = float(clamp(new_cy, 0, LORES_H - 1))
