@@ -13181,9 +13181,27 @@ def process_locked_tracker(gray, cb_t0=None):
                     _snap_strong = (_iac_ok
                             and _iac_score >= MATCH_GOOD_SCORE
                             and _iac_psr >= IDENTITY_ANCHOR_MIN_PSR)
+                    # SUSTAINED не имеет собственного резкого пика (PSR
+                    # здесь не проверяется вообще) — его единственное
+                    # доказательство это score>=0.40 два раза подряд. Этого
+                    # достаточно, чтобы ПОЙМАТЬ дрейф, но не достаточно,
+                    # чтобы ПЕРЕБИТЬ live, который сам держит не хуже (разбор
+                    # реального борта 06.10, flight_20261006_125100 t=355.3:
+                    # anchor score=0.52 psr=2.6 стянул лок с растущей цели,
+                    # у которой live score был 0.62-0.75 — выше anchor'а, но
+                    # сравнения не было вообще). STRONG эту проверку
+                    # специально не получает: его собственный PSR>=4.0 —
+                    # independent доказательство, и именно STRONG обязан
+                    # перебивать уверенный-но-неправильный live (случай с
+                    # грузовиком на стенде 05.10, growth-гейт).
+                    _live_leads_sustained_snap = (
+                        match_ok and score is not None
+                        and score >= _iac_score
+                        and score >= MATCH_GOOD_SCORE)
                     _snap_sustained = (_iac_ok
                             and _iac_score >= MATCH_GOOD_SCORE
-                            and _identity_anchor_check_streak >= 2)
+                            and _identity_anchor_check_streak >= 2
+                            and not _live_leads_sustained_snap)
                     if _snap_strong or _snap_sustained:
                         _snap_dx = (_iac_mx - new_cx) * 0.5
                         _snap_dy = (_iac_my - new_cy) * 0.5
@@ -13193,10 +13211,11 @@ def process_locked_tracker(gray, cb_t0=None):
                         _match_dbg["identity_anchor_snap_dy"] = _snap_dy
                         flight_log.event(
                             "ANCHOR SNAP dx=%.1f dy=%.1f score=%.2f psr=%.2f "
-                            "streak=%d path=%s"
+                            "streak=%d path=%s live_score=%.2f"
                             % (_snap_dx, _snap_dy, _iac_score, _iac_psr,
                                _identity_anchor_check_streak,
-                               "strong" if _snap_strong else "sustained"))
+                               "strong" if _snap_strong else "sustained",
+                               float(score) if score is not None else -1.0))
                 _match_dbg["identity_anchor_check_ran"] = 1
                 _match_dbg["identity_anchor_check_score"] = (
                     _iac_score if _iac_ok else 0.0)
