@@ -7809,11 +7809,15 @@ def _anchor_bank_maybe_refresh(gray, cx, cy, w, h, live_score,
 # не сам B. Обёртка ниже — единственное место, которое решает "anchor
 # подтверждает ИМЕННО эту позицию", а не "anchor где-то нашёлся".
 #
-# Допуск — половина СОБСТВЕННОГО размера anchor'а, не независимая
-# придуманная константа: крупный объект естественно даёт больше subpixel/
-# квантования слопа при повторном обнаружении, чем мелкий, так допуск
-# масштабируется вместе с целью.
-IDENTITY_ANCHOR_MATCH_MAX_OFFSET_FRAC = 0.5
+# Допуск — доля СОБСТВЕННОГО размера anchor'а, не независимая
+# придуманная константа: крупный объект естественно даёт больше
+# subpixel/квантования слопа при повторном обнаружении, чем мелкий.
+# Было 0.5. На коробке 28 px это 14 px: пик у края рамки засчитывался
+# как «это всё ещё центр лока» (борт fc1756f, t=252.47, offset 11.7 px,
+# score якоря 0.69 против live 0.71). Streak сбрасывался, pull не
+# шёл (live чуть выше), и шаблон доучивался уже на съезде. 0.25 на
+# той же коробке — 7 px: край рамки больше не подтверждение.
+IDENTITY_ANCHOR_MATCH_MAX_OFFSET_FRAC = 0.25
 
 # PSR порог для ACTIVE SNAP (не для _anchor_confirms_position — туда PSR
 # не идёт как confirmation, см. её докстроку). По реальным логам
@@ -8238,8 +8242,20 @@ def _template_adaptation_gate(score, flow_ok):
         if bc is not None and bok in (0, False) and float(bc) < BLOB_VERIFY_MIN_CONTRAST:
             return False, "flat_background"
     # Якорь машины в стороне, а живой score на тропинке высокий.
-    # Учить шаблон в этом кадре — запомнить тропинку. Медиана за окно,
-    # не один кадр: порог 8 px выше шума на цели (p75 около 0.6 px).
+    # Учить шаблон в этом кадре — запомнить тропинку.
+    # Свежий замер, не медиана: медиана из десятка точек догоняет съезд
+    # только через ~0.7 с (борт fc1756f, t=252.5: offset уже 11.7 px,
+    # медиана ещё 0.26, adapt=1). Шум на цели в том заходе p75 = 0.26 px.
+    # На крупной рамке порог растёт: 4 px там ещё внутри объекта.
+    fresh_off = _match_dbg.get("identity_anchor_check_offset")
+    if fresh_off is not None:
+        _side = 0.0
+        if tmpl_w is not None and tmpl_h is not None:
+            _side = float(max(tmpl_w, tmpl_h))
+        if float(fresh_off) >= max(4.0, 0.20 * _side):
+            return False, "anchor_offset"
+    # Медиана за окно — запасной, более медленный сигнал. Порог 8 px
+    # выше шума на цели (p75 около 0.6 px).
     aoff = _match_dbg.get("blob_roll_aoff_med")
     if aoff is not None and float(aoff) >= PATH_ANCHOR_OFFSET_PX:
         return False, "anchor_offset"
