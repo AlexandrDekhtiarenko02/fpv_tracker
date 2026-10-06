@@ -177,19 +177,9 @@ for i in range(1, 16):
     t.process_locked_tracker(scene)
     if t.track_state != t.TRACK_STATE_TRACKED:
         continue
-    assert t._match_dbg.get("template_adaptation_allowed") == 0, (
-        "сценарий C предполагает гейт-отказ каждый кадр — иначе эта "
-        "проверка ничего не показывает, allowed=%r reason=%r"
-        % (t._match_dbg.get("template_adaptation_allowed"),
-           t._match_dbg.get("adapt_skip_reason")))
-    # lead < 0.15 больше не двигает рамку на полный шаг потока. На шумной
-    # сцене этого теста LK из-за этого один кадр может потерять пару
-    # (reason=no_flow). Отказ всё равно отказ: build_template уже вызван,
-    # метаданные обязаны описывать живой шаблон, а не выброшенный.
-    assert t._match_dbg.get("adapt_skip_reason") in (
-        "ambiguous_peak", "no_flow"), (
-        "сценарий C предполагает отказ гейта (ambiguous_peak или no_flow), "
-        "получено %r" % t._match_dbg.get("adapt_skip_reason"))
+    assert t._match_dbg.get("adapt_skip_reason") == "ambiguous_peak", (
+        "сценарий C предполагает тот же гейт-отказ каждый кадр, что и "
+        "секция A — иначе эта проверка ничего не показывает")
     _real_w, _real_h = t.template_gray.shape[1], t.template_gray.shape[0]
     _real_std = float(np.std(t.template_gray))
     if (t.tmpl_w, t.tmpl_h) != (_real_w, _real_h):
