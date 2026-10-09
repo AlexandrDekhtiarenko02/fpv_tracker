@@ -13197,6 +13197,22 @@ def process_locked_tracker(gray, cb_t0=None):
     _stand_score_sample("match")
     last_flow_ok = flow_ok
 
+    # Мелкая рамка без пятна. Матч здесь сравнивает фон с фоном: у колеи
+    # и яркой дороги score высокий, и вес 0.22 кадр за кадром переносит
+    # рамку на соседний кусок. Положение в этом кадре берём только из
+    # потока — он держит точку клика, пока картинка едет. Score и решение
+    # «держим ли захват» у матча остаются. Пятно, если оно есть, центр
+    # забирает ниже, как и раньше.
+    _blob_now = None
+    if track_state == TRACK_STATE_TRACKED:
+        _blob_now = _small_blob_center(gray, lock_cx, lock_cy, lock_w, lock_h)
+    _small_flow_only = (
+        track_state == TRACK_STATE_TRACKED
+        and lock_w is not None and lock_h is not None
+        and lock_w < SMALL_BLOB_MAX_BOX
+        and lock_h < SMALL_BLOB_MAX_BOX
+        and _blob_now is None)
+
     new_cx, new_cy = lock_cx, lock_cy
     tracked_ok = False
     # IDENTITY_UNCERTAIN (см. константы перед reanchor_tracker_at_current_
@@ -13266,6 +13282,8 @@ def process_locked_tracker(gray, cb_t0=None):
                 _identity_flow_match_disagree = True
                 zatuh = MATCH_GAP_SOFT / dist_fm
                 w_m *= max(MATCH_GAP_MIN_K, zatuh)
+            if _small_flow_only:
+                w_m = 0.0
             new_cx = (1.0 - w_m) * pred_cx + w_m * match_cx
             new_cy = (1.0 - w_m) * pred_cy + w_m * match_cy
             _match_dbg["w_m"] = w_m
@@ -13279,8 +13297,12 @@ def process_locked_tracker(gray, cb_t0=None):
         new_cy = pred_cy
         tracked_ok = True
     elif match_ok and score >= MATCH_GOOD_SCORE:
-        new_cx = match_cx
-        new_cy = match_cy
+        # Потока нет. На крупной цели положение можно взять из матча.
+        # На мелкой без пятна — нет: это как раз прыжок на яркую дорогу.
+        # Захват по score не снимаем, рамка остаётся где стояла.
+        if not _small_flow_only:
+            new_cx = match_cx
+            new_cy = match_cy
         tracked_ok = True
 
     # НАЙДЕНО (отчёт 25.09, разбор поверх 64949ec, п.D): streak — это
@@ -13356,10 +13378,9 @@ def process_locked_tracker(gray, cb_t0=None):
             # рамку. Если в текущей рамке одно компактное пятно —
             # центр это оно, предложенный шаг в этот кадр не берём.
             # На ровной текстуре пятен нет, шаг потока остаётся.
-            _blob = _small_blob_center(gray, lock_cx, lock_cy, lock_w, lock_h)
-            if _blob is not None:
-                new_cx = float(_blob[0])
-                new_cy = float(_blob[1])
+            if _blob_now is not None:
+                new_cx = float(_blob_now[0])
+                new_cy = float(_blob_now[1])
 
         # ИЗМЕРЕНИЕ СТОИМОСТИ (разбор реальных бортовых логов 2d83a09:
         # cb_wall_ms медиана 37.2мс при бюджете 41.7мс, но сумма
@@ -13539,7 +13560,8 @@ def process_locked_tracker(gray, cb_t0=None):
                             and score >= MATCH_GOOD_SCORE)
                     _pull_offset = math.hypot(_iac_mx - new_cx,
                                                _iac_my - new_cy)
-                    if _pull_offset >= 2.0 and not _live_leads_anchor:
+                    if (_pull_offset >= 2.0 and not _live_leads_anchor
+                            and not _small_flow_only):
                         _pull_dx = (_iac_mx - new_cx) * 0.5
                         _pull_dy = (_iac_my - new_cy) * 0.5
                         _pull_dx, _pull_dy = clamp_correction(_pull_dx, _pull_dy)
@@ -13623,7 +13645,7 @@ def process_locked_tracker(gray, cb_t0=None):
                             and not _live_leads_sustained_snap
                             and _snap_lead >= ANCHOR_SNAP_MIN_LEAD
                             and _gap_ok)
-                    if _snap_strong or _snap_sustained:
+                    if (_snap_strong or _snap_sustained) and not _small_flow_only:
                         _snap_dx = (_iac_mx - new_cx) * 0.5
                         _snap_dy = (_iac_my - new_cy) * 0.5
                         _snap_dx, _snap_dy = clamp_correction(_snap_dx, _snap_dy)
@@ -13854,6 +13876,7 @@ def process_locked_tracker(gray, cb_t0=None):
                     _as_peak_unique = (
                         _as_lead is None or _as_lead >= ADAPT_UNIQUE_LEAD)
                     if (_as_ok
+                            and not _small_flow_only
                             and _as_peak_unique
                             and _as_score >= BLOB_ROLL_AUTOSNAP_MIN_SCORE
                             and _as_move >= BLOB_ROLL_AUTOSNAP_MIN_MOVE_PX
