@@ -2539,6 +2539,15 @@ _FLIGHT_LOG_COLUMNS = (
     # стоимости кадра от теплового throttling — снаружи оба выглядят
     # одинаково как «FPS упал», а лечатся по-разному.
     "cpu_temp_c,cpu_freq_mhz,"
+    # ЗАГРУЗКА ПЛАТЫ, раз в секунду, тем же тиком, что температура.
+    # cpu_util_pct — занятость всех ядер с прошлого тика. cpu0..3 —
+    # по ядрам: видно, занят ли один поток или все четыре. throttle_flags —
+    # биты прошивки Pi (0 недонапряжение, 1 частота урезана, 2 троттлинг
+    # сейчас; старшие биты — то же самое «уже случалось»). Пусто, если
+    # файла прошивки нет. mem_avail_kb и load_1m — чтобы «кадр не успел»
+    # отличить от нехватки памяти и от чужого процесса.
+    "cpu_util_pct,cpu0_pct,cpu1_pct,cpu2_pct,cpu3_pct,"
+    "throttle_flags,mem_avail_kb,load_1m,"
     # БЮДЖЕТ КАДРА (п.4/п.5): пропуск примерки масштаба по нехватке времени —
     # отдельно от size_skip=1..7 (которые про «мерили и не получилось»),
     # иначе замедление борта на разборе выглядело бы как отказ алгоритма.
@@ -3292,6 +3301,113 @@ def _read_cma_free_kb():
 # разные лекарства). Читаются раз в секунду тем же таймером, что CMA.
 _cpu_temp_c = None
 _cpu_freq_mhz = None
+# Снимок /proc/stat с прошлого тика: без разности процентов занятости нет.
+_cpu_stat_prev = None
+_cpu_util_pct = None
+_cpu_core_pct = (None, None, None, None)
+_throttle_flags = None
+_mem_avail_kb = None
+_load_1m = None
+
+
+def _cpu_idle_total(nums):
+    """idle+iowait и сумма счётчиков. Ожидание диска не считаем занятостью."""
+    if nums is None or len(nums) < 4:
+        return None
+    idle = nums[3] + (nums[4] if len(nums) > 4 else 0)
+    total = sum(nums[:8] if len(nums) >= 8 else nums)
+    return idle, total
+
+
+def _cpu_pct(prev, cur):
+    if prev is None or cur is None:
+        return None
+    dt = cur[1] - prev[1]
+    if dt <= 0:
+        return None
+    di = cur[0] - prev[0]
+    pct = 100.0 * (1.0 - di / float(dt))
+    if pct < 0.0:
+        return 0.0
+    if pct > 100.0:
+        return 100.0
+    return pct
+
+
+def _read_proc_stat_cpus():
+    total = None
+    cores = []
+    with open("/proc/stat") as f:
+        for line in f:
+            if not line.startswith("cpu"):
+                break
+            parts = line.split()
+            nums = [int(x) for x in parts[1:]]
+            if parts[0] == "cpu":
+                total = nums
+            else:
+                cores.append(nums)
+    return total, cores
+
+
+def _sample_board_load():
+    """Занятость ядер, троттлинг, память, loadavg. Раз в секунду, не в горячем кадре."""
+    global _cpu_stat_prev, _cpu_util_pct, _cpu_core_pct
+    global _throttle_flags, _mem_avail_kb, _load_1m
+    try:
+        total, cores = _read_proc_stat_cpus()
+        cur_total = _cpu_idle_total(total)
+        cur_cores = [_cpu_idle_total(c) for c in cores[:4]]
+        prev = _cpu_stat_prev
+        if prev is not None:
+            pct = _cpu_pct(prev[0], cur_total)
+            if pct is not None:
+                _cpu_util_pct = pct
+            pcts = []
+            for i in range(4):
+                p = prev[1][i] if i < len(prev[1]) else None
+                c = cur_cores[i] if i < len(cur_cores) else None
+                pcts.append(_cpu_pct(p, c))
+            if any(p is not None for p in pcts):
+                _cpu_core_pct = tuple(pcts)
+        _cpu_stat_prev = (cur_total, tuple(cur_cores))
+    except Exception:
+        pass
+    _throttle_flags = _read_throttle_flags()
+    _mem_avail_kb = _read_mem_avail_kb()
+    _load_1m = _read_load_1m()
+
+
+def _read_throttle_flags():
+    """Битовая маска get_throttled прошивки Pi. None, если sysfs нет."""
+    for path in (
+            "/sys/devices/platform/soc/soc:firmware/get_throttled",
+            "/sys/devices/platform/soc/firmware/get_throttled"):
+        try:
+            with open(path) as f:
+                return int(f.read().strip(), 0)
+        except Exception:
+            continue
+    return None
+
+
+def _read_mem_avail_kb():
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1])
+    except Exception:
+        return None
+    return None
+
+
+def _read_load_1m():
+    try:
+        with open("/proc/loadavg") as f:
+            return float(f.read().split()[0])
+    except Exception:
+        return None
 
 
 def _read_cpu_temp_c():
@@ -15204,6 +15320,10 @@ def _capture_flight_row(cb_t0):
             _match_dbg.get("map_w"), _match_dbg.get("map_h"),
             _flow_dbg.get("points"), _flow_dbg.get("inliers"),
             _cpu_temp_c, _cpu_freq_mhz,
+            _cpu_util_pct,
+            _cpu_core_pct[0], _cpu_core_pct[1],
+            _cpu_core_pct[2], _cpu_core_pct[3],
+            _throttle_flags, _mem_avail_kb, _load_1m,
             _match_dbg.get("expensive_stage_skipped"),
             _match_dbg.get("skip_reason"),
             _match_dbg.get("template_adaptation_allowed"),
@@ -15633,6 +15753,7 @@ def camera_callback(request):
         _cma_free_kb = _read_cma_free_kb()
         _cpu_temp_c = _read_cpu_temp_c()
         _cpu_freq_mhz = _read_cpu_freq_mhz()
+        _sample_board_load()
         _cam_exp_us, _cam_gain, _cam_colour_gain_r, _cam_colour_gain_b = (
             _read_cam_exposure_metadata(request))
         _cma_read_t = _cb_t0
@@ -16042,6 +16163,18 @@ def main():
         picam2.set_controls({"FrameDurationLimits": (_fd, _fd)})
     except Exception:
         pass
+    try:
+        _gov = None
+        _fmax = None
+        with open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor") as f:
+            _gov = f.read().strip()
+        with open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq") as f:
+            _fmax = int(f.read().strip()) / 1000.0
+        flight_log.event(
+            "плата: ядер=%s opencv_потоков=%s governor=%s макс_мгц=%s"
+            % (os.cpu_count(), cv2.getNumThreads(), _gov, _fmax))
+    except Exception as exc:
+        flight_log.event("плата: не прочиталась (%s)" % exc)
 
     # ЖДЁМ, ПОКА АВТОМАТИКА СОЙДЁТСЯ, а не фиксированные полсекунды.
     #
