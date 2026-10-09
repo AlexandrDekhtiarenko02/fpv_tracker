@@ -77,10 +77,20 @@ cv2.setNumThreads(1)
 CAMERA_ROTATE_180 = False
 
 MAIN_W, MAIN_H = 640, 480
-# Частота кадров закрепляется жёстко (см. запуск камеры). Ровный интервал
-# важнее высокой цифры: по нему считаются скорость роста цели и время до
-# контакта, а гуляющий интервал портит обе.
+# Частота кадров. В захвате ровные 20 к/с (LOCK_FPS): по этому интервалу
+# считаются рост цели и время до контакта. Вне захвата длительность
+# короче, под затвор (см. _dlitelnost_kadra). CAM_FPS оставлен для
+# пересчёта тех порогов, которые заданы в кадрах, а не в секундах.
 CAM_FPS = 24.0
+# В захвате просим 20 к/с (50 мс). Замер 09.10: обычный кадр 30 мс,
+# медленный 42 мс. В 42 мс он не влезал и частота прыгала около 21.
+# 50 мс медленный кадр вмещает, интервал перестаёт рваться.
+LOCK_FPS = 20.0
+LOCK_FRAME_US = int(round(1e6 / LOCK_FPS))
+# Простой кадр на борту 09.10: медиана 7.6 мс, максимум 15.5. Короче
+# 16 мс он не всегда успевает, и частота вне захвата снова прыгает,
+# хотя затвор и позволял бы быстрее.
+IDLE_FRAME_FLOOR_US = 16000
 
 # --- РАЗРЕШЕНИЕ ТРЕКИНГА ---
 # Трекинг исторически шёл по уменьшенной вдвое картинке 320x240, то есть
@@ -3452,6 +3462,12 @@ _cam_exp_us = None
 _cam_gain = None
 _cam_colour_gain_r = None
 _cam_colour_gain_b = None
+# Последняя заданная камере длительность кадра. None — ещё не задавали.
+_cam_frame_us = None
+# Длительность вне захвата, посчитанная один раз после фиксации выдержки.
+# Живой замер экспозиции раз в секунду её не двигает: иначе камера
+# получала бы новый предел на каждом колебании в десятки микросекунд.
+_cam_idle_us = None
 
 
 def _read_cam_exposure_metadata(request):
@@ -15726,6 +15742,47 @@ _cb_oshibka_n = 0
 KADR_OSHIBKA_PERIOD_S = 2.0
 
 
+def _dlitelnost_kadra(state):
+    """Длительность кадра в микросекундах. Оба края равны: вилка заставляет
+    камеру саму ронять кадры, и интервал снова прыгает.
+
+    В захвате всегда 50 мс. Вне захвата — самое короткое, что позволяет
+    затвор, но не короче IDLE_FRAME_FLOOR_US: кадр не может быть короче
+    выдержки, а простой кадр длиннее 8 мс считать нечего.
+    """
+    if state in (TRACK_STATE_TRACKED, TRACK_STATE_HOLD,
+                 TRACK_STATE_IDENTITY_UNCERTAIN, TRACK_STATE_VISUAL_UNSTABLE):
+        return LOCK_FRAME_US
+    if _cam_idle_us:
+        return int(_cam_idle_us)
+    exp = int(_cam_exp_us) if _cam_exp_us else 33000
+    return max(exp, IDLE_FRAME_FLOOR_US)
+
+
+def _primenit_kadry(state):
+    """Поставить длительность кадра, если она изменилась. set_controls из
+    pre_callback только дописывает словарь контролов, отдельный запрос
+    к камере не делает (capture_metadata из callback как раз нельзя)."""
+    global _cam_frame_us
+    us = _dlitelnost_kadra(state)
+    if us == _cam_frame_us:
+        return
+    cam = globals().get("picam2")
+    if cam is None:
+        return
+    try:
+        cam.set_controls({"FrameDurationLimits": (us, us)})
+    except Exception:
+        return
+    bylo = _cam_frame_us
+    _cam_frame_us = us
+    if bylo is not None:
+        flight_log.event(
+            "КАДР: %s, %.0f к/с (%d мкс)"
+            % ("захват" if us == LOCK_FRAME_US else "без захвата",
+               1e6 / float(us), us))
+
+
 def camera_callback(request):
     global chroma_u, chroma_v, _gs_n
     global _last_main_mean, _last_main_top_mean, _cma_free_kb, _cma_read_t
@@ -15738,6 +15795,7 @@ def camera_callback(request):
     _stand_cb_wall_t0 = time.perf_counter() if hasattr(time, "perf_counter") else None
     _cb_t0 = time.monotonic()
     _stand_cb_mono_t0 = _cb_t0
+    _primenit_kadry(track_state)
     # _etap_ms должен отражать ТОЛЬКО этапы, реально выполненные В ЭТОМ
     # кадре — без явной очистки словарь копил значения с прошлых вызовов
     # (комментарий у объявления "заводится каждый кадр заново" не
@@ -16164,9 +16222,12 @@ def main():
     #
     # Просим ровно CAM_FPS. Бюджет кадра становится 41.7 мс против 23 мс
     # обработки — с запасом даже на выбросы.
-    _fd = int(round(1e6 / max(1.0, CAM_FPS)))
+    # До того, как выдержка известна, держим кадр не короче потолка
+    # выдержки (33 мс). Иначе на старте попросили бы 16 мс при ещё
+    # открытом затворе. После фиксации экспозиции предел ставится заново.
+    _boot_us = 33000
     try:
-        picam2.set_controls({"FrameDurationLimits": (_fd, _fd)})
+        picam2.set_controls({"FrameDurationLimits": (_boot_us, _boot_us)})
     except Exception:
         pass
     try:
@@ -16285,8 +16346,14 @@ def main():
             ctrl["ColourGains"] = tuple(colour_measured)
         # Закрепляем частоту ЗАНОВО: в некоторых версиях libcamera установка
         # AE/AWB-контролов сбрасывает предел длительности кадра, и частота
-        # уезжает обратно к «как получится».
-        ctrl["FrameDurationLimits"] = (_fd, _fd)
+        # уезжает обратно к «как получится». На старте захвата нет, поэтому
+        # сразу короткая длительность под затвор, а не 20 к/с.
+        global _cam_exp_us, _cam_frame_us, _cam_idle_us
+        _cam_exp_us = int(ctrl["ExposureTime"])
+        _cam_idle_us = max(_cam_exp_us, IDLE_FRAME_FLOOR_US)
+        _idle_us = _dlitelnost_kadra(TRACK_STATE_IDLE)
+        ctrl["FrameDurationLimits"] = (_idle_us, _idle_us)
+        _cam_frame_us = _idle_us
         picam2.set_controls(ctrl)
         flight_log.event(
             "КАМЕРА: настройка за %.1f с. Экспозиция ЗАФИКСИРОВАНА (выдержка "
