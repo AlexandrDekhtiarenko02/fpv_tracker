@@ -944,15 +944,14 @@ ADAPT_SCORE_WINDOW_S = 1.0
 # свежий кандидат, вырезанный из текущей рамки, честно «выиграл» PSR
 # и зацементировал обочину. Ниже этого score refresh не голосует.
 TREF_MIN_LIVE_SCORE = 0.65
-# Шаг рамки за кадр, когда лок нечем подтвердить. Дорога t=6.49: lead<=0,
-# поток −4.6 px, рамка прыгнула на 9 px. Машина t=4.88: score 0.53,
-# поток +7 px, рамка ушла на 14 px. 3 px при ~20 кадр/с — это 60 px/с
-# в координатах трекера (на экране 640 вдвое больше: кадр считается
-# в 320). Режет один всплеск, не ползание: шаг меньше 3 px проходит.
-# Порог — тот же, что у обучения (ADAPT_UNIQUE_LEAD). Четверть шага на
-# каждом таком кадре пробовали в 42e76c1: дорога 210435 и захват 210405
-# на 80–98% кадров имели lead < 0.15, рамка взяла ~8 px из ~40, которые
-# просил поток, и цель ушла из неё. Ползание по колее этим не лечится.
+# Шаг рамки за кадр, когда пик уже уникален, но score слабый.
+# Машина t=4.88: score 0.53, поток +7 px, рамка ушла на 14 px.
+# 3 px при ~20 кадр/с — 60 px/с в координатах трекера (на экране
+# 640 вдвое больше). Неуникальный пик этим потолком не лечится:
+# ползание по колее меньше 3 px. На заходе цель в кадре стоит,
+# поэтому при lead < ADAPT_UNIQUE_LEAD шаг обнуляется целиком,
+# а не режется до четверти (четверть в 42e76c1 всё равно уносила
+# рамку и одновременно не давала ей ехать за живой целью).
 WEAK_LOCK_STEP_MAX_PX = 3.0
 WEAK_SCORE_STEP_THR = 0.60
 MATCH_GOOD_SCORE = 0.40    # было 0.34 — выше планка «уверенного» матча
@@ -13233,25 +13232,22 @@ def process_locked_tracker(gray, cb_t0=None):
             k = MAX_LOCK_STEP / max(step, 1e-6)
             new_cx = lock_cx + (new_cx - lock_cx) * k
             new_cy = lock_cy + (new_cy - lock_cy) * k
-        # Всплеск потока, когда пик не подтверждает цель. Потолок 3 px
-        # режет один кадр (дорога 201356: +9 px, машина 201219: +14 px).
-        # Срабатывает при lead < 0.15, не только при lead <= 0: на 204137
-        # всплеск −4.8 px прошёл при lead=+0.008. Шаги меньше потолка не
-        # трогаем — иначе рамка не едет за целью (210405, 210435).
+        # Заход на цель: точка в кадре стоит. Пока пик не уникален,
+        # поток — сползание по колее (204137: +26 px шагами < 1 px),
+        # а не движение цели. Рамку не сдвигаем. Уникальный пик едет
+        # как раньше; слабый score при уникальном пике упирается в 3 px.
         if track_state == TRACK_STATE_TRACKED:
             _lead_now = None
             _sec_now = _match_dbg.get("second")
             if _sec_now is not None and score > 0.0:
                 _lead_now = (score - float(_sec_now)) / max(score, 1e-6)
-            _step_cap = None
-            if score < WEAK_SCORE_STEP_THR:
-                _step_cap = WEAK_LOCK_STEP_MAX_PX
             if _lead_now is not None and _lead_now < ADAPT_UNIQUE_LEAD:
-                _step_cap = WEAK_LOCK_STEP_MAX_PX
-            if _step_cap is not None:
+                new_cx = lock_cx
+                new_cy = lock_cy
+            elif score < WEAK_SCORE_STEP_THR:
                 step = math.hypot(new_cx - lock_cx, new_cy - lock_cy)
-                if step > _step_cap:
-                    k = _step_cap / step
+                if step > WEAK_LOCK_STEP_MAX_PX:
+                    k = WEAK_LOCK_STEP_MAX_PX / step
                     new_cx = lock_cx + (new_cx - lock_cx) * k
                     new_cy = lock_cy + (new_cy - lock_cy) * k
 
