@@ -119,7 +119,7 @@ def tick():
     t.process_locked_tracker(scene)
 
 
-ROLL_US = 300.0   # заметно за пределами MANUAL_NUDGE_DEADBAND_US=60
+ROLL_US = 450.0   # за MANUAL_NUDGE_DEADBAND_US=300
 t.MANUAL_NUDGE_CONTROL_DELAY_ENABLED = True
 
 print("=== 1. Покой: заморозки нет ===")
@@ -142,25 +142,36 @@ assert t._match_dbg.get("nudge_control_frozen") == 1, (
 print("    nudge_control_frozen=1, _nudge_frozen_box == box до правки")
 
 print("\n=== 3. Серия кадров активного nudge: заморозка держится, снимок "
-      "НЕ меняется, а target_box_main (видимая рамка) едет живо ===")
+      "НЕ меняется. Удержание стика рамку не везёт дальше, больший ход — "
+      "везёт, обратный ход пружины — нет ===")
 _frozen_snapshot = t._nudge_frozen_box
-_boxes_seen = []
-for _ in range(5):
+_held = []
+for _ in range(3):
     tick()
     assert t._match_dbg.get("nudge_control_frozen") == 1
     assert t._nudge_frozen_box == _frozen_snapshot, (
         "снимок заморозки сдвинулся ВО ВРЕМЯ активного nudge — обязан "
         "оставаться от самого начала правки")
     with t.state_lock:
-        _boxes_seen.append(t.target_box_main)
-assert len(set(_boxes_seen)) > 1, (
-    "target_box_main не менялся ВО ВРЕМЯ nudge — оператору нечем "
-    "целиться на экране, живая визуальная обратная связь потеряна")
-assert _boxes_seen[-1] != _frozen_snapshot, (
+        _held.append(t.target_box_main)
+assert len(set(_held)) == 1, (
+    "удержание стика на месте продолжило двигать рамку")
+assert _held[-1] != _frozen_snapshot, (
     "target_box_main (живой) совпал с замороженным control-box")
-print("    заморозка держится %d кадров без изменения снимка, "
-      "target_box_main реально уехал от него (визуальная обратная связь "
-      "есть)" % 5)
+set_stick(500.0)
+tick()
+with t.state_lock:
+    _further = t.target_box_main
+assert _further != _held[-1], (
+    "больший ход стика не сдвинул рамку дальше — пилоту нечем довести")
+set_stick(ROLL_US)
+tick()
+with t.state_lock:
+    _back = t.target_box_main
+assert _back == _further, (
+    "обратный ход стика вернул рамку, защёлка не удержала дальний край")
+assert t._nudge_frozen_box == _frozen_snapshot
+print("    заморозка держится, упор уводит рамку дальше, пружина назад — нет")
 
 print("\n=== 4. НАЙДЕНО ревью (п.1): отпускание стика снимает заморозку "
       "В ТОТ ЖЕ КАДР, что и reanchor — не секундой позже. control сразу "

@@ -108,7 +108,7 @@ print("=== 1. Один цикл nudge (отклонить -> отпустить)
       "изменился ни объектом, ни байтами; template_gray/geometry_epoch "
       "ИЗМЕНИЛИСЬ (живая коррекция реально сработала) ===")
 _tmpl_before = t.template_gray.copy()
-ROLL_US = 300.0
+ROLL_US = 450.0
 nudge_and_release(ROLL_US, 0.0, n_frames=5)
 assert t.geometry_epoch == epoch0 + 1, (
     "тест сам по себе негоден: отпускание стика не подняло geometry_epoch "

@@ -1,19 +1,13 @@
-"""Направления осей и скорость manual nudge после стендовой обратной связи
-на 3ff7a5e (тангаж инвертирован, скорость нужна втрое ниже).
+"""Направления осей и длина броска manual nudge.
 
 Подтверждает явно, по отдельности:
   A. Roll вправо (AUX2>1500)  -> рамка едет ВПРАВО  (dx > 0)
   B. Roll влево  (AUX2<1500)  -> рамка едет ВЛЕВО   (dx < 0)
   C. Pitch «вверх» (AUX3>1500) -> рамка едет ВВЕРХ по кадру (dy < 0 — в
      координатах изображения y растёт ВНИЗ, значит «вверх» это МЕНЬШЕ y).
-     Раньше (MANUAL_NUDGE_PITCH_SIGN=+1) знак был противоположным —
-     ровно тот баг, который отметили на стенде.
   D. Pitch «вниз» (AUX3<1500)  -> рамка едет ВНИЗ по кадру (dy > 0)
-  E. Скорость при полном стике ~ 1/3 прежней (была 60 px/с, стала 20).
-
-Snap-back после release (review-пункт про старый absolute template)
-отдельно закрыт test_reanchor_no_snapback.py — здесь не дублируется,
-только сама скорость/направление.
+  E. Смещение — доля хода стика до упора, не скорость. Полный упор
+     даёт MANUAL_NUDGE_THROW_PX за один кадр.
 """
 import os
 import sys
@@ -102,7 +96,7 @@ def one_nudge_step(roll_us=0.0, pitch_us=0.0):
     return t.lock_cx - cx0, t.lock_cy - cy0
 
 
-STICK = 300.0  # заметно за пределами мёртвой зоны (60 us)
+STICK = 450.0  # за дедбендом 300: избыток 150 из 200 до упора
 
 print("=== A/B. Roll: право/лево соответствуют рамке ===")
 dx_right, _ = one_nudge_step(roll_us=+STICK)
@@ -132,31 +126,26 @@ assert t.MANUAL_NUDGE_PITCH_SIGN == -1, (
     "MANUAL_NUDGE_PITCH_SIGN=%r — ожидался -1 после инверсии по стендовой "
     "обратной связи" % t.MANUAL_NUDGE_PITCH_SIGN)
 
-print("\n=== E. Скорость ~ 1/3 прежней (была 60 px/с, стала 20) ===")
-OLD_MAX_PX_S = 60.0
-print("    MANUAL_NUDGE_MAX_PX_S = %.1f px/с (было %.1f)"
-      % (t.MANUAL_NUDGE_MAX_PX_S, OLD_MAX_PX_S))
-ratio = t.MANUAL_NUDGE_MAX_PX_S / OLD_MAX_PX_S
-print("    отношение к прежней скорости: %.3f (цель ~1/3 = 0.333)" % ratio)
-assert abs(ratio - 1.0 / 3.0) < 0.05, (
-    "скорость nudge не в районе трети прежней: отношение %.3f" % ratio)
+print("\n=== E. Бросок, не скорость: доля хода до упора, упор = THROW_PX ===")
+travel = t.MANUAL_NUDGE_STICK_HALF_US - t.MANUAL_NUDGE_DEADBAND_US
+frac = (STICK - t.MANUAL_NUDGE_DEADBAND_US) / travel
+expected = frac * t.MANUAL_NUDGE_THROW_PX
+print("    THROW_PX = %.1f, стик %.0f us -> %.2f px" % (
+    t.MANUAL_NUDGE_THROW_PX, STICK, expected))
+assert abs(dx_right - expected) < 1e-6, (
+    "вправо %.4f, формула броска %.4f" % (dx_right, expected))
+assert abs(t.MANUAL_NUDGE_THROW_PX - 24.0) < 1e-6
 
-# Тот же факт — прямым измерением шага рамки за кадр при отклонении
-# STICK=300us. norm учитывает мёртвую зону — иначе сравнение считало бы
-# шаг при ПОЛНОМ (500us) отклонении, а STICK=300 до него не доходит.
-_half = 500.0 - t.MANUAL_NUDGE_DEADBAND_US
-_norm = (STICK - t.MANUAL_NUDGE_DEADBAND_US) / _half
-step_measured = dx_right
-step_expected_new = t.MANUAL_NUDGE_MAX_PX_S * _norm / t.CAM_FPS
-step_expected_old = OLD_MAX_PX_S * _norm / t.CAM_FPS
-print("    шаг за кадр при стике %.0fus: %.4f px (новый номинал %.4f, "
-      "старый был бы %.4f)"
-      % (STICK, step_measured, step_expected_new, step_expected_old))
-assert abs(step_measured - step_expected_new) < 1e-6, (
-    "измеренный шаг не совпадает с MANUAL_NUDGE_MAX_PX_S*norm/CAM_FPS")
-assert step_measured < step_expected_old / 2.0, (
-    "шаг всё ещё сравним со старой скоростью — константа не изменилась "
-    "на практике")
+capture()
+t._nudge_prev_t = None
+set_stick(t.MANUAL_NUDGE_STICK_HALF_US, 0.0)
+cx0 = t.lock_cx
+_clk.tick(FRAME_DT)
+t.process_locked_tracker(scene)
+full = t.lock_cx - cx0
+print("    упор -> %+.3f px" % full)
+assert abs(full - t.MANUAL_NUDGE_THROW_PX) < 1e-6, (
+    "полный ход стика дал %.3f, ожидалось THROW_PX" % full)
 
 print("\nOK: roll вправо/влево и pitch вверх/вниз соответствуют движению "
-      "рамки, скорость коррекции снижена примерно втрое")
+      "рамки, длина броска — доля хода стика до упора")

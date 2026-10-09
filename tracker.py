@@ -8474,6 +8474,7 @@ def reset_tracking(to_acq=False):
     # AUX off), поэтому здесь и чистим.
     _nudge_was_active = False
     _nudge_prev_t = None
+    _nudge_throw_clear()
     # Tier-1 таймер "краткого transport gap" (см. MANUAL_NUDGE_SUSPEND_
     # TIMEOUT_S) относится к ТЕКУЩЕЙ серии правок на ТЕКУЩЕМ локе — та же
     # причина, что и для _nudge_was_active/_nudge_prev_t выше: новый заход
@@ -11831,10 +11832,19 @@ def draw_overlay_on_frame(frame):
 # — то же самое замирание, что уже сломало nudge один раз, задело бы и
 # AUX-копии, если брать их оттуда.
 #
-# ВХОД СКОРОСТНОЙ, а не абсолютный: отклонение стика задаёт СКОРОСТЬ сдвига
-# рамки (px/с), а не координату. Абсолютный mapping заставил бы рамку
-# дёргаться к точке, куда указывает стик В ЭТОТ МОМЕНТ, что для стика без
-# самоцентровки на позицию неприменимо и физически не то, чем стик является.
+# ВХОД — БРОСОК, а не скорость. Пружинный стик нельзя привязать к
+# абсолютной точке кадра: отпустил — он сам вернётся в центр и утянул бы
+# рамку обратно. Постоянная скорость (было 5 px/с за дедбендом) тоже
+# неудобна: съезд на десяток пикселей — это секунды удержания, и всё это
+# время борт не правит за рамкой, а отпустить надо точно в пиксель.
+#
+# Жест: насколько стик ушёл ЗА дедбенд к упору, настолько рамка уходит от
+# точки, где жест начался. Полный оставшийся ход (упор) — MANUAL_NUDGE_
+# THROW_PX. Пока стик едет наружу, рамка едет с ним. Когда пружина ведёт
+# стик обратно в ту же сторону, рамка стоит на дальнем месте броска.
+# Стик дошёл до дедбенда — жест кончился, reanchor как раньше, следующий
+# бросок считается уже от новой точки. Смена стороны без этого — новый
+# бросок той же оси от исходной точки жеста, не добавка к старому пику.
 MANUAL_NUDGE_ENABLED = True
 # Индексы AUX2/AUX3 в массиве rc_channels/ch (RPYT+AUX1..4, 0-based):
 # ch[0]=Roll ch[1]=Pitch ch[2]=Yaw ch[3]=Throttle ch[4]=AUX1 ch[5]=AUX2
@@ -11848,26 +11858,21 @@ MANUAL_NUDGE_PITCH_AUX_IDX = 6
 # основного приёмника (RC_FRESH_WINDOW) — величина одна и та же по
 # смыслу: сколько без нового опроса допустимо считать канал живым.
 MANUAL_NUDGE_RC_FRESH_S = RC_FRESH_WINDOW
-# ПО ПРЯМОМУ ТРЕБОВАНИЮ ОПЕРАТОРА (разбор 06.10): коррекция больше НЕ
-# пропорциональна отклонению стика (раньше "чуть отвёл — чуть поехала,
-# сильно отвёл — быстро поехала" — именно это оператор назвал
-# неудобным). Теперь бинарно: внутри дедбенда — ноль, за ним —
-# ФИКСИРОВАННАЯ скорость MANUAL_NUDGE_FIXED_PX_S, ничего посередине.
-#
-# ПЕРВАЯ ПОПЫТКА (425 из 500, 85%) оказалась неудобной с другой стороны
-# — отзыв оператора "сильно быстро и как-то с запозданием": почти весь
-# ход стика давал 0, а у самого упора — сразу полная скорость, без
-# перехода. 300 из 500 (60%) — требует решительного, не случайного
-# отклонения, но реагирует заметно раньше упора. Это ровно тот параметр,
-# который имеет смысл подстроить под руку конкретного пилота на месте.
+# ПО ПРЯМОМУ ТРЕБОВАНИЮ ОПЕРАТОРА (разбор 06.10) непрерывная скорость
+# «чуть стик — чуть поехала, упор — быстро» была неудобной. Фиксированные
+# 5 px/с за дедбендом тоже: рамку нечем дозировать, только держать стик
+# и успеть отпустить. Дедбенд оставлен — случайное касание стика рамку
+# не трогает. За ним смещение пропорционально ОСТАВШЕМУСЯ ходу до упора,
+# но это расстояние одного броска, а не скорость.
 MANUAL_NUDGE_DEADBAND_US = 300.0
-# Фиксированная скорость рамки за дедбендом (px/с, LORES). Не зависит
-# от того, насколько именно за дедбендом стик — либо 0, либо это число.
-# БЫЛО 10 — отзыв оператора: "скорость меньше", ощущение запоздалой
-# реакции на текущей. Дедбенд (выше) не трогаем — жалоба именно на
-# скорость самого движения, не на порог срабатывания. Если и 5 некомфортно
-# — это по-прежнему одно число, меняется прямо здесь.
-MANUAL_NUDGE_FIXED_PX_S = 5.0
+# Куда встаёт рамка при стике в упоре за дедбендом, px lores (на экране
+# 640 это вдвое больше). 24 px закрывает обычный съезд одним движением.
+# Меньший ход стика — та же доля. Меняется одним числом, если на стенде
+# полный бросок окажется коротким или слишком длинным.
+MANUAL_NUDGE_THROW_PX = 24.0
+# Половина хода канала вокруг 1500: упор это 1000 или 2000. За вычетом
+# дедбенда остаётся ход, который отображается на THROW_PX.
+MANUAL_NUDGE_STICK_HALF_US = 500.0
 # Знаки осей — как ROLL_SIGN/PITCH_SIGN у самого управления: физическая
 # ориентация приёмника и камеры не гарантирует «стик вправо/вверх = рамка
 # туда же» без проверки на конкретном борту. Меняются на месте так же, как
@@ -11885,12 +11890,62 @@ MANUAL_NUDGE_PITCH_SIGN = -1
 # стика (переход True -> False = «оператор закончил, пора re-anchor»).
 _nudge_was_active = False
 # Момент последнего кадра, где nudge реально сдвигал рамку — для перевода
-# px/с в px/кадр по РЕАЛЬНОМУ интервалу, а не по номинальному CAM_FPS.
-# При просевшем FPS (крупная цель, тепловой throttling) номинал завышает
-# частоту кадров, и рамка при одном и том же стике ехала бы медленнее —
-# для ручного интерфейса это неприятно: одинаковое усилие пилота должно
-# давать примерно одинаковое смещение за равное РЕАЛЬНОЕ время.
+# _nudge_prev_t больше не задаёт шаг: бросок не зависит от dt.
+# Сбрасывается вместе с жестом, чтобы старый интервал не всплыл,
+# если скорость когда-нибудь вернут.
 _nudge_prev_t = None
+# Точка, откуда начался ТЕКУЩИЙ бросок, и дальнее смещение по каждой оси.
+# None — жеста нет. Обратный ход пружины пик не уменьшает.
+_nudge_origin_cx = None
+_nudge_origin_cy = None
+_nudge_peak_dx = 0.0
+_nudge_peak_dy = 0.0
+
+
+def _nudge_cmd_px(exc_us):
+    """Смещение рамки за бросок, px lores.
+
+    exc_us — отклонение сверх дедбенда, со знаком. 0 внутри зоны.
+    Упор стика (MANUAL_NUDGE_STICK_HALF_US от центра) даёт полный
+    MANUAL_NUDGE_THROW_PX, меньший ход — ту же долю.
+    """
+    if exc_us == 0.0:
+        return 0.0
+    travel = MANUAL_NUDGE_STICK_HALF_US - MANUAL_NUDGE_DEADBAND_US
+    if travel < 1.0:
+        travel = 1.0
+    frac = exc_us / travel
+    if frac > 1.0:
+        frac = 1.0
+    elif frac < -1.0:
+        frac = -1.0
+    return frac * MANUAL_NUDGE_THROW_PX
+
+
+def _nudge_latch(peak, cmd):
+    """Защёлка одной оси.
+
+    Наружу рамка догоняет стик. Пока стик возвращается в ту же сторону,
+    рамка остаётся на дальнем месте. Смена знака начинает бросок заново
+    от нуля этого жеста, а не от старого пика.
+    """
+    if cmd == 0.0:
+        return peak
+    if peak == 0.0 or (cmd > 0.0) != (peak > 0.0):
+        return cmd
+    if abs(cmd) > abs(peak):
+        return cmd
+    return peak
+
+
+def _nudge_throw_clear():
+    """Жест кончился или лок сброшен — следующий бросок с новой точки."""
+    global _nudge_origin_cx, _nudge_origin_cy, _nudge_peak_dx, _nudge_peak_dy
+    _nudge_origin_cx = None
+    _nudge_origin_cy = None
+    _nudge_peak_dx = 0.0
+    _nudge_peak_dy = 0.0
+
 # Заморозка адаптации шаблона после re-anchor (ТЗ §12 п.6): позиция ещё не
 # подтверждена свежим match/flow, учить эталон на непроверенном месте
 # рискованно. Снимается, как только придёт хотя бы один кадр со свежим
@@ -12384,6 +12439,7 @@ def process_locked_tracker(gray, cb_t0=None):
     global template_scale_acc, color_axis
     global lock_w0, lock_h0
     global _nudge_was_active, _nudge_prev_t
+    global _nudge_origin_cx, _nudge_origin_cy, _nudge_peak_dx, _nudge_peak_dy
     global _nudge_frozen_box, _nudge_abort_pending, _nudge_suspended_since_t
     global _identity_uncertain_pending, _identity_uncertain_streak
     global _identity_anchor_check_streak, _identity_anchor_check_last_t
@@ -12776,6 +12832,7 @@ def process_locked_tracker(gray, cb_t0=None):
     # ОЖИВЛЯТЬ слежение — только править уже живое.
     _nudge_active = False
     _nudge_dx = _nudge_dy = 0.0
+    _nudge_goal_cx = _nudge_goal_cy = None
     _aux2_raw = _aux3_raw = None
     _nudge_rc_fresh = False
     _have_aux = False
@@ -12811,34 +12868,24 @@ def process_locked_tracker(gray, cb_t0=None):
             _nudge_active = (_roll_exc != 0.0) or (_pitch_exc != 0.0)
 
             if _nudge_active:
-                # ШАГ ЗА КАДР ПО РЕАЛЬНОМУ ВРЕМЕНИ, а не по номинальному
-                # CAM_FPS (review: «manual nudge должен быть независим от
-                # фактического FPS»). При просевшем FPS (крупная цель,
-                # тепловой throttling) номинал завышает частоту кадров, и
-                # рамка при том же усилии стика ехала бы медленнее в
-                # реальном времени — для ручного интерфейса это неприятно.
-                _now_nudge = time.monotonic()
-                if _nudge_prev_t is not None:
-                    _nudge_dt = _now_nudge - _nudge_prev_t
-                else:
-                    _nudge_dt = 1.0 / CAM_FPS
-                # Потолок на случай паузы (первый кадр после входа в
-                # TRACKED, застрявший callback) — рамка не прыгает на всю
-                # накопленную паузу разом.
-                _nudge_dt = min(_nudge_dt, 3.0 / CAM_FPS)
-                _nudge_prev_t = _now_nudge
-
-                # ФИКСИРОВАННАЯ скорость, не пропорциональная отклонению
-                # (по требованию оператора) — либо 0 (внутри дедбенда,
-                # уже решено выше в _roll_exc/_pitch_exc), либо ровно
-                # MANUAL_NUDGE_FIXED_PX_S в сторону отклонения, без
-                # промежуточных значений.
-                _roll_dir = math.copysign(1.0, _roll_exc) if _roll_exc != 0.0 else 0.0
-                _pitch_dir = math.copysign(1.0, _pitch_exc) if _pitch_exc != 0.0 else 0.0
-                _nudge_dx = (MANUAL_NUDGE_ROLL_SIGN * _roll_dir
-                            * MANUAL_NUDGE_FIXED_PX_S * _nudge_dt)
-                _nudge_dy = (MANUAL_NUDGE_PITCH_SIGN * _pitch_dir
-                            * MANUAL_NUDGE_FIXED_PX_S * _nudge_dt)
+                # Бросок: куда стик ушёл за дедбенд, туда и рамка от точки
+                # начала жеста. Время кадра не входит — удержание стика
+                # рамку дальше не везёт, просевший FPS не меняет длину.
+                _cmd_dx = MANUAL_NUDGE_ROLL_SIGN * _nudge_cmd_px(_roll_exc)
+                _cmd_dy = MANUAL_NUDGE_PITCH_SIGN * _nudge_cmd_px(_pitch_exc)
+                if not _nudge_was_active or _nudge_origin_cx is None:
+                    _nudge_origin_cx = float(lock_cx)
+                    _nudge_origin_cy = float(lock_cy)
+                    _nudge_peak_dx = 0.0
+                    _nudge_peak_dy = 0.0
+                _nudge_peak_dx = _nudge_latch(_nudge_peak_dx, _cmd_dx)
+                _nudge_peak_dy = _nudge_latch(_nudge_peak_dy, _cmd_dy)
+                _nudge_goal_cx = float(clamp(
+                    _nudge_origin_cx + _nudge_peak_dx, 0, LORES_W - 1))
+                _nudge_goal_cy = float(clamp(
+                    _nudge_origin_cy + _nudge_peak_dy, 0, LORES_H - 1))
+                _nudge_dx = _nudge_goal_cx - float(lock_cx)
+                _nudge_dy = _nudge_goal_cy - float(lock_cy)
 
     # НАЙДЕНО (ревью по a2f5fe0 — SAFETY, обобщение фикса по c6fb464
     # п.3). Настоящим отпусканием стика считается ТОЛЬКО track_state
@@ -12919,8 +12966,8 @@ def process_locked_tracker(gray, cb_t0=None):
         # его отсчёт: пилот стик не отпускал, это была просто пауза в
         # телеметрии, а не решение закончить правку.
         _nudge_suspended_since_t = None
-        lock_cx = float(clamp(lock_cx + _nudge_dx, 0, LORES_W - 1))
-        lock_cy = float(clamp(lock_cy + _nudge_dy, 0, LORES_H - 1))
+        lock_cx = _nudge_goal_cx
+        lock_cy = _nudge_goal_cy
         lost_frames = 0
         box = lores_box_to_main(lock_cx, lock_cy, lock_w, lock_h)
         with state_lock:
@@ -12952,6 +12999,7 @@ def process_locked_tracker(gray, cb_t0=None):
         # и gray разойдутся по-настоящему.
         _nudge_was_active = False
         _nudge_suspended_since_t = None
+        _nudge_throw_clear()
         flight_log.event("MANUAL_NUDGE end")
         reanchor_tracker_at_current_box(gray, "manual_reanchor")
         # Заморозку снимаем СРАЗУ, тем же кадром, что и сам reanchor — не
@@ -13028,6 +13076,7 @@ def process_locked_tracker(gray, cb_t0=None):
         _nudge_was_active = False
         _nudge_suspended_since_t = None
         _nudge_frozen_box = None
+        _nudge_throw_clear()
         _nudge_abort_pending = True
         lost_frames += 1
         box = lores_box_to_main(lock_cx, lock_cy, lock_w, lock_h)
@@ -13061,6 +13110,7 @@ def process_locked_tracker(gray, cb_t0=None):
         _nudge_was_active = False
         _nudge_suspended_since_t = None
         _nudge_frozen_box = None
+        _nudge_throw_clear()
         # НАЙДЕНО (ревью по dfdde00): HOLD ниже — НЕ ранний выход, на
         # следующем кадре код падает в обычный flow_predict/match с
         # грязной смесью (lock_cx/cy уже промежуточные, prev_gray/points/

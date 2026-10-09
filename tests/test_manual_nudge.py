@@ -9,11 +9,13 @@
 MANUAL_NUDGE_ROLL_AUX_IDX в tracker.py).
 
 Проверяется:
-  A/B/C/D — исходная механика: мёртвая зона, движение по формуле стика
+  A/B/C/D — исходная механика: мёртвая зона, бросок по формуле стика
       (а не от flow/match), re-anchor при отпускании, снятие заморозки.
   E — HOLD не оживает в TRACKED от одного лишь стика (review п.1).
   F — состояние коррекции не переживает потерю/новый лок (review п.2).
-  G — шаг nudge не зависит от фактического FPS (review п.5).
+  G — длина броска не зависит от FPS и от того, сколько стик держат.
+  H — обратный ход пружины рамку не возвращает; новый бросок после
+      отпускания считается от новой точки.
 """
 import math
 import os
@@ -120,14 +122,14 @@ assert t._match_dbg.get("nudge_rc_fresh") == 1, (
     "AUX-копии не считаются свежими сразу после записи rc_link_ts — "
     "диагностика свежести сломана")
 
-print("\n=== B. Стик отклонён вправо (AUX2) — рамка едет по формуле, а не "
-      "от flow/match ===")
-ROLL_US = 300.0  # заметно за пределами MANUAL_NUDGE_DEADBAND_US=60
+print("\n=== B. Стик отклонён вправо (AUX2) — рамка встаёт на бросок, "
+      "а не ползёт и не едет от flow/match ===")
+ROLL_US = 450.0  # за дедбендом 300: избыток 150 из 200 до упора
 set_stick(ROLL_US)
-half = 500.0 - t.MANUAL_NUDGE_DEADBAND_US
-norm = (ROLL_US - t.MANUAL_NUDGE_DEADBAND_US) / half
-expected_step = t.MANUAL_NUDGE_ROLL_SIGN * norm * t.MANUAL_NUDGE_MAX_PX_S * FRAME_DT
-print("    ожидаемый шаг за кадр (dt=%.4f): %.4f px" % (FRAME_DT, expected_step))
+travel = t.MANUAL_NUDGE_STICK_HALF_US - t.MANUAL_NUDGE_DEADBAND_US
+frac = (ROLL_US - t.MANUAL_NUDGE_DEADBAND_US) / travel
+expected = t.MANUAL_NUDGE_ROLL_SIGN * frac * t.MANUAL_NUDGE_THROW_PX
+print("    ожидаемое смещение броска: %.4f px" % expected)
 
 positions = [t.lock_cx]
 N = 5
@@ -141,14 +143,13 @@ for _ in range(N):
 
 steps = [positions[i + 1] - positions[i] for i in range(len(positions) - 1)]
 print("    шаги lock_cx:", ["%.4f" % s for s in steps])
-# Первый шаг активации — по номинальному dt (_nudge_prev_t ещё не было),
-# остальные — по РЕАЛЬНОМУ интервалу между кадрами (здесь он равен
-# номинальному, часы тикают ровно FRAME_DT).
-for s in steps:
-    assert abs(s - expected_step) < 1e-6, (
-        "шаг рамки (%.4f) не совпадает с формулой стика (%.4f) — либо "
-        "nudge считает неверно, либо flow/match всё-таки вмешались"
-        % (s, expected_step))
+assert abs(steps[0] - expected) < 1e-6, (
+    "первый кадр броска (%.4f) не совпадает с формулой стика (%.4f)"
+    % (steps[0], expected))
+for s in steps[1:]:
+    assert abs(s) < 1e-6, (
+        "удержание стика на месте сдвинуло рамку ещё на %.4f — "
+        "бросок не должен копить скорость" % s)
 assert t.geometry_epoch == epoch0, (
     "geometry_epoch изменился ВО ВРЕМЯ коррекции — re-anchor должен "
     "случиться только на ОТПУСКАНИИ стика")
@@ -274,10 +275,10 @@ print("    reset_tracking очищает _nudge_was_active/_nudge_prev_t/"
       "прошлого")
 
 
-print("\n=== G. Шаг nudge не зависит от фактического FPS (review п.5) ===")
-# Один и тот же РЕАЛЬНЫЙ отрезок времени (1 секунда) отклонённого стика —
-# при 24 к/с (нормальный FPS) и при 12 к/с (просевший, крупная цель) —
-# должен дать ПОХОЖЕЕ суммарное смещение, а не вдвое разное.
+print("\n=== G. Длина броска не зависит ни от FPS, ни от длительности "
+      "удержания ===")
+# Один и тот же угол стика, удержанный секунду при 24 и при 12 к/с,
+# должен дать ОДНО смещение — длину броска, а не путь = скорость × время.
 epoch_before_g = t.geometry_epoch
 
 
@@ -312,16 +313,42 @@ with t.state_lock:
 moved_12 = run_nudge_for(1.0, 12.0)
 
 print("    смещение за 1 реальную секунду: 24 fps -> %.2f px, 12 fps -> "
-      "%.2f px" % (moved_24, moved_12))
-assert moved_24 > 0 and moved_12 > 0, (
-    "тест сам по себе негоден: смещения должны быть положительны")
-rel_diff = abs(moved_24 - moved_12) / max(moved_24, moved_12)
-assert rel_diff < 0.15, (
-    "смещение за одинаковое реальное время различается на %.0f%% между "
-    "24 и 12 fps (%.2f px против %.2f px) — шаг nudge зависит от "
-    "фактического FPS, а не должен" % (rel_diff * 100, moved_24, moved_12))
+      "%.2f px (бросок %.2f)" % (moved_24, moved_12, expected))
+assert abs(moved_24 - expected) < 1e-6 and abs(moved_12 - expected) < 1e-6, (
+    "удержание стика дало не длину броска: 24 fps %.2f, 12 fps %.2f, "
+    "ожидалось %.2f" % (moved_24, moved_12, expected))
 
 
-print("\nOK: ручная коррекция двигает рамку по формуле AUX2/AUX3, не "
+print("\n=== H. Пружина назад рамку не возвращает; следующий бросок — "
+      "от новой точки ===")
+capture()
+cx_h = t.lock_cx
+set_stick(500.0)
+_clk.tick(FRAME_DT)
+t.process_locked_tracker(scene)
+at_stop = t.lock_cx
+assert abs((at_stop - cx_h) - t.MANUAL_NUDGE_THROW_PX) < 1e-6, (
+    "полный ход стика не дал THROW_PX: %.3f" % (at_stop - cx_h))
+set_stick(ROLL_US)  # ближе к центру, но всё ещё за дедбендом
+_clk.tick(FRAME_DT)
+t.process_locked_tracker(scene)
+assert abs(t.lock_cx - at_stop) < 1e-6, (
+    "обратный ход стика вернул рамку: %.3f -> %.3f" % (at_stop, t.lock_cx))
+set_stick(0)
+_clk.tick(FRAME_DT)
+t.process_locked_tracker(scene)
+cx_after = t.lock_cx
+set_stick(ROLL_US)
+_clk.tick(FRAME_DT)
+t.process_locked_tracker(scene)
+assert abs((t.lock_cx - cx_after) - expected) < 1e-6, (
+    "второй бросок после отпускания не посчитан от новой точки: %.3f"
+    % (t.lock_cx - cx_after))
+set_stick(0)
+_clk.tick(FRAME_DT)
+t.process_locked_tracker(scene)
+
+
+print("\nOK: ручная коррекция ставит рамку броском AUX2/AUX3, не "
       "оживляет HOLD, не переживает потерю лока, не зависит от FPS, "
-      "отпускание вызывает re-anchor с новой эпохой и заморозкой адаптации")
+      "пружина назад рамку не тянет, отпускание вызывает re-anchor")
