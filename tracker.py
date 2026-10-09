@@ -587,17 +587,14 @@ BLOB_VERIFY_MIN_EDGE_RATIO = 1.2
 # срабатывание на реальных захватах. frac=0.3 (7 px для 24-рамки)
 # ближе к размеру самой цели.
 BLOB_VERIFY_CENTER_FRAC = 0.3
-# Мелкая дальняя цель. Рамка 20–24 px, сам объект 5–10. Шаблон и точки
-# потока сидят на фоне вокруг него: корреляция нормализует яркость,
-# и белое на зелёном для неё такое же пятно, как трава. При приближении
-# фон течёт, рамка уезжает с объекта. Пока в рамке есть одно компактное
-# пятно яркости, центр держим на нём, а не на текстуре вокруг.
+# Мелкая дальняя цель. Рамка до 32 px, сам объект несколько пикселей.
+# Шаблон и точки потока сидят на фоне вокруг него. Пока в рамке одно
+# компактное пятно яркости, центр кадра — это пятно, шаг потока не берём.
 SMALL_BLOB_MAX_BOX = 32
 SMALL_BLOB_MIN_PIXELS = 6
 SMALL_BLOB_MAX_FRACTION = 0.25
 SMALL_BLOB_CONTRAST = 18.0
 SMALL_BLOB_SPREAD = 0.25
-SMALL_BLOB_PULL_MAX_PX = 3.0
 # BLOB VERIFY DEBOUNCE: сколько кадров подряд fail чтобы считать
 # что lock реально на фоне. 30 кадров ≈ 1 секунда при 30 fps.
 # Разбор 5f68fc6: 15 кадров давали ложные срабатывания в первые
@@ -7830,6 +7827,11 @@ def _anchor_bank_maybe_refresh(gray, cx, cy, w, h, live_score,
     # там всё равно доминирует фон, slots 1-3 станут "дорожными".
     if int(w) < TEMPLATE_FREEZE_SMALL_PX:
         return False
+    # Та же мелкая рамка, что и у живого шаблона: патч банка — это фон.
+    if (lock_w is not None and lock_h is not None
+            and lock_w < SMALL_BLOB_MAX_BOX
+            and lock_h < SMALL_BLOB_MAX_BOX):
+        return False
     if live_score < IDENTITY_ANCHOR_BANK_REFRESH_MIN_SCORE:
         return False
     if anchor_score < IDENTITY_ANCHOR_BANK_REFRESH_MIN_ANCHOR_SCORE:
@@ -8278,6 +8280,13 @@ def _template_adaptation_gate(score, flow_ok):
     # initial template пока цель не вырастет в кадре.
     if (tmpl_w is not None
             and tmpl_w < TEMPLATE_FREEZE_SMALL_PX):
+        return False, "small_target_frozen"
+    # Рамка мельче 32 px. Шаблон шире коробки, фона в нём больше, чем
+    # цели. Уникальный кусок травы проходит lead и становится эталоном.
+    # Пока коробка не выросла, живой шаблон не трогаем — остаётся клик.
+    if (lock_w is not None and lock_h is not None
+            and lock_w < SMALL_BLOB_MAX_BOX
+            and lock_h < SMALL_BLOB_MAX_BOX):
         return False, "small_target_frozen"
     # Пик не уникален — не учим, даже если якорь только что подтвердил
     # позицию. На дороге (201356) якорь подтверждал колею: aoff ~1 px,
@@ -13344,18 +13353,13 @@ def process_locked_tracker(gray, cb_t0=None):
                     new_cx = lock_cx + (new_cx - lock_cx) * k
                     new_cy = lock_cy + (new_cy - lock_cy) * k
             # Мелкая цель: поток сидит на фоне вокруг пятна и уносит
-            # рамку при приближении. Если в рамке одно компактное
-            # пятно яркости — белое на зелёном, — центр к нему.
-            # На ровной текстуре пятен нет, шаг потока не трогаем.
-            _blob = _small_blob_center(gray, new_cx, new_cy, lock_w, lock_h)
+            # рамку. Если в текущей рамке одно компактное пятно —
+            # центр это оно, предложенный шаг в этот кадр не берём.
+            # На ровной текстуре пятен нет, шаг потока остаётся.
+            _blob = _small_blob_center(gray, lock_cx, lock_cy, lock_w, lock_h)
             if _blob is not None:
-                _bdx = _blob[0] - new_cx
-                _bdy = _blob[1] - new_cy
-                _bstep = math.hypot(_bdx, _bdy)
-                if _bstep > 0.75:
-                    _bk = min(1.0, SMALL_BLOB_PULL_MAX_PX / _bstep)
-                    new_cx += _bdx * _bk
-                    new_cy += _bdy * _bk
+                new_cx = float(_blob[0])
+                new_cy = float(_blob[1])
 
         # ИЗМЕРЕНИЕ СТОИМОСТИ (разбор реальных бортовых логов 2d83a09:
         # cb_wall_ms медиана 37.2мс при бюджете 41.7мс, но сумма

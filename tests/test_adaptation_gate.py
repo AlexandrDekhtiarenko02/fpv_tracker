@@ -99,6 +99,22 @@ def fake_ambiguous_match(score=0.90, lead_gap=0.02):
     return _f
 
 
+def allow_adapt(scene):
+    """A–D проверяют lead-гейт, а не запрет мелкой рамки.
+
+    Рамка мельче SMALL_BLOB_MAX_BOX шаблон больше не учит. Поднимаем
+    коробку выше порога и пересобираем эталон, иначе проверка lead
+    недостижима: отказ случится раньше, по размеру.
+    """
+    px = float(t.SMALL_BLOB_MAX_BOX + 16)
+    t.lock_w = px
+    t.lock_h = px
+    t.template_gray = t.build_template(
+        scene, t.lock_cx, t.lock_cy, px, px)
+    if t.template_base is not None:
+        t.template_base = t.template_gray.copy()
+
+
 def run_scenario(ambiguous, n_frames=15):
     t.reset_tracking(to_acq=True)
     with t.state_lock:
@@ -112,6 +128,7 @@ def run_scenario(ambiguous, n_frames=15):
     scene0 = make_scene(0)
     t.process_locked_tracker(scene0)
     assert t.track_state == t.TRACK_STATE_TRACKED, "захват не состоялся"
+    allow_adapt(scene0)
     tmpl0 = t.template_gray.copy()
     if ambiguous:
         t.template_match_locked = fake_ambiguous_match()
@@ -170,6 +187,7 @@ t.track_state = t.TRACK_STATE_ACQ
 scene0 = make_scene(0)
 t.process_locked_tracker(scene0)
 assert t.track_state == t.TRACK_STATE_TRACKED
+allow_adapt(scene0)
 t.template_match_locked = fake_ambiguous_match()
 _mismatches = []
 for i in range(1, 16):
@@ -212,6 +230,7 @@ t.track_state = t.TRACK_STATE_ACQ
 scene0 = make_scene(0)
 t.process_locked_tracker(scene0)
 assert t.track_state == t.TRACK_STATE_TRACKED
+allow_adapt(scene0)
 _checked_addweighted_frames = 0
 _mismatches_d = []
 _tg_prev = t.template_gray.copy()
@@ -242,6 +261,33 @@ assert not _mismatches_d, (
 print("    %d кадров с реальным addWeighted-смешиванием — template_std "
       "каждый раз совпадал с np.std(смешанного template_gray)"
       % _checked_addweighted_frames)
+
+print("\n=== E. Рамка мельче 32 px — шаблон не учится даже на однозначном пике ===")
+t.template_match_locked = _real_template_match_locked
+t.reset_tracking(to_acq=True)
+with t.state_lock:
+    t.aux4_state = True
+t.acq_wait_left = 0
+t.prev_aux_on = True
+t.track_state = t.TRACK_STATE_ACQ
+scene0 = make_scene(0)
+t.process_locked_tracker(scene0)
+assert t.track_state == t.TRACK_STATE_TRACKED
+assert t.lock_w < t.SMALL_BLOB_MAX_BOX and t.lock_h < t.SMALL_BLOB_MAX_BOX, (
+    "сценарий E негоден: после захвата рамка уже не мелкая "
+    "(%.1f x %.1f)" % (t.lock_w, t.lock_h))
+tmpl_e = t.template_gray.copy()
+reasons_e = []
+for i in range(1, 11):
+    t.process_locked_tracker(make_scene(i))
+    reasons_e.append(t._match_dbg.get("adapt_skip_reason"))
+print("    lock %.1fx%.1f, причины:" % (t.lock_w, t.lock_h), reasons_e)
+assert np.array_equal(t.template_gray, tmpl_e), (
+    "мелкая рамка изменила template_gray")
+assert any(r == "small_target_frozen" for r in reasons_e), (
+    "мелкая рамка ни разу не отказала как small_target_frozen: %s" % reasons_e)
+assert all(r in ("", "small_target_frozen", None) for r in reasons_e), (
+    "мелкая рамка училась по другой причине: %s" % reasons_e)
 
 t.IDENTITY_UNCERTAIN_ENABLED = True
 

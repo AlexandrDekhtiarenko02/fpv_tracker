@@ -96,6 +96,10 @@ print("=== 1. Sustained ambiguity + real anchor confirms: track_state "
       "мешают live-matcher быть уверенным (реальный сценарий захвата №3 "
       "из логов 2f7d275) ===")
 capture()
+# Запрет мелкой рамки срабатывает раньше lead. Эта секция проверяет
+# именно ambiguity, поэтому рамка выше порога.
+t.lock_w = float(t.SMALL_BLOB_MAX_BOX + 16)
+t.lock_h = t.lock_w
 _anchor_ref = t._identity_anchor_gray
 _anchor_bytes = t._identity_anchor_gray.copy()
 t.flow_predict = fake_flow_still

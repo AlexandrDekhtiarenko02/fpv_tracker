@@ -76,6 +76,9 @@ print("=== 1. Прямая проверка _template_adaptation_gate: при "
       "даже при чистом кадре (flow_ok=True, lead большой, flow_gap=0) "
       "===")
 capture()
+# Прямой вызов гейта проверяет soft_distrust, не запрет мелкой рамки.
+t.lock_w = float(t.SMALL_BLOB_MAX_BOX + 16)
+t.lock_h = t.lock_w
 # Чистое состояние: gate обязан разрешить
 t._match_dbg["second"] = 0.05    # lead=(0.90-0.05)/0.90 >> MATCH_LEAD_FULL
 t._match_dbg["flow_gap"] = 0.0

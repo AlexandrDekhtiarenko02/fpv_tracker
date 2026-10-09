@@ -119,21 +119,37 @@ for _ in range(3):
     _clk.tick(FRAME_DT)
     t.process_locked_tracker(scene)
 
-# NUDGE от A к B: полное отклонение стика, пока рамка не дойдёт до B.
+# NUDGE от A к B двумя бросками: один полный ход — 24 px, до B ещё
+# остаток. Удержание стика больше не везёт рамку.
 print("\n=== Nudge от A (%.0f) к B (%.0f) ===" % (AX, BX))
-ROLL_US = 300.0
-set_stick(ROLL_US)
-guard = 0
-while t.lock_cx < BX and guard < 200:
-    set_stick(ROLL_US)
+
+
+def one_throw(roll_us):
+    set_stick(roll_us)
     _clk.tick(FRAME_DT)
     t.process_locked_tracker(scene)
-    guard += 1
-assert guard < 200, "nudge не дошёл до B за разумное число кадров"
-assert t._match_dbg.get("manual_nudge") == 1, "nudge не был активен по пути"
-print("    дошли до lock_cx=%.2f за %d кадров" % (t.lock_cx, guard))
+    assert t._match_dbg.get("manual_nudge") == 1, "nudge не был активен"
+    held = t.lock_cx
+    set_stick(0)
+    _clk.tick(FRAME_DT)
+    t.process_locked_tracker(scene)
+    assert abs(t.lock_cx - held) < 1.0, "отпускание сдвинуло рамку"
+    return t.lock_cx
 
-# Отпускаем ровно у B.
+
+one_throw(t.MANUAL_NUDGE_STICK_HALF_US)
+remain = BX - t.lock_cx
+travel = t.MANUAL_NUDGE_STICK_HALF_US - t.MANUAL_NUDGE_DEADBAND_US
+frac = remain / t.MANUAL_NUDGE_THROW_PX
+roll = t.MANUAL_NUDGE_DEADBAND_US + max(frac, 0.0) * travel
+if roll <= t.MANUAL_NUDGE_DEADBAND_US:
+    roll = t.MANUAL_NUDGE_DEADBAND_US + 1.0
+cx_thrown = one_throw(roll)
+print("    дошли до lock_cx=%.2f двумя бросками" % cx_thrown)
+assert abs(cx_thrown - BX) < 10.0, (
+    "броски не посадили рамку рядом с B (%.1f, цель %.0f)" % (cx_thrown, BX))
+
+# Стик уже в центре, reanchor уже был. Кадр ниже — тот же отпуск.
 set_stick(0)
 _clk.tick(FRAME_DT)
 t.process_locked_tracker(scene)
