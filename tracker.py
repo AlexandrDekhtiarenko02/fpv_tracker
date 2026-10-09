@@ -944,14 +944,13 @@ ADAPT_SCORE_WINDOW_S = 1.0
 # свежий кандидат, вырезанный из текущей рамки, честно «выиграл» PSR
 # и зацементировал обочину. Ниже этого score refresh не голосует.
 TREF_MIN_LIVE_SCORE = 0.65
-# Шаг рамки за кадр, когда пик уже уникален, но score слабый.
-# Машина t=4.88: score 0.53, поток +7 px, рамка ушла на 14 px.
-# 3 px при ~20 кадр/с — 60 px/с в координатах трекера (на экране
-# 640 вдвое больше). Неуникальный пик этим потолком не лечится:
-# ползание по колее меньше 3 px. На заходе цель в кадре стоит,
-# поэтому при lead < ADAPT_UNIQUE_LEAD шаг обнуляется целиком,
-# а не режется до четверти (четверть в 42e76c1 всё равно уносила
-# рамку и одновременно не давала ей ехать за живой целью).
+# Шаг рамки за кадр, когда пик нечем подтвердить. Машина t=4.88:
+# score 0.53, поток +7 px, рамка ушла на 14 px. Дорога t=6.49:
+# lead<=0, один кадр −4.6 px. 3 px при ~20 кадр/с — 60 px/с
+# в координатах трекера (на экране 640 вдвое больше).
+# Нулевой шаг на каждом lead < 0.15 (3a80c9d) оставил рамку висеть
+# в воздухе: состояние так и было TRACKED, колея под ней давала
+# score 0.6–0.8. 105609 и 105640.
 WEAK_LOCK_STEP_MAX_PX = 3.0
 WEAK_SCORE_STEP_THR = 0.60
 MATCH_GOOD_SCORE = 0.40    # было 0.34 — выше планка «уверенного» матча
@@ -13232,22 +13231,25 @@ def process_locked_tracker(gray, cb_t0=None):
             k = MAX_LOCK_STEP / max(step, 1e-6)
             new_cx = lock_cx + (new_cx - lock_cx) * k
             new_cy = lock_cy + (new_cy - lock_cy) * k
-        # Заход на цель: точка в кадре стоит. Пока пик не уникален,
-        # поток — сползание по колее (204137: +26 px шагами < 1 px),
-        # а не движение цели. Рамку не сдвигаем. Уникальный пик едет
-        # как раньше; слабый score при уникальном пике упирается в 3 px.
+        # Всплеск, когда пик не подтверждает цель. Потолок 3 px.
+        # Нулевой шаг здесь не ставим: рамка зависает в воздухе,
+        # а TRACKED не снимается, потому что колея всё ещё похожа
+        # (105609, 105640). Шаг меньше 3 px — движение картинки,
+        # его не режем.
         if track_state == TRACK_STATE_TRACKED:
             _lead_now = None
             _sec_now = _match_dbg.get("second")
             if _sec_now is not None and score > 0.0:
                 _lead_now = (score - float(_sec_now)) / max(score, 1e-6)
+            _step_cap = None
+            if score < WEAK_SCORE_STEP_THR:
+                _step_cap = WEAK_LOCK_STEP_MAX_PX
             if _lead_now is not None and _lead_now < ADAPT_UNIQUE_LEAD:
-                new_cx = lock_cx
-                new_cy = lock_cy
-            elif score < WEAK_SCORE_STEP_THR:
+                _step_cap = WEAK_LOCK_STEP_MAX_PX
+            if _step_cap is not None:
                 step = math.hypot(new_cx - lock_cx, new_cy - lock_cy)
-                if step > WEAK_LOCK_STEP_MAX_PX:
-                    k = WEAK_LOCK_STEP_MAX_PX / step
+                if step > _step_cap:
+                    k = _step_cap / step
                     new_cx = lock_cx + (new_cx - lock_cx) * k
                     new_cy = lock_cy + (new_cy - lock_cy) * k
 
