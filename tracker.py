@@ -607,18 +607,6 @@ SMALL_BLOB_PULL_MAX_PX = 3.0
 # Похожий по яркости грузовик этим не отличается. Выдержка двигает
 # медиану кадра вместе с целью и отказ не включает.
 DULL_TARGET_BRIGHT_MARGIN = 40.0
-# Белый кузов шире кольца рамки: центр и кольцо оба белые, дельта
-# кольца < 18, и клик ошибочно выходит «тусклым». Тогда подтяжка
-# пятна выключена, а запрет «не светлее клика» не мешает уйти
-# на траву — клик и так белый. Если центр светлее кадра хотя бы
-# на BRIGHT_BODY_REL, это кузов, не тропа (+44 у тропы в 112556).
-# С него на заметно более тёмное не сходим. Тёмные окна кузова
-# подтяжкой по модулю отклонения не ищем: она ведёт рамку в стекло.
-BRIGHT_BODY_REL = 55.0
-BRIGHT_BODY_DARK_MARGIN = 60.0
-# Компактное светлое пятно в окне шире рамки. Доля и разброс больше,
-# чем у мелкого пятна внутри рамки: грузовик уже не «крошка», но
-# ещё не заливает окно, как дорога.
 # BLOB VERIFY DEBOUNCE: сколько кадров подряд fail чтобы считать
 # что lock реально на фоне. 30 кадров ≈ 1 секунда при 30 fps.
 # Разбор 5f68fc6: 15 кадров давали ложные срабатывания в первые
@@ -4807,10 +4795,8 @@ chroma_v = None
 target_uv = None          # (U, V) цели, снятые при захвате
 color_active = False      # различает ли цвет цель и фон в этом захвате
 # Клин этого захвата. True — кликнули по яркому пятну (белая машина).
-# False — цель не пятно: либо тусклая (на широкое яркое не переходим),
-# либо яркий кузов (на тёмное не сходим).
+# False — цель тусклая, на более яркое рядом не переходим.
 target_chases_blob = False
-target_holds_bright = False
 target_luma_rel = 0.0      # центр минус медиана кадра в момент клика
 color_axis = None         # направление «цель минус фон» в цветности
 color_separation = 0.0
@@ -7430,35 +7416,6 @@ def _small_blob_center(gray, cx, cy, box_w, box_h):
         return None
 
 
-def _bright_compact_center(gray, cx, cy, box_w, box_h):
-    """Центр компактного светлого пятна в окне шире рамки, или None.
-
-    Только пиксели светлее медианы окна — тёмное стекло кузова не тянет.
-    Широкая дорога окно заливает или размазывает выбросы: компактного
-    пятна нет, и такой шаг тусклой цели не разрешаем.
-    """
-    if box_w > SMALL_BLOB_MAX_BOX or box_h > SMALL_BLOB_MAX_BOX:
-        return None
-    try:
-        pw = max(12, int(box_w * 2.6))
-        ph = max(12, int(box_h * 2.6))
-        patch, (x1, y1, _, _) = crop_center(gray, cx, cy, pw, ph)
-        if patch.shape[0] < 8 or patch.shape[1] < 8:
-            return None
-        f = patch.astype(np.float32)
-        med = float(np.median(f))
-        ys, xs = np.nonzero(f >= med + SMALL_BLOB_CONTRAST)
-        n = int(xs.size)
-        if n < SMALL_BLOB_MIN_PIXELS or n > 0.35 * f.size:
-            return None
-        spread = max(float(xs.std()), float(ys.std()))
-        if spread > 0.22 * max(patch.shape[0], patch.shape[1]):
-            return None
-        return float(x1) + float(xs.mean()), float(y1) + float(ys.mean())
-    except Exception:
-        return None
-
-
 def _center_vs_ring(gray, cx, cy, box_w, box_h):
     """Насколько центр светлее кольца вокруг рамки. None, если мерить нечем."""
     try:
@@ -8436,7 +8393,7 @@ def reset_tracking(to_acq=False):
     global lock_cx, lock_cy, lock_w, lock_h, tmpl_w, tmpl_h, template_gray, template_std
     global lock_w0, lock_h0
     global template_base, target_uv, color_active, color_separation
-    global target_chases_blob, target_holds_bright, target_luma_rel
+    global target_chases_blob, target_luma_rel
     global color_axis
     global _identity_anchor_gray, _identity_anchor_w, _identity_anchor_h
     global _identity_anchor_std
@@ -8506,7 +8463,6 @@ def reset_tracking(to_acq=False):
     target_uv = None
     color_active = False
     target_chases_blob = False
-    target_holds_bright = False
     target_luma_rel = 0.0
     _shadow_track_dbg = {"active": False}
     _shadow_fresh_candidate = None
@@ -12482,7 +12438,7 @@ def process_locked_tracker(gray, cb_t0=None):
     global _flow_reference_t
     global tmpl_w, tmpl_h, template_std
     global template_base, target_uv, color_active, color_separation
-    global target_chases_blob, target_holds_bright, target_luma_rel
+    global target_chases_blob, target_luma_rel
     global lost_frames, frame_index, last_match_score, last_flow_ok
     global fps_t0, fps_frames, fps_current
     global prev_aux_on, acq_wait_left, lock_sequence
@@ -12836,30 +12792,21 @@ def process_locked_tracker(gray, cb_t0=None):
             else:
                 color_active = False
             # Клин клика. Центр заметно светлее своего кольца — цель
-            # сама пятно (белая машина мельче рамки), его держим подтяжкой.
-            # Кольцо тоже белое — кузов шире рамки: на тёмное не сходим.
-            # Иначе цель тусклая. Широкая дорога светлее и центра, и кольца,
-            # на неё не идём. Компактный яркий предмет рядом — не дорога.
+            # сама пятно (белая машина), его потом держим подтяжкой.
+            # Тусклый центр — грузовик. Запоминаем, насколько он светлее
+            # медианы кадра: широкая дорога светлее и центра, и кольца,
+            # кольцо её не выдаёт.
             _delta0 = _center_vs_ring(gray, lock_cx, lock_cy, lock_w, lock_h)
             _cmean0 = _center_mean(gray, lock_cx, lock_cy, lock_w, lock_h)
             target_luma_rel = (
                 0.0 if _cmean0 is None else _cmean0 - _frame_luma(gray))
             target_chases_blob = bool(
                 _delta0 is not None and _delta0 >= SMALL_BLOB_CONTRAST)
-            target_holds_bright = bool(
-                not target_chases_blob
-                and target_luma_rel >= BRIGHT_BODY_REL)
             if target_chases_blob:
-                flight_log.event(
-                    "КЛИН: цель — яркое пятно (центр−кадр %+.0f)"
-                    % target_luma_rel)
-            elif target_holds_bright:
-                flight_log.event(
-                    "КЛИН: цель — яркий кузов, на тёмное не сходим "
-                    "(центр−кадр %+.0f)" % target_luma_rel)
+                flight_log.event("КЛИН: цель — яркое пятно")
             else:
                 flight_log.event(
-                    "КЛИН: цель тусклая, на широкое яркое не сходим "
+                    "КЛИН: цель тусклая, на яркое рядом не сходим "
                     "(центр−кадр %+.0f)" % target_luma_rel)
             prev_gray = gray.copy()
             _flow_reference_t = time.monotonic()
@@ -13425,12 +13372,11 @@ def process_locked_tracker(gray, cb_t0=None):
                     k = _step_cap / step
                     new_cx = lock_cx + (new_cx - lock_cx) * k
                     new_cy = lock_cy + (new_cy - lock_cy) * k
-            # Мелкая цель. Яркое пятно мельче рамки — центр к нему.
-            # Яркий кузов шире кольца: пятно не ищем (стекло темнее краски),
-            # но шаг на заметно более тёмное, чем клик, не делаем.
-            # Тусклый клик на широкую светлую дорогу не ведём. На компактный
-            # яркий предмет — ведём: дорога окно заливает, предмет нет.
-            # Такой же по яркости грузовик от этого не отличается.
+            # Мелкая цель. Если кликнули по яркому пятну — центр к нему.
+            # Если цель тусклая, пятно рядом ярче неё: подтяжка увела бы
+            # на дорогу. Тогда шаг, после которого центр стал заметно
+            # светлее, чем в момент клика, не делаем. Такой же по яркости
+            # грузовик от этого не отличается.
             if target_chases_blob:
                 _blob = _small_blob_center(gray, new_cx, new_cy, lock_w, lock_h)
                 if _blob is not None:
@@ -13441,31 +13387,14 @@ def process_locked_tracker(gray, cb_t0=None):
                         _bk = min(1.0, SMALL_BLOB_PULL_MAX_PX / _bstep)
                         new_cx += _bdx * _bk
                         new_cy += _bdy * _bk
-            if (lock_w <= SMALL_BLOB_MAX_BOX
-                    and lock_h <= SMALL_BLOB_MAX_BOX):
+            elif (lock_w <= SMALL_BLOB_MAX_BOX
+                  and lock_h <= SMALL_BLOB_MAX_BOX):
                 _cmean = _center_mean(gray, new_cx, new_cy, lock_w, lock_h)
-                _rel = (None if _cmean is None
-                        else _cmean - _frame_luma(gray))
-                if target_holds_bright:
-                    if (_rel is not None
-                            and _rel < target_luma_rel - BRIGHT_BODY_DARK_MARGIN):
-                        new_cx = lock_cx
-                        new_cy = lock_cy
-                elif not target_chases_blob and _rel is not None and (
-                        _rel > target_luma_rel + DULL_TARGET_BRIGHT_MARGIN):
-                    _blob = _bright_compact_center(
-                        gray, new_cx, new_cy, lock_w, lock_h)
-                    if _blob is None:
-                        new_cx = lock_cx
-                        new_cy = lock_cy
-                    else:
-                        _bdx = _blob[0] - new_cx
-                        _bdy = _blob[1] - new_cy
-                        _bstep = math.hypot(_bdx, _bdy)
-                        if _bstep > 0.75:
-                            _bk = min(1.0, SMALL_BLOB_PULL_MAX_PX / _bstep)
-                            new_cx += _bdx * _bk
-                            new_cy += _bdy * _bk
+                if (_cmean is not None
+                        and _cmean - _frame_luma(gray)
+                        > target_luma_rel + DULL_TARGET_BRIGHT_MARGIN):
+                    new_cx = lock_cx
+                    new_cy = lock_cy
 
         # ИЗМЕРЕНИЕ СТОИМОСТИ (разбор реальных бортовых логов 2d83a09:
         # cb_wall_ms медиана 37.2мс при бюджете 41.7мс, но сумма
