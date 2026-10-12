@@ -84,6 +84,20 @@ sleep 3
 echo "  энергосбер. теперь: $(iw dev "$IFACE" get power_save 2>/dev/null || echo '?')"
 echo "  адрес            : $(hostname -I | awk '{print $1}')"
 
+# Меню на борту крутится не от root и само nmcli вызвать не может.
+PRAVA="/etc/sudoers.d/fpv-nmcli"
+KTO="${SUDO_USER:-root}"
+if [ "$KTO" != "root" ] && [ -x /usr/bin/nmcli ]; then
+    printf '%s ALL=(root) NOPASSWD: /usr/bin/nmcli\n' "$KTO" > "$PRAVA"
+    chmod 440 "$PRAVA"
+    if visudo -cf "$PRAVA" >/dev/null 2>&1; then
+        echo "  меню Wi-Fi   : $KTO может переподключать сеть без пароля"
+    else
+        rm -f "$PRAVA"
+        echo "  меню Wi-Fi   : правило sudo не принято, проверь visudo" >&2
+    fi
+fi
+
 echo
 echo "Готово. Настройки переживают перезагрузку."
 echo "Проверить после ребута:  iw dev $IFACE get power_save"

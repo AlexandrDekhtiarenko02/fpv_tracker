@@ -9856,32 +9856,63 @@ def _menu_nmcli(argv, timeout=20):
 
 
 def _menu_wifi_ssid():
-    """Имя сети. Кэш на секунду: iwgetid на каждом кадре малине ни к чему."""
+    """Имя сети. Кэш на секунду, чтобы не звать nmcli на каждом кадре."""
     global _menu_wifi_kesh
     now = time.monotonic()
     tekst, kogda = _menu_wifi_kesh
     if tekst and now - kogda < 1.0:
         return tekst
-    imya = "none"
-    try:
-        p = subprocess.run(
-            ["iwgetid", "-r"], capture_output=True, text=True, timeout=2)
-        syroy = (p.stdout or "").strip()
-        if syroy:
-            imya = "".join(
-                ch if 32 <= ord(ch) < 127 else "?" for ch in syroy)[:22]
-    except Exception:
-        imya = "none"
+    imya = _menu_wifi_prochitat()
     _menu_wifi_kesh = (imya, now)
     return imya
 
 
-def _menu_wifi_shag(argv):
-    """Одна команда nmcli. Чужой код ошибки — не повод останавливаться:
-    отключение уже выключенного интерфейса как раз так и отвечает.
-    Нет прав — одна попытка через sudo без пароля.
+def _menu_wifi_chistoe(imya):
+    imya = "".join(ch if 32 <= ord(ch) < 127 else "?" for ch in (imya or ""))
+    imya = imya.strip()
+    return imya[:22] if imya else ""
+
+
+def _menu_wifi_prochitat():
+    """Текущая сеть без прав суперпользователя.
+
+    iwgetid на Bookworm часто не установлен, поэтому сначала NetworkManager,
+    потом iw, и только затем старая команда.
     """
-    kod, tekst = _menu_nmcli(argv)
+    kod, tekst = _menu_nmcli(
+        ["nmcli", "-t", "-f", "NAME,TYPE,DEVICE", "con", "show", "--active"])
+    if kod == 0:
+        for lin in tekst.splitlines():
+            chasti = lin.split(":")
+            if len(chasti) >= 3 and "wireless" in chasti[-2] and chasti[-1] == "wlan0":
+                imya = _menu_wifi_chistoe(":".join(chasti[:-2]))
+                if imya:
+                    return imya
+    kod, tekst = _menu_nmcli(["iw", "dev", "wlan0", "link"])
+    if kod == 0:
+        for lin in tekst.splitlines():
+            if "SSID:" in lin:
+                imya = _menu_wifi_chistoe(lin.split("SSID:", 1)[1])
+                if imya:
+                    return imya
+    try:
+        p = subprocess.run(
+            ["iwgetid", "-r"], capture_output=True, text=True, timeout=2)
+        imya = _menu_wifi_chistoe(p.stdout)
+        if imya:
+            return imya
+    except Exception:
+        pass
+    return "none"
+
+
+def _menu_wifi_shag(argv):
+    """Одна команда nmcli. Чужой код ошибки — не повод останавливаться.
+    Нет прав — повтор через sudo без пароля, полный путь как в sudoers.
+    """
+    hvost = list(argv[1:]) if argv and argv[0] == "nmcli" else list(argv)
+    polnyy = ["/usr/bin/nmcli", *hvost]
+    kod, tekst = _menu_nmcli(polnyy)
     if kod == 0:
         return 0
     if kod == 127:
@@ -9890,7 +9921,7 @@ def _menu_wifi_shag(argv):
     if not any(s in niz for s in (
             "not authorized", "insufficient", "polkit", "privileg", "password")):
         return 0
-    kod2, _tekst2 = _menu_nmcli(["sudo", "-n", *argv])
+    kod2, _tekst2 = _menu_nmcli(["sudo", "-n", *polnyy])
     if kod2 == 0:
         return 0
     return 1
@@ -9910,8 +9941,8 @@ def _menu_wifi_zanovo():
             _menu_stroka("no nmcli")
             return "no nmcli"
         if kod != 0:
-            _menu_stroka("no rights")
-            return "no rights"
+            _menu_stroka("run wifi_fix")
+            return "run wifi_fix"
     time.sleep(1.0)
     _menu_wifi_kesh = ("", 0.0)
     imya = _menu_wifi_ssid()
@@ -10002,6 +10033,26 @@ def _menu_derzhanie(now, znak):
     return znak
 
 
+def _menu_listanie(now, znak):
+    """Ход по списку, пока стик держат. Короткий жест сюда не попадает:
+    первый пункт даёт край. Чем дольше упор, тем чаще следующий пункт.
+    """
+    global _menu_derzh_z, _menu_derzh_t, _menu_derzh_sled
+    if znak == 0:
+        _menu_derzh_z = 0
+        return 0
+    if znak != _menu_derzh_z:
+        _menu_derzh_z = znak
+        _menu_derzh_t = now
+        _menu_derzh_sled = now + MENU_DERZH_S
+        return 0
+    if now < _menu_derzh_sled:
+        return 0
+    pauza = 0.22 if (now - _menu_derzh_t) < 1.1 else 0.08
+    _menu_derzh_sled = now + pauza
+    return znak
+
+
 def _menu_tick(now, kanaly, armed):
     """Один кадр меню. kanaly — живые стики RPYT. Возвращает, открыто ли."""
     global _menu_otkryto, _menu_put, _menu_kursor, _menu_pravka, _menu_derzh_z
@@ -10060,10 +10111,17 @@ def _menu_tick(now, kanaly, armed):
         return True
     if shag_tang:
         _menu_kursor += -1 if shag_tang > 0 else 1
-        if _menu_kursor < 0:
-            _menu_kursor = 0
-        elif _menu_kursor >= len(deti):
-            _menu_kursor = len(deti) - 1
+        # Таймер удержания с этого же кадра, иначе повтор ждёт лишний кадр.
+        _menu_derzh_z = 0
+        _menu_listanie(now, _menu_zona(tang, 0))
+    else:
+        povtor = _menu_listanie(now, _menu_zona(tang, _menu_derzh_z))
+        if povtor:
+            _menu_kursor += -1 if povtor > 0 else 1
+    if _menu_kursor < 0:
+        _menu_kursor = 0
+    elif _menu_kursor >= len(deti):
+        _menu_kursor = len(deti) - 1
     if shag_kren > 0:
         punkt = deti[_menu_kursor]
         if punkt.get("deti"):
@@ -10075,6 +10133,7 @@ def _menu_tick(now, kanaly, armed):
             _menu_pravka = True
         elif punkt.get("dejstvie"):
             _menu_zapustit(punkt["dejstvie"])
+        _menu_derzh_z = 0
     elif shag_kren < 0:
         if _menu_put:
             _menu_kursor = _menu_put.pop()

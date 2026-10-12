@@ -104,6 +104,17 @@ sudo systemctl daemon-reload
 sudo systemctl enable -q tracker.service
 say "  запуск: /usr/bin/python3 ${DIR}/tracker.py"
 
+# Меню переподключает Wi-Fi из службы, а она не root.
+if [ -x /usr/bin/nmcli ]; then
+    PRAVA="/etc/sudoers.d/fpv-nmcli"
+    printf '%s ALL=(root) NOPASSWD: /usr/bin/nmcli\n' "$USER_NAME" | sudo tee "$PRAVA" >/dev/null
+    sudo chmod 440 "$PRAVA"
+    if ! sudo visudo -cf "$PRAVA" >/dev/null 2>&1; then
+        sudo rm -f "$PRAVA"
+        warn "правило sudo для меню Wi-Fi не принято"
+    fi
+fi
+
 # --- итог ------------------------------------------------------------------
 echo
 say "Готово."

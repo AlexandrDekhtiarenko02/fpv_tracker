@@ -152,7 +152,7 @@ t._menu_ekran = []
 assert t._menu_wifi_zanovo() == "PodilOfficer"
 assert t._menu_ekran[0] == "reconnecting"
 assert t._menu_ekran[-1] == "PodilOfficer"
-assert any(a[:3] == ["sudo", "-n", "nmcli"] for a in vyzovy_nm)
+assert any(a[:2] == ["sudo", "-n"] and a[2].endswith("nmcli") for a in vyzovy_nm)
 t._menu_otkryto = True
 t._menu_put = []
 t._menu_kursor = 0
@@ -161,6 +161,28 @@ tools = [p for p in t._menu_derevo() if p["imya"] == "Tools"][0]
 deti = [p for p in tools["deti"] if p["imya"] == "Wi-Fi"][0]["deti"]
 assert deti[0]["get"]() == "PodilOfficer"
 print("    ", [p["imya"] for p in deti])
+
+print("\n=== 11. Долгий упор листает меню, короткий — нет ===")
+sbros()
+t._menu_tick(6000.0, stiki(gaz=2000, tang=2000), False)
+t._menu_tick(6000.2, stiki(), False)
+t._menu_tick(6000.4, stiki(tang=1000), False)
+t._menu_tick(6000.6, stiki(), False)
+t._menu_tick(6000.8, stiki(tang=1000), False)
+t._menu_tick(6001.0, stiki(), False)
+t._menu_tick(6001.2, stiki(kren=2000), False)
+assert t._menu_kursor == 0
+t._menu_tick(6001.4, stiki(), False)
+t._menu_tick(6001.6, stiki(tang=1000), False)
+assert t._menu_kursor == 1, t._menu_kursor
+t._menu_tick(6001.9, stiki(tang=1000), False)
+assert t._menu_kursor == 1, "короткий упор сдвинул ещё раз"
+t._menu_tick(6002.3, stiki(tang=1000), False)
+assert t._menu_kursor == 2, t._menu_kursor
+t._menu_tick(6002.9, stiki(tang=1000), False)
+bystro = t._menu_kursor
+t._menu_tick(6003.05, stiki(tang=1000), False)
+assert t._menu_kursor == bystro + 1, (bystro, t._menu_kursor)
 
 print("\n=== 10. Яркость в Tracker, выдержка не трогается ===")
 sbros()
