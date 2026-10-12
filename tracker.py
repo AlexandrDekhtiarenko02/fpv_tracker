@@ -2198,6 +2198,9 @@ HOVER_ALPHA = 0.05
 # Вписанное висение, ШИМ. None — ещё не задано, закон учится со стика.
 # Меню и local_settings.py пишут сюда число, его можно править без правки кода.
 HOVER_PWM = None
+# Сдвиг яркости картинки, от -1 до 1. Ноль — как сняла камера.
+# Это не выдержка: экспозиция остаётся замороженной.
+BRIGHTNESS = 0.0
 # Доля висения на текущем наклоне, ниже которой убавка не идёт.
 # 0.90 — управляемое снижение, не провал.
 THR_DESCEND_FRACTION = 0.90
@@ -4818,6 +4821,8 @@ _menu_zanyato = False
 _menu_status = ""
 _menu_ekran = []
 _menu_wifi_kesh = ("", 0.0)
+_yarkost_shag = 0
+_picam2 = None
 _nastroiki_put = None
 # Сглаженная геометрическая команда газа. None — геометрия молчит.
 _thr_geom_out = None
@@ -9653,11 +9658,40 @@ def _zapisat_visenie(pwm):
         pass
 
 
+def _zapisat_yarkost(shag):
+    """Сдвиг яркости. 10 на стике — это +1.0 у камеры, выдержка не меняется."""
+    global _yarkost_shag, BRIGHTNESS
+    shag = int(round(shag))
+    if shag < -10:
+        shag = -10
+    elif shag > 10:
+        shag = 10
+    _yarkost_shag = shag
+    BRIGHTNESS = shag / 10.0
+    try:
+        _sohranit_nastroiku("BRIGHTNESS", "%.1f" % BRIGHTNESS)
+    except Exception:
+        pass
+    try:
+        if _picam2 is not None:
+            _picam2.set_controls({"Brightness": BRIGHTNESS})
+    except Exception:
+        pass
+    try:
+        flight_log.event("ЯРКОСТЬ ЗАДАНА: %+.1f" % BRIGHTNESS)
+    except Exception:
+        pass
+
+
 def _menu_derevo():
     return [
         {"imya": "Throttle", "deti": [
             {"imya": "Hover", "min": 1100, "max": 1800, "shag": 10,
              "get": lambda: _hover_pwm, "set": _zapisat_visenie},
+        ]},
+        {"imya": "Tracker", "deti": [
+            {"imya": "Brightness", "min": -10, "max": 10, "shag": 1,
+             "get": lambda: _yarkost_shag, "set": _zapisat_yarkost},
         ]},
         {"imya": "Tools", "deti": [
             {"imya": "Update", "dejstvie": _menu_obnovit},
@@ -16869,6 +16903,15 @@ if HOVER_PWM is not None:
         _hover_logged = True
     except (TypeError, ValueError):
         pass
+try:
+    _yarkost_shag = int(round(float(BRIGHTNESS) * 10))
+except (TypeError, ValueError):
+    _yarkost_shag = 0
+if _yarkost_shag < -10:
+    _yarkost_shag = -10
+elif _yarkost_shag > 10:
+    _yarkost_shag = 10
+BRIGHTNESS = _yarkost_shag / 10.0
 
 # =========================================================
 # 12. START
@@ -16947,8 +16990,9 @@ def _uzhe_zapushchen():
 def main():
     if _uzhe_zapushchen():
         raise SystemExit(1)
-    global picam2
+    global picam2, _picam2
     picam2 = Picamera2()
+    _picam2 = picam2
 
     sensor_mode = None
     preferred = [
@@ -17147,6 +17191,9 @@ def main():
                "ЗАФИКСИРОВАН" if colour_measured is not None else "не задан",
                ("ColourGains=%.2f/%.2f" % tuple(colour_measured))
                if colour_measured else "нет"))
+        if BRIGHTNESS:
+            picam2.set_controls({"Brightness": float(BRIGHTNESS)})
+            flight_log.event("ЯРКОСТЬ ПРИ СТАРТЕ: %+.1f" % BRIGHTNESS)
     except Exception:
         pass
 

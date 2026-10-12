@@ -80,6 +80,8 @@ t._nastroiki_put = put
 t._menu_tick(4000.0, stiki(gaz=2000, tang=2000), False)
 t._menu_tick(4000.2, stiki(), False)
 t._menu_tick(4000.4, stiki(tang=1000), False)
+t._menu_tick(4000.5, stiki(), False)
+t._menu_tick(4000.55, stiki(tang=1000), False)
 vybr = [s[0] for s in t._menu_stroki() if s[1]]
 assert vybr == ["Tools"], (vybr, t._menu_stroki())
 t._menu_tick(4000.6, stiki(), False)
@@ -159,5 +161,34 @@ tools = [p for p in t._menu_derevo() if p["imya"] == "Tools"][0]
 deti = [p for p in tools["deti"] if p["imya"] == "Wi-Fi"][0]["deti"]
 assert deti[0]["get"]() == "PodilOfficer"
 print("    ", [p["imya"] for p in deti])
+
+print("\n=== 10. Яркость в Tracker, выдержка не трогается ===")
+sbros()
+t._nastroiki_put = put
+t._yarkost_shag = 0
+t.BRIGHTNESS = 0.0
+prinyato = []
+
+class Cam:
+    def set_controls(self, ctrl):
+        prinyato.append(dict(ctrl))
+
+t._picam2 = Cam()
+t._menu_tick(5000.0, stiki(gaz=2000, tang=2000), False)
+t._menu_tick(5000.2, stiki(), False)
+t._menu_tick(5000.4, stiki(tang=1000), False)
+assert [s[0] for s in t._menu_stroki() if s[1]] == ["Tracker"]
+t._menu_tick(5000.6, stiki(), False)
+t._menu_tick(5000.8, stiki(kren=2000), False)
+t._menu_tick(5001.0, stiki(), False)
+t._menu_tick(5001.2, stiki(kren=2000), False)
+assert t._menu_pravka
+t._menu_tick(5001.4, stiki(), False)
+t._menu_tick(5001.6, stiki(tang=2000), False)
+assert t._yarkost_shag == 1, t._yarkost_shag
+assert t.BRIGHTNESS == 0.1
+assert prinyato == [{"Brightness": 0.1}], prinyato
+assert "AeEnable" not in open(put, encoding="utf-8").read()
+assert "BRIGHTNESS = 0.1" in open(put, encoding="utf-8").read()
 
 print("\nOK: меню на земле, висение пишется")
