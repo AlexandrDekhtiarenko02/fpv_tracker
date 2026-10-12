@@ -2195,6 +2195,9 @@ HOVER_VARIO_MAX_CMS = 40          # |вариометр| меньше 0.4 м/с 
 HOVER_THR_MIN = 1150
 HOVER_THR_MAX = 1750
 HOVER_ALPHA = 0.05
+# Вписанное висение, ШИМ. None — ещё не задано, закон учится со стика.
+# Меню и local_settings.py пишут сюда число, его можно править без правки кода.
+HOVER_PWM = None
 # Доля висения на текущем наклоне, ниже которой убавка не идёт.
 # 0.90 — управляемое снижение, не провал.
 THR_DESCEND_FRACTION = 0.90
@@ -4803,6 +4806,14 @@ throttle_integral = 0.0
 # Висение, снятое до захвата. None — ещё не видели ровной высоты.
 _hover_pwm = None
 _hover_logged = False
+_menu_otkryto = False
+_menu_put = []
+_menu_kursor = 0
+_menu_pravka = False
+_menu_pred = {"gaz": 0, "kren": 0, "tang": 0, "rych": 0}
+_menu_zhest_s = 0.0
+_menu_zakryt_s = 0.0
+_nastroiki_put = None
 # Сглаженная геометрическая команда газа. None — геометрия молчит.
 _thr_geom_out = None
 _geom_mode_log = None
@@ -5606,6 +5617,14 @@ def fc_io_loop():
             have_fresh_rc = (time.monotonic() - rc_ts) <= RC_FRESH_WINDOW
             if have_fresh_rc and not OBSERVE_ONLY:
                 apply_ov = ov and aux_now
+                # Меню съедает стики. На борт в это время уходит центр и
+                # холостой, иначе набор висения крутил бы моторы.
+                if _menu_otkryto:
+                    apply_ov = True
+                    r_cmd = 1500.0
+                    p_cmd = 1500.0
+                    y_cmd = 1500.0
+                    t_cmd = float(THROTTLE_MIN_PWM)
                 channels = build_output_channels(
                     live, r_cmd, p_cmd, y_cmd, t_cmd, apply_ov)
                 # СНАЧАЛА отправляем, ПОТОМ помечаем отправленным. Раньше было
@@ -9557,6 +9576,246 @@ def _podtyanut_gaz(tek, goal, skorost_pwm_s, k):
     return float(goal)
 
 
+# --- МЕНЮ НА СТИКАХ ---
+# Открывается на земле, без арма: оба стика вверх и держать полсекунды.
+# Левый вверх-вниз ходит по строкам. Правый вправо заходит, влево выходит.
+# На числе правый вправо ещё раз включает правку, и правый вверх-вниз
+# меняет значение. Левый влево закрывает меню откуда угодно.
+# Пока меню открыто, на полётник уходят центр и холостой, а не стики.
+
+MENU_VVERH = 1800
+MENU_NIZ = 1200
+MENU_ZHEST_S = 0.5
+
+
+def _put_nastroek():
+    if _nastroiki_put:
+        return _nastroiki_put
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "local_settings.py")
+
+
+def _sohranit_nastroiku(imya, znach):
+    """Вписать одну настройку в local_settings.py, остальные строки не трогать."""
+    put = _put_nastroek()
+    linii = []
+    if os.path.exists(put):
+        with open(put, encoding="utf-8") as f:
+            linii = f.read().splitlines()
+    nov = "%s = %s" % (imya, znach)
+    nashli = False
+    itog = []
+    for lin in linii:
+        gol = lin.split("#", 1)[0].strip()
+        if gol.startswith(imya) and gol[len(imya):].lstrip().startswith("="):
+            itog.append(nov)
+            nashli = True
+        else:
+            itog.append(lin)
+    if not nashli:
+        if itog and itog[-1] != "":
+            itog.append("")
+        itog.append(nov)
+    with open(put, "w", encoding="utf-8") as f:
+        f.write("\n".join(itog) + "\n")
+
+
+def _zapisat_visenie(pwm):
+    """Запомнить висение и сразу отдать его закону газа."""
+    global _hover_pwm, HOVER_PWM, _hover_logged
+    pwm = int(round(pwm))
+    if pwm < 1100:
+        pwm = 1100
+    elif pwm > 1800:
+        pwm = 1800
+    HOVER_PWM = pwm
+    _hover_pwm = float(pwm)
+    _hover_logged = True
+    try:
+        _sohranit_nastroiku("HOVER_PWM", pwm)
+    except Exception:
+        pass
+    try:
+        flight_log.event("ВИСЕНИЕ ЗАДАНО: %d ШИМ" % pwm)
+    except Exception:
+        pass
+
+
+def _menu_derevo():
+    return [
+        {"imya": "Газ", "deti": [
+            {"imya": "Висенье", "min": 1100, "max": 1800, "shag": 10,
+             "get": lambda: _hover_pwm, "set": _zapisat_visenie},
+        ]},
+    ]
+
+
+def _menu_uzel():
+    uzel = {"deti": _menu_derevo()}
+    for i in _menu_put:
+        deti = uzel.get("deti") or []
+        if i < 0 or i >= len(deti):
+            break
+        uzel = deti[i]
+    return uzel
+
+
+def _menu_zona(v):
+    if v >= MENU_VVERH:
+        return 1
+    if v <= MENU_NIZ:
+        return -1
+    return 0
+
+
+def _menu_kray(imya, v):
+    z = _menu_zona(v)
+    pred = _menu_pred.get(imya, 0)
+    _menu_pred[imya] = z
+    if z != 0 and z != pred:
+        return z
+    return 0
+
+
+def _menu_zakryt():
+    global _menu_otkryto, _menu_put, _menu_kursor, _menu_pravka
+    _menu_otkryto = False
+    _menu_put = []
+    _menu_kursor = 0
+    _menu_pravka = False
+
+
+def _menu_tick(now, kanaly, armed):
+    """Один кадр меню. kanaly — живые стики RPYT. Возвращает, открыто ли."""
+    global _menu_otkryto, _menu_put, _menu_kursor, _menu_pravka
+    global _menu_zhest_s, _menu_zakryt_s
+    if not kanaly or len(kanaly) < 4:
+        return _menu_otkryto
+    kren = int(kanaly[0])
+    tang = int(kanaly[1])
+    rych = int(kanaly[2])
+    gaz = int(kanaly[3])
+    if armed is not False:
+        if _menu_otkryto:
+            _menu_zakryt()
+        _menu_zhest_s = 0.0
+        for k in _menu_pred:
+            _menu_pred[k] = 0
+        return False
+    oba_vverh = gaz >= MENU_VVERH and tang >= MENU_VVERH
+    if not _menu_otkryto:
+        if oba_vverh:
+            if _menu_zhest_s <= 0.0:
+                _menu_zhest_s = now
+            elif now - _menu_zhest_s >= MENU_ZHEST_S:
+                _menu_otkryto = True
+                _menu_put = []
+                _menu_kursor = 0
+                _menu_pravka = False
+                _menu_zhest_s = 0.0
+                for imya, v in (("gaz", gaz), ("kren", kren),
+                                ("tang", tang), ("rych", rych)):
+                    _menu_pred[imya] = _menu_zona(v)
+        else:
+            _menu_zhest_s = 0.0
+        return _menu_otkryto
+    # Левый влево — выход из меню целиком.
+    if rych <= MENU_NIZ:
+        if _menu_zakryt_s <= 0.0:
+            _menu_zakryt_s = now
+        elif now - _menu_zakryt_s >= 0.3:
+            _menu_zakryt()
+            _menu_zakryt_s = 0.0
+            return False
+    else:
+        _menu_zakryt_s = 0.0
+    deti = _menu_uzel().get("deti") or []
+    if not deti:
+        return True
+    if _menu_kursor >= len(deti):
+        _menu_kursor = len(deti) - 1
+    shag_gaz = _menu_kray("gaz", gaz)
+    shag_kren = _menu_kray("kren", kren)
+    shag_tang = _menu_kray("tang", tang)
+    _menu_kray("rych", rych)
+    if _menu_pravka:
+        punkt = deti[_menu_kursor]
+        if shag_tang:
+            tek = punkt["get"]()
+            if tek is None:
+                tek = 1400
+            _zapisat = punkt["set"]
+            _zapisat(float(tek) + shag_tang * punkt["shag"])
+        if shag_kren < 0:
+            _menu_pravka = False
+        return True
+    if shag_gaz:
+        _menu_kursor += -1 if shag_gaz > 0 else 1
+        if _menu_kursor < 0:
+            _menu_kursor = 0
+        elif _menu_kursor >= len(deti):
+            _menu_kursor = len(deti) - 1
+    if shag_kren > 0:
+        punkt = deti[_menu_kursor]
+        if punkt.get("deti"):
+            _menu_put.append(_menu_kursor)
+            _menu_kursor = 0
+        elif punkt.get("set"):
+            if punkt["get"]() is None:
+                punkt["set"](1400)
+            _menu_pravka = True
+    elif shag_kren < 0:
+        if _menu_put:
+            _menu_kursor = _menu_put.pop()
+        else:
+            _menu_zakryt()
+    return _menu_otkryto
+
+
+def _menu_stroki():
+    """Строки для кадра: (текст, выбрана, правка)."""
+    if not _menu_otkryto:
+        return []
+    deti = _menu_uzel().get("deti") or []
+    out = []
+    for i, p in enumerate(deti):
+        if p.get("deti") is not None and "get" not in p:
+            tekst = p["imya"]
+        else:
+            zn = p["get"]()
+            tekst = "%s  %s" % (p["imya"], "нет" if zn is None else "%d" % int(zn))
+        out.append((tekst, i == _menu_kursor, _menu_pravka and i == _menu_kursor))
+    return out
+
+
+def _narisovat_menu(frame):
+    if not _menu_otkryto:
+        return
+    stroki = _menu_stroki()
+    x, y = 16, 36
+    cv2.putText(frame, "МЕНЮ", (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                0.7, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(frame, "МЕНЮ", (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                0.7, (255, 255, 255), 1, cv2.LINE_AA)
+    y += 32
+    for tekst, vybran, pravka in stroki:
+        nadpis = ("> " if vybran else "  ") + tekst
+        if pravka:
+            nadpis += "  <"
+        cv2.putText(frame, nadpis, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65, (0, 0, 0), 3, cv2.LINE_AA)
+        cvet = (80, 220, 255) if pravka else (255, 255, 255)
+        cv2.putText(frame, nadpis, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65, cvet, 1, cv2.LINE_AA)
+        y += 28
+    y += 8
+    podskaz = "лев влево — выход" if not _menu_pravka else "прав вверх-вниз, влево — готово"
+    cv2.putText(frame, podskaz, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(frame, podskaz, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5, (220, 220, 220), 1, cv2.LINE_AA)
+
+
 def update_control_from_target():
     """Тонкая обёртка вокруг _update_control_from_target_impl() — измеряет
     время этапа "управление" (_etap_ms["upravlenie"]), сам контур не
@@ -12176,6 +12435,9 @@ def draw_overlay_on_frame(frame):
         box = target_box_main
         vis = target_visible
         aux_for_mag = aux4_state
+        _menu_kanaly = list(app_state.get("rc_channels") or [])
+        _menu_armed = app_state.get("armed")
+    _menu_tick(time.monotonic(), _menu_kanaly, _menu_armed)
     # Отсчёт анимации метки — от появления цели, а не от начала захода.
     # Замечается здесь, в рисовании, а не в ядре слежения: это чисто
     # оформление, и ядру о нём знать незачем.
@@ -12203,6 +12465,7 @@ def draw_overlay_on_frame(frame):
     # отчёт, окажись он раньше.
     draw_sensor_report(frame)
     draw_control_state(frame)
+    _narisovat_menu(frame)
 
 # --- РУЧНАЯ КОРРЕКЦИЯ РАМКИ ВО ВРЕМЯ TRACKED (ТЗ next-commit spec §11/§12) ---
 #
@@ -13235,7 +13498,9 @@ def process_locked_tracker(gray, cb_t0=None):
     _aux2_raw = _aux3_raw = None
     _nudge_rc_fresh = False
     _have_aux = False
-    _nudge_eligible = MANUAL_NUDGE_ENABLED and track_state == TRACK_STATE_TRACKED
+    _nudge_eligible = (MANUAL_NUDGE_ENABLED
+                      and track_state == TRACK_STATE_TRACKED
+                      and not _menu_otkryto)
 
     if _nudge_eligible:
         with state_lock:
@@ -16336,6 +16601,13 @@ if RECORD_HIRES:
 LAUNCH_RAMP_UP_FRAMES = max(1, int(round(LAUNCH_RAMP_UP_S * CAM_FPS)))
 LAUNCH_HOLD_FRAMES = max(1, int(round(LAUNCH_HOLD_S * CAM_FPS)))
 LAUNCH_RAMP_DOWN_FRAMES = max(1, int(round(LAUNCH_RAMP_DOWN_S * CAM_FPS)))
+
+if HOVER_PWM is not None:
+    try:
+        _hover_pwm = float(HOVER_PWM)
+        _hover_logged = True
+    except (TypeError, ValueError):
+        pass
 
 # =========================================================
 # 12. START
