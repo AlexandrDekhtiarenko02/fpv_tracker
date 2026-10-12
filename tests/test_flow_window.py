@@ -1,4 +1,4 @@
-import io, os, numpy as np, cv2, math
+import io, os, re, time, numpy as np, cv2, math
 # Путь от самого файла теста: вшитый путь к моей машине делал тест
 # незапускаемым на малине, а прогонять его нужно как раз там.
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -6,7 +6,30 @@ src = io.open(os.path.join(_ROOT, "tracker.py"), encoding="utf-8").read()
 ns = {"cv2": cv2, "np": np, "math": math, "FLOW_MIN_POINTS": 3,
       "FLOW_ERR_MAX": 20.0, "FLOW_MAX_STEP": 30.0, "FLOW_WINDOW_PAD": 72, "FLOW_WINDOW_ENABLED": True,
       "FLOW_WINDOW_PAD_MIN": 24, "FLOW_WIN": 15,
-      "FLOW_LEVELS": 1, "FLOW_ITERS": 8}
+      "FLOW_LEVELS": 1, "FLOW_ITERS": 8, "time": time}
+# Константы расширения берутся ИЗ КОДА, а не вписываются числами: иначе они
+# однажды разойдутся, поток тихо свалится во внешний except и вернёт «не
+# сошлось» — а тест покажет расхождение координат, ничего не сказав о причине.
+_src_all = io.open(os.path.join(_ROOT, "tracker.py"), encoding="utf-8").read()
+for _im in ("FLOW_RASSH_MIN_R", "FLOW_RASSH_MIN", "FLOW_RASSH_MAX",
+            "FLOW_RASSH_SVEZH_S", "FLOW_ROBUST_RESID_MULT",
+            "FLOW_ROBUST_RESID_FLOOR_PX"):
+    ns[_im] = float(re.search(r"^%s = (.+?)(?:\s+#.*)?$" % _im,
+                              _src_all, re.M).group(1))
+ns["_flow_rasshirenie"] = None
+ns["_flow_rasshirenie_t"] = 0.0
+ns["_flow_dbg"] = {}
+# flow_predict теперь метит _flow_dbg["frame_index"] = frame_index (метка
+# свежести для shadow-диагностики, см. control-shadow-architecture) —
+# просто читает уже существующий счётчик кадров, значение тут неважно.
+ns["frame_index"] = 0
+# flow_predict теперь зовёт _flow_fit_translation_scale (совместная оценка
+# сдвига и масштаба, ТЗ §7) — извлекаем и её, иначе NameError внутри
+# flow_predict тихо ловится собственным except и тест видит «не сошлось»
+# вместо настоящей причины.
+exec("def _flow_fit_translation_scale("
+     + src.split("def _flow_fit_translation_scale(")[1]
+           .split("\ndef flow_predict")[0], ns)
 exec("def flow_predict(" + src.split("def flow_predict(")[1].split("\ndef estimate_size_at_position")[0], ns)
 win_fn = ns["flow_predict"]
 

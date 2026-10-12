@@ -38,8 +38,8 @@ for f in ("draw_control_state", "_preduprezhdenie_ob_overrayde"):
 # Строка обязана рисоваться. Функция, которую никто не зовёт, — это её
 # отсутствие, только незаметное.
 assert "draw_control_state(frame)" in src, "draw_control_state никто не вызывает"
-assert "_preduprezhdenie_ob_overrayde(apply_ov)" in src, (
-    "предупреждение не вызывается из потока MSP")
+assert "_preduprezhdenie_ob_overrayde(apply_ov and sent_ok)" in src, (
+    "предупреждение не вызывается из потока MSP (или не учитывает, ушёл ли кадр)")
 
 # В режиме наблюдения строки быть не должно: там трекер и не обязан рулить,
 # и красная надпись означала бы поломку там, где всё правильно.

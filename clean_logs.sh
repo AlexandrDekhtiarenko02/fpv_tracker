@@ -18,6 +18,11 @@ n_csv=$(find "$D" -maxdepth 1 -name 'flight_*.csv' | wc -l | tr -d ' ')
 n_ev=$(find "$D" -maxdepth 1 \( -name 'flight_*.log' -o -name 'flight_*.txt' \) | wc -l | tr -d ' ')
 sz=$(du -sh "$D" 2>/dev/null | cut -f1)
 echo "    полётных логов: ${n_csv} csv, ${n_ev} прочих"
+# Папки захватов — это основной объём: их набирается по сотне за день, и
+# именно они занимают почти всё место. Раньше скрипт их НЕ удалял, и после
+# «чистки» оставалось 250 МБ из 260 — то есть чистка не работала.
+n_zah=$(ls -d "$D"/zahvaty/*/ 2>/dev/null | wc -l | tr -d ' ')
+echo "    папок захватов: ${n_zah}"
 if [ -d "$D/acq_debug" ]; then
     echo "    снимков захвата: $(ls "$D/acq_debug" | wc -l | tr -d ' ') файлов"
 fi
@@ -36,4 +41,9 @@ fi
 
 find "$D" -maxdepth 1 -name 'flight_*' -delete
 rm -rf "$D/acq_debug"
+rm -rf "$D/zahvaty"
+mkdir -p "$D/zahvaty"
+# Дожидаемся записи: карта монтирована с отложенной записью, и без sync
+# каталог может остаться наполовину удалённым, если пропадёт питание.
+sync
 echo "==> Готово. Осталось: $(du -sh "$D" 2>/dev/null | cut -f1)"
