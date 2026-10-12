@@ -9577,15 +9577,15 @@ def _podtyanut_gaz(tek, goal, skorost_pwm_s, k):
 
 
 # --- МЕНЮ НА СТИКАХ ---
-# Открывается на земле, без арма: оба стика вверх и держать полсекунды.
+# Открывается только без арма: оба стика вверх, в тот же кадр, без выдержки.
+# На взведённом борте жест игнорируется, а уже открытое меню закрывается.
 # Левый вверх-вниз ходит по строкам. Правый вправо заходит, влево выходит.
-# На числе правый вправо ещё раз включает правку, и правый вверх-вниз
-# меняет значение. Левый влево закрывает меню откуда угодно.
+# На числе правый вправо включает правку, правый вверх-вниз меняет значение.
+# Левый влево закрывает меню. Действие — на входе стика в упор, не по таймеру.
 # Пока меню открыто, на полётник уходят центр и холостой, а не стики.
 
 MENU_VVERH = 1800
 MENU_NIZ = 1200
-MENU_ZHEST_S = 0.5
 
 
 def _put_nastroek():
@@ -9688,47 +9688,39 @@ def _menu_zakryt():
 def _menu_tick(now, kanaly, armed):
     """Один кадр меню. kanaly — живые стики RPYT. Возвращает, открыто ли."""
     global _menu_otkryto, _menu_put, _menu_kursor, _menu_pravka
-    global _menu_zhest_s, _menu_zakryt_s
     if not kanaly or len(kanaly) < 4:
         return _menu_otkryto
     kren = int(kanaly[0])
     tang = int(kanaly[1])
     rych = int(kanaly[2])
     gaz = int(kanaly[3])
+    # None тоже запрет: пока полётник не сказал, взведён ли борт, меню не трогаем.
     if armed is not False:
         if _menu_otkryto:
             _menu_zakryt()
-        _menu_zhest_s = 0.0
         for k in _menu_pred:
             _menu_pred[k] = 0
         return False
     oba_vverh = gaz >= MENU_VVERH and tang >= MENU_VVERH
     if not _menu_otkryto:
-        if oba_vverh:
-            if _menu_zhest_s <= 0.0:
-                _menu_zhest_s = now
-            elif now - _menu_zhest_s >= MENU_ZHEST_S:
-                _menu_otkryto = True
-                _menu_put = []
-                _menu_kursor = 0
-                _menu_pravka = False
-                _menu_zhest_s = 0.0
-                for imya, v in (("gaz", gaz), ("kren", kren),
-                                ("tang", tang), ("rych", rych)):
-                    _menu_pred[imya] = _menu_zona(v)
-        else:
-            _menu_zhest_s = 0.0
+        # Первый кадр упора, без удержания. Повторно не открываем, пока
+        # стики не ушли из упора и не пришли снова.
+        prixod = oba_vverh and not (
+            _menu_pred.get("gaz") == 1 and _menu_pred.get("tang") == 1)
+        _menu_pred["gaz"] = _menu_zona(gaz)
+        _menu_pred["tang"] = _menu_zona(tang)
+        _menu_pred["kren"] = _menu_zona(kren)
+        _menu_pred["rych"] = _menu_zona(rych)
+        if prixod:
+            _menu_otkryto = True
+            _menu_put = []
+            _menu_kursor = 0
+            _menu_pravka = False
         return _menu_otkryto
-    # Левый влево — выход из меню целиком.
-    if rych <= MENU_NIZ:
-        if _menu_zakryt_s <= 0.0:
-            _menu_zakryt_s = now
-        elif now - _menu_zakryt_s >= 0.3:
-            _menu_zakryt()
-            _menu_zakryt_s = 0.0
-            return False
-    else:
-        _menu_zakryt_s = 0.0
+    # Левый влево — выход сразу, как стик дошёл до упора.
+    if _menu_kray("rych", rych) < 0:
+        _menu_zakryt()
+        return False
     deti = _menu_uzel().get("deti") or []
     if not deti:
         return True
@@ -9737,7 +9729,6 @@ def _menu_tick(now, kanaly, armed):
     shag_gaz = _menu_kray("gaz", gaz)
     shag_kren = _menu_kray("kren", kren)
     shag_tang = _menu_kray("tang", tang)
-    _menu_kray("rych", rych)
     if _menu_pravka:
         punkt = deti[_menu_kursor]
         if shag_tang:

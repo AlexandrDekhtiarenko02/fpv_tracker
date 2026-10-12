@@ -34,11 +34,10 @@ for i in range(8):
     t._menu_tick(1000.0 + i * 0.1, stiki(gaz=2000, tang=2000), True)
 assert not t._menu_otkryto, "меню открылось на взведённом борту"
 
-print("\n=== 2. Без арма оба стика вверх открывают ===")
+print("\n=== 2. Без арма оба стика вверх открывают сразу ===")
 sbros()
 t._nastroiki_put = put
-assert not t._menu_tick(2000.0, stiki(gaz=2000, tang=2000), False)
-assert t._menu_tick(2000.6, stiki(gaz=2000, tang=2000), False)
+assert t._menu_tick(2000.0, stiki(gaz=2000, tang=2000), False)
 assert t._menu_stroki()[0][0].startswith("Throttle")
 
 print("\n=== 3. Правый вправо заходит в висение и меняет его ===")
@@ -63,8 +62,8 @@ print("\n=== 5. Левый влево закрывает ===")
 sbros()
 t._nastroiki_put = put
 t._menu_tick(3000.0, stiki(gaz=2000, tang=2000), False)
-t._menu_tick(3000.6, stiki(gaz=2000, tang=2000), False)
-t._menu_tick(3001.0, stiki(rych=1000), False)
-assert t._menu_tick(3001.4, stiki(rych=1000), False) is False
+assert t._menu_otkryto
+t._menu_tick(3000.4, stiki(), False)
+assert t._menu_tick(3000.6, stiki(rych=1000), False) is False
 
 print("\nOK: меню на земле, висение пишется")
