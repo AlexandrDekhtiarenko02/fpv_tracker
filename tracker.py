@@ -9802,29 +9802,29 @@ def _narisovat_menu(frame):
         if pravka:
             s += "  <"
         nadpisi.append((s, vybran, pravka))
-    shir = cv2.getTextSize(zag, font, 0.7, 1)[0][0]
-    for s, _, _ in nadpisi:
-        shir = max(shir, cv2.getTextSize(s, font, 0.65, 1)[0][0])
-    shir = max(shir, cv2.getTextSize(podskaz, font, 0.5, 1)[0][0])
-    x0, y0 = 8, 8
-    vys = 28 + 28 * max(1, len(nadpisi)) + 36
-    x1 = min(int(frame.shape[1]) - 4, x0 + shir + 24)
-    y1 = min(int(frame.shape[0]) - 4, y0 + vys)
-    # Плотная плашка, иначе строки теряются на OSD и на картинке.
+    # Окно всегда одно и то же: 2/3 кадра, по центру. Не поджимается под текст.
+    vysota, shirina = int(frame.shape[0]), int(frame.shape[1])
+    shir_okna = (shirina * 2) // 3
+    vys_okna = (vysota * 2) // 3
+    x0 = (shirina - shir_okna) // 2
+    y0 = (vysota - vys_okna) // 2
+    x1 = x0 + shir_okna
+    y1 = y0 + vys_okna
     cv2.rectangle(frame, (x0, y0), (x1, y1), (12, 12, 12, 0), -1)
     cv2.rectangle(frame, (x0, y0), (x1, y1), COLOR_WHITE, 1)
-    x, y = x0 + 12, y0 + 26
+    x, y = x0 + 16, y0 + 32
     cv2.putText(frame, zag, (x, y), font, 0.7, COLOR_WHITE, 1, cv2.LINE_AA)
-    y += 30
+    y += 36
     for s, vybran, pravka in nadpisi:
+        if y > y1 - 40:
+            break
         if vybran:
-            cv2.rectangle(frame, (x0 + 4, y - 18), (x1 - 4, y + 8),
+            cv2.rectangle(frame, (x0 + 6, y - 20), (x1 - 6, y + 8),
                           (48, 48, 48, 0), -1)
         cvet = COLOR_CYAN if pravka else COLOR_WHITE
         cv2.putText(frame, s, (x, y), font, 0.65, cvet, 1, cv2.LINE_AA)
-        y += 28
-    y += 4
-    cv2.putText(frame, podskaz, (x, y), font, 0.5, (210, 210, 210, 0),
+        y += 30
+    cv2.putText(frame, podskaz, (x, y1 - 16), font, 0.5, (210, 210, 210, 0),
                 1, cv2.LINE_AA)
 
 
