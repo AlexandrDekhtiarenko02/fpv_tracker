@@ -2176,6 +2176,43 @@ TAU_UBYV_MIN_TOCHEK = 12       # предел поправки по времен
 # секунду. Поэтому пропажу переживаем экстраполяцией, а не обнулением. Но
 # недолго: через TAU_HOLD_S оценка признаётся протухшей и газ отпускается.
 TAU_HOLD_S = 1.5
+
+# --- ГАЗ: ВИСЕНИЕ, ПЕРЕЛЁТ, БЛИЗКО И ВЫСОКО ---
+#
+# Опора газа замирает на стике момента захвата: во время override полётник
+# отдаёт нашу же команду, и читать её как стик нельзя. Если тот стик был
+# ниже висения, весь захват крутится вокруг слишком малой тяги.
+#
+# Висение учится ДО захвата, по живому стику, и только пока вариометр около
+# нуля. Ниже висения, поправленного на наклон (тяга вверх = газ * cos),
+# команда не опускается. Исключение — перелёт и «близко и высоко»: там газ
+# можно убавить, но только до доли висения, а не к холостому. Прошлый закон
+# по углу уходил на 90 ШИМ ниже стика 1300 и ронял борт.
+#
+# Без измеренного висения геометрию газом не трогаем: не зная пола, убавка
+# снова кончается холостым.
+HOVER_VARIO_MAX_CMS = 40          # |вариометр| меньше 0.4 м/с — высота стоит
+HOVER_THR_MIN = 1150
+HOVER_THR_MAX = 1750
+HOVER_ALPHA = 0.05
+# Доля висения на текущем наклоне, ниже которой убавка не идёт.
+# 0.90 — управляемое снижение, не провал.
+THR_DESCEND_FRACTION = 0.90
+# На столько °/с СВЕРХ мёртвой зоны убавка доходит до пола.
+# Замер перелёта 2.1 °/с минус зона 0.3 — как раз этот ход.
+THR_LOS_FULL_DPS = 1.8
+THR_GEOM_SLEW_OVERSHOOT = 80.0    # ШИМ/с, перелёт
+THR_GEOM_SLEW_STEEP = 300.0       # ШИМ/с, близко и высоко
+# Близко и высоко: короткая дальность по земле при ещё большой высоте
+# и крутом угле. Пологий дальний заход сюда не попадает.
+THR_STEEP_ALT_M = 12.0
+THR_STEEP_RANGE_M = 45.0
+THR_STEEP_DEPRESSION_DEG = 30.0
+# Нос вниз (ШИМ выше 1500) в этих режимах ограничен. 40 — небольшой
+# доворот, не пикирование в центр рамки. 70 пропускает поправку прицела
+# на перелёт (20 px * P) и не пускает полный провал носа.
+PITCH_STEEP_MAX_PWM = 40
+PITCH_OVERSHOOT_MAX_PWM = 70
 DY_INTEGRAL_RATE = 0.04
 DY_INTEGRAL_MAX = 60.0
 DY_INTEGRAL_DECAY = 0.985
@@ -4758,6 +4795,12 @@ _dover_psr_ema = None
 
 smooth_throttle_out = None
 throttle_integral = 0.0
+# Висение, снятое до захвата. None — ещё не видели ровной высоты.
+_hover_pwm = None
+_hover_logged = False
+# Сглаженная геометрическая команда газа. None — геометрия молчит.
+_thr_geom_out = None
+_geom_mode_log = None
 prev_ady = 0.0
 
 # Интеграторы прицельных осей. Копят остаточную ошибку P+D, чтобы крестик
@@ -9397,6 +9440,113 @@ def _reset_geometry_history(reason):
         pass
 
 
+def _visenie_na_naklone(hover_pwm, pitch_deg):
+    """Тяга, которая держит высоту при этом тангаже.
+
+    Нос вниз режет вертикальную составляющую: вверх остаётся газ * cos.
+    Чтобы высота стояла, газ надо поднять как 1/cos. Дальше 60° не
+    делим — косинус там уже мал, и пол раздуется в упор.
+    """
+    if hover_pwm is None:
+        return None
+    ugol = 0.0 if pitch_deg is None else float(pitch_deg)
+    if ugol < 0.0:
+        ugol = 0.0
+    elif ugol > 60.0:
+        ugol = 60.0
+    cos_p = math.cos(math.radians(ugol))
+    if cos_p < 0.5:
+        cos_p = 0.5
+    return float(hover_pwm) / cos_p
+
+
+def _uchit_visenie(thr, vario_cms):
+    """Запомнить газ, которым высота стояла. Зовётся только по живому стику."""
+    global _hover_pwm, _hover_logged
+    if thr is None or vario_cms is None:
+        return
+    thr = float(thr)
+    if thr < HOVER_THR_MIN or thr > HOVER_THR_MAX:
+        return
+    if abs(float(vario_cms)) > HOVER_VARIO_MAX_CMS:
+        return
+    if _hover_pwm is None:
+        _hover_pwm = thr
+        if not _hover_logged:
+            _hover_logged = True
+            try:
+                flight_log.event(
+                    "ВИСЕНИЕ: %.0f ШИМ (вариометр около нуля)" % thr)
+            except Exception:
+                pass
+        return
+    _hover_pwm += HOVER_ALPHA * (thr - _hover_pwm)
+
+
+def _blizko_i_vysoko(dep_deg, range_m, alt_m):
+    """Короткая дальность по земле при ещё большой высоте и крутом угле."""
+    if dep_deg is None or alt_m is None:
+        return False
+    if float(alt_m) < THR_STEEP_ALT_M:
+        return False
+    if float(dep_deg) < THR_STEEP_DEPRESSION_DEG:
+        return False
+    if range_m is None:
+        range_m = float(alt_m) / math.tan(math.radians(float(dep_deg)))
+    return float(range_m) <= THR_STEEP_RANGE_M
+
+
+def _rezhim_gaza(pitched, base_thr, los_rate, steep):
+    """Куда вести газ геометрией. (режим, цель_ШИМ) или (None, None).
+
+    Цель не ниже доли висения и не выше опоры. Без висения вернёт пусто:
+    убавлять от неизвестного пола нельзя.
+    """
+    if pitched is None or base_thr is None:
+        return None, None
+    cruise = max(float(base_thr), float(pitched))
+    floor = float(pitched) * THR_DESCEND_FRACTION
+    if floor > cruise:
+        floor = cruise
+    if steep:
+        return "steep", floor
+    if los_rate is None:
+        return None, None
+    excess = float(los_rate) - LOS_RATE_DEADBAND_DPS
+    if excess <= 0.0:
+        return None, None
+    dolya = excess / THR_LOS_FULL_DPS
+    if dolya > 1.0:
+        dolya = 1.0
+    return "overshoot", cruise + (floor - cruise) * dolya
+
+
+def _ogranich_nos(target_pitch, mode):
+    """Не давать носу уйти вниз сильнее небольшого доворота."""
+    if mode == "steep":
+        potolok = 1500 + PITCH_STEEP_MAX_PWM
+    elif mode == "overshoot":
+        potolok = 1500 + PITCH_OVERSHOOT_MAX_PWM
+    else:
+        return target_pitch
+    if target_pitch > potolok:
+        return potolok
+    return target_pitch
+
+
+def _podtyanut_gaz(tek, goal, skorost_pwm_s, k):
+    """Подойти к цели не быстрее skorost ШИМ/с."""
+    if tek is None:
+        return float(goal)
+    dt = max(0.0, float(k)) * NOMINAL_DT
+    shag = float(skorost_pwm_s) * dt
+    if goal > tek + shag:
+        return tek + shag
+    if goal < tek - shag:
+        return tek - shag
+    return float(goal)
+
+
 def update_control_from_target():
     """Тонкая обёртка вокруг _update_control_from_target_impl() — измеряет
     время этапа "управление" (_etap_ms["upravlenie"]), сам контур не
@@ -9429,6 +9579,7 @@ def _update_control_from_target_impl():
     global _gyro_y_sgl, _gyro_x_sgl
     global filtered_dx_yaw, prev_adx, prev_ady_ctrl
     global smooth_throttle_out, throttle_integral, prev_ady
+    global _hover_pwm, _thr_geom_out, _geom_mode_log
     global roll_integral, pitch_integral, yaw_integral
     global smoothed_pitch_deg
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
@@ -9558,6 +9709,14 @@ def _update_control_from_target_impl():
         base_thr = THROTTLE_MIN_PWM
     elif base_thr > THROTTLE_MAX_PWM:
         base_thr = THROTTLE_MAX_PWM
+    # Висение учится только по живому стику (rc_fresh гаснет на override)
+    # и только в арме: без арма вариометр стоит нулём и соврать легко.
+    if rc_fresh:
+        with state_lock:
+            _var_h = app_state.get("vario_cms")
+            _armed_h = app_state.get("armed")
+        if _armed_h:
+            _uchit_visenie(base_thr, _var_h)
 
     if not controllable or box is None:
         # Сбрасываем ВСЕ накопители, иначе windup из прошлой сессии вылезет
@@ -9613,6 +9772,8 @@ def _update_control_from_target_impl():
         prev_ady = 0.0
         smooth_throttle_out = None
         throttle_integral = 0.0
+        _thr_geom_out = None
+        _geom_mode_log = None
         roll_integral = 0.0
         pitch_integral = 0.0
         yaw_integral = 0.0
@@ -10490,6 +10651,33 @@ def _update_control_from_target_impl():
     _pid_dbg["roll_after_slew"] = target_roll - 1500
     _pid_dbg["pitch_after_slew"] = target_pitch - 1500
 
+    # Геометрия газа. Считается до веток: и ограничение носа, и сама
+    # команда газа смотрят на один и тот же режим.
+    _geom_mode = None
+    _geom_goal = None
+    _geom_pitched = None
+    if isinstance(closure, dict):
+        with state_lock:
+            _alt_g = app_state.get("alt_cm")
+            _pitch_g = app_state.get("fc_pitch_deg")
+            _pitch_ts = app_state.get("fc_pitch_ts", 0.0)
+        if _pitch_ts <= 0.0 or (now_mono - _pitch_ts) > 1.0:
+            _pitch_g = None
+        _geom_pitched = _visenie_na_naklone(_hover_pwm, _pitch_g)
+        _alt_m = None if _alt_g is None else float(_alt_g) / 100.0
+        _steep = _blizko_i_vysoko(
+            closure.get("depression_deg"), closure.get("range_m"), _alt_m)
+        _los_g = None
+        if (_los_skorost_ts > 0.0
+                and (now_mono - _los_skorost_ts) <= LOS_RATE_STALE_S):
+            _los_g = _los_skorost
+        _geom_mode, _geom_goal = _rezhim_gaza(
+            _geom_pitched, base_thr, _los_g, _steep)
+        # Близко и высоко нос ограничиваем даже без висения: пикировать
+        # в центр рамки нельзя, хотя газ без пола не убавляем.
+        if _steep and _geom_mode is None:
+            _geom_mode = "steep"
+
     # --- THROTTLE ---
     thr_adjust = 0.0
     if not OVERRIDE_THROTTLE:
@@ -10757,6 +10945,18 @@ def _update_control_from_target_impl():
         _final_dx0 = None
         _final_dy0 = None
 
+    _nos_do = target_pitch
+    target_pitch = _ogranich_nos(target_pitch, _geom_mode)
+    if target_pitch < _nos_do:
+        _slew_pitch = float(target_pitch)
+        if _geom_mode != _geom_mode_log:
+            try:
+                flight_log.event(
+                    "ТАНГАЖ: нос вниз ограничен %d -> %d (%s)"
+                    % (_nos_do, target_pitch, _geom_mode))
+            except Exception:
+                pass
+
     # --- ПРЕДЕЛ СКОРОСТИ СНИЖЕНИЯ ---
     #
     # Вариометр до сих пор не использовался нигде, хотя это единственное
@@ -10772,6 +10972,7 @@ def _update_control_from_target_impl():
     # разумных пределах, он молчит и поведение в точности прежнее. Он вступает
     # только когда закон газа по углу визирования увёл аппарат в проваливание,
     # из которого тот уже не выйдет. Это страховка, а не регулятор.
+    _vario_derzhit = False
     if VARIO_LIMIT_ENABLED and OVERRIDE_THROTTLE:
         with state_lock:
             _var = app_state.get("vario_cms")
@@ -10780,6 +10981,7 @@ def _update_control_from_target_impl():
                 and now_mono - _var_ts <= VARIO_FRESH_S):
             _sink = -float(_var) / 100.0        # положительное = снижаемся
             if _sink > VARIO_MAX_SINK_MPS:
+                _vario_derzhit = True
                 pribavka = (_sink - VARIO_MAX_SINK_MPS) * VARIO_LIMIT_GAIN
                 if pribavka > VARIO_LIMIT_MAX:
                     pribavka = VARIO_LIMIT_MAX
@@ -10809,6 +11011,46 @@ def _update_control_from_target_impl():
         target_throttle = int(round(smooth_throttle_out))
         target_throttle = max(THROTTLE_MIN_PWM,
                               min(THROTTLE_MAX_PWM, target_throttle))
+
+        # Пол висения и геометрическая убавка применяются ПОСЛЕ процентного
+        # окна. Окно в 15% как раз и держало ручку в 1-5%: перелёт оно
+        # выбрать не могло, а стик ниже висения поднять не имело права.
+        # Сглаживатель хвоста каждый кадр тянет команду обратно к стику,
+        # поэтому навязанное значение пишется и в него, иначе пол не удержится.
+        if _geom_goal is not None:
+            skorost = (THR_GEOM_SLEW_STEEP if _geom_mode == "steep"
+                       else THR_GEOM_SLEW_OVERSHOOT)
+            _thr_geom_out = _podtyanut_gaz(
+                _thr_geom_out if _thr_geom_out is not None else target_throttle,
+                _geom_goal, skorost, k)
+            # Провал быстрее предела уже сидит в target_throttle. Геометрия
+            # не имеет права увести ниже этой страховки.
+            if _vario_derzhit and target_throttle > _thr_geom_out:
+                _thr_geom_out = float(target_throttle)
+            target_throttle = int(round(_thr_geom_out))
+            smooth_throttle_out = float(target_throttle)
+        elif (_geom_pitched is not None
+                and target_throttle < _geom_pitched):
+            _thr_geom_out = _podtyanut_gaz(
+                _thr_geom_out if _thr_geom_out is not None else target_throttle,
+                _geom_pitched, THR_GEOM_SLEW_STEEP, k)
+            target_throttle = int(round(_thr_geom_out))
+            smooth_throttle_out = float(target_throttle)
+        else:
+            _thr_geom_out = None
+        target_throttle = max(THROTTLE_MIN_PWM,
+                              min(THROTTLE_MAX_PWM, target_throttle))
+        if _geom_mode != _geom_mode_log:
+            _geom_mode_log = _geom_mode
+            try:
+                if _geom_mode is not None:
+                    flight_log.event(
+                        "ГАЗ: %s, команда %d, пол висения %s"
+                        % (_geom_mode, target_throttle,
+                           ("%.0f" % _geom_pitched)
+                           if _geom_pitched is not None else "нет"))
+            except Exception:
+                pass
 
     # Launch throttle boost — применяется ТОЛЬКО при OVERRIDE_THROTTLE=True,
     # чтобы не наступать на ручное управление пилота.
