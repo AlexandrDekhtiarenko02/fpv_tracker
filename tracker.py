@@ -9582,9 +9582,9 @@ def _podtyanut_gaz(tek, goal, skorost_pwm_s, k):
 # --- МЕНЮ НА СТИКАХ ---
 # Открывается только без арма: оба стика вверх, в тот же кадр, без выдержки.
 # На взведённом борте жест игнорируется, а уже открытое меню закрывается.
-# Левый вверх-вниз ходит по строкам. Правый вправо заходит, влево выходит.
-# На числе правый вправо включает правку, правый вверх-вниз меняет значение.
-# Левый влево закрывает меню. Действие — на входе стика в упор, не по таймеру.
+# Правый вверх-вниз ходит по строкам. Правый вправо заходит, влево выходит.
+# На числе правый вправо включает правку, и тот же правый вверх-вниз
+# меняет значение. Левый влево закрывает меню.
 # Пока меню открыто, на полётник уходят центр и холостой, а не стики.
 
 MENU_VVERH = 1800
@@ -9843,7 +9843,7 @@ def _menu_tick(now, kanaly, armed):
         return True
     if _menu_kursor >= len(deti):
         _menu_kursor = len(deti) - 1
-    shag_gaz = _menu_kray("gaz", gaz)
+    _menu_kray("gaz", gaz)
     shag_kren = _menu_kray("kren", kren)
     shag_tang = _menu_kray("tang", tang)
     if _menu_pravka:
@@ -9858,8 +9858,8 @@ def _menu_tick(now, kanaly, armed):
             _menu_pravka = False
             _menu_derzh_z = 0
         return True
-    if shag_gaz:
-        _menu_kursor += -1 if shag_gaz > 0 else 1
+    if shag_tang:
+        _menu_kursor += -1 if shag_tang > 0 else 1
         if _menu_kursor < 0:
             _menu_kursor = 0
         elif _menu_kursor >= len(deti):
@@ -9907,7 +9907,7 @@ def _narisovat_menu(frame):
     stroki = _menu_stroki()
     font = cv2.FONT_HERSHEY_SIMPLEX
     zag = "MENU"
-    podskaz = ("L left = exit" if not _menu_pravka
+    podskaz = ("R up/down, L left = exit" if not _menu_pravka
                else "R up/down, left = done")
     nadpisi = []
     for tekst, vybran, pravka in stroki:
