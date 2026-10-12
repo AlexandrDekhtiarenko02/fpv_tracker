@@ -4814,6 +4814,8 @@ _menu_pred = {"gaz": 0, "kren": 0, "tang": 0, "rych": 0}
 _menu_derzh_z = 0
 _menu_derzh_t = 0.0
 _menu_derzh_sled = 0.0
+_menu_zanyato = False
+_menu_status = ""
 _nastroiki_put = None
 # Сглаженная геометрическая команда газа. None — геометрия молчит.
 _thr_geom_out = None
@@ -9648,7 +9650,90 @@ def _menu_derevo():
             {"imya": "Hover", "min": 1100, "max": 1800, "shag": 10,
              "get": lambda: _hover_pwm, "set": _zapisat_visenie},
         ]},
+        {"imya": "Tools", "deti": [
+            {"imya": "Update", "dejstvie": _menu_obnovit},
+            {"imya": "Clear logs", "dejstvie": _menu_ochistit_logi},
+        ]},
     ]
+
+
+def _menu_mozhno():
+    """Обслуживание только на земле. None — полётник ещё не сказал."""
+    with state_lock:
+        return app_state.get("armed") is False
+
+
+def _menu_skript(imya, *args, timeout=120):
+    put = os.path.join(os.path.dirname(os.path.abspath(__file__)), imya)
+    try:
+        p = subprocess.run(
+            ["bash", put, *args],
+            cwd=os.path.dirname(put),
+            capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except subprocess.TimeoutExpired:
+        return 1, "timeout"
+    except Exception as exc:
+        return 1, str(exc)
+
+
+def _menu_obnovit():
+    """Забрать текущую ветку и выйти: systemd поднимет службу с новым кодом."""
+    if not _menu_mozhno():
+        return "armed"
+    kod, tekst = _menu_skript("obnovit.sh")
+    if kod != 0:
+        niz = (tekst or "").lower()
+        if "timeout" in niz or "сеть недоступна" in niz:
+            return "no network"
+        if "local changes" in niz or "правили прямо" in niz:
+            return "local edits"
+        return "update failed"
+    if not _menu_mozhno():
+        return "armed"
+    os.kill(os.getpid(), signal.SIGTERM)
+    return "restarting"
+
+
+def _menu_ochistit_logi():
+    """Стереть полётные логи. Записи кадров и разборы остаются."""
+    if not _menu_mozhno():
+        return "armed"
+    try:
+        if lock_log.active:
+            lock_log.end("меню: очистка логов")
+    except Exception:
+        pass
+    try:
+        flight_log.stop()
+    except Exception:
+        pass
+    kod, _tekst = _menu_skript("clean_logs.sh", "--yes", timeout=60)
+    try:
+        flight_log._stop.clear()
+        flight_log.start()
+    except Exception:
+        pass
+    return "cleared" if kod == 0 else "clear failed"
+
+
+def _menu_zapustit(fn):
+    global _menu_zanyato, _menu_status
+    if _menu_zanyato:
+        return
+    _menu_zanyato = True
+    _menu_status = "working"
+
+    def telo():
+        global _menu_zanyato, _menu_status
+        try:
+            _menu_status = fn() or "done"
+        except Exception:
+            _menu_status = "failed"
+        finally:
+            _menu_zanyato = False
+
+    threading.Thread(target=telo, daemon=True).start()
 
 
 def _menu_uzel():
@@ -9788,6 +9873,8 @@ def _menu_tick(now, kanaly, armed):
             if punkt["get"]() is None:
                 punkt["set"](1400)
             _menu_pravka = True
+        elif punkt.get("dejstvie"):
+            _menu_zapustit(punkt["dejstvie"])
     elif shag_kren < 0:
         if _menu_put:
             _menu_kursor = _menu_put.pop()
@@ -9804,6 +9891,8 @@ def _menu_stroki():
     out = []
     for i, p in enumerate(deti):
         if p.get("deti") is not None and "get" not in p:
+            tekst = p["imya"]
+        elif p.get("dejstvie"):
             tekst = p["imya"]
         else:
             zn = p["get"]()
@@ -9848,6 +9937,9 @@ def _narisovat_menu(frame):
         cvet = COLOR_CYAN if pravka else COLOR_WHITE
         cv2.putText(frame, s, (x, y), font, 0.65, cvet, 1, cv2.LINE_AA)
         y += 30
+    if _menu_status:
+        cv2.putText(frame, _menu_status, (x, y1 - 42), font, 0.55,
+                    COLOR_YELLOW, 1, cv2.LINE_AA)
     cv2.putText(frame, podskaz, (x, y1 - 16), font, 0.5, (210, 210, 210, 0),
                 1, cv2.LINE_AA)
 

@@ -74,4 +74,27 @@ assert t._menu_otkryto
 t._menu_tick(3000.4, stiki(), False)
 assert t._menu_tick(3000.6, stiki(rych=1000), False) is False
 
+print("\n=== 6. Tools: обновление и очистка логов ===")
+sbros()
+t._nastroiki_put = put
+t._menu_tick(4000.0, stiki(gaz=2000, tang=2000), False)
+t._menu_tick(4000.2, stiki(), False)
+t._menu_tick(4000.4, stiki(gaz=1000), False)
+vybr = [s[0] for s in t._menu_stroki() if s[1]]
+assert vybr == ["Tools"], (vybr, t._menu_stroki())
+t._menu_tick(4000.6, stiki(), False)
+t._menu_tick(4000.8, stiki(kren=2000), False)
+imena = [s[0] for s in t._menu_stroki()]
+assert imena == ["Update", "Clear logs"], imena
+vyzovy = []
+t._menu_zapustit(lambda: vyzovy.append(1) or "ok")
+import time as _time
+_time.sleep(0.3)
+assert vyzovy == [1], vyzovy
+assert t._menu_status == "ok"
+with t.state_lock:
+    t.app_state["armed"] = True
+assert t._menu_obnovit() == "armed"
+assert t._menu_ochistit_logi() == "armed"
+
 print("\nOK: меню на земле, висение пишется")
