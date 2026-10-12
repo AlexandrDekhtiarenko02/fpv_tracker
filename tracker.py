@@ -9978,22 +9978,36 @@ def _narisovat_menu(frame):
     x, y = x0 + 16, y0 + 32
     cv2.putText(frame, zag, (x, y), font, 0.7, COLOR_WHITE, 1, cv2.LINE_AA)
     y += 36
-    for s, vybran, pravka in nadpisi:
-        if y > y1 - 120:
+    linii = list(_menu_ekran) if _menu_ekran else (
+        [_menu_status] if _menu_status else [])
+    # Нижняя полоса закреплена: статус и подсказка. Пункты выше неё не
+    # рисуются, поэтому длинный список на статус не наезжает.
+    podval = 28 + 26 * max(1, len(linii))
+    granica = y1 - podval
+    shag_y = 30
+    skolko = max(1, (granica - 8 - y) // shag_y)
+    nachalo = 0
+    for i, (_, vybran, _) in enumerate(nadpisi):
+        if vybran:
+            nachalo = i
             break
+    if nachalo > len(nadpisi) - skolko:
+        nachalo = max(0, len(nadpisi) - skolko)
+    for s, vybran, pravka in nadpisi[nachalo:nachalo + skolko]:
         if vybran:
             cv2.rectangle(frame, (x0 + 6, y - 20), (x1 - 6, y + 8),
                           (48, 48, 48, 0), -1)
         cvet = COLOR_CYAN if pravka else COLOR_WHITE
         cv2.putText(frame, s, (x, y), font, 0.65, cvet, 1, cv2.LINE_AA)
-        y += 30
-    linii = list(_menu_ekran) if _menu_ekran else (
-        [_menu_status] if _menu_status else [])
-    yy = y1 - 16 - 26 * len(linii)
+        y += shag_y
+    cv2.rectangle(frame, (x0 + 1, granica), (x1 - 1, y1 - 1),
+                  (28, 28, 28, 0), -1)
+    cv2.line(frame, (x0 + 8, granica), (x1 - 8, granica), (90, 90, 90, 0), 1)
+    yy = granica + 22
     for lin in linii:
         cv2.putText(frame, lin, (x, yy), font, 0.6, COLOR_YELLOW, 1, cv2.LINE_AA)
         yy += 26
-    cv2.putText(frame, podskaz, (x, y1 - 16), font, 0.5, (210, 210, 210, 0),
+    cv2.putText(frame, podskaz, (x, y1 - 14), font, 0.5, (210, 210, 210, 0),
                 1, cv2.LINE_AA)
 
 
