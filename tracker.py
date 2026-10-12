@@ -12459,35 +12459,10 @@ def _sensor_report():
         ("mag", bool(mag) and any(mag), None, na_plate(2), False),
     ]
 
-    # GPS ждём, если его обещали настройкой, если полётник видит его на плате
-    # или если спутники хоть раз появлялись — последнее само по себе
-    # доказывает наличие модуля.
-    # Ждём GPS, если о нём сказал сам полётник (функция включена либо он в
-    # перечне датчиков), если спутники хоть раз появлялись, либо если его
-    # обещали настройкой. Любого из четырёх достаточно.
-    gps_zhdyom = bool(GPS_EXPECTED or gps_bylo > 0 or gps_feature
-                      or na_plate(3))
-    # ВАЖНО: у GPS признак «на плате» берётся НЕ из перечня датчиков. Там он
-    # появляется только при фиксе, а фикса может не быть часами — и модуль,
-    # который стоит на борту, объявлялся бы отсутствующим. Поэтому na_bortu
-    # для GPS оставляем неизвестным (None), а судим по включённой функции.
-    if not gps_zhdyom:
-        # Ни функция, ни перечень, ни спутники — модуля нет и не ждали.
-        punkty.append(("gps", False, None, False, False))
-    elif gps_est and sats >= GPS_SATS_ENOUGH:
-        punkty.append(("gps", True, "%d sats" % sats, None, True))
-    elif gps_est:
-        punkty.append(("gps", False, "%d sats, weak" % sats, None, True))
-    elif sats > 0:
-        punkty.append(("gps", False, "%d sats" % sats, None, True))
-    elif gps_otvet:
-        punkty.append(("gps", False, "no fix", None, True))
-    else:
-        punkty.append(("gps", False, None, None, True))
+    # GPS на кадр не выводим: на этом борту он не нужен.
 
     stroki = []
-    vse_ok = True          # всё, КРОМЕ GPS
-    gps_gotov = True
+    vse_ok = True
     if not est:
         # Полётник не прислал перечень датчиков — мы не знаем, что на плате.
         # Молчать об этом нельзя: тогда «нет данных» не отличить от «нет
@@ -12495,15 +12470,6 @@ def _sensor_report():
         stroki.append(("fc list", "no data" if srok else "...",
                        COLOR_SENSOR_FAIL if srok else COLOR_SENSOR_WAIT))
         vse_ok = False
-    def ne_ok(imya):
-        """Считать ли неготовность этого датчика неготовностью борта.
-
-        GPS — не считать: фикса можно ждать минутами, а в помещении не
-        дождаться вовсе, и держать из-за него весь отчёт на экране нельзя.
-        Его состояние показывается отдельной строкой.
-        """
-        return imya != "gps"
-
     for imya, ok, primech, na_bortu, nuzhen in punkty:
         # ПОРЯДОК ВАЖЕН: слово платы сильнее наличия данных. Полётник отвечает
         # на запрос высоты и с выключенным барометром — нулями, и проверка
@@ -12512,10 +12478,7 @@ def _sensor_report():
         if na_bortu is False:
             if nuzhen:
                 stroki.append((imya, "missing", COLOR_SENSOR_FAIL))
-                if ne_ok(imya):
-                    vse_ok = False
-                else:
-                    gps_gotov = False
+                vse_ok = False
             else:
                 stroki.append((imya, "none", COLOR_SENSOR_NONE))
         elif ok:
@@ -12523,34 +12486,22 @@ def _sensor_report():
             stroki.append((imya, hvost, COLOR_SENSOR_OK))
         elif primech:                   # отвечает, но ещё не готов
             stroki.append((imya, primech, COLOR_SENSOR_WAIT))
-            if ne_ok(imya):
-                vse_ok = False
-            else:
-                gps_gotov = False
+            vse_ok = False
         elif na_bortu and srok:
             # Полётник видит датчик на плате, а данных нет. Это отказ, и
             # неважно, обязателен он для замера или нет: молчащая железка,
             # которая физически стоит, — поломка.
             stroki.append((imya, "no data", COLOR_SENSOR_FAIL))
-            if ne_ok(imya):
-                vse_ok = False
-            else:
-                gps_gotov = False
+            vse_ok = False
         elif not nuzhen and srok:
             # Не обещан, на плате не значится, ответа нет — его и не ждали.
             stroki.append((imya, "none", COLOR_SENSOR_NONE))
         elif srok:
             stroki.append((imya, "no data", COLOR_SENSOR_FAIL))
-            if ne_ok(imya):
-                vse_ok = False
-            else:
-                gps_gotov = False
+            vse_ok = False
         else:
             stroki.append((imya, "...", COLOR_SENSOR_WAIT))
-            if ne_ok(imya):
-                vse_ok = False
-            else:
-                gps_gotov = False
+            vse_ok = False
 
     global _sensors_ok_since
     if not vse_ok:
@@ -12560,12 +12511,6 @@ def _sensor_report():
         _sensors_ok_since = now
     if now - _sensors_ok_since <= STARTUP_OK_SHOW_S:
         return stroki
-    # Всё существенное поднялось — убираем, чтобы не мешало. Но если ждём
-    # GPS, а фикса ещё нет, оставляем ОДНУ его строку: спутники подтягиваются
-    # минутами, и пилот должен видеть, дождался он или нет. Держать из-за
-    # этого весь отчёт на экране незачем.
-    if not gps_gotov:
-        return [r for r in stroki if r[0] == "gps"]
     return None
 
 
@@ -12635,12 +12580,10 @@ def draw_control_state(frame):
             svezho = (now - app_state.get("steering_ts", 0.0)) < 0.5
             prinyat = bool(app_state.get("fc_override_on"))
             izvestno = app_state.get("fc_override_ts", 0.0) > 0.0
-        if not (rulim and svezho):
-            tekst, col = "ovr - standby", COLOR_WHITE
-        elif not izvestno:
+        if not (rulim and svezho) or prinyat:
+            return
+        if not izvestno:
             tekst, col = "ovr - sending", COLOR_YELLOW
-        elif prinyat:
-            tekst, col = "ovr - live", COLOR_GREEN
         else:
             tekst, col = "ovr - NOT ACCEPTED", COLOR_RED
         h, w = frame.shape[0], frame.shape[1]

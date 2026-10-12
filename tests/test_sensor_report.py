@@ -89,20 +89,15 @@ d = _kak_slovar(_tr(**_vse_podnyalos(rc_link_ts=time.monotonic() - 30.0)))
 print("    связь 30 с назад:", d["rc"])
 assert not d["rc"].startswith("ok"), "устаревший ответ принят за живую связь"
 
-print("\n=== 3. Ответ нулями — это отсутствие GPS, а не исправный GPS ===")
+print("\n=== 3. GPS на кадр не выводится ===")
 for opisanie, st in (
         ("полные нули", dict(gps_fix=0, gps_sats=0, gps_lat=0.0, gps_lon=0.0)),
         ("нет захвата", dict(gps_fix=0, gps_sats=9, gps_lat=50.4, gps_lon=30.5)),
-        ("нет спутников", dict(gps_fix=1, gps_sats=0, gps_lat=50.4, gps_lon=30.5)),
-        ("нулевые координаты", dict(gps_fix=1, gps_sats=9, gps_lat=0.0,
-                                    gps_lon=0.0)),
-        ("три спутника", dict(gps_fix=1, gps_sats=3, gps_lat=50.4,
-                              gps_lon=30.5))):
-    d = _kak_slovar(_tr(**_vse_podnyalos(**st)))
-    print("    %-20s -> %s" % (opisanie, d["gps"]))
-    assert not d["gps"].startswith("ok"), (
-        "«%s» принято за годный GPS" % opisanie)
-assert _kak_slovar(_tr(**_vse_podnyalos()))["gps"].startswith("ok")
+        ("годный фикс", _vse_podnyalos())):
+    d = _kak_slovar(_tr(**st) if opisanie != "годный фикс"
+                    else _tr(**_vse_podnyalos()))
+    print("    %-20s gps=%s" % (opisanie, "gps" in d))
+    assert "gps" not in d, opisanie
 
 print("\n=== 4. Акселерометр в нулях — это не исправный акселерометр ===")
 d = _kak_slovar(_tr(**_vse_podnyalos(acc=(0, 0, 0))))
@@ -112,7 +107,7 @@ assert not d["acc"].startswith("ok"), "неоткалиброванный дат
 print("\n=== 5. Строка не исчезает НИКОГДА: отсутствие названо вслух ===")
 # Прятать строку нельзя: список из четырёх пунктов вместо семи читается как
 # «всё хорошо», и пропажа барометра выглядит ровно как его исправность.
-ozhidaem = {"rc", "attitude", "gyro", "acc", "baro", "mag", "gps"}
+ozhidaem = {"rc", "attitude", "gyro", "acc", "baro", "mag"}
 for opisanie, srok, st in (
         ("плата без баро и магнитометра", True,
          dict(_vse_podnyalos(), sensor_mask=(1 << 0) | (1 << 3) | (1 << 5),
@@ -155,10 +150,8 @@ t = _tr(srok=True, gps=False, **dict(
     _vse_podnyalos(), sensor_mask=(1 << 0) | (1 << 1) | (1 << 5), mag=None,
     gps_fix=None, gps_sats=None, gps_lat=None, gps_lon=None))
 d = _kak_slovar(t)
-print("    магнитометр: %s, GPS: %s" % (d["mag"], d["gps"]))
-assert d["mag"] == "none" and d["gps"] == "none", (
-    "борт без магнитометра и GPS вечно висел бы с ошибкой по железке, "
-    "которой нет по замыслу")
+print("    магнитометр: %s" % d["mag"])
+assert d["mag"] == "none" and "gps" not in d
 assert t._sensors_ok_since is not None, (
     "необязательная железка не должна мешать отчёту уйти с экрана")
 
@@ -195,47 +188,25 @@ t = _tr(armed=True, **_vse_podnyalos())
 assert t._sensor_report() is None, "на заходе картинку загораживать нечем"
 assert _narisovano(t).sum() == 0
 
-print("\n=== 13. Модуль GPS на борту виден ДО фикса ===")
-# Найдено на борту: GPS поставили, а отчёт писал none. Полётник показывает
-# GPS в перечне датчиков только при фиксе, а фикса в помещении не будет
-# никогда — судить по перечню нельзя. Источник истины: включена ли функция.
+print("\n=== 13. GPS на кадр не выводится ===")
 FGPS = 1 << 7
 bez_gps_v_perechne = (1 << 0) | (1 << 1) | (1 << 5)
 baza = dict(_vse_podnyalos(), sensor_mask=bez_gps_v_perechne, mag=None)
-for opisanie, st, zhdyom in (
-        ("функция выключена, модуля нет", dict(feature_mask=0, gps_fix=0,
-                                               gps_sats=0), "none"),
-        ("МОДУЛЬ ЕСТЬ, фикса нет", dict(feature_mask=FGPS, gps_fix=0,
-                                        gps_sats=0), "no fix"),
-        ("модуль ловит 4 спутника", dict(feature_mask=FGPS, gps_fix=0,
-                                         gps_sats=4), "4 sats"),
+for opisanie, st in (
+        ("функция выключена", dict(feature_mask=0, gps_fix=0, gps_sats=0)),
+        ("модуль есть, фикса нет", dict(feature_mask=FGPS, gps_fix=0, gps_sats=0)),
+        ("модуль ловит 4 спутника", dict(feature_mask=FGPS, gps_fix=0, gps_sats=4)),
         ("фикс на 9 спутниках", dict(feature_mask=FGPS, gps_fix=1, gps_sats=9,
-                                     gps_lat=50.4, gps_lon=30.5), "ok  9 sats")):
+                                     gps_lat=50.4, gps_lon=30.5))):
     d = _kak_slovar(_tr(srok=True, gps=False, **dict(baza, **st)))
-    print("    %-30s -> %s" % (opisanie, d["gps"]))
-    assert d["gps"] == zhdyom, (
-        "«%s»: показано «%s» вместо «%s»" % (opisanie, d["gps"], zhdyom))
+    print("    %-28s -> %s" % (opisanie, "gps" in d))
+    assert "gps" not in d, opisanie
 
-print("\n=== 14. Ожидание фикса не держит на экране весь отчёт ===")
-# Фикса можно ждать минутами, а в помещении не дождаться вовсе. Держать
-# из-за этого семь строк поверх картинки нельзя — но и убирать GPS нельзя,
-# пилот должен видеть, дождался он или нет.
+print("\n=== 14. Ожидание фикса не держит отчёт на экране ===")
 t = _tr(srok=True, gps=False, **dict(baza, feature_mask=FGPS, gps_fix=0,
                                      gps_sats=2))
-polnyi = t._sensor_report()
-assert len(polnyi) > 1, "отчёт должен быть полным, пока идёт срок показа"
 t._sensors_ok_since = time.monotonic() - t.STARTUP_OK_SHOW_S - 1.0
-ostatok = t._sensor_report()
-print("    было строк %d, осталось %s"
-      % (len(polnyi), [(n, v) for n, v, _ in ostatok]))
-assert [n for n, _v, _c in ostatok] == ["gps"], (
-    "на экране должна остаться ТОЛЬКО строка GPS")
-
-t = _tr(srok=True, gps=False, **dict(baza, feature_mask=FGPS, gps_fix=1,
-                                     gps_sats=9, gps_lat=50.4, gps_lon=30.5))
-t._sensors_ok_since = time.monotonic() - t.STARTUP_OK_SHOW_S - 1.0
-assert t._sensor_report() is None, (
-    "фикс есть — отчёту незачем оставаться на экране")
+assert t._sensor_report() is None, "из-за GPS отчёт остался на кадре"
 
 print("\n=== 15. Отчёт целиком в кадре, ниже лупы и без кириллицы ===")
 # Берётся ИЗ МОДУЛЯ, а не числом: лупу уже уменьшали, и вписанное число молча
