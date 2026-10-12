@@ -9660,6 +9660,9 @@ def _menu_derevo():
         ]},
         {"imya": "Tools", "deti": [
             {"imya": "Update", "dejstvie": _menu_obnovit},
+            {"imya": "Restart", "dejstvie": _menu_perezapusk},
+            {"imya": "Record", "dejstvie": _menu_zapis,
+             "get": lambda: "on" if RECORD_FRAMES else "off"},
             {"imya": "Clear logs", "dejstvie": _menu_ochistit_logi},
         ]},
     ]
@@ -9767,6 +9770,40 @@ def _menu_ochistit_logi():
     except Exception:
         pass
     return "cleared" if kod == 0 else "clear failed"
+
+
+def _menu_perezapusk():
+    """Перезапуск без скачивания кода. Служба поднимется сама."""
+    global _menu_ekran
+    if not _menu_mozhno():
+        return "armed"
+    _menu_ekran = []
+    _menu_stroka("restarting")
+    time.sleep(1.0)
+    os.kill(os.getpid(), signal.SIGTERM)
+    return "restarting"
+
+
+def _menu_zapis():
+    """Включить или выключить запись кадров. Настройка остаётся после перезапуска."""
+    global RECORD_FRAMES
+    if not _menu_mozhno():
+        return "armed"
+    RECORD_FRAMES = not bool(RECORD_FRAMES)
+    try:
+        _sohranit_nastroiku("RECORD_FRAMES", True if RECORD_FRAMES else False)
+    except Exception:
+        pass
+    if not RECORD_FRAMES:
+        try:
+            frame_recorder.stop("menu")
+        except Exception:
+            pass
+    try:
+        flight_log.event("ЗАПИСЬ КАДРОВ: %s" % ("вкл" if RECORD_FRAMES else "выкл"))
+    except Exception:
+        pass
+    return "record on" if RECORD_FRAMES else "record off"
 
 
 def _menu_zapustit(fn):
@@ -9943,7 +9980,10 @@ def _menu_stroki():
         if p.get("deti") is not None and "get" not in p:
             tekst = p["imya"]
         elif p.get("dejstvie"):
-            tekst = p["imya"]
+            if p.get("get"):
+                tekst = "%s  %s" % (p["imya"], p["get"]())
+            else:
+                tekst = p["imya"]
         else:
             zn = p["get"]()
             tekst = "%s  %s" % (p["imya"], "none" if zn is None else "%d" % int(zn))

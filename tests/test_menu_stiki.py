@@ -85,7 +85,7 @@ assert vybr == ["Tools"], (vybr, t._menu_stroki())
 t._menu_tick(4000.6, stiki(), False)
 t._menu_tick(4000.8, stiki(kren=2000), False)
 imena = [s[0] for s in t._menu_stroki()]
-assert imena == ["Update", "Clear logs"], imena
+assert imena == ["Update", "Restart", "Record  off", "Clear logs"], imena
 vyzovy = []
 t._menu_zapustit(lambda: vyzovy.append(1) or "ok")
 import time as _time
@@ -109,5 +109,24 @@ t.time.sleep = lambda s: None
 assert t._menu_obnovit() == "restarting"
 assert t._menu_ekran == ["updated", "abc1234", "restarting"], t._menu_ekran
 assert ubity, "процесс не перезапускается"
+
+print("\n=== 8. Restart и Record ===")
+t._menu_ekran = []
+ubity.clear()
+assert t._menu_perezapusk() == "restarting"
+assert t._menu_ekran == ["restarting"]
+assert ubity
+t.RECORD_FRAMES = False
+with t.state_lock:
+    t.app_state["armed"] = False
+assert t._menu_zapis() == "record on"
+assert t.RECORD_FRAMES is True
+assert "RECORD_FRAMES = True" in open(put, encoding="utf-8").read()
+assert t._menu_zapis() == "record off"
+assert "RECORD_FRAMES = False" in open(put, encoding="utf-8").read()
+with t.state_lock:
+    t.app_state["armed"] = True
+assert t._menu_zapis() == "armed"
+assert t._menu_perezapusk() == "armed"
 
 print("\nOK: меню на земле, висение пишется")
