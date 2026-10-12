@@ -4819,6 +4819,7 @@ _menu_derzh_t = 0.0
 _menu_derzh_sled = 0.0
 _menu_zanyato = False
 _menu_status = ""
+_menu_status_t = 0.0
 _menu_ekran = []
 _menu_wifi_kesh = ("", 0.0)
 _yarkost_shag = 0
@@ -9603,6 +9604,7 @@ MENU_OTPUST_NIZ = 1400
 # Короче этого — один шаг. Дольше — значение едет само, всегда по одному шагу.
 MENU_DERZH_S = 0.6
 MENU_DERZH_SHAG_S = 0.08
+MENU_STATUS_S = 2.5
 
 
 def _put_nastroek():
@@ -9729,9 +9731,21 @@ def _menu_skript(imya, *args, timeout=120):
 
 def _menu_stroka(tekst):
     """Одна строка статуса. Остаётся на экране, новые дописываются ниже."""
-    global _menu_status
+    global _menu_status, _menu_status_t
     _menu_ekran.append(str(tekst))
     _menu_status = str(tekst)
+    _menu_status_t = time.monotonic()
+
+
+def _menu_status_proverit(now):
+    """Статус гаснет сам. Пока операция идёт, строки не трогаем."""
+    global _menu_status, _menu_status_t, _menu_ekran
+    if _menu_zanyato or not (_menu_status or _menu_ekran):
+        return
+    if _menu_status_t and now - _menu_status_t >= MENU_STATUS_S:
+        _menu_status = ""
+        _menu_ekran = []
+        _menu_status_t = 0.0
 
 
 def _menu_tekushchiy_commit():
@@ -9951,19 +9965,21 @@ def _menu_wifi_zanovo():
 
 
 def _menu_zapustit(fn):
-    global _menu_zanyato, _menu_status
+    global _menu_zanyato, _menu_status, _menu_status_t
     if _menu_zanyato:
         return
     _menu_zanyato = True
     _menu_status = "working"
+    _menu_status_t = time.monotonic()
 
     def telo():
-        global _menu_zanyato, _menu_status
+        global _menu_zanyato, _menu_status, _menu_status_t
         try:
             _menu_status = fn() or "done"
         except Exception:
             _menu_status = "failed"
         finally:
+            _menu_status_t = time.monotonic()
             _menu_zanyato = False
 
     threading.Thread(target=telo, daemon=True).start()
@@ -10056,6 +10072,7 @@ def _menu_listanie(now, znak):
 def _menu_tick(now, kanaly, armed):
     """Один кадр меню. kanaly — живые стики RPYT. Возвращает, открыто ли."""
     global _menu_otkryto, _menu_put, _menu_kursor, _menu_pravka, _menu_derzh_z
+    _menu_status_proverit(now)
     if not kanaly or len(kanaly) < 4:
         return _menu_otkryto
     kren = int(kanaly[0])

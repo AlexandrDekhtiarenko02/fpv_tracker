@@ -213,4 +213,17 @@ assert prinyato == [{"Brightness": 0.1}], prinyato
 assert "AeEnable" not in open(put, encoding="utf-8").read()
 assert "BRIGHTNESS = 0.1" in open(put, encoding="utf-8").read()
 
+print("\n=== 12. Статус гаснет сам, пока операция идёт — нет ===")
+t._menu_ekran = ["cleared"]
+t._menu_status = "cleared"
+t._menu_status_t = 7000.0
+t._menu_zanyato = True
+t._menu_tick(7003.0, stiki(), False)
+assert t._menu_ekran == ["cleared"]
+t._menu_zanyato = False
+t._menu_tick(7002.0, stiki(), False)
+assert t._menu_status == "cleared"
+t._menu_tick(7002.6, stiki(), False)
+assert t._menu_status == "" and t._menu_ekran == []
+
 print("\nOK: меню на земле, висение пишется")
