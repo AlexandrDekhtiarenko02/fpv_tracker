@@ -2135,6 +2135,18 @@ LOS_RATE_DEADBAND_DPS = 0.3
 # но не сброс в ноль.
 LOS_THROTTLE_GAIN = 25.0
 LOS_THROTTLE_MAX = 120.0
+# Курс столкновения, предварительный. Знаки те же, что у сдвига прицела:
+# угол растёт — нос вниз, азимут крутится — крен в ту же сторону.
+# Сила намеренно скромная: после вылета её правят по col_p и col_r.
+# Пиксели рамки при этом ослаблены, иначе они стягивают прицел в центр
+# ровно тогда, когда курс уже достигнут.
+COLLISION_ENABLED = True
+COLLISION_PITCH_PIXEL = 0.40
+COLLISION_ROLL_PIXEL = 0.20
+COLLISION_PITCH_PWM_DPS = 20.0
+COLLISION_ROLL_PWM_DPS = 12.0
+COLLISION_PITCH_MAX = 80.0
+COLLISION_ROLL_MAX = 70.0
 
 # --- ПРЕДЕЛ СКОРОСТИ СНИЖЕНИЯ ---
 # Страховка от проваливания, а не регулятор: односторонняя и с мёртвой зоной,
@@ -2553,7 +2565,7 @@ _FLIGHT_LOG_COLUMNS = (
     # цепочке.
     "roll_after_trust,roll_before_slew,roll_after_slew,"
     "pitch_after_trust,pitch_before_slew,pitch_after_slew,"
-    "launch_pwm,cruise_pwm,rate_damp,roll_damp,pitch_comb,"
+    "launch_pwm,cruise_pwm,rate_damp,roll_damp,pitch_comb,col_p,col_r,"
     "yaw_filt,yaw_weight,yaw_pd,yaw_ff,yaw_i,yaw_off,yaw_sat,"
     "los_rate,los_aim_px,az_rate,los_aim_x_px,tau_ubyv,rost_ot_zahvata,final_hold,doverie,base_thr,thr_adjust,thr_i,rc_fresh,"
     "cmd_roll,cmd_pitch,cmd_yaw,cmd_thr,"
@@ -8791,6 +8803,36 @@ def _vyderzhka_sbros(sost):
     sost["tik"] = None
 
 
+def _stolknovenie_pwm(skorost, ts, now, deadband, gain, limit, sign):
+    """ШИМ, который обнуляет скорость угла, а не положение рамки.
+
+    Протухшая оценка — ноль, не вчерашнее значение. Мёртвая зона та же,
+    что у сдвига прицела: шум не должен качать борт.
+    """
+    if ts <= 0.0 or (now - ts) > LOS_RATE_STALE_S:
+        return 0.0
+    if skorost > deadband:
+        izb = skorost - deadband
+    elif skorost < -deadband:
+        izb = skorost + deadband
+    else:
+        return 0.0
+    pwm = sign * gain * izb
+    if pwm > limit:
+        return limit
+    if pwm < -limit:
+        return -limit
+    return pwm
+
+
+def _kadr_oshibka(net, deadband):
+    if abs(net) < deadband:
+        return 0.0
+    if net > 0:
+        return net - deadband
+    return net + deadband
+
+
 def _pid_axis_step(error, prev_error, integral, ff_value,
                    p_gain, d_gain, i_gain, ff_gain,
                    integral_max, integral_decay,
@@ -11285,8 +11327,31 @@ def _update_control_from_target_impl():
     # Урезаем не до нуля: полностью глухой контур в финале хуже, чем вялый.
     trust_k = TRUST_MIN + (1.0 - TRUST_MIN) * doverie
 
+    # Курс столкновения. Скорость угла — основная команда тангажа и крена.
+    # Рамка остаётся слабой, только чтобы цель не вышла из кадра.
+    # Рыскание ведёт камеру по рамке в полную силу: иначе захват пропадёт.
+    # Сдвиг прицела (los_aim_*) в эту ошибку не входит — он как раз срывал
+    # курс, обнуляясь в момент, когда угол переставал меняться.
+    col_p = 0.0
+    col_r = 0.0
+    ady_p = ady
+    adx_r = adx
+    adx_y = adx
+    if COLLISION_ENABLED:
+        col_p = _stolknovenie_pwm(
+            _los_skorost, _los_skorost_ts, now_mono,
+            LOS_RATE_DEADBAND_DPS, COLLISION_PITCH_PWM_DPS,
+            COLLISION_PITCH_MAX, PITCH_SIGN) * trust_k
+        col_r = _stolknovenie_pwm(
+            _az_skorost, _az_skorost_ts, now_mono,
+            LOS_AZ_DEADBAND_DPS, COLLISION_ROLL_PWM_DPS,
+            COLLISION_ROLL_MAX, ROLL_SIGN) * trust_k
+        ady_p = _kadr_oshibka(dy_aim - los_aim_px, DEADBAND_Y) * COLLISION_PITCH_PIXEL
+        adx_r = _kadr_oshibka(dx_aim - los_aim_x_px, DEADBAND_X) * COLLISION_ROLL_PIXEL
+        adx_y = _kadr_oshibka(dx_aim - los_aim_x_px, DEADBAND_X)
+
     roll_offset, prev_adx, roll_integral = _pid_axis_step(
-        adx, prev_adx, roll_integral,
+        adx_r, prev_adx, roll_integral,
         target_vx_smoothed,
         p_roll_eff, D_GAIN_ROLL, i_roll_eff, ff_roll_eff,
         ROLL_INTEGRAL_MAX, ROLL_INTEGRAL_DECAY,
@@ -11327,6 +11392,7 @@ def _update_control_from_target_impl():
 
     else:
         roll_offset *= trust_k
+    roll_offset += col_r
     target_roll = max(1000, min(2000, 1500 + roll_offset))
     # ЕДИНИЦЫ — ОТКЛОНЕНИЕ ОТ ЦЕНТРА (PWM offset), А НЕ АБСОЛЮТНЫЙ RC.
     # roll_off/roll_after_trust уже в offset — target_roll-1500 приводит
@@ -11337,7 +11403,7 @@ def _update_control_from_target_impl():
 
     # --- PITCH: P+D+I+FF через хелпер с anti-windup ---
     pitch_offset, prev_ady_ctrl, pitch_integral = _pid_axis_step(
-        ady, prev_ady_ctrl, pitch_integral,
+        ady_p, prev_ady_ctrl, pitch_integral,
         target_vy_smoothed,
         p_pitch_eff, D_GAIN_PITCH, i_pitch_eff, ff_pitch_eff,
         PITCH_INTEGRAL_MAX, PITCH_INTEGRAL_DECAY,
@@ -11401,7 +11467,7 @@ def _update_control_from_target_impl():
     # снимок pitch_offset * trust_k, что входит в combined_pitch ниже.
     _pid_dbg["pitch_after_trust"] = pitch_offset * trust_k
     combined_pitch = (pitch_offset * trust_k + launch_pitch_pwm
-                      + cruise_pitch_pwm + rate_damp_pwm)
+                      + cruise_pitch_pwm + rate_damp_pwm + col_p)
     target_pitch = max(1000, min(2000, 1500 + combined_pitch))
     # ЕДИНИЦЫ — offset, см. пояснение у крена выше.
     _pid_dbg["pitch_before_slew"] = target_pitch - 1500
@@ -11409,9 +11475,9 @@ def _update_control_from_target_impl():
     # --- YAW: фильтр + ослабление при больших adx + I + FF с anti-windup ---
     # Yaw не использует хелпер потому что error — это filtered_dx_yaw × yaw_weight,
     # а I-добавка тоже взвешивается. Логика та же, но с весом.
-    filtered_dx_yaw += alpha_for_dt(YAW_FILTER_ALPHA, k) * (float(adx) - filtered_dx_yaw)
-    abs_adx = abs(adx)
-    if abs_adx < YAW_ROLL_CROSSOVER:
+    filtered_dx_yaw += alpha_for_dt(YAW_FILTER_ALPHA, k) * (float(adx_y) - filtered_dx_yaw)
+    abs_adx = abs(adx_y)
+    if COLLISION_ENABLED or abs_adx < YAW_ROLL_CROSSOVER:
         yaw_weight = 1.0
     else:
         yaw_weight = max(0.3, 1.0 - (abs_adx - YAW_ROLL_CROSSOVER) / max(YAW_ROLL_BLEND_RANGE, 1.0))
@@ -11424,7 +11490,7 @@ def _update_control_from_target_impl():
     yaw_sat_neg = yaw_total_unsat <= -MAX_YAW_DEFLECT
     yaw_i_dir = YAW_SIGN * yaw_error_weighted
     yaw_push_further = (yaw_sat_pos and yaw_i_dir > 0) or (yaw_sat_neg and yaw_i_dir < 0)
-    if adx != 0 and not yaw_push_further:
+    if adx_y != 0 and not yaw_push_further:
         yaw_integral += yaw_error_weighted * I_GAIN_YAW * k
         if yaw_integral > YAW_INTEGRAL_MAX:
             yaw_integral = YAW_INTEGRAL_MAX
@@ -12459,7 +12525,7 @@ def _update_control_from_target_impl():
         # Отдельной колонкой: без неё вклад демпфирования не отличить от
         # прицельного, а именно его размер и надо проверять по логу.
         "rate_damp": rate_damp_pwm, "roll_damp": roll_damp_pwm,
-        "pitch_comb": combined_pitch,
+        "pitch_comb": combined_pitch, "col_p": col_p, "col_r": col_r,
         "yaw_filt": filtered_dx_yaw, "yaw_weight": yaw_weight,
         "yaw_pd": yaw_pd, "yaw_ff": yaw_ff, "yaw_i": yaw_integral,
         "yaw_off": yaw_offset,
@@ -16355,7 +16421,7 @@ def _capture_flight_row(cb_t0):
             g("roll_after_trust"), g("roll_before_slew"), g("roll_after_slew"),
             g("pitch_after_trust"), g("pitch_before_slew"), g("pitch_after_slew"),
             g("launch_pwm"), g("cruise_pwm"), g("rate_damp"), g("roll_damp"),
-            g("pitch_comb"),
+            g("pitch_comb"), g("col_p"), g("col_r"),
             g("yaw_filt"), g("yaw_weight"), g("yaw_pd"), g("yaw_ff"),
             g("yaw_i"), g("yaw_off"), g("yaw_sat"),
             g("los_rate"), g("los_aim_px"), g("az_rate"), g("los_aim_x_px"),
