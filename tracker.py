@@ -9685,6 +9685,99 @@ def _zapisat_yarkost(shag):
         pass
 
 
+def _menu_svet_zamok(cam, md, controls):
+    """Заморозить выдержку и баланс по уже измеренному кадру."""
+    global _cam_exp_us, _cam_idle_us, _cam_frame_us
+    exp = min(int(md.get("ExposureTime") or 8000), 33000)
+    gain = float(md.get("AnalogueGain") or 1.0)
+    colour = md.get("ColourGains")
+    ctrl = {}
+    if "AeEnable" in controls:
+        ctrl["AeEnable"] = False
+    ctrl["ExposureTime"] = exp
+    ctrl["AnalogueGain"] = gain
+    if "AwbEnable" in controls:
+        ctrl["AwbEnable"] = False
+    if colour is not None:
+        ctrl["ColourGains"] = tuple(colour)
+    _cam_exp_us = exp
+    _cam_idle_us = max(exp, IDLE_FRAME_FLOOR_US)
+    idle = _dlitelnost_kadra(TRACK_STATE_IDLE)
+    ctrl["FrameDurationLimits"] = (idle, idle)
+    _cam_frame_us = idle
+    cam.set_controls(ctrl)
+    if BRIGHTNESS:
+        cam.set_controls({"Brightness": float(BRIGHTNESS)})
+    return exp
+
+
+def _menu_svet():
+    """Дать камере сойтись на текущий свет и снова заморозить выдержку.
+
+    Яркость из меню не трогаем. Автоматика остаётся выключенной: в полёте
+    она уезжала вместе с тангажом.
+    """
+    global _menu_ekran
+    if not _menu_mozhno():
+        return "armed"
+    cam = _picam2
+    if cam is None:
+        return "no camera"
+    try:
+        controls = getattr(cam, "camera_controls", {}) or {}
+    except Exception:
+        controls = {}
+    _menu_ekran = []
+    _menu_stroka("measuring")
+    vklyuchit = {"FrameDurationLimits": (33000, 33000)}
+    if "AeEnable" in controls:
+        vklyuchit["AeEnable"] = True
+    if "AwbEnable" in controls:
+        vklyuchit["AwbEnable"] = True
+    try:
+        cam.set_controls(vklyuchit)
+    except Exception:
+        return "camera error"
+    md = {}
+    prev = None
+    stable = 0
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < CAM_SETTLE_MAX_S:
+        if not _menu_mozhno():
+            break
+        time.sleep(CAM_SETTLE_STEP_S)
+        try:
+            md = cam.capture_metadata()
+        except Exception:
+            try:
+                _menu_svet_zamok(cam, md, controls)
+            except Exception:
+                pass
+            return "camera error"
+        cur = (int(md.get("ExposureTime") or 0), float(md.get("AnalogueGain") or 0.0))
+        if prev is not None and abs(cur[0] - prev[0]) <= max(50, prev[0] * 0.02) \
+                and abs(cur[1] - prev[1]) <= 0.05:
+            stable += 1
+            if stable >= CAM_SETTLE_STABLE:
+                break
+        else:
+            stable = 0
+        prev = cur
+    try:
+        exp = _menu_svet_zamok(cam, md, controls)
+    except Exception:
+        return "camera error"
+    if not _menu_mozhno():
+        return "armed"
+    tekst = "locked %dms" % int(round(exp / 1000.0))
+    _menu_stroka(tekst)
+    try:
+        flight_log.event("СВЕТ ЗАФИКСИРОВАН ИЗ МЕНЮ: %d мкс" % exp)
+    except Exception:
+        pass
+    return tekst
+
+
 def _menu_derevo():
     return [
         {"imya": "Throttle", "deti": [
@@ -9694,6 +9787,7 @@ def _menu_derevo():
         {"imya": "Tracker", "deti": [
             {"imya": "Brightness", "min": -10, "max": 10, "shag": 1,
              "get": lambda: _yarkost_shag, "set": _zapisat_yarkost},
+            {"imya": "Lock light", "dejstvie": _menu_svet},
         ]},
         {"imya": "Tools", "deti": [
             {"imya": "Update", "dejstvie": _menu_obnovit},

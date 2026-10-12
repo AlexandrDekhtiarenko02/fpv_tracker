@@ -213,6 +213,35 @@ assert prinyato == [{"Brightness": 0.1}], prinyato
 assert "AeEnable" not in open(put, encoding="utf-8").read()
 assert "BRIGHTNESS = 0.1" in open(put, encoding="utf-8").read()
 
+print("\n=== 13. Lock light замораживает выдержку и гасит автоматику ===")
+class Svet:
+    camera_controls = {"AeEnable": (0, 1, 1), "AwbEnable": (0, 1, 1)}
+    def __init__(self):
+        self.ctrl = []
+    def set_controls(self, ctrl):
+        self.ctrl.append(dict(ctrl))
+    def capture_metadata(self):
+        return {"ExposureTime": 4200, "AnalogueGain": 1.2,
+                "ColourGains": (1.1, 1.4)}
+
+cam = Svet()
+t._picam2 = cam
+t.BRIGHTNESS = 0.0
+t.time.sleep = lambda s: None
+with t.state_lock:
+    t.app_state["armed"] = False
+t._menu_ekran = []
+assert t._menu_svet() == "locked 4ms"
+assert cam.ctrl[0]["AeEnable"] is True
+zamok = cam.ctrl[-1]
+assert zamok["AeEnable"] is False
+assert zamok["AwbEnable"] is False
+assert zamok["ExposureTime"] == 4200
+assert "Brightness" not in zamok
+with t.state_lock:
+    t.app_state["armed"] = True
+assert t._menu_svet() == "armed"
+
 print("\n=== 12. Статус гаснет сам, пока операция идёт — нет ===")
 t._menu_ekran = ["cleared"]
 t._menu_status = "cleared"
