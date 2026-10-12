@@ -9643,8 +9643,8 @@ def _zapisat_visenie(pwm):
 
 def _menu_derevo():
     return [
-        {"imya": "Газ", "deti": [
-            {"imya": "Висенье", "min": 1100, "max": 1800, "shag": 10,
+        {"imya": "Throttle", "deti": [
+            {"imya": "Hover", "min": 1100, "max": 1800, "shag": 10,
              "get": lambda: _hover_pwm, "set": _zapisat_visenie},
         ]},
     ]
@@ -9783,7 +9783,7 @@ def _menu_stroki():
             tekst = p["imya"]
         else:
             zn = p["get"]()
-            tekst = "%s  %s" % (p["imya"], "нет" if zn is None else "%d" % int(zn))
+            tekst = "%s  %s" % (p["imya"], "none" if zn is None else "%d" % int(zn))
         out.append((tekst, i == _menu_kursor, _menu_pravka and i == _menu_kursor))
     return out
 
@@ -9792,28 +9792,40 @@ def _narisovat_menu(frame):
     if not _menu_otkryto:
         return
     stroki = _menu_stroki()
-    x, y = 16, 36
-    cv2.putText(frame, "МЕНЮ", (x, y), cv2.FONT_HERSHEY_SIMPLEX,
-                0.7, (0, 0, 0), 3, cv2.LINE_AA)
-    cv2.putText(frame, "МЕНЮ", (x, y), cv2.FONT_HERSHEY_SIMPLEX,
-                0.7, (255, 255, 255), 1, cv2.LINE_AA)
-    y += 32
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    zag = "MENU"
+    podskaz = ("L left = exit" if not _menu_pravka
+               else "R up/down, left = done")
+    nadpisi = []
     for tekst, vybran, pravka in stroki:
-        nadpis = ("> " if vybran else "  ") + tekst
+        s = ("> " if vybran else "  ") + tekst
         if pravka:
-            nadpis += "  <"
-        cv2.putText(frame, nadpis, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65, (0, 0, 0), 3, cv2.LINE_AA)
-        cvet = (80, 220, 255) if pravka else (255, 255, 255)
-        cv2.putText(frame, nadpis, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65, cvet, 1, cv2.LINE_AA)
+            s += "  <"
+        nadpisi.append((s, vybran, pravka))
+    shir = cv2.getTextSize(zag, font, 0.7, 1)[0][0]
+    for s, _, _ in nadpisi:
+        shir = max(shir, cv2.getTextSize(s, font, 0.65, 1)[0][0])
+    shir = max(shir, cv2.getTextSize(podskaz, font, 0.5, 1)[0][0])
+    x0, y0 = 8, 8
+    vys = 28 + 28 * max(1, len(nadpisi)) + 36
+    x1 = min(int(frame.shape[1]) - 4, x0 + shir + 24)
+    y1 = min(int(frame.shape[0]) - 4, y0 + vys)
+    # Плотная плашка, иначе строки теряются на OSD и на картинке.
+    cv2.rectangle(frame, (x0, y0), (x1, y1), (12, 12, 12, 0), -1)
+    cv2.rectangle(frame, (x0, y0), (x1, y1), COLOR_WHITE, 1)
+    x, y = x0 + 12, y0 + 26
+    cv2.putText(frame, zag, (x, y), font, 0.7, COLOR_WHITE, 1, cv2.LINE_AA)
+    y += 30
+    for s, vybran, pravka in nadpisi:
+        if vybran:
+            cv2.rectangle(frame, (x0 + 4, y - 18), (x1 - 4, y + 8),
+                          (48, 48, 48, 0), -1)
+        cvet = COLOR_CYAN if pravka else COLOR_WHITE
+        cv2.putText(frame, s, (x, y), font, 0.65, cvet, 1, cv2.LINE_AA)
         y += 28
-    y += 8
-    podskaz = "лев влево — выход" if not _menu_pravka else "прав вверх-вниз, влево — готово"
-    cv2.putText(frame, podskaz, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
-                0.5, (0, 0, 0), 3, cv2.LINE_AA)
-    cv2.putText(frame, podskaz, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
-                0.5, (220, 220, 220), 1, cv2.LINE_AA)
+    y += 4
+    cv2.putText(frame, podskaz, (x, y), font, 0.5, (210, 210, 210, 0),
+                1, cv2.LINE_AA)
 
 
 def update_control_from_target():

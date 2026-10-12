@@ -39,12 +39,12 @@ sbros()
 t._nastroiki_put = put
 assert not t._menu_tick(2000.0, stiki(gaz=2000, tang=2000), False)
 assert t._menu_tick(2000.6, stiki(gaz=2000, tang=2000), False)
-assert t._menu_stroki()[0][0].startswith("Газ")
+assert t._menu_stroki()[0][0].startswith("Throttle")
 
 print("\n=== 3. Правый вправо заходит в висение и меняет его ===")
 t._menu_tick(2001.0, stiki(), False)
 assert t._menu_tick(2001.2, stiki(kren=2000), False)
-assert t._menu_stroki()[0][0].startswith("Висенье")
+assert t._menu_stroki()[0][0].startswith("Hover")
 t._menu_tick(2001.5, stiki(), False)
 assert t._menu_tick(2001.7, stiki(kren=2000), False)
 assert t._menu_pravka
