@@ -158,7 +158,8 @@ t._menu_put = []
 t._menu_kursor = 0
 t._menu_pravka = False
 tools = [p for p in t._menu_derevo() if p["imya"] == "Tools"][0]
-deti = [p for p in tools["deti"] if p["imya"] == "Wi-Fi"][0]["deti"]
+wifi = [p for p in tools["deti"] if p["imya"] == "Wi-Fi"][0]
+deti = wifi["deti"]()
 assert deti[0]["get"]() == "PodilOfficer"
 print("    ", [p["imya"] for p in deti])
 
@@ -254,5 +255,45 @@ t._menu_tick(7002.0, stiki(), False)
 assert t._menu_status == "cleared"
 t._menu_tick(7002.6, stiki(), False)
 assert t._menu_status == "" and t._menu_ekran == []
+
+print("\n=== 14. Выбор сети и значок в шапке ===")
+import numpy as np
+t._menu_wifi_seti = (["PodilOfficer", "iPhone"], t.time.monotonic())
+t._menu_wifi_ssid = lambda: "iPhone"
+punkty = t._menu_wifi_deti()
+assert [p["imya"] for p in punkty] == [
+    "Network", "PodilOfficer", "iPhone", "Reconnect"], [p["imya"] for p in punkty]
+assert punkty[2]["get"]() == "on"
+vyzovy = []
+
+def nm_vybor(argv, timeout=20):
+    vyzovy.append(list(argv))
+    return 0, ""
+
+t._menu_nmcli = nm_vybor
+t.time.sleep = lambda s: None
+with t.state_lock:
+    t.app_state["armed"] = False
+assert t._menu_wifi_podkluchit("PodilOfficer") == "iPhone"
+assert any("connection" in a and "up" in a and "PodilOfficer" in a for a in vyzovy)
+
+t._menu_otkryto = True
+t._menu_put = []
+t._menu_kursor = 0
+t._menu_pravka = False
+t._menu_ekran = []
+t._menu_status = ""
+t._menu_wifi_ssid = lambda: "PodilOfficer"
+kadr = np.zeros((480, 720, 3), np.uint8)
+t._narisovat_menu(kadr)
+polosa = kadr[70:140, 500:700]
+krasnyj = (polosa[:, :, 2] > 180) & (polosa[:, :, 1] < 80)
+assert not krasnyj.any()
+t._menu_wifi_ssid = lambda: "none"
+pustoj = np.zeros((480, 720, 3), np.uint8)
+t._narisovat_menu(pustoj)
+polosa = pustoj[70:140, 500:700]
+krasnyj = (polosa[:, :, 2] > 180) & (polosa[:, :, 1] < 80)
+assert krasnyj.any()
 
 print("\nOK: меню на земле, висение пишется")

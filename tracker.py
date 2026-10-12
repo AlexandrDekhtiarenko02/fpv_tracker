@@ -4822,6 +4822,7 @@ _menu_status = ""
 _menu_status_t = 0.0
 _menu_ekran = []
 _menu_wifi_kesh = ("", 0.0)
+_menu_wifi_seti = ([], 0.0)
 _yarkost_shag = 0
 _picam2 = None
 _nastroiki_put = None
@@ -9795,10 +9796,7 @@ def _menu_derevo():
             {"imya": "Record", "dejstvie": _menu_zapis,
              "get": lambda: "on" if RECORD_FRAMES else "off"},
             {"imya": "Clear logs", "dejstvie": _menu_ochistit_logi},
-            {"imya": "Wi-Fi", "deti": [
-                {"imya": "Network", "get": _menu_wifi_ssid},
-                {"imya": "Reconnect", "dejstvie": _menu_wifi_zanovo},
-            ]},
+            {"imya": "Wi-Fi", "deti": _menu_wifi_deti},
         ]},
     ]
 
@@ -10014,6 +10012,83 @@ def _menu_wifi_prochitat():
     return "none"
 
 
+def _menu_wifi_spisok():
+    """Сохранённые сети. Кэш на несколько секунд: дерево меню строится каждый кадр."""
+    global _menu_wifi_seti
+    now = time.monotonic()
+    spisok, kogda = _menu_wifi_seti
+    if kogda and now - kogda < 5.0:
+        return list(spisok)
+    kod, tekst = _menu_nmcli(
+        ["nmcli", "-t", "-f", "NAME,TYPE", "con", "show"], timeout=3)
+    imena = []
+    if kod == 0:
+        hvost = ":802-11-wireless"
+        for lin in tekst.splitlines():
+            if not lin.endswith(hvost):
+                continue
+            imya = _menu_wifi_chistoe(lin[:-len(hvost)].replace("\\:", ":"))
+            if imya and imya not in imena:
+                imena.append(imya)
+    _menu_wifi_seti = (imena, now)
+    return imena
+
+
+def _menu_wifi_deti():
+    deti = [{"imya": "Network", "get": _menu_wifi_ssid}]
+    seichas = _menu_wifi_ssid()
+    for imya in _menu_wifi_spisok():
+        punkt = {"imya": imya, "dejstvie": _menu_wifi_vybor(imya)}
+        if imya == seichas:
+            punkt["get"] = lambda: "on"
+        deti.append(punkt)
+    deti.append({"imya": "Reconnect", "dejstvie": _menu_wifi_zanovo})
+    return deti
+
+
+def _menu_wifi_vybor(imya):
+    def dejstvie():
+        return _menu_wifi_podkluchit(imya)
+    return dejstvie
+
+
+def _menu_wifi_podkluchit(imya):
+    """Подключить выбранную сохранённую сеть и оставить её предпочтительной."""
+    global _menu_wifi_kesh, _menu_wifi_seti, _menu_ekran
+    if not _menu_mozhno():
+        return "armed"
+    _menu_ekran = []
+    _menu_stroka("connecting")
+    kod = _menu_wifi_shag(["nmcli", "connection", "up", imya])
+    if kod == 127:
+        _menu_stroka("no nmcli")
+        return "no nmcli"
+    if kod != 0:
+        _menu_stroka("run wifi_fix")
+        return "run wifi_fix"
+    _menu_wifi_shag([
+        "nmcli", "connection", "modify", imya,
+        "connection.autoconnect-priority", "200"])
+    time.sleep(0.6)
+    _menu_wifi_kesh = ("", 0.0)
+    _menu_wifi_seti = ([], 0.0)
+    seichas = _menu_wifi_ssid()
+    tekst = seichas if seichas != "none" else imya
+    _menu_stroka(tekst)
+    return tekst
+
+
+def _menu_wifi_znachok(frame, cx, cy, est):
+    """Значок сети: дуги от точки. Без сети те же дуги перечёркнуты."""
+    cvet = (235, 235, 235) if est else (150, 150, 150)
+    cv2.circle(frame, (cx, cy), 2, cvet, -1, cv2.LINE_AA)
+    for r in (6, 11, 16):
+        cv2.ellipse(frame, (cx, cy), (r, r), 0, 225, 315, cvet, 1, cv2.LINE_AA)
+    if not est:
+        cv2.line(frame, (cx - 14, cy - 18), (cx + 12, cy + 2),
+                 (40, 40, 230), 2, cv2.LINE_AA)
+
+
 def _menu_wifi_shag(argv):
     """Одна команда nmcli. Чужой код ошибки — не повод останавливаться.
     Нет прав — повтор через sudo без пароля, полный путь как в sudoers.
@@ -10079,10 +10154,17 @@ def _menu_zapustit(fn):
     threading.Thread(target=telo, daemon=True).start()
 
 
+def _menu_deti(uzel):
+    deti = uzel.get("deti") if uzel else None
+    if callable(deti):
+        deti = deti()
+    return deti or []
+
+
 def _menu_uzel():
     uzel = {"deti": _menu_derevo()}
     for i in _menu_put:
-        deti = uzel.get("deti") or []
+        deti = _menu_deti(uzel)
         if i < 0 or i >= len(deti):
             break
         uzel = deti[i]
@@ -10200,7 +10282,7 @@ def _menu_tick(now, kanaly, armed):
     if _menu_kray("rych", rych) < 0:
         _menu_zakryt()
         return False
-    deti = _menu_uzel().get("deti") or []
+    deti = _menu_deti(_menu_uzel())
     if not deti:
         return True
     if _menu_kursor >= len(deti):
@@ -10257,7 +10339,7 @@ def _menu_stroki():
     """Строки для кадра: (текст, выбрана, правка)."""
     if not _menu_otkryto:
         return []
-    deti = _menu_uzel().get("deti") or []
+    deti = _menu_deti(_menu_uzel())
     out = []
     for i, p in enumerate(deti):
         if p.get("deti") is not None and "get" not in p:
@@ -10304,6 +10386,15 @@ def _narisovat_menu(frame):
     cv2.rectangle(frame, (x0, y0), (x1, y1), COLOR_WHITE, 1)
     x, y = x0 + 16, y0 + 32
     cv2.putText(frame, zag, (x, y), font, 0.7, COLOR_WHITE, 1, cv2.LINE_AA)
+    ssid = _menu_wifi_ssid()
+    est_set = ssid not in ("", "none")
+    cx = x1 - 28
+    cy = y0 + 30
+    if est_set:
+        (tw, _), _ = cv2.getTextSize(ssid, font, 0.55, 1)
+        tx = max(x0 + 110, cx - 24 - tw)
+        cv2.putText(frame, ssid, (tx, y - 2), font, 0.55, COLOR_WHITE, 1, cv2.LINE_AA)
+    _menu_wifi_znachok(frame, cx, cy, est_set)
     y += 36
     linii = list(_menu_ekran) if _menu_ekran else (
         [_menu_status] if _menu_status else [])
