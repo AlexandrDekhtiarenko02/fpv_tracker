@@ -4811,8 +4811,9 @@ _menu_put = []
 _menu_kursor = 0
 _menu_pravka = False
 _menu_pred = {"gaz": 0, "kren": 0, "tang": 0, "rych": 0}
-_menu_zhest_s = 0.0
-_menu_zakryt_s = 0.0
+_menu_derzh_z = 0
+_menu_derzh_t = 0.0
+_menu_derzh_sled = 0.0
 _nastroiki_put = None
 # Сглаженная геометрическая команда газа. None — геометрия молчит.
 _thr_geom_out = None
@@ -9679,10 +9680,41 @@ def _menu_kray(imya, v):
 
 def _menu_zakryt():
     global _menu_otkryto, _menu_put, _menu_kursor, _menu_pravka
+    global _menu_derzh_z, _menu_derzh_t
     _menu_otkryto = False
     _menu_put = []
     _menu_kursor = 0
     _menu_pravka = False
+    _menu_derzh_z = 0
+    _menu_derzh_t = 0.0
+
+
+def _menu_derzhanie(now, znak):
+    """Дополнительные шаги, пока стик держат в упоре.
+
+    Первый шаг даёт край, здесь его нет. Через короткое ожидание значение
+    начинает ехать само, и чем дольше упор, тем крупнее шаг.
+    """
+    global _menu_derzh_z, _menu_derzh_t, _menu_derzh_sled
+    if znak == 0:
+        _menu_derzh_z = 0
+        return 0
+    if znak != _menu_derzh_z:
+        _menu_derzh_z = znak
+        _menu_derzh_t = now
+        _menu_derzh_sled = now + 0.28
+        return 0
+    if now < _menu_derzh_sled:
+        return 0
+    dolya = now - _menu_derzh_t
+    if dolya < 0.7:
+        mnozh, pauza = 1, 0.16
+    elif dolya < 1.4:
+        mnozh, pauza = 5, 0.09
+    else:
+        mnozh, pauza = 10, 0.05
+    _menu_derzh_sled = now + pauza
+    return znak * mnozh
 
 
 def _menu_tick(now, kanaly, armed):
@@ -9731,14 +9763,15 @@ def _menu_tick(now, kanaly, armed):
     shag_tang = _menu_kray("tang", tang)
     if _menu_pravka:
         punkt = deti[_menu_kursor]
-        if shag_tang:
+        shagov = shag_tang + _menu_derzhanie(now, _menu_zona(tang))
+        if shagov:
             tek = punkt["get"]()
             if tek is None:
                 tek = 1400
-            _zapisat = punkt["set"]
-            _zapisat(float(tek) + shag_tang * punkt["shag"])
+            punkt["set"](float(tek) + shagov * punkt["shag"])
         if shag_kren < 0:
             _menu_pravka = False
+            _menu_derzh_z = 0
         return True
     if shag_gaz:
         _menu_kursor += -1 if shag_gaz > 0 else 1

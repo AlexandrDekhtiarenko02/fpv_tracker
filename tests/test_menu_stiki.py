@@ -12,8 +12,6 @@ t = offline.load_tracker()
 
 def sbros():
     t._menu_zakryt()
-    t._menu_zhest_s = 0.0
-    t._menu_zakryt_s = 0.0
     for k in t._menu_pred:
         t._menu_pred[k] = 0
     t._hover_pwm = None
@@ -53,6 +51,16 @@ t._menu_tick(2002.0, stiki(), False)
 t._menu_tick(2002.2, stiki(tang=2000), False)
 assert t._hover_pwm == 1410, t._hover_pwm
 assert "HOVER_PWM = 1410" in open(put, encoding="utf-8").read()
+
+print("\n=== 3b. Долгий упор ускоряет шаг ===")
+t._menu_tick(2002.4, stiki(tang=2000), False)
+assert t._hover_pwm == 1410, "удержание сразу дало лишний шаг"
+t._menu_tick(2002.7, stiki(tang=2000), False)
+assert t._hover_pwm == 1420, t._hover_pwm
+bylo = t._hover_pwm
+t._menu_tick(2004.0, stiki(tang=2000), False)
+skachok = t._hover_pwm - bylo
+assert skachok >= 50, skachok
 
 print("\n=== 4. Арм закрывает меню ===")
 t._menu_tick(2003.0, stiki(), True)
