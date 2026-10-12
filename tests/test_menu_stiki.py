@@ -52,15 +52,15 @@ t._menu_tick(2002.2, stiki(tang=2000), False)
 assert t._hover_pwm == 1410, t._hover_pwm
 assert "HOVER_PWM = 1410" in open(put, encoding="utf-8").read()
 
-print("\n=== 3b. Долгий упор ускоряет шаг ===")
-t._menu_tick(2002.4, stiki(tang=2000), False)
-assert t._hover_pwm == 1410, "удержание сразу дало лишний шаг"
+print("\n=== 3b. Короткий жест — один шаг, долгий — ровно по 10 ===")
 t._menu_tick(2002.7, stiki(tang=2000), False)
+assert t._hover_pwm == 1410, t._hover_pwm
+t._menu_tick(2002.85, stiki(tang=2000), False)
 assert t._hover_pwm == 1420, t._hover_pwm
-bylo = t._hover_pwm
-t._menu_tick(2004.0, stiki(tang=2000), False)
-skachok = t._hover_pwm - bylo
-assert skachok >= 50, skachok
+t._menu_tick(2002.90, stiki(tang=1750), False)
+assert t._hover_pwm == 1420, "дрожание у края дало лишний шаг"
+t._menu_tick(2003.0, stiki(tang=2000), False)
+assert t._hover_pwm == 1430, t._hover_pwm
 
 print("\n=== 4. Арм закрывает меню ===")
 t._menu_tick(2003.0, stiki(), True)

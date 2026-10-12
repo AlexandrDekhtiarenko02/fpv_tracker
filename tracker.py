@@ -9589,6 +9589,13 @@ def _podtyanut_gaz(tek, goal, skorost_pwm_s, k):
 
 MENU_VVERH = 1800
 MENU_NIZ = 1200
+# Пока стик не вернулся сюда, упор ещё считается тем же жестом.
+# Иначе дрожание у края даёт второй шаг сразу за первым.
+MENU_OTPUST_VVERH = 1600
+MENU_OTPUST_NIZ = 1400
+# Короче этого — один шаг. Дольше — значение едет само, всегда по одному шагу.
+MENU_DERZH_S = 0.6
+MENU_DERZH_SHAG_S = 0.08
 
 
 def _put_nastroek():
@@ -9746,7 +9753,11 @@ def _menu_uzel():
     return uzel
 
 
-def _menu_zona(v):
+def _menu_zona(v, pred=0):
+    if pred == 1 and v >= MENU_OTPUST_VVERH:
+        return 1
+    if pred == -1 and v <= MENU_OTPUST_NIZ:
+        return -1
     if v >= MENU_VVERH:
         return 1
     if v <= MENU_NIZ:
@@ -9755,8 +9766,8 @@ def _menu_zona(v):
 
 
 def _menu_kray(imya, v):
-    z = _menu_zona(v)
     pred = _menu_pred.get(imya, 0)
+    z = _menu_zona(v, pred)
     _menu_pred[imya] = z
     if z != 0 and z != pred:
         return z
@@ -9777,8 +9788,9 @@ def _menu_zakryt():
 def _menu_derzhanie(now, znak):
     """Дополнительные шаги, пока стик держат в упоре.
 
-    Первый шаг даёт край, здесь его нет. Через короткое ожидание значение
-    начинает ехать само, и чем дольше упор, тем крупнее шаг.
+    Первый шаг даёт край. Пока упор короче MENU_DERZH_S, больше ничего:
+    короткое движение — ровно один шаг. Дальше шаг тот же, через
+    равные промежутки, без разгона.
     """
     global _menu_derzh_z, _menu_derzh_t, _menu_derzh_sled
     if znak == 0:
@@ -9787,24 +9799,17 @@ def _menu_derzhanie(now, znak):
     if znak != _menu_derzh_z:
         _menu_derzh_z = znak
         _menu_derzh_t = now
-        _menu_derzh_sled = now + 0.28
+        _menu_derzh_sled = now + MENU_DERZH_S
         return 0
     if now < _menu_derzh_sled:
         return 0
-    dolya = now - _menu_derzh_t
-    if dolya < 0.7:
-        mnozh, pauza = 1, 0.16
-    elif dolya < 1.4:
-        mnozh, pauza = 5, 0.09
-    else:
-        mnozh, pauza = 10, 0.05
-    _menu_derzh_sled = now + pauza
-    return znak * mnozh
+    _menu_derzh_sled = now + MENU_DERZH_SHAG_S
+    return znak
 
 
 def _menu_tick(now, kanaly, armed):
     """Один кадр меню. kanaly — живые стики RPYT. Возвращает, открыто ли."""
-    global _menu_otkryto, _menu_put, _menu_kursor, _menu_pravka
+    global _menu_otkryto, _menu_put, _menu_kursor, _menu_pravka, _menu_derzh_z
     if not kanaly or len(kanaly) < 4:
         return _menu_otkryto
     kren = int(kanaly[0])
@@ -9848,7 +9853,7 @@ def _menu_tick(now, kanaly, armed):
     shag_tang = _menu_kray("tang", tang)
     if _menu_pravka:
         punkt = deti[_menu_kursor]
-        shagov = shag_tang + _menu_derzhanie(now, _menu_zona(tang))
+        shagov = shag_tang + _menu_derzhanie(now, _menu_zona(tang, _menu_derzh_z))
         if shagov:
             tek = punkt["get"]()
             if tek is None:
