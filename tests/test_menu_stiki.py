@@ -97,4 +97,17 @@ with t.state_lock:
 assert t._menu_obnovit() == "armed"
 assert t._menu_ochistit_logi() == "armed"
 
+print("\n=== 7. Обновление показывает коммит и перезапуск ===")
+with t.state_lock:
+    t.app_state["armed"] = False
+t._menu_ekran = []
+t._menu_skript = lambda *a, **k: (0, "")
+t._menu_tekushchiy_commit = lambda: "abc1234"
+ubity = []
+t.os.kill = lambda pid, sig: ubity.append((pid, sig))
+t.time.sleep = lambda s: None
+assert t._menu_obnovit() == "restarting"
+assert t._menu_ekran == ["updated", "abc1234", "restarting"], t._menu_ekran
+assert ubity, "процесс не перезапускается"
+
 print("\nOK: меню на земле, висение пишется")

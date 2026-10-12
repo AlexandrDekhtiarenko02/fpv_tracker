@@ -4816,6 +4816,7 @@ _menu_derzh_t = 0.0
 _menu_derzh_sled = 0.0
 _menu_zanyato = False
 _menu_status = ""
+_menu_ekran = []
 _nastroiki_put = None
 # Сглаженная геометрическая команда газа. None — геометрия молчит.
 _thr_geom_out = None
@@ -9684,8 +9685,42 @@ def _menu_skript(imya, *args, timeout=120):
         return 1, str(exc)
 
 
+def _menu_stroka(tekst):
+    """Одна строка статуса. Остаётся на экране, новые дописываются ниже."""
+    global _menu_status
+    _menu_ekran.append(str(tekst))
+    _menu_status = str(tekst)
+
+
+def _menu_tekushchiy_commit():
+    """Короткий хеш и английская часть сообщения. Кириллицу шрифт не рисует."""
+    koren = os.path.dirname(os.path.abspath(__file__))
+    try:
+        hesh = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=koren, capture_output=True, text=True, timeout=5)
+        tema = subprocess.run(
+            ["git", "log", "-1", "--pretty=%s"],
+            cwd=koren, capture_output=True, text=True, timeout=5)
+    except Exception:
+        return ""
+    korotkiy = (hesh.stdout or "").strip()
+    if hesh.returncode != 0 or not korotkiy:
+        return ""
+    slova = "".join(ch if ord(ch) < 128 else " " for ch in (tema.stdout or ""))
+    slova = " ".join(slova.split())
+    if slova:
+        return (korotkiy + "  " + slova)[:48]
+    return korotkiy
+
+
 def _menu_obnovit():
-    """Забрать текущую ветку и выйти: systemd поднимет службу с новым кодом."""
+    """Забрать текущую ветку, показать коммит и выйти.
+
+    systemd поднимет службу уже с новым файлом. Паузы нужны, чтобы кадр
+    успел нарисовать каждую строку до перезапуска.
+    """
+    global _menu_ekran
     if not _menu_mozhno():
         return "armed"
     kod, tekst = _menu_skript("obnovit.sh")
@@ -9698,6 +9733,16 @@ def _menu_obnovit():
         return "update failed"
     if not _menu_mozhno():
         return "armed"
+    _menu_ekran = []
+    _menu_stroka("updated")
+    time.sleep(1.0)
+    _menu_stroka(_menu_tekushchiy_commit() or "commit ?")
+    time.sleep(1.4)
+    if not _menu_mozhno():
+        _menu_stroka("armed")
+        return "armed"
+    _menu_stroka("restarting")
+    time.sleep(1.2)
     os.kill(os.getpid(), signal.SIGTERM)
     return "restarting"
 
@@ -9934,7 +9979,7 @@ def _narisovat_menu(frame):
     cv2.putText(frame, zag, (x, y), font, 0.7, COLOR_WHITE, 1, cv2.LINE_AA)
     y += 36
     for s, vybran, pravka in nadpisi:
-        if y > y1 - 40:
+        if y > y1 - 120:
             break
         if vybran:
             cv2.rectangle(frame, (x0 + 6, y - 20), (x1 - 6, y + 8),
@@ -9942,9 +9987,12 @@ def _narisovat_menu(frame):
         cvet = COLOR_CYAN if pravka else COLOR_WHITE
         cv2.putText(frame, s, (x, y), font, 0.65, cvet, 1, cv2.LINE_AA)
         y += 30
-    if _menu_status:
-        cv2.putText(frame, _menu_status, (x, y1 - 42), font, 0.55,
-                    COLOR_YELLOW, 1, cv2.LINE_AA)
+    linii = list(_menu_ekran) if _menu_ekran else (
+        [_menu_status] if _menu_status else [])
+    yy = y1 - 16 - 26 * len(linii)
+    for lin in linii:
+        cv2.putText(frame, lin, (x, yy), font, 0.6, COLOR_YELLOW, 1, cv2.LINE_AA)
+        yy += 26
     cv2.putText(frame, podskaz, (x, y1 - 16), font, 0.5, (210, 210, 210, 0),
                 1, cv2.LINE_AA)
 
