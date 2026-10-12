@@ -4817,6 +4817,7 @@ _menu_derzh_sled = 0.0
 _menu_zanyato = False
 _menu_status = ""
 _menu_ekran = []
+_menu_wifi_kesh = ("", 0.0)
 _nastroiki_put = None
 # Сглаженная геометрическая команда газа. None — геометрия молчит.
 _thr_geom_out = None
@@ -9664,6 +9665,10 @@ def _menu_derevo():
             {"imya": "Record", "dejstvie": _menu_zapis,
              "get": lambda: "on" if RECORD_FRAMES else "off"},
             {"imya": "Clear logs", "dejstvie": _menu_ochistit_logi},
+            {"imya": "Wi-Fi", "deti": [
+                {"imya": "Network", "get": _menu_wifi_ssid},
+                {"imya": "Reconnect", "dejstvie": _menu_wifi_zanovo},
+            ]},
         ]},
     ]
 
@@ -9804,6 +9809,80 @@ def _menu_zapis():
     except Exception:
         pass
     return "record on" if RECORD_FRAMES else "record off"
+
+
+def _menu_nmcli(argv, timeout=20):
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except FileNotFoundError:
+        return 127, "not found"
+    except Exception as exc:
+        return 1, str(exc)
+
+
+def _menu_wifi_ssid():
+    """Имя сети. Кэш на секунду: iwgetid на каждом кадре малине ни к чему."""
+    global _menu_wifi_kesh
+    now = time.monotonic()
+    tekst, kogda = _menu_wifi_kesh
+    if tekst and now - kogda < 1.0:
+        return tekst
+    imya = "none"
+    try:
+        p = subprocess.run(
+            ["iwgetid", "-r"], capture_output=True, text=True, timeout=2)
+        syroy = (p.stdout or "").strip()
+        if syroy:
+            imya = "".join(
+                ch if 32 <= ord(ch) < 127 else "?" for ch in syroy)[:22]
+    except Exception:
+        imya = "none"
+    _menu_wifi_kesh = (imya, now)
+    return imya
+
+
+def _menu_wifi_shag(argv):
+    """Одна команда nmcli. Чужой код ошибки — не повод останавливаться:
+    отключение уже выключенного интерфейса как раз так и отвечает.
+    Нет прав — одна попытка через sudo без пароля.
+    """
+    kod, tekst = _menu_nmcli(argv)
+    if kod == 0:
+        return 0
+    if kod == 127:
+        return 127
+    niz = (tekst or "").lower()
+    if not any(s in niz for s in (
+            "not authorized", "insufficient", "polkit", "privileg", "password")):
+        return 0
+    kod2, _tekst2 = _menu_nmcli(["sudo", "-n", *argv])
+    if kod2 == 0:
+        return 0
+    return 1
+
+
+def _menu_wifi_zanovo():
+    """Отпустить wlan0 и отдать его NetworkManager: он сам выберет сеть."""
+    global _menu_wifi_kesh, _menu_ekran
+    if not _menu_mozhno():
+        return "armed"
+    _menu_ekran = []
+    _menu_stroka("reconnecting")
+    for argv in (["nmcli", "device", "disconnect", "wlan0"],
+                 ["nmcli", "device", "connect", "wlan0"]):
+        kod = _menu_wifi_shag(argv)
+        if kod == 127:
+            _menu_stroka("no nmcli")
+            return "no nmcli"
+        if kod != 0:
+            _menu_stroka("no rights")
+            return "no rights"
+    time.sleep(1.0)
+    _menu_wifi_kesh = ("", 0.0)
+    imya = _menu_wifi_ssid()
+    _menu_stroka(imya if imya != "none" else "no network")
+    return imya
 
 
 def _menu_zapustit(fn):
@@ -9986,7 +10065,11 @@ def _menu_stroki():
                 tekst = p["imya"]
         else:
             zn = p["get"]()
-            tekst = "%s  %s" % (p["imya"], "none" if zn is None else "%d" % int(zn))
+            if isinstance(zn, str):
+                tekst = "%s  %s" % (p["imya"], zn)
+            else:
+                tekst = "%s  %s" % (
+                    p["imya"], "none" if zn is None else "%d" % int(zn))
         out.append((tekst, i == _menu_kursor, _menu_pravka and i == _menu_kursor))
     return out
 

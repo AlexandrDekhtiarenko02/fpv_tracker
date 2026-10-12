@@ -85,7 +85,7 @@ assert vybr == ["Tools"], (vybr, t._menu_stroki())
 t._menu_tick(4000.6, stiki(), False)
 t._menu_tick(4000.8, stiki(kren=2000), False)
 imena = [s[0] for s in t._menu_stroki()]
-assert imena == ["Update", "Restart", "Record  off", "Clear logs"], imena
+assert imena == ["Update", "Restart", "Record  off", "Clear logs", "Wi-Fi"], imena
 vyzovy = []
 t._menu_zapustit(lambda: vyzovy.append(1) or "ok")
 import time as _time
@@ -128,5 +128,36 @@ with t.state_lock:
     t.app_state["armed"] = True
 assert t._menu_zapis() == "armed"
 assert t._menu_perezapusk() == "armed"
+
+print("\n=== 9. Wi-Fi: имя сети и переподключение ===")
+with t.state_lock:
+    t.app_state["armed"] = False
+t._menu_wifi_kesh = ("", 0.0)
+vyzovy_nm = []
+
+def falsh_nmcli(argv, timeout=20):
+    vyzovy_nm.append(list(argv))
+    if argv[:2] == ["sudo", "-n"]:
+        return 0, ""
+    if "disconnect" in argv:
+        return 1, "not authorized"
+    return 0, ""
+
+t._menu_nmcli = falsh_nmcli
+t.time.sleep = lambda s: None
+t._menu_wifi_ssid = lambda: "PodilOfficer"
+t._menu_ekran = []
+assert t._menu_wifi_zanovo() == "PodilOfficer"
+assert t._menu_ekran[0] == "reconnecting"
+assert t._menu_ekran[-1] == "PodilOfficer"
+assert any(a[:3] == ["sudo", "-n", "nmcli"] for a in vyzovy_nm)
+t._menu_otkryto = True
+t._menu_put = []
+t._menu_kursor = 0
+t._menu_pravka = False
+tools = [p for p in t._menu_derevo() if p["imya"] == "Tools"][0]
+deti = [p for p in tools["deti"] if p["imya"] == "Wi-Fi"][0]["deti"]
+assert deti[0]["get"]() == "PodilOfficer"
+print("    ", [p["imya"] for p in deti])
 
 print("\nOK: меню на земле, висение пишется")
