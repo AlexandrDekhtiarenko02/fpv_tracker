@@ -247,10 +247,12 @@ for _ in range(15):
     kadr(dx=100, dy=70, score=0.90)   # прогрев: доверие сходится к 1.0
 for _ in range(3):
     sc = kadr(dx=100, dy=70, score=0.05)   # резкий обвал -> trust_k << 1
-_do_razryva = sc["roll_trust_restriction"]
-print("    до разрыва: roll_trust_restriction=%.1f (_shadow_roll_prev_"
-      "restriction=%.1f)" % (_do_razryva, t._shadow_roll_prev_restriction))
-assert abs(t._shadow_roll_prev_restriction) > t.SHADOW_WINDUP_RESTRICT_PWM, (
+# Крен больше не командует по пикселям, поэтому урезание доверия
+# видно на тангаже: он по-прежнему ведётся ошибкой рамки.
+_do_razryva = sc["pitch_trust_restriction"]
+print("    до разрыва: pitch_trust_restriction=%.1f (_shadow_pitch_prev_"
+      "restriction=%.1f)" % (_do_razryva, t._shadow_pitch_prev_restriction))
+assert abs(t._shadow_pitch_prev_restriction) > t.SHADOW_WINDUP_RESTRICT_PWM, (
     "тест сам не годен: до разрыва должна была накопиться заметная "
     "restriction, иначе сценарий ничего не проверяет")
 t._reset_geometry_history("тест: имитация frame gap/re-anchor")

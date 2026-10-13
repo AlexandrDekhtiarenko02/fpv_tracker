@@ -58,6 +58,10 @@ def frame(dt=FRAME_DT, dx_px=0, dy_px=10, rost=1.5):
         t.app_state["alt_ts"] = t.time.monotonic()
         t.app_state["gyro"] = (0, 0, 0)
         t.app_state["imu_ts"] = t.time.monotonic()
+        t.app_state["fc_roll_deg"] = 0.0
+    # Скорость азимута, не смещение рамки: крен больше не догоняет пиксели.
+    t._az_skorost = 3.0
+    t._az_skorost_ts = t.time.monotonic()
     t.update_control_from_target()
 
 

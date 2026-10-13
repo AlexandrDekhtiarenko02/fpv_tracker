@@ -151,7 +151,7 @@ print("\n=== 6. Диагностика-only: gap НЕ участвует в push
       "— по исходному тексту final_hold-блок стоит ПОСЛЕ anti-windup ===")
 import io  # noqa: E402
 src = io.open(os.path.join(_ROOT, "tracker.py"), encoding="utf-8").read()
-i_windup = src.index("_shadow_windup_step(\n            adx,")
+i_windup = src.index("_shadow_windup_step(\n            ady,")
 i_hold = src.index("Final-hold delivered-MODEL gap: нашли по 14")
 assert i_hold > i_windup, (
     "final-hold блок обязан идти ПОСЛЕ вызовов _shadow_windup_step — "

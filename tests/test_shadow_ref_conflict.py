@@ -199,7 +199,7 @@ i_start = src.index("# ================= SHADOW CONTROLLER =================")
 i_end = src.index("# ================ /SHADOW CONTROLLER ================")
 shadow_body = src[i_start:i_end]
 i_conflict = shadow_body.index("Reference conflict / sustained pitch-compensation")
-i_windup_call = shadow_body.index("_shadow_windup_step(\n            adx,")
+i_windup_call = shadow_body.index("_shadow_windup_step(\n            ady,")
 assert i_conflict < i_windup_call, (
     "блок должен идти сразу после AimReference (§4), до anti-windup — "
     "порядок внутри try не влияет на изоляцию, но так он не создаёт "

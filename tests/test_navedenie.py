@@ -33,8 +33,7 @@ assert zn["LEAD_AIM_ENABLED"] is True, "упреждение выключено 
 POZ_PX = 5.6          # медиана |ady|
 SNOS_PX_KADR = 0.88   # медиана |tgt_vy|
 
-for os_imya, p_gain, ff_gain in (("тангаж", zn["P_GAIN_PITCH"], zn["FF_GAIN_PITCH"]),
-                                 ("крен", zn["P_GAIN_ROLL"], zn["FF_GAIN_ROLL"])):
+for os_imya, p_gain, ff_gain in (("тангаж", zn["P_GAIN_PITCH"], zn["FF_GAIN_PITCH"]),):
     vklad_poz = POZ_PX * p_gain
     vklad_snos = SNOS_PX_KADR * (p_gain * zn["LEAD_FRAMES"] + ff_gain)
     otn = vklad_snos / vklad_poz
@@ -46,6 +45,12 @@ for os_imya, p_gain, ff_gain in (("тангаж", zn["P_GAIN_PITCH"], zn["FF_GAI
     assert otn <= 4.0, (
         "%s: снос перевешивает положение в %.1f раза — контур пойдёт за "
         "шумом разности кадров, а цель уползёт из кадра" % (os_imya, otn))
+
+# Крен ведёт скорость азимута, не скорость рамки. Иначе собственный крен
+# сдвигает рамку и стик перекладывается на другой бок.
+assert zn["FF_GAIN_ROLL"] == 0.0
+assert zn["PN_ROLL_BANK_MAX"] <= 25.0
+assert zn["PN_ROLL_PWM_MAX"] < zn["MAX_ROLL_DEFLECT"]
 
 # Упреждение горизонтом больше полусекунды при задержке петли 125 мс — это
 # уже не упреждение, а экстраполяция в пустоту.

@@ -61,20 +61,16 @@ def kadr(dx, dy=0, score=0.85):
     return t._shadow_ctl_dbg
 
 
-print("=== 1. Крупный устойчивый dx вправо: roll и yaw оба заметно "
-      "активны и с одним знаком -> both_active=True ===")
+print("=== 1. Смещение рамки само по себе крен не ведёт ===")
 force_reset()
 sc = None
 for _ in range(10):
-    sc = kadr(dx=200)   # заметное, устойчивое смещение вправо
+    sc = kadr(dx=40)   # внутри мёртвой зоны поводка
 print("    sign_roll=%d sign_yaw=%d mag_roll=%.1f mag_yaw=%.1f "
       "both_active=%s" % (sc["sign_roll"], sc["sign_yaw"], sc["mag_roll"],
                           sc["mag_yaw"], sc["roll_yaw_both_active"]))
-assert sc["sign_roll"] > 0, "цель справа не даёт roll_off > 0"
-assert sc["sign_yaw"] > 0, "цель справа не даёт yaw_pd > 0"
-assert sc["roll_yaw_both_active"], (
-    "устойчивое крупное смещение вправо — оба контура тянут в одну "
-    "сторону, both_active должен быть True")
+assert sc["sign_roll"] == 0, "рамка ушла, а крен пошёл за ней"
+assert not sc["roll_yaw_both_active"]
 
 print("\n=== 2. Цель почти в центре: обе оси близки к нулю -> "
       "both_active=False ===")
@@ -87,23 +83,27 @@ print("    mag_roll=%.2f mag_yaw=%.2f both_active=%s"
 assert not sc["roll_yaw_both_active"], (
     "цель у центра — ни одна ось не должна считаться 'заметно активной'")
 
-print("\n=== 3. sign_roll/sign_yaw соответствуют направлению — влево "
-      "даёт противоположный знак ===")
+print("\n=== 3. Знак крена задаёт скорость азимута, не сторона рамки ===")
 force_reset()
-sc_right = None
-for _ in range(10):
-    sc_right = kadr(dx=200)
+t._pn_bank_i = 0.0
+t._pn_bank_tek = 0.0
+t._az_skorost = 3.0
+t._az_skorost_ts = t.time.monotonic()
+with t.state_lock:
+    t.app_state["fc_roll_deg"] = 0.0
+sc_plus = kadr(dx=0)
 force_reset()
-sc_left = None
-for _ in range(10):
-    sc_left = kadr(dx=-200)
-print("    вправо: sign_roll=%d sign_yaw=%d | влево: sign_roll=%d sign_yaw=%d"
-      % (sc_right["sign_roll"], sc_right["sign_yaw"],
-         sc_left["sign_roll"], sc_left["sign_yaw"]))
-assert sc_right["sign_roll"] == -sc_left["sign_roll"]
-assert sc_right["sign_yaw"] == -sc_left["sign_yaw"]
-assert sc_left["roll_yaw_both_active"], (
-    "устойчивое крупное смещение влево тоже должно давать both_active")
+t._pn_bank_i = 0.0
+t._pn_bank_tek = 0.0
+t._az_skorost = -3.0
+t._az_skorost_ts = t.time.monotonic()
+with t.state_lock:
+    t.app_state["fc_roll_deg"] = 0.0
+sc_minus = kadr(dx=0)
+print("    азимут +3: sign_roll=%d | азимут -3: sign_roll=%d"
+      % (sc_plus["sign_roll"], sc_minus["sign_roll"]))
+assert sc_plus["sign_roll"] > 0 and sc_minus["sign_roll"] < 0
+assert sc_plus["sign_roll"] == -sc_minus["sign_roll"]
 
 print("\n=== 4. yaw_weight гасит yaw при большой |dx| (уже в live-законе) "
       "— both_active должен это уважать, не спорить с ним ===")

@@ -63,17 +63,31 @@ assert t._pribavka_zapreshchena(24.0, 18.0, 10.0) is True   # +6°
 assert t._pribavka_zapreshchena(20.0, 18.0, -500.0) is False  # просадка — можно
 assert t._pribavka_zapreshchena(20.0, 18.0, 10.0) is False
 
-print("=== 6. Крен: лид не в интеграторе, ff одного порядка с P ===")
-off, prev, integ = t._pid_axis_step(
-    20.0, 0.0, 0.0, 2.0,
-    t.P_GAIN_ROLL, 0.0, t.I_GAIN_ROLL, t.FF_GAIN_ROLL,
-    t.ROLL_INTEGRAL_MAX, 1.0, t.ROLL_SIGN, t.MAX_ROLL_DEFLECT,
-    k=1.0, i_error=0.0)
-assert integ == 0.0, integ
-# Скорость 2 px/кадр за 0.4 с — это 24 px. P на них ~96, ff не в десять раз слабее.
-ff = 2.0 * t.FF_GAIN_ROLL
-p_na_snose = 2.0 * t.ROLL_LEAD_S * t.NOMINAL_FPS * t.P_GAIN_ROLL
-assert ff >= p_na_snose * 0.5, (ff, p_na_snose)
+print("=== 6. Крен держит крен курса, а не догоняет рамку ===")
+now = 1000.0
+t._pn_bank_i = 0.0
+t._pn_bank_tek = 0.0
+# Скорость азимута есть, борт ещё ровный: стик кладёт крен, но не в упор.
+pwm = t._kren_na_kurs(4.0, now, 0.0, 0.0, now, 1.0)
+assert 0 < pwm <= t.PN_ROLL_BANK_SLEW / t.NOMINAL_FPS * t.PN_ROLL_PWM_PER_DEG + 1.0, pwm
+# Крен уже равен желаемому: ручка отпущена, рамка у центра ничего не добавляет.
+zhel = t.PN_ROLL_BANK_PER_DPS * (4.0 - t.LOS_AZ_DEADBAND_DPS)
+t._pn_bank_i = 0.0
+t._pn_bank_tek = zhel
+derzhit = t._kren_na_kurs(4.0, now, zhel, 0.0, now, 1.0)
+assert abs(derzhit) < 8.0, derzhit
+t._pn_bank_i = 0.0
+t._pn_bank_tek = zhel
+u_centra = t._kren_na_kurs(4.0, now, zhel, 15.0, now, 1.0)
+assert abs(u_centra - derzhit) < 1.0, (u_centra, derzhit)
+# У края кадра поводок есть, но это не переклад.
+t._pn_bank_i = 0.0
+t._pn_bank_tek = 0.0
+povodok = t._kren_na_kurs(0.0, now, 0.0, 160.0, now, 1.0)
+assert 0 < povodok < 50.0, povodok
+# Без крена с полётника стик молчит.
+assert t._kren_na_kurs(4.0, now, None, 0.0, now, 1.0) == 0.0
+assert t.FF_GAIN_ROLL == 0.0
 assert t.ROLL_LEAD_S >= 0.4 - 1e-9
 assert t.LEAD_FRAMES == 8
 

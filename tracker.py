@@ -1604,7 +1604,8 @@ LEAD_MAX_PX = 80.0 * TRACK_SCALE
 # (мотор начинает работать ДО появления позиционной ошибки).
 # Работает в паре с LEAD — они не конкурируют, а дополняют друг друга.
 # Подбор: 1.5-3.0 для roll, в полёте калибровать на пересекающей цели.
-FF_GAIN_ROLL = 48.0     # PWM на (px/кадр). P на смещении за 0.4 с, не 6–9% от него
+FF_GAIN_ROLL = 0.0      # крен больше не догоняет скорость рамки: собственный
+                        # крен сдвигает её, и этот член перекладывал борт
 FF_GAIN_PITCH = 1.5     # PWM на (px/кадр) скорости цели по Y
 FF_GAIN_YAW = 1.0       # PWM на (px/кадр). Больше раскачивает нос сразу после лока
 # Ближе этого к центру рыскание молчит. Иначе лок почти в центре
@@ -2175,6 +2176,26 @@ COLLISION_PITCH_PWM_DPS = 8.0
 COLLISION_ROLL_PWM_DPS = 6.0
 COLLISION_PITCH_MAX = 35.0
 COLLISION_ROLL_MAX = 28.0
+# Крен держит КРЕН курса столкновения, а не догоняет рамку.
+# Стик в ACRO задаёт скорость крена. Желаемый крен — боковое ускорение,
+# он пропорционален скорости азимута. Стик только доводит борт до этого
+# крена и отпускается: иначе рамка, сдвинутая собственным креном, даёт
+# команду в другую сторону, и борт плавает. На заходе 13.10 в 6–9 с
+# рамка была у нуля, а крен уже рос до +13°, потом переклад до −38°.
+# 4 °/с → (4 − 0.5) × 5 = 17°. Потолок 22°: −38° уже несло мимо цели,
+# хотя нос на неё смотрел.
+PN_ROLL_BANK_PER_DPS = 5.0
+PN_ROLL_BANK_MAX = 22.0
+PN_ROLL_BANK_SLEW = 40.0
+PN_ROLL_I_DEG_PER_S = 1.5
+PN_ROLL_I_MAX = 8.0
+PN_ROLL_PWM_PER_DEG = 6.0
+PN_ROLL_PWM_MAX = 110.0
+# Поводок рамки молчит, пока цель не у края. Смещение в центре — это
+# и есть курс столкновения, стягивать его обратно значит снова лететь дугой.
+PN_ROLL_LEASH_PX = 70.0
+PN_ROLL_LEASH_DEG = 0.06
+PN_ROLL_LEASH_MAX = 6.0
 
 # --- ПРЕДЕЛ СКОРОСТИ СНИЖЕНИЯ ---
 # Страховка от проваливания, а не регулятор: односторонняя и с мёртвой зоной,
@@ -4912,6 +4933,10 @@ prev_ady = 0.0
 roll_integral = 0.0
 pitch_integral = 0.0
 yaw_integral = 0.0
+# Накопленный добор крена (градусы, знак скорости азимута) и крен,
+# к которому стик уже едет. Сбрасываются вместе с интегратором рамки.
+_pn_bank_i = 0.0
+_pn_bank_tek = 0.0
 
 # Сглаженное значение fc_pitch_deg для расчёта компенсации тангажа.
 smoothed_pitch_deg = 0.0
@@ -8646,6 +8671,7 @@ def reset_tracking(to_acq=False):
     global filtered_dx_yaw, prev_adx, prev_ady_ctrl
     global smooth_throttle_out, throttle_integral, prev_ady
     global roll_integral, pitch_integral, yaw_integral
+    global _pn_bank_i, _pn_bank_tek
     global smoothed_pitch_deg
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
@@ -8753,6 +8779,8 @@ def reset_tracking(to_acq=False):
     roll_integral = 0.0
     pitch_integral = 0.0
     yaw_integral = 0.0
+    _pn_bank_i = 0.0
+    _pn_bank_tek = 0.0
 
     smoothed_pitch_deg = 0.0
 
@@ -8886,6 +8914,64 @@ def _stolknovenie_pwm(skorost, ts, now, deadband, gain, limit, sign):
         return limit
     if pwm < -limit:
         return -limit
+    return pwm
+
+
+def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k):
+    """Стик, который держит крен курса столкновения.
+
+    Желаемый крен пропорционален скорости азимута. Пока борт до него
+    не дошёл, стик отклонён; когда дошёл — стик у центра, крен стоит.
+    Рамка около центра стик не двигает. Без свежего крена команда ноль:
+    вслепую крутить скорость крена нельзя, борт ляжет и не выровняется.
+    """
+    global _pn_bank_i, _pn_bank_tek
+    if bank_deg is None:
+        return 0.0
+    fresh = (az_ts > 0.0) and ((now - az_ts) <= LOS_RATE_STALE_S)
+    leash = 0.0
+    if fresh:
+        if az > LOS_AZ_DEADBAND_DPS:
+            izb = az - LOS_AZ_DEADBAND_DPS
+        elif az < -LOS_AZ_DEADBAND_DPS:
+            izb = az + LOS_AZ_DEADBAND_DPS
+        else:
+            izb = 0.0
+        if izb != 0.0:
+            _pn_bank_i += izb * PN_ROLL_I_DEG_PER_S * (k / NOMINAL_FPS)
+            if _pn_bank_i > PN_ROLL_I_MAX:
+                _pn_bank_i = PN_ROLL_I_MAX
+            elif _pn_bank_i < -PN_ROLL_I_MAX:
+                _pn_bank_i = -PN_ROLL_I_MAX
+        else:
+            _pn_bank_i *= 0.5 ** (k / NOMINAL_FPS)
+        if dx_px is not None and abs(dx_px) > PN_ROLL_LEASH_PX:
+            leash = (abs(dx_px) - PN_ROLL_LEASH_PX) * PN_ROLL_LEASH_DEG
+            if leash > PN_ROLL_LEASH_MAX:
+                leash = PN_ROLL_LEASH_MAX
+            if dx_px < 0.0:
+                leash = -leash
+        zhel = ROLL_SIGN * (
+            PN_ROLL_BANK_PER_DPS * izb + _pn_bank_i + leash)
+    else:
+        _pn_bank_i *= 0.5 ** (k / NOMINAL_FPS)
+        zhel = 0.0
+    if zhel > PN_ROLL_BANK_MAX:
+        zhel = PN_ROLL_BANK_MAX
+    elif zhel < -PN_ROLL_BANK_MAX:
+        zhel = -PN_ROLL_BANK_MAX
+    shag = PN_ROLL_BANK_SLEW * (k / NOMINAL_FPS)
+    if _pn_bank_tek < zhel - shag:
+        _pn_bank_tek += shag
+    elif _pn_bank_tek > zhel + shag:
+        _pn_bank_tek -= shag
+    else:
+        _pn_bank_tek = zhel
+    pwm = (_pn_bank_tek - float(bank_deg)) * PN_ROLL_PWM_PER_DEG
+    if pwm > PN_ROLL_PWM_MAX:
+        return PN_ROLL_PWM_MAX
+    if pwm < -PN_ROLL_PWM_MAX:
+        return -PN_ROLL_PWM_MAX
     return pwm
 
 
@@ -10795,6 +10881,7 @@ def _update_control_from_target_impl():
     global smooth_throttle_out, throttle_integral, prev_ady
     global _hover_pwm, _thr_geom_out, _geom_mode_log
     global roll_integral, pitch_integral, yaw_integral
+    global _pn_bank_i, _pn_bank_tek
     global smoothed_pitch_deg
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
@@ -10991,6 +11078,8 @@ def _update_control_from_target_impl():
         roll_integral = 0.0
         pitch_integral = 0.0
         yaw_integral = 0.0
+        _pn_bank_i = 0.0
+        _pn_bank_tek = 0.0
         # SHADOW-состояние — своё, отдельное от live-интеграторов выше, но
         # сбрасывается по тому же событию (новый/потерянный захват): иначе
         # диагностика windup тянула бы накопление прошлой цели в новую.
@@ -11643,10 +11732,6 @@ def _update_control_from_target_impl():
             _los_skorost, _los_skorost_ts, now_mono,
             LOS_RATE_DEADBAND_DPS, COLLISION_PITCH_PWM_DPS,
             COLLISION_PITCH_MAX, PITCH_SIGN) * trust_k
-        col_r = _stolknovenie_pwm(
-            _az_skorost, _az_skorost_ts, now_mono,
-            LOS_AZ_DEADBAND_DPS, COLLISION_ROLL_PWM_DPS,
-            COLLISION_ROLL_MAX, ROLL_SIGN) * trust_k
         ady_p *= COLLISION_PITCH_PIXEL
         adx_r = _kadr_oshibka(dx_aim - los_aim_x_px, DEADBAND_X) * COLLISION_ROLL_PIXEL
         adx_y = _kadr_oshibka(dx_aim - los_aim_x_px, DEADBAND_X)
@@ -11655,22 +11740,33 @@ def _update_control_from_target_impl():
     _vx_ff = target_vx_smoothed
     if abs(_vx_ff) < ROLL_FF_VEL_DEAD:
         _vx_ff = 0.0
-    roll_offset, prev_adx, roll_integral = _pid_axis_step(
-        adx_r, prev_adx, roll_integral,
-        _vx_ff,
-        p_roll_eff, D_GAIN_ROLL, i_roll_eff, ff_roll_eff,
-        ROLL_INTEGRAL_MAX, ROLL_INTEGRAL_DECAY,
-        ROLL_SIGN, MAX_ROLL_DEFLECT, dbg_key="roll", k=k,
-        i_error=_kadr_oshibka(dx_raw, DEADBAND_X),
-    )
-    # ДИАГНОСТИКА ANTI-WINDUP. "requested" (сырой выход _pid_axis_step,
-    # уже в _pid_dbg["roll"][4]) считает насыщение по MAX_ROLL_DEFLECT —
-    # но НЕ видит ни trust_k, ни демпфирование по гироскопу, ни slew ниже.
-    # I может продолжать копиться, хотя реальная команда после них уже
-    # сильно урезана. Снимок ЗДЕСЬ — до какого-либо изменения контура: то
-    # же значение trust_k * roll_offset, что участвует в строке ниже,
-    # просто прочитано для лога до присвоения.
-    _pid_dbg["roll_after_trust"] = roll_offset * trust_k
+    if COLLISION_ENABLED:
+        # Крен курса. Пиксельный PID здесь не вызывается: на заходе 13.10
+        # его FF по скорости рамки доходил до −197 и перекладывал борт,
+        # пока скорость азимута в стик почти не попадала.
+        with state_lock:
+            _bank = app_state.get("fc_roll_deg")
+            _bank_ts = app_state.get("fc_pitch_ts", 0.0)
+        if (_bank is None or _bank_ts <= 0.0
+                or (now_mono - _bank_ts) > LAUNCH_ATT_TIMEOUT):
+            _bank = None
+        col_r = _kren_na_kurs(
+            _az_skorost, _az_skorost_ts, _bank, dx_raw, now_mono, k) * trust_k
+        roll_integral = 0.0
+        roll_offset = 0.0
+        _pid_dbg["roll"] = (
+            col_r, 0.0, _pn_bank_i * PN_ROLL_PWM_PER_DEG, 0.0, col_r,
+            abs(col_r) >= PN_ROLL_PWM_MAX - 1e-6)
+    else:
+        roll_offset, prev_adx, roll_integral = _pid_axis_step(
+            adx_r, prev_adx, roll_integral,
+            _vx_ff,
+            p_roll_eff, D_GAIN_ROLL, i_roll_eff, ff_roll_eff,
+            ROLL_INTEGRAL_MAX, ROLL_INTEGRAL_DECAY,
+            ROLL_SIGN, MAX_ROLL_DEFLECT, dbg_key="roll", k=k,
+            i_error=_kadr_oshibka(dx_raw, DEADBAND_X),
+        )
+    _pid_dbg["roll_after_trust"] = roll_offset * trust_k + col_r
     # Демпфирование по гироскопу для крена — то же, что у тангажа. Крен
     # раскачивался сильнее и при этом не имел его вовсе.
     roll_damp_pwm = 0.0
@@ -12626,14 +12722,22 @@ def _update_control_from_target_impl():
         # был пропущен; сейчас YAW_RATE_DAMP_ENABLED=False, поэтому вклад
         # 0.0, но при включении в будущем shadow-путь не разойдётся с live
         # молча.
-        _roll_requested_raw = ROLL_SIGN * (r_p + r_d + r_ff + _shadow_roll_integral)
         _pitch_requested_raw = PITCH_SIGN * (p_p + p_d + p_ff + _shadow_pitch_integral)
         _yaw_requested_raw = YAW_SIGN * (yaw_pd + yaw_ff + _shadow_yaw_integral)
 
-        _shadow_roll_integral, _roll_restricted_prev, _roll_pushed = _shadow_windup_step(
-            adx, _roll_requested_raw, MAX_ROLL_DEFLECT, _shadow_roll_prev_restriction,
-            _shadow_roll_integral, i_roll_eff, ROLL_INTEGRAL_MAX,
-            ROLL_INTEGRAL_DECAY, ROLL_SIGN, k)
+        # Крен больше не копит пиксели: живая команда — крен курса.
+        # Теневой интегратор по рамке здесь врал бы, что борт догоняет её.
+        if COLLISION_ENABLED:
+            _shadow_roll_integral = 0.0
+        else:
+            _roll_requested_raw = ROLL_SIGN * (
+                r_p + r_d + r_ff + _shadow_roll_integral)
+            _shadow_roll_integral, _roll_restricted_prev, _roll_pushed = (
+                _shadow_windup_step(
+                    adx, _roll_requested_raw, MAX_ROLL_DEFLECT,
+                    _shadow_roll_prev_restriction,
+                    _shadow_roll_integral, i_roll_eff, ROLL_INTEGRAL_MAX,
+                    ROLL_INTEGRAL_DECAY, ROLL_SIGN, k))
         _shadow_pitch_integral, _pitch_restricted_prev, _pitch_pushed = _shadow_windup_step(
             ady, _pitch_requested_raw, MAX_PITCH_DEFLECT, _shadow_pitch_prev_restriction,
             _shadow_pitch_integral, i_pitch_eff, PITCH_INTEGRAL_MAX,
