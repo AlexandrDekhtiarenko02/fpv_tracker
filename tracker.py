@@ -9654,9 +9654,12 @@ def _narisovat_hover_test(frame):
         return
     font = cv2.FONT_HERSHEY_SIMPLEX
     tekst = "HOVER  " + _hover_test_status
-    (tw, _), _ = cv2.getTextSize(tekst, font, 0.6, 1)
+    (tw, th), _ = cv2.getTextSize(tekst, font, 0.6, 1)
     x = max(8, (frame.shape[1] - tw) // 2)
-    cv2.putText(frame, tekst, (x, 28), font, 0.6, COLOR_YELLOW, 1, cv2.LINE_AA)
+    y = 28
+    cv2.rectangle(frame, (x - 6, y - th - 6), (x + tw + 6, y + 6),
+                  (240, 240, 240), -1)
+    cv2.putText(frame, tekst, (x, y), font, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
 
 
 def _blizko_i_vysoko(dep_deg, range_m, alt_m):
