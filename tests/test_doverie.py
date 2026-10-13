@@ -21,6 +21,12 @@ CX, CY = t.CENTER_X, t.CENTER_Y
 
 
 def kadr(score, psr=None, dy=40):
+    # Тангаж держит угол, а не рамку. Ошибка для проверки доверия —
+    # нос на 8° выше курса: стик должен его опускать, и доверие этот
+    # стик урезает. Смещение коробки в 40 px само по себе стик не двигает.
+    t._pitch_pri_loke = 16.0
+    t._pn_nos_tek = 16.0
+    t._pn_nos_i = 0.0
     t.last_match_score = score
     t._match_dbg = {} if psr is None else {"psr": psr}
     t.target_box_main = (CX - 20, CY - 20 + dy, CX + 20, CY + 20 + dy)
@@ -30,8 +36,9 @@ def kadr(score, psr=None, dy=40):
     with t.state_lock:
         t.app_state["rc_throttle"] = 1450
         t.app_state["rc_throttle_ts"] = t.time.monotonic()
-        t.app_state["fc_pitch_deg"] = 15.0
+        t.app_state["fc_pitch_deg"] = 8.0
         t.app_state["fc_pitch_ts"] = t.time.monotonic()
+        t.app_state["fc_roll_deg"] = 0.0
         t.app_state["gyro"] = (0, 0, 0)
         t.app_state["imu_ts"] = t.time.monotonic()
     t.update_control_from_target()
@@ -46,6 +53,8 @@ def sbros():
     t._slew_roll = 1500.0
     t._slew_yaw = 1500.0
     t._pitch_pri_loke = None
+    t._pn_nos_tek = None
+    t._pn_nos_i = 0.0
     t.pitch_integral = 0.0
     t.prev_ady_ctrl = 0.0
 

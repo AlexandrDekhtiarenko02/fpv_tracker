@@ -2196,6 +2196,38 @@ PN_ROLL_PWM_MAX = 110.0
 PN_ROLL_LEASH_PX = 70.0
 PN_ROLL_LEASH_DEG = 0.06
 PN_ROLL_LEASH_MAX = 6.0
+# Тангаж — тот же закон, что крен, в вертикали. Опора — угол носа
+# в момент захвата. Скорость угла визирования опускает или поднимает
+# нос от этой опоры, не больше чем на 10°: дальше это уже пикирование,
+# которое на заходах 13.10 уносило борт мимо цели.
+PN_PITCH_DEG_PER_DPS = 4.0
+PN_PITCH_FROM_LOCK_MAX = 10.0
+PN_PITCH_FROM_LOCK_MIN = -6.0
+PN_PITCH_SLEW = 12.0
+PN_PITCH_I_DEG_PER_S = 0.6
+PN_PITCH_I_MAX = 4.0
+PN_PITCH_PWM_PER_DEG = 8.0
+PN_PITCH_PWM_MAX = 80.0
+PN_PITCH_LEASH_PX = 70.0
+PN_PITCH_LEASH_DEG = 0.04
+PN_PITCH_LEASH_MAX = 4.0
+# Рыскание не строит курс. Оно доворачивает нос в сторону крена,
+# чтобы борт не летел боком, и слабо подтягивает цель только у края кадра.
+YAW_S_BANK = 1.5
+YAW_BANK_QUIET_DEG = 4.0
+YAW_BANK_PWM_MAX = 30.0
+YAW_LEASH_PX = 50.0
+YAW_LEASH_PWM = 0.3
+YAW_LEASH_MAX = 15.0
+# Газ держит снижение = высота / время до цели, вокруг висения.
+# 40 м и 10 с — это 4 м/с вниз. Выше висения этот закон не поднимает:
+# набор уносит заход. Ниже висения не больше чем на 120 ШИМ, иначе
+# далеко от цели борт просто падает.
+GAZ_PWM_PER_MPS = 25.0
+GAZ_SINK_MAX = 6.0
+GAZ_NIZHE_MAX = 120.0
+GAZ_TAU_MIN_S = 1.5
+GAZ_TAU_MAX_S = 30.0
 
 # --- ПРЕДЕЛ СКОРОСТИ СНИЖЕНИЯ ---
 # Страховка от проваливания, а не регулятор: односторонняя и с мёртвой зоной,
@@ -4937,6 +4969,8 @@ yaw_integral = 0.0
 # к которому стик уже едет. Сбрасываются вместе с интегратором рамки.
 _pn_bank_i = 0.0
 _pn_bank_tek = 0.0
+_pn_nos_i = 0.0
+_pn_nos_tek = None
 
 # Сглаженное значение fc_pitch_deg для расчёта компенсации тангажа.
 smoothed_pitch_deg = 0.0
@@ -8671,7 +8705,7 @@ def reset_tracking(to_acq=False):
     global filtered_dx_yaw, prev_adx, prev_ady_ctrl
     global smooth_throttle_out, throttle_integral, prev_ady
     global roll_integral, pitch_integral, yaw_integral
-    global _pn_bank_i, _pn_bank_tek
+    global _pn_bank_i, _pn_bank_tek, _pn_nos_i, _pn_nos_tek
     global smoothed_pitch_deg
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
@@ -8781,6 +8815,8 @@ def reset_tracking(to_acq=False):
     yaw_integral = 0.0
     _pn_bank_i = 0.0
     _pn_bank_tek = 0.0
+    _pn_nos_i = 0.0
+    _pn_nos_tek = None
 
     smoothed_pitch_deg = 0.0
 
@@ -8925,7 +8961,7 @@ def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k):
     Рамка около центра стик не двигает. Без свежего крена команда ноль:
     вслепую крутить скорость крена нельзя, борт ляжет и не выровняется.
     """
-    global _pn_bank_i, _pn_bank_tek
+    global _pn_bank_i, _pn_bank_tek, _pn_nos_i, _pn_nos_tek
     if bank_deg is None:
         return 0.0
     fresh = (az_ts > 0.0) and ((now - az_ts) <= LOS_RATE_STALE_S)
@@ -8972,6 +9008,128 @@ def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k):
         return PN_ROLL_PWM_MAX
     if pwm < -PN_ROLL_PWM_MAX:
         return -PN_ROLL_PWM_MAX
+    return pwm
+
+
+def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k):
+    """Стик тангажа, который держит угол курса столкновения.
+
+    Опора — нос в момент захвата. Скорость угла визирования сдвигает
+    желаемый нос от опоры. Стик в ACRO задаёт скорость тангажа, поэтому
+    он только доводит борт до этого угла и отпускается. Рамка около
+    центра нос не двигает.
+    """
+    global _pn_nos_i, _pn_nos_tek
+    if pitch_deg is None:
+        return 0.0
+    opora = float(pitch_lock) if pitch_lock is not None else float(pitch_deg)
+    if _pn_nos_tek is None:
+        _pn_nos_tek = opora
+    fresh = (los_ts > 0.0) and ((now - los_ts) <= LOS_RATE_STALE_S)
+    leash = 0.0
+    if fresh:
+        if los > LOS_RATE_DEADBAND_DPS:
+            izb = los - LOS_RATE_DEADBAND_DPS
+        elif los < -LOS_RATE_DEADBAND_DPS:
+            izb = los + LOS_RATE_DEADBAND_DPS
+        else:
+            izb = 0.0
+        if izb != 0.0:
+            _pn_nos_i += izb * PN_PITCH_I_DEG_PER_S * (k / NOMINAL_FPS)
+            if _pn_nos_i > PN_PITCH_I_MAX:
+                _pn_nos_i = PN_PITCH_I_MAX
+            elif _pn_nos_i < -PN_PITCH_I_MAX:
+                _pn_nos_i = -PN_PITCH_I_MAX
+        else:
+            _pn_nos_i *= 0.5 ** (k / NOMINAL_FPS)
+        if dy_px is not None and abs(dy_px) > PN_PITCH_LEASH_PX:
+            leash = (abs(dy_px) - PN_PITCH_LEASH_PX) * PN_PITCH_LEASH_DEG
+            if leash > PN_PITCH_LEASH_MAX:
+                leash = PN_PITCH_LEASH_MAX
+            if dy_px < 0.0:
+                leash = -leash
+        dobor = PN_PITCH_DEG_PER_DPS * izb + _pn_nos_i + leash
+    else:
+        _pn_nos_i *= 0.5 ** (k / NOMINAL_FPS)
+        dobor = 0.0
+    if dobor > PN_PITCH_FROM_LOCK_MAX:
+        dobor = PN_PITCH_FROM_LOCK_MAX
+    elif dobor < PN_PITCH_FROM_LOCK_MIN:
+        dobor = PN_PITCH_FROM_LOCK_MIN
+    zhel = opora + dobor
+    shag = PN_PITCH_SLEW * (k / NOMINAL_FPS)
+    if _pn_nos_tek < zhel - shag:
+        _pn_nos_tek += shag
+    elif _pn_nos_tek > zhel + shag:
+        _pn_nos_tek -= shag
+    else:
+        _pn_nos_tek = zhel
+    pwm = (PITCH_PWM_TO_FC_ANGLE_SIGN
+           * (_pn_nos_tek - float(pitch_deg)) * PN_PITCH_PWM_PER_DEG)
+    if pwm > PN_PITCH_PWM_MAX:
+        return PN_PITCH_PWM_MAX
+    if pwm < -PN_PITCH_PWM_MAX:
+        return -PN_PITCH_PWM_MAX
+    return pwm
+
+
+def _ryaskan_na_kurs(bank_deg, dx_px):
+    """Рыскание в сторону крена и слабый поводок у края кадра.
+
+    Курс им не строится. Нос без крена и без цели у края стоит.
+    """
+    pwm = 0.0
+    if bank_deg is not None and abs(float(bank_deg)) >= YAW_BANK_QUIET_DEG:
+        dob = float(bank_deg) * YAW_S_BANK
+        if dob > YAW_BANK_PWM_MAX:
+            dob = YAW_BANK_PWM_MAX
+        elif dob < -YAW_BANK_PWM_MAX:
+            dob = -YAW_BANK_PWM_MAX
+        pwm += dob
+    if dx_px is not None and abs(dx_px) > YAW_LEASH_PX:
+        hv = (abs(dx_px) - YAW_LEASH_PX) * YAW_LEASH_PWM
+        if hv > YAW_LEASH_MAX:
+            hv = YAW_LEASH_MAX
+        if dx_px < 0.0:
+            hv = -hv
+        pwm += YAW_SIGN * hv
+    if pwm > MAX_YAW_DEFLECT:
+        return float(MAX_YAW_DEFLECT)
+    if pwm < -MAX_YAW_DEFLECT:
+        return float(-MAX_YAW_DEFLECT)
+    return pwm
+
+
+def _gaz_po_vysote(hover, alt_m, tau_s, vario_cms):
+    """Газ вокруг висения: высота должна кончиться вместе с дальностью.
+
+    Нужное снижение — высота / время. Снижаемся медленнее — газ ниже
+    висения. Быстрее — газ обратно к висению, но не выше него.
+    Нет времени или оно мусорное — None, пусть решает запасной закон.
+    """
+    if hover is None or alt_m is None or tau_s is None:
+        return None
+    tau = float(tau_s)
+    if tau < GAZ_TAU_MIN_S or tau > GAZ_TAU_MAX_S:
+        return None
+    alt = float(alt_m)
+    if alt < 0.5:
+        return float(hover)
+    nuzhno = alt / tau
+    if nuzhno > GAZ_SINK_MAX:
+        nuzhno = GAZ_SINK_MAX
+    if vario_cms is None:
+        fakt = 0.0
+    else:
+        fakt = -float(vario_cms) / 100.0
+    oshibka = nuzhno - fakt
+    pwm = float(hover) - GAZ_PWM_PER_MPS * oshibka
+    verh = float(hover)
+    niz = float(hover) - GAZ_NIZHE_MAX
+    if pwm > verh:
+        pwm = verh
+    if pwm < niz:
+        pwm = niz
     return pwm
 
 
@@ -10881,7 +11039,7 @@ def _update_control_from_target_impl():
     global smooth_throttle_out, throttle_integral, prev_ady
     global _hover_pwm, _thr_geom_out, _geom_mode_log
     global roll_integral, pitch_integral, yaw_integral
-    global _pn_bank_i, _pn_bank_tek
+    global _pn_bank_i, _pn_bank_tek, _pn_nos_i, _pn_nos_tek
     global smoothed_pitch_deg
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
@@ -11080,6 +11238,8 @@ def _update_control_from_target_impl():
         yaw_integral = 0.0
         _pn_bank_i = 0.0
         _pn_bank_tek = 0.0
+        _pn_nos_i = 0.0
+        _pn_nos_tek = None
         # SHADOW-состояние — своё, отдельное от live-интеграторов выше, но
         # сбрасывается по тому же событию (новый/потерянный захват): иначе
         # диагностика windup тянула бы накопление прошлой цели в новую.
@@ -11714,11 +11874,8 @@ def _update_control_from_target_impl():
     # Урезаем не до нуля: полностью глухой контур в финале хуже, чем вялый.
     trust_k = TRUST_MIN + (1.0 - TRUST_MIN) * doverie
 
-    # Курс столкновения. Скорость угла — основная команда тангажа и крена.
-    # Рамка остаётся слабой, только чтобы цель не вышла из кадра.
-    # Рыскание ведёт камеру по рамке в полную силу: иначе захват пропадёт.
-    # Сдвиг прицела (los_aim_*) в эту ошибку не входит — он как раз срывал
-    # курс, обнуляясь в момент, когда угол переставал меняться.
+    # Крен и тангаж держат угол курса столкновения. Рыскание — только
+    # за креном и у края кадра, курс им не строится.
     col_p = 0.0
     col_r = 0.0
     # Тангаж: dy_raw + прицел + lead_y. Без pitch_comp и без сдвига
@@ -11803,33 +11960,45 @@ def _update_control_from_target_impl():
     # абсолютный RC, абсолютный RC).
     _pid_dbg["roll_before_slew"] = target_roll - 1500
 
-    # --- PITCH: P+D+I+FF через хелпер с anti-windup ---
-    pitch_offset, prev_ady_ctrl, pitch_integral = _pid_axis_step(
-        ady_p, prev_ady_ctrl, pitch_integral,
-        target_vy_smoothed,
-        p_pitch_eff, D_GAIN_PITCH, i_pitch_eff, ff_pitch_eff,
-        PITCH_INTEGRAL_MAX, PITCH_INTEGRAL_DECAY,
-        PITCH_SIGN, MAX_PITCH_DEFLECT, dbg_key="pitch", k=k,
-    )
-    _p_ch, _d_ch, _i_ch, _ff_ch, _p_out, _p_sat = _pid_dbg.get(
-        "pitch", (0.0, 0.0, 0.0, 0.0, 0.0, False))
-    # Сырая цель уже не просит дальше в сторону интегратора — сброс.
-    pitch_integral = _sbros_integrala(pitch_integral, box_cy - CENTER_Y)
+    # --- PITCH: угол курса, не рамка ---
     _pitch_tek_pot, _ = svezhiy_tangazh(now_mono)
     _vyshe_potolka = _potolok_tangazha(_pitch_tek_pot, _pitch_pri_loke)
-    if _vyshe_potolka:
-        # Положительные P и I как раз опускают нос. Выше потолка их нет.
-        if _p_ch > 0.0:
-            _p_ch = 0.0
-        if pitch_integral > 0.0:
-            pitch_integral = 0.0
-    pitch_offset = PITCH_SIGN * (_p_ch + _d_ch + _ff_ch + pitch_integral)
-    if pitch_offset > MAX_PITCH_DEFLECT:
-        pitch_offset = MAX_PITCH_DEFLECT
-    elif pitch_offset < -MAX_PITCH_DEFLECT:
-        pitch_offset = -MAX_PITCH_DEFLECT
-    _pid_dbg["pitch"] = (_p_ch, _d_ch, pitch_integral, _ff_ch,
-                         pitch_offset, _p_sat)
+    if COLLISION_ENABLED:
+        # Нос держит угол, при котором цель перестаёт уезжать по вертикали.
+        # Пиксельный PID здесь не вызывается: он доворачивал нос на рамку,
+        # а высота при этом не снижалась.
+        pitch_integral = 0.0
+        col_p = 0.0
+        pitch_offset = _nos_na_kurs(
+            _los_skorost, _los_skorost_ts, _pitch_tek_pot, _pitch_pri_loke,
+            box_cy - CENTER_Y, now_mono, k)
+        _p_sat = abs(pitch_offset) >= PN_PITCH_PWM_MAX - 1e-6
+        _pid_dbg["pitch"] = (
+            pitch_offset, 0.0, _pn_nos_i * PN_PITCH_PWM_PER_DEG, 0.0,
+            pitch_offset, _p_sat)
+    else:
+        pitch_offset, prev_ady_ctrl, pitch_integral = _pid_axis_step(
+            ady_p, prev_ady_ctrl, pitch_integral,
+            target_vy_smoothed,
+            p_pitch_eff, D_GAIN_PITCH, i_pitch_eff, ff_pitch_eff,
+            PITCH_INTEGRAL_MAX, PITCH_INTEGRAL_DECAY,
+            PITCH_SIGN, MAX_PITCH_DEFLECT, dbg_key="pitch", k=k,
+        )
+        _p_ch, _d_ch, _i_ch, _ff_ch, _p_out, _p_sat = _pid_dbg.get(
+            "pitch", (0.0, 0.0, 0.0, 0.0, 0.0, False))
+        pitch_integral = _sbros_integrala(pitch_integral, box_cy - CENTER_Y)
+        if _vyshe_potolka:
+            if _p_ch > 0.0:
+                _p_ch = 0.0
+            if pitch_integral > 0.0:
+                pitch_integral = 0.0
+        pitch_offset = PITCH_SIGN * (_p_ch + _d_ch + _ff_ch + pitch_integral)
+        if pitch_offset > MAX_PITCH_DEFLECT:
+            pitch_offset = MAX_PITCH_DEFLECT
+        elif pitch_offset < -MAX_PITCH_DEFLECT:
+            pitch_offset = -MAX_PITCH_DEFLECT
+        _pid_dbg["pitch"] = (_p_ch, _d_ch, pitch_integral, _ff_ch,
+                             pitch_offset, _p_sat)
     # Поверх PID — launch boost и cruise. Они могут вытолкнуть target_pitch
     # за MAX_PITCH_DEFLECT, но финальный clamp 1000-2000 остаётся.
     # --- ДЕМПФИРОВАНИЕ ПО ГИРОСКОПУ ---
@@ -11887,47 +12056,61 @@ def _update_control_from_target_impl():
     # ДИАГНОСТИКА ANTI-WINDUP (см. пояснение у крена выше) — тот же
     # снимок pitch_offset * trust_k, что входит в combined_pitch ниже.
     _pid_dbg["pitch_after_trust"] = pitch_offset * trust_k
-    combined_pitch = (pitch_offset * trust_k + launch_pitch_pwm
-                      + cruise_pitch_pwm + rate_damp_pwm + col_p)
+    # На курсе столкновения тангаж — только удержание угла. Наклон по
+    # времени до контакта сюда не добавляется: это второй регулятор
+    # с другой целью на той же оси.
+    if COLLISION_ENABLED:
+        combined_pitch = pitch_offset * trust_k + rate_damp_pwm + col_p
+    else:
+        combined_pitch = (pitch_offset * trust_k + launch_pitch_pwm
+                          + cruise_pitch_pwm + rate_damp_pwm + col_p)
     target_pitch = max(1000, min(2000, 1500 + combined_pitch))
     # ЕДИНИЦЫ — offset, см. пояснение у крена выше.
     _pid_dbg["pitch_before_slew"] = target_pitch - 1500
 
-    # --- YAW: фильтр + ослабление при больших adx + I + FF с anti-windup ---
-    # Yaw не использует хелпер потому что error — это filtered_dx_yaw × yaw_weight,
-    # а I-добавка тоже взвешивается. Логика та же, но с весом.
-    filtered_dx_yaw += alpha_for_dt(YAW_FILTER_ALPHA, k) * (float(adx_y) - filtered_dx_yaw)
-    abs_adx = abs(adx_y)
-    if COLLISION_ENABLED or abs_adx < YAW_ROLL_CROSSOVER:
-        yaw_weight = 1.0
-    else:
-        yaw_weight = max(0.3, 1.0 - (abs_adx - YAW_ROLL_CROSSOVER) / max(YAW_ROLL_BLEND_RANGE, 1.0))
-
-    yaw_error_weighted = filtered_dx_yaw * yaw_weight
-    yaw_pd = yaw_error_weighted * P_GAIN_YAW
-    yaw_ff = _vx_ff * ff_yaw_eff * yaw_weight
-    # Почти в центре рыскание молчит. Иначе сразу после лока нос
-    # начинает гулять, рамка уезжает, и команда её догоняет.
-    if abs(adx_y) < YAW_QUIET_PX:
-        yaw_pd = 0.0
+    # --- YAW: за креном, не за рамкой ---
+    if COLLISION_ENABLED:
+        with state_lock:
+            _bank_y = app_state.get("fc_roll_deg")
+            _bank_y_ts = app_state.get("fc_pitch_ts", 0.0)
+        if (_bank_y is None or _bank_y_ts <= 0.0
+                or (now_mono - _bank_y_ts) > LAUNCH_ATT_TIMEOUT):
+            _bank_y = None
+        yaw_pd = _ryaskan_na_kurs(_bank_y, dx_raw)
         yaw_ff = 0.0
-        yaw_error_weighted = 0.0
-    yaw_total_unsat = YAW_SIGN * (yaw_pd + yaw_ff + yaw_integral)
-    yaw_sat_pos = yaw_total_unsat >= MAX_YAW_DEFLECT
-    yaw_sat_neg = yaw_total_unsat <= -MAX_YAW_DEFLECT
-    yaw_i_dir = YAW_SIGN * yaw_error_weighted
-    yaw_push_further = (yaw_sat_pos and yaw_i_dir > 0) or (yaw_sat_neg and yaw_i_dir < 0)
-    if adx_y != 0 and not yaw_push_further:
-        yaw_integral += yaw_error_weighted * I_GAIN_YAW * k
-        if yaw_integral > YAW_INTEGRAL_MAX:
-            yaw_integral = YAW_INTEGRAL_MAX
-        elif yaw_integral < -YAW_INTEGRAL_MAX:
-            yaw_integral = -YAW_INTEGRAL_MAX
-    yaw_integral *= YAW_INTEGRAL_DECAY ** k
-    if abs(adx_y) < YAW_QUIET_PX:
         yaw_integral = 0.0
-
-    yaw_offset = YAW_SIGN * (yaw_pd + yaw_ff + yaw_integral) * trust_k
+        yaw_error_weighted = 0.0
+        yaw_weight = 1.0
+        yaw_offset = yaw_pd * trust_k
+    else:
+        filtered_dx_yaw += alpha_for_dt(YAW_FILTER_ALPHA, k) * (float(adx_y) - filtered_dx_yaw)
+        abs_adx = abs(adx_y)
+        if abs_adx < YAW_ROLL_CROSSOVER:
+            yaw_weight = 1.0
+        else:
+            yaw_weight = max(0.3, 1.0 - (abs_adx - YAW_ROLL_CROSSOVER) / max(YAW_ROLL_BLEND_RANGE, 1.0))
+        yaw_error_weighted = filtered_dx_yaw * yaw_weight
+        yaw_pd = yaw_error_weighted * P_GAIN_YAW
+        yaw_ff = _vx_ff * ff_yaw_eff * yaw_weight
+        if abs(adx_y) < YAW_QUIET_PX:
+            yaw_pd = 0.0
+            yaw_ff = 0.0
+            yaw_error_weighted = 0.0
+        yaw_total_unsat = YAW_SIGN * (yaw_pd + yaw_ff + yaw_integral)
+        yaw_sat_pos = yaw_total_unsat >= MAX_YAW_DEFLECT
+        yaw_sat_neg = yaw_total_unsat <= -MAX_YAW_DEFLECT
+        yaw_i_dir = YAW_SIGN * yaw_error_weighted
+        yaw_push_further = (yaw_sat_pos and yaw_i_dir > 0) or (yaw_sat_neg and yaw_i_dir < 0)
+        if adx_y != 0 and not yaw_push_further:
+            yaw_integral += yaw_error_weighted * I_GAIN_YAW * k
+            if yaw_integral > YAW_INTEGRAL_MAX:
+                yaw_integral = YAW_INTEGRAL_MAX
+            elif yaw_integral < -YAW_INTEGRAL_MAX:
+                yaw_integral = -YAW_INTEGRAL_MAX
+        yaw_integral *= YAW_INTEGRAL_DECAY ** k
+        if abs(adx_y) < YAW_QUIET_PX:
+            yaw_integral = 0.0
+        yaw_offset = YAW_SIGN * (yaw_pd + yaw_ff + yaw_integral) * trust_k
 
     # Демпфирование рыскания по гироскопу — то же, что у тангажа и крена.
     #
@@ -12349,32 +12532,36 @@ def _update_control_from_target_impl():
         _final_dy0 = None
 
     _nos_do = target_pitch
-    target_pitch = _ogranich_nos(target_pitch, _geom_mode)
-    if target_pitch < _nos_do:
-        _slew_pitch = float(target_pitch)
-        if _geom_mode != _geom_mode_log:
-            try:
-                flight_log.event(
-                    "ТАНГАЖ: нос вниз ограничен %d -> %d (%s)"
-                    % (_nos_do, target_pitch, _geom_mode))
-            except Exception:
-                pass
+    # Эти потолки писались под прицел в центр рамки: он сам пикировал.
+    # Угол курса уже зажат относительно захвата, второй потолок его глушит.
+    if not COLLISION_ENABLED:
+        target_pitch = _ogranich_nos(target_pitch, _geom_mode)
+        if target_pitch < _nos_do:
+            _slew_pitch = float(target_pitch)
+            if _geom_mode != _geom_mode_log:
+                try:
+                    flight_log.event(
+                        "ТАНГАЖ: нос вниз ограничен %d -> %d (%s)"
+                        % (_nos_do, target_pitch, _geom_mode))
+                except Exception:
+                    pass
     # Потолок от угла захвата. Стик выше 1500 продолжает опускать нос
     # (~6 °/с, пока стик выше 1508). Выше потолка команда не опускает.
     if _vyshe_potolka and target_pitch > 1500:
         target_pitch = 1500
         _slew_pitch = 1500.0
-    # Крутой угол при ещё большой высоте. Стик выше 1500 продолжает
-    # опускать нос, и заход превращается в пикирование вместо снижения.
-    # Если нос уже ушёл ниже захвата, слегка отдаём его назад.
-    if _derzh_nos and target_pitch > 1500:
-        target_pitch = 1500
-        _slew_pitch = 1500.0
-    if (_derzh_nos and _pitch_tek_pot is not None and _pitch_pri_loke is not None
-            and _pitch_tek_pot > _pitch_pri_loke + PITCH_DERZH_LIHOK_DEG
-            and target_pitch > PITCH_DERZH_NAZAD_PWM):
-        target_pitch = PITCH_DERZH_NAZAD_PWM
-        _slew_pitch = float(PITCH_DERZH_NAZAD_PWM)
+    if not COLLISION_ENABLED:
+        # Крутой угол при ещё большой высоте. Стик выше 1500 продолжает
+        # опускать нос, и заход превращается в пикирование вместо снижения.
+        # Если нос уже ушёл ниже захвата, слегка отдаём его назад.
+        if _derzh_nos and target_pitch > 1500:
+            target_pitch = 1500
+            _slew_pitch = 1500.0
+        if (_derzh_nos and _pitch_tek_pot is not None and _pitch_pri_loke is not None
+                and _pitch_tek_pot > _pitch_pri_loke + PITCH_DERZH_LIHOK_DEG
+                and target_pitch > PITCH_DERZH_NAZAD_PWM):
+            target_pitch = PITCH_DERZH_NAZAD_PWM
+            _slew_pitch = float(PITCH_DERZH_NAZAD_PWM)
 
     # --- ПРЕДЕЛ СКОРОСТИ СНИЖЕНИЯ ---
     #
@@ -12417,6 +12604,7 @@ def _update_control_from_target_impl():
     # борту это выглядело так: лока нет, лупа пропадает, весь оверлей
     # исчезает — потому что исключение случалось ДО отрисовки. Пока ветки
     # заканчивались каждая по-своему, четвёртый закон повторил бы это снова.
+    _cel_gaz = None
     if OVERRIDE_THROTTLE:
         max_adj = max(30.0, base_thr * THROTTLE_PERCENT / 100.0)
         thr_adjust = max(-max_adj, min(max_adj, thr_adjust))
@@ -12431,12 +12619,29 @@ def _update_control_from_target_impl():
         target_throttle = max(THROTTLE_MIN_PWM,
                               min(THROTTLE_MAX_PWM, target_throttle))
 
+        # Закон высоты: снижение = высота / время, вокруг висения.
+        # Пока он может посчитать цель, геометрия и срез его не перебивают —
+        # иначе они каждый кадр возвращают ручку к висению, и закон
+        # успевает сдвинуться только на один шаг.
+        if _hover_pwm is not None:
+            with state_lock:
+                _alt_pv_syroy = app_state.get("alt_cm")
+                _var_pv = app_state.get("vario_cms")
+                _var_pv_ts = app_state.get("alt_ts", 0.0)
+            _alt_pv = None if _alt_pv_syroy is None else float(_alt_pv_syroy) / 100.0
+            if not _var_pv_ts or (now_mono - _var_pv_ts) > VARIO_FRESH_S:
+                _var_pv = None
+            if (_tracked_since_t is not None
+                    and (now_mono - _tracked_since_t) >= 1.0):
+                _cel_gaz = _gaz_po_vysote(
+                    _hover_pwm, _alt_pv, _tau_now, _var_pv)
+
         # Пол висения и геометрическая убавка применяются ПОСЛЕ процентного
         # окна. Окно в 15% как раз и держало ручку в 1-5%: перелёт оно
         # выбрать не могло, а стик ниже висения поднять не имело права.
         # Сглаживатель хвоста каждый кадр тянет команду обратно к стику,
         # поэтому навязанное значение пишется и в него, иначе пол не удержится.
-        if _geom_goal is not None:
+        if _cel_gaz is None and _geom_goal is not None:
             skorost = (THR_GEOM_SLEW_STEEP if _geom_mode == "steep"
                        else THR_GEOM_SLEW_OVERSHOOT)
             _thr_geom_out = _podtyanut_gaz(
@@ -12448,7 +12653,7 @@ def _update_control_from_target_impl():
                 _thr_geom_out = float(target_throttle)
             target_throttle = int(round(_thr_geom_out))
             smooth_throttle_out = float(target_throttle)
-        elif (_hover_pwm is not None
+        elif (_cel_gaz is None and _hover_pwm is not None
                 and target_throttle < float(_hover_pwm)):
             # Стик ниже ровного висения поднимаем до него. Наклон носа
             # сюда не входит: из-за него моторы раскручивались перед целью.
@@ -12457,7 +12662,7 @@ def _update_control_from_target_impl():
                 float(_hover_pwm), THR_GEOM_SLEW_STEEP, k)
             target_throttle = int(round(_thr_geom_out))
             smooth_throttle_out = float(target_throttle)
-        else:
+        elif _cel_gaz is None:
             _thr_geom_out = None
         target_throttle = max(THROTTLE_MIN_PWM,
                               min(THROTTLE_MAX_PWM, target_throttle))
@@ -12496,8 +12701,9 @@ def _update_control_from_target_impl():
     # Сброс заранее: дальность, время, угол от захвата или просадка.
     # Геометрия висения выше по коду может этот газ поднимать — здесь
     # потолок её перебивает, иначе стик захвата 1548–1560 так и доезжает
-    # до цели и высота растёт.
-    if OVERRIDE_THROTTLE:
+    # до цели и высота растёт. Закон высоты этот срез не пускает:
+    # далеко от цели он сажал борт в пол.
+    if OVERRIDE_THROTTLE and _cel_gaz is None:
         _srez_cel = _srez_gaza(
             base_thr,
             closure.get("range_m") if isinstance(closure, dict) else None,
@@ -12528,6 +12734,33 @@ def _update_control_from_target_impl():
         global_pitch_cmd = target_pitch
         global_yaw_cmd = target_yaw
         global_throttle_cmd = target_throttle
+
+    # Газ по высоте и времени. Старые пороги и геометрия выше посчитаны,
+    # но если есть висение, высота и вменяемое время — команда эта, а не они.
+    # Иначе снова срез до 1200 далеко от цели или стик захвата до самого конца.
+    if OVERRIDE_THROTTLE and _hover_pwm is not None:
+        with state_lock:
+            _alt_pv_syroy = app_state.get("alt_cm")
+            _var_pv = app_state.get("vario_cms")
+            _var_pv_ts = app_state.get("alt_ts", 0.0)
+        _alt_pv = None if _alt_pv_syroy is None else float(_alt_pv_syroy) / 100.0
+        if not _var_pv_ts or (now_mono - _var_pv_ts) > VARIO_FRESH_S:
+            _var_pv = None
+        _zrel_gaz = (_tracked_since_t is not None
+                     and (now_mono - _tracked_since_t) >= 1.0)
+        _cel_gaz = (_gaz_po_vysote(_hover_pwm, _alt_pv, _tau_now, _var_pv)
+                    if _zrel_gaz else None)
+        if _cel_gaz is not None:
+            _thr_geom_out = _podtyanut_gaz(
+                _thr_geom_out if _thr_geom_out is not None else target_throttle,
+                _cel_gaz, THR_GEOM_SLEW_OVERSHOOT, k)
+            target_throttle = int(round(_thr_geom_out))
+            target_throttle = max(THROTTLE_MIN_PWM,
+                                  min(THROTTLE_MAX_PWM, target_throttle))
+            smooth_throttle_out = float(target_throttle)
+            global_throttle_cmd = target_throttle
+            with state_lock:
+                app_state["dyn_throttle"] = target_throttle
 
     # Снимок для лога. Собирается здесь, потому что это единственное место, где
     # видны все промежуточные величины сразу; снаружи их уже не восстановить.

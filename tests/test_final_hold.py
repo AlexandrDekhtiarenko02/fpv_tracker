@@ -46,7 +46,7 @@ _clk = _Chasy()
 t.time.monotonic = _clk.monotonic
 
 
-def zahod(rost, dy_px):
+def zahod(rost, dy_px, pitch=20.0):
     """Кадр захода: рамка выросла в rost раз, цель смещена на dy_px."""
     _clk.tick()  # один кадр = один шаг часов
     # Размер при захвате — в координатах lores, коробка — в координатах кадра.
@@ -60,8 +60,9 @@ def zahod(rost, dy_px):
     with t.state_lock:
         t.app_state["rc_throttle"] = 1450
         t.app_state["rc_throttle_ts"] = t.time.monotonic()
-        t.app_state["fc_pitch_deg"] = 20.0
+        t.app_state["fc_pitch_deg"] = pitch
         t.app_state["fc_pitch_ts"] = t.time.monotonic()
+        t.app_state["fc_roll_deg"] = 0.0
         t.app_state["alt_cm"] = 3000
         t.app_state["alt_ts"] = t.time.monotonic()
         t.app_state["gyro"] = (0, 0, 0)
@@ -87,14 +88,23 @@ def derzhi_finala(rost, dy_px=0):
 
 
 t._final_zamorozhen = False
-print("=== 1. До порога контур рулит: команда следует за ошибкой ===")
-komandy = []
-for dy in (0, 40, -40):
-    p, _r = zahod(rost=1.5, dy_px=dy)
-    komandy.append(p)
-    print("    рост 1.5, смещение %+3d px -> тангаж %d" % (dy, p))
-assert len(set(komandy)) > 1, (
-    "команда не меняется при разной ошибке — контур не рулит там, где должен")
+print("=== 1. До порога контур рулит по углу, рамка около центра молчит ===")
+for _ in range(5):
+    zahod(rost=1.5, dy_px=0, pitch=20.0)
+na_ugle, _ = zahod(rost=1.5, dy_px=0, pitch=20.0)
+u_ramki, _ = zahod(rost=1.5, dy_px=40, pitch=20.0)
+nizhe = None
+for _ in range(8):
+    nizhe, _ = zahod(rost=1.5, dy_px=0, pitch=12.0)
+vyshe = None
+for _ in range(8):
+    vyshe, _ = zahod(rost=1.5, dy_px=0, pitch=28.0)
+print("    на угле %d, рамка +40 px %d, нос выше курса %d, нос ниже %d"
+      % (na_ugle, u_ramki, nizhe, vyshe))
+assert abs(na_ugle - u_ramki) <= 8, (
+    "рамка в 40 px сдвинула тангаж: курс снова ведёт коробка")
+assert nizhe > 1520, "нос выше курса, а стик его не опускает: %s" % nizhe
+assert vyshe < 1480, "нос ниже курса, а стик его не поднимает: %s" % vyshe
 
 print("\n=== 2. За порогом команда замирает (после подтверждения по времени) ===")
 t._final_zamorozhen = False
@@ -175,8 +185,8 @@ print("\n=== 4. Выключается штатно ===")
 t.FINAL_HOLD_ENABLED = False
 t._final_zamorozhen = False
 t.lock_w0 = t.lock_h0 = 20.0
-a, _ = zahod(rost=t.FINAL_HOLD_ROST + 2.0, dy_px=0)
-b, _ = zahod(rost=t.FINAL_HOLD_ROST + 2.0, dy_px=80)
+a, _ = zahod(rost=t.FINAL_HOLD_ROST + 2.0, dy_px=0, pitch=20.0)
+b, _ = zahod(rost=t.FINAL_HOLD_ROST + 2.0, dy_px=0, pitch=10.0)
 t.FINAL_HOLD_ENABLED = True
 print("    при выключенной заморозке команда снова меняется: %d -> %d" % (a, b))
 assert a != b, "выключатель не работает"
@@ -237,8 +247,8 @@ t._slew_pitch = 1500.0
 t.pitch_integral = 0.0
 t.prev_ady_ctrl = 0.0
 t._pitch_pri_loke = None
-a, _ = zahod(rost=1.3, dy_px=0)
-b, _ = zahod(rost=1.3, dy_px=60)
+a, _ = zahod(rost=1.3, dy_px=0, pitch=20.0)
+b, _ = zahod(rost=1.3, dy_px=0, pitch=10.0)
 print("    после снятия команда снова меняется: %d -> %d" % (a, b))
 assert a != b, "новый заход всё ещё заморожен"
 

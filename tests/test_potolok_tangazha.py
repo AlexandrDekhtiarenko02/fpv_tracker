@@ -97,4 +97,143 @@ uroven = t._kren_k_gorizontu(100.0, 15.0)
 assert uroven < 0.0, uroven
 assert t._kren_k_gorizontu(0.0, 0.0) == 0.0
 assert t._kren_k_gorizontu(100.0, None) == 20.0
+
+print("=== 8. Тангаж держит угол курса, не рамку ===")
+t._pn_nos_i = 0.0
+t._pn_nos_tek = None
+# Угол растёт, нос ещё на захвате: стик опускает нос, но не в упор.
+pwm_n = t._nos_na_kurs(2.5, now, 12.0, 12.0, 0.0, now, 1.0)
+assert 0 < pwm_n <= t.PN_PITCH_PWM_MAX, pwm_n
+# Нос уже на желаемом: стик отпущен. Рамка в 10 px ничего не добавляет.
+zhel_n = 12.0 + t.PN_PITCH_DEG_PER_DPS * (2.5 - t.LOS_RATE_DEADBAND_DPS)
+t._pn_nos_i = 0.0
+t._pn_nos_tek = zhel_n
+derzh_n = t._nos_na_kurs(2.5, now, zhel_n, 12.0, 0.0, now, 1.0)
+assert abs(derzh_n) < 8.0, derzh_n
+t._pn_nos_i = 0.0
+t._pn_nos_tek = zhel_n
+u_centra_n = t._nos_na_kurs(2.5, now, zhel_n, 12.0, 10.0, now, 1.0)
+assert abs(u_centra_n - derzh_n) < 1.0, (u_centra_n, derzh_n)
+# Добор не больше 10° от захвата.
+assert t.PN_PITCH_FROM_LOCK_MAX <= t.PITCH_POTOLK_DEG + 1e-6
+
+print("=== 9. Рыскание молчит без крена и цели у края ===")
+assert t._ryaskan_na_kurs(0.0, 10.0) == 0.0
+assert t._ryaskan_na_kurs(2.0, 20.0) == 0.0
+v_kren = t._ryaskan_na_kurs(10.0, 0.0)
+assert 0 < v_kren <= t.YAW_BANK_PWM_MAX, v_kren
+assert t._ryaskan_na_kurs(-10.0, 0.0) == -v_kren
+# Край кадра добавляет немного, не разворот.
+kray = t._ryaskan_na_kurs(0.0, 120.0)
+assert 0 < kray <= t.YAW_LEASH_MAX, kray
+
+print("=== 10. Газ снижает так, чтобы высота кончилась вместе с дальностью ===")
+# 40 м / 10 с = 4 м/с. Вариометра нет — газ ниже висения, не в пол.
+g = t._gaz_po_vysote(1500, 40.0, 10.0, None)
+assert g is not None and 1500 - t.GAZ_NIZHE_MAX <= g < 1500, g
+# Уже снижаемся как надо — газ на висении.
+rovno = t._gaz_po_vysote(1500, 40.0, 10.0, -400.0)
+assert abs(rovno - 1500) < 1.0, rovno
+# Снижаемся быстрее, чем нужно — не выше висения.
+vyshe = t._gaz_po_vysote(1500, 40.0, 10.0, -900.0)
+assert vyshe <= 1500.0, vyshe
+# Мусорное время закон не включает.
+assert t._gaz_po_vysote(1500, 40.0, 0.2, 0.0) is None
+assert t._gaz_po_vysote(1500, 40.0, None, 0.0) is None
+
+print("=== 11. Живой контур отдаёт закон, а не старый потолок ===")
+# Высоко и круто старый код зажимал тангаж в 1500 и добавлял чужой наклон.
+# Здесь нос ещё на угле захвата, угол визирования растёт на 2.5 °/с,
+# высота 40 м, время 10 с, снижения нет.
+
+
+class _Chasy:
+    def __init__(self):
+        self.t = 8000.0
+
+    def monotonic(self):
+        return self.t
+
+    def tick(self):
+        self.t += 1.0 / 30.0
+
+
+_clk = _Chasy()
+_vremya = t.time.monotonic
+_zamena = t._estimate_closure
+t.time.monotonic = _clk.monotonic
+_dep = {"v": 25.0}
+
+
+def _podmena(*a, **kw):
+    out = dict(_zamena(*a, **kw))
+    _dep["v"] += 2.5 / 30.0
+    out["tau_s"] = 10.0
+    out["depression_deg"] = _dep["v"]
+    out["range_m"] = 200.0
+    out["tau_sigma_s"] = 0.2
+    return out
+
+
+t._estimate_closure = _podmena
+CX, CY = t.CENTER_X, t.CENTER_Y
+with t.state_lock:
+    t.target_controllable = False
+    t.target_box_main = None
+t.update_control_from_target()
+t._dep_hist.clear()
+t._hover_pwm = 1500.0
+t._thr_geom_out = None
+t._gyro_y_sgl = 0.0
+t._az_skorost = 0.0
+t._az_skorost_ts = 0.0
+t._pn_bank_i = 0.0
+t._pn_bank_tek = 0.0
+t._pn_nos_i = 0.0
+t._pn_nos_tek = None
+
+
+def _kadr(pitch=20.0, roll=0.0, dx=0.0):
+    t.target_box_main = (CX - 20 + dx, CY - 20, CX + 20 + dx, CY + 20)
+    t.target_controllable = True
+    t.target_visible = True
+    t.last_match_score = 0.9
+    t._match_dbg = {"psr": 6.0}
+    t.lock_w0 = t.lock_h0 = 40.0
+    with t.state_lock:
+        t.app_state["rc_throttle"] = 1500
+        t.app_state["rc_throttle_ts"] = _clk.t
+        t.app_state["fc_pitch_deg"] = pitch
+        t.app_state["fc_pitch_ts"] = _clk.t
+        t.app_state["fc_roll_deg"] = roll
+        t.app_state["alt_cm"] = 4000
+        t.app_state["alt_ts"] = _clk.t
+        t.app_state["vario_cms"] = 0
+        t.app_state["gyro"] = (0.0, 0.0, 0.0)
+        t.app_state["imu_ts"] = _clk.t
+        t.app_state["armed"] = False
+    _clk.tick()
+    t.update_control_from_target()
+
+
+for _ in range(90):
+    _kadr(pitch=20.0, roll=0.0, dx=0.0)
+print("    тангаж %s рыскание %s газ %s крен %s" % (
+    t.global_pitch_cmd, t.global_yaw_cmd, t.global_throttle_cmd,
+    t.global_roll_cmd))
+# Потолок перелёта старого кода — 1550. Угол курса просит больше.
+assert t.global_pitch_cmd >= 1560, t.global_pitch_cmd
+# Без крена и без цели у края нос не крутим.
+assert abs(t.global_yaw_cmd - 1500) <= 2, t.global_yaw_cmd
+# 40 м / 10 с = 4 м/с, снижения нет: 1500 − 4×25 = 1400. Не в пол и не выше висения.
+assert 1370 <= t.global_throttle_cmd <= 1430, t.global_throttle_cmd
+for _ in range(6):
+    _kadr(pitch=20.0, roll=12.0, dx=0.0)
+print("    крен %s при банке +12, рыскание %s" % (
+    t.global_roll_cmd, t.global_yaw_cmd))
+# Крен выравнивает крыло. Рыскание идёт за банком, не против него.
+assert t.global_roll_cmd < 1480, t.global_roll_cmd
+assert t.global_yaw_cmd > 1510, t.global_yaw_cmd
+t.time.monotonic = _vremya
+t._estimate_closure = _zamena
 print("ok")
