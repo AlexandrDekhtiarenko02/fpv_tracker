@@ -71,7 +71,8 @@ t._pn_bank_tek = 0.0
 pwm = t._kren_na_kurs(4.0, now, 0.0, 0.0, now, 1.0)
 assert 0 < pwm <= t.PN_ROLL_BANK_SLEW / t.NOMINAL_FPS * t.PN_ROLL_PWM_PER_DEG + 1.0, pwm
 # Крен уже равен желаемому: ручка отпущена, рамка у центра ничего не добавляет.
-zhel = t.PN_ROLL_BANK_PER_DPS * (4.0 - t.LOS_AZ_DEADBAND_DPS)
+zhel = t.PN_ROLL_BANK_PER_DPS * (4.0 - t.PN_ROLL_AZ_DEADBAND_DPS)
+zhel = max(-t.PN_ROLL_BANK_MAX, min(t.PN_ROLL_BANK_MAX, zhel))
 t._pn_bank_i = 0.0
 t._pn_bank_tek = zhel
 derzhit = t._kren_na_kurs(4.0, now, zhel, 0.0, now, 1.0)
@@ -87,6 +88,35 @@ povodok = t._kren_na_kurs(0.0, now, 0.0, 160.0, now, 1.0)
 assert 0 < povodok < 50.0, povodok
 # Без крена с полётника стик молчит.
 assert t._kren_na_kurs(4.0, now, None, 0.0, now, 1.0) == 0.0
+# Далёкий ровный увод: крен есть и набирается плавно, но не в потолок.
+# Шум ниже мёртвой зоны крен не растит.
+t._pn_bank_i = 0.0
+t._pn_bank_tek = 0.0
+now_d = now
+shag = t.PN_ROLL_BANK_SLEW / t.NOMINAL_FPS + 1e-6
+pred = 0.0
+for _ in range(int(8 * t.NOMINAL_FPS)):
+    now_d += 1.0 / t.NOMINAL_FPS
+    t._kren_na_kurs(0.8, now_d, 0.0, 0.0, now_d, 1.0)
+    assert abs(t._pn_bank_tek - pred) <= shag
+    pred = t._pn_bank_tek
+assert 4.0 <= t._pn_bank_tek <= 12.0, t._pn_bank_tek
+t._pn_bank_i = 0.0
+t._pn_bank_tek = 0.0
+now_n = now
+for _ in range(int(8 * t.NOMINAL_FPS)):
+    now_n += 1.0 / t.NOMINAL_FPS
+    t._kren_na_kurs(0.15, now_n, 0.0, 0.0, now_n, 1.0)
+assert abs(t._pn_bank_tek) < 1.0, t._pn_bank_tek
+# Быстрый азимут упирается в прежний потолок, не выше.
+t._pn_bank_i = 0.0
+t._pn_bank_tek = 0.0
+now_b = now
+for _ in range(int(4 * t.NOMINAL_FPS)):
+    now_b += 1.0 / t.NOMINAL_FPS
+    t._kren_na_kurs(4.0, now_b, 0.0, 0.0, now_b, 1.0)
+assert abs(t._pn_bank_tek) <= t.PN_ROLL_BANK_MAX + 1e-6
+assert t._pn_bank_tek > 18.0, t._pn_bank_tek
 assert t.FF_GAIN_ROLL == 0.0
 assert t.ROLL_LEAD_S >= 0.4 - 1e-9
 assert t.LEAD_FRAMES == 8
