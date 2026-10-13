@@ -1224,6 +1224,7 @@ _auto_tref_total_count = 0
 #
 # Здесь оверрайд не включается вовсе. Заодно это гарантия безопасности: машина
 # физически не может вмешаться в управление, пока пилот заходит на цель.
+# Включается из меню Tools → Pilot log, настройка остаётся после перезапуска.
 OBSERVE_ONLY = False
 
 OVERRIDE_ROLL = True
@@ -10572,6 +10573,8 @@ def _menu_derevo():
             {"imya": "Restart", "dejstvie": _menu_perezapusk},
             {"imya": "Record", "dejstvie": _menu_zapis,
              "get": lambda: "on" if RECORD_FRAMES else "off"},
+            {"imya": "Pilot log", "dejstvie": _menu_pilot,
+             "get": lambda: "on" if OBSERVE_ONLY else "off"},
             {"imya": "Clear logs", "dejstvie": _menu_ochistit_logi},
             {"imya": "Wi-Fi", "deti": _menu_wifi_deti},
         ]},
@@ -10726,6 +10729,27 @@ def _menu_zapis():
     except Exception:
         pass
     return "record on" if RECORD_FRAMES else "record off"
+
+
+def _menu_pilot():
+    """Режим сбора: трекер пишет лог, пилот рулит сам.
+
+    Оверрайд не включается вовсе — см. OBSERVE_ONLY. Настройка остаётся
+    после перезапуска. Перед обычным вылетом выключить.
+    """
+    global OBSERVE_ONLY
+    if not _menu_mozhno():
+        return "armed"
+    OBSERVE_ONLY = not bool(OBSERVE_ONLY)
+    try:
+        _sohranit_nastroiku("OBSERVE_ONLY", True if OBSERVE_ONLY else False)
+    except Exception:
+        pass
+    try:
+        flight_log.event("РЕЖИМ ПИЛОТА: %s" % ("вкл" if OBSERVE_ONLY else "выкл"))
+    except Exception:
+        pass
+    return "pilot on" if OBSERVE_ONLY else "pilot off"
 
 
 def _menu_nmcli(argv, timeout=20):
@@ -13990,6 +14014,21 @@ _metka_t0 = None
 _metka_bylo_vidno = False
 
 
+def _narisovat_pilot(frame):
+    """Метка режима сбора. В очках должно быть видно, что борт не рулит."""
+    try:
+        h, w = frame.shape[0], frame.shape[1]
+        tekst = "PILOT"
+        x = int(w * 0.04)
+        y = int(h * 0.12)
+        cv2.putText(frame, tekst, (x, y), cv2.FONT_HERSHEY_PLAIN,
+                    1.6, COLOR_BLACK, 3, cv2.LINE_AA)
+        cv2.putText(frame, tekst, (x, y), cv2.FONT_HERSHEY_PLAIN,
+                    1.6, COLOR_YELLOW, 1, cv2.LINE_AA)
+    except Exception:
+        pass
+
+
 def draw_overlay_on_frame(frame):
     global _metka_t0, _metka_bylo_vidno
     with state_lock:
@@ -14026,6 +14065,8 @@ def draw_overlay_on_frame(frame):
     # отчёт, окажись он раньше.
     draw_sensor_report(frame)
     draw_control_state(frame)
+    if OBSERVE_ONLY:
+        _narisovat_pilot(frame)
     _narisovat_hover_test(frame)
     _narisovat_menu(frame)
 
