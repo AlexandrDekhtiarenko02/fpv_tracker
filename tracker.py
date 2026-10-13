@@ -1341,6 +1341,10 @@ CMD_SLEW_PWM_PER_S = 1200.0
 # выше номинального шага при 24 к/с (50), поэтому на ровном ходу ограничитель
 # работает как прежде, а длинный кадр больше не даёт права на ступеньку.
 CMD_SLEW_MAX_STEP = 55.0
+# Крен отдельно. Общий предел 55 ШИМ за кадр пропускал скачки 30–70:
+# шум скорости цели через feedforward сразу оказывался на стике.
+ROLL_SLEW_PWM_PER_S = 280.0
+ROLL_SLEW_MAX_STEP = 14.0
 # Тангаж ведём мягче остальных осей: именно на нём видны рывки, и именно он
 # отвечает за прицеливание, где резкость ничего не даёт. 700 PWM/с — это 29
 # PWM за кадр при 24 к/с, то есть от центра до края (200) за 0.29 с. Замерено,
@@ -1572,9 +1576,11 @@ LEAD_VEL_ALPHA = 0.06
 # Зато упреждение ему нужнее всего: цель уходит вбок, и доворот по факту
 # ошибки всегда опаздывает.
 #
-# 0.20 при номинале 30 к/с — постоянная 0.15 с, срез около 1.1 Гц. Снос
-# проходит почти целиком, и упреждение снова становится величиной, а не нулём.
-ROLL_LEAD_VEL_ALPHA = 0.20
+# 0.08 при номинале 30 к/с — постоянная около 0.4 с. Одиночный скачок
+# рамки не доходит до стика, устойчивый снос цели проходит и даёт упреждение.
+ROLL_LEAD_VEL_ALPHA = 0.08
+# Медленнее этого сноса feedforward крена молчит: это дрожание рамки, не ход цели.
+ROLL_FF_VEL_DEAD = 0.25
 # Если межкадровая скорость больше этого порога (px/кадр) — кадр считается
 # глитчем (re-lock / occlusion) и не идёт в фильтр.
 LEAD_MAX_VEL_JUMP = 25.0 * TRACK_SCALE
@@ -2150,9 +2156,9 @@ COLLISION_ENABLED = True
 COLLISION_PITCH_PIXEL = 0.40
 COLLISION_ROLL_PIXEL = 0.20
 COLLISION_PITCH_PWM_DPS = 8.0
-COLLISION_ROLL_PWM_DPS = 12.0
+COLLISION_ROLL_PWM_DPS = 6.0
 COLLISION_PITCH_MAX = 35.0
-COLLISION_ROLL_MAX = 70.0
+COLLISION_ROLL_MAX = 28.0
 
 # --- ПРЕДЕЛ СКОРОСТИ СНИЖЕНИЯ ---
 # Страховка от проваливания, а не регулятор: односторонняя и с мёртвой зоной,
@@ -2227,16 +2233,23 @@ THR_DESCEND_FRACTION = 0.90
 THR_LOS_FULL_DPS = 1.8
 THR_GEOM_SLEW_OVERSHOOT = 200.0   # ШИМ/с, перелёт. 80 не успевало: борт набирал высоту
 THR_GEOM_SLEW_STEEP = 300.0       # ШИМ/с, близко и высоко
-# Близко и высоко: короткая дальность по земле при ещё большой высоте
-# и крутом угле. Пологий дальний заход сюда не попадает.
-THR_STEEP_ALT_M = 12.0
-THR_STEEP_RANGE_M = 45.0
-THR_STEEP_DEPRESSION_DEG = 30.0
-# Нос вниз (ШИМ выше 1500) в этих режимах ограничен. Крутой заход — небольшой
-# доворот. Перелёт пропускает поправку прицела, но не полный клевок: упор
-# в 70 ШИМ на вылете уводил тангаж к 50–70° и срывал рамку.
-PITCH_STEEP_MAX_PWM = 40
+# Близко и высоко: короткая дальность по земле при ещё большой высоте.
+# Раньше порог был 45 м и 30° — к этому моменту нос уже стоял на 35–40°,
+# а высота ещё не падала. Дальность считается из высоты и угла, не из
+# шумной оценки tau.
+THR_STEEP_ALT_M = 25.0
+THR_STEEP_RANGE_M = 140.0
+THR_STEEP_DEPRESSION_DEG = 20.0
+# В крутом заходе нос вниз не добавляем совсем: высоту снимает газ.
+# Перелёт пропускает небольшой доворот, но не клевок.
+PITCH_STEEP_MAX_PWM = 0
 PITCH_OVERSHOOT_MAX_PWM = 50
+# Угол уже крутой, даже если до 140 м ещё лететь: нос дальше не опускаем.
+# Иначе на подходе он набирает те самые +15° вместо снижения.
+PITCH_DERZH_ALT_M = 25.0
+PITCH_DERZH_DEP_DEG = 20.0
+PITCH_DERZH_LIHOK_DEG = 4.0
+PITCH_DERZH_NAZAD_PWM = 1485
 # Выше тангажа захвата на столько градусов нос дальше не опускаем.
 # На удачных заходах угол не рос после лока. На остальных стик стоял
 # выше 1500 и угол набирал ~6 °/с, пока не доходил до 50–60°.
@@ -9712,7 +9725,11 @@ def _narisovat_hover_test(frame):
 
 
 def _blizko_i_vysoko(dep_deg, range_m, alt_m):
-    """Короткая дальность по земле при ещё большой высоте и крутом угле."""
+    """Короткая дальность по земле при ещё большой высоте.
+
+    Дальность, если её не передали, берётся из высоты и угла. Пологий
+    дальний заход сюда не попадает: там угол маленький и частное большое.
+    """
     if dep_deg is None or alt_m is None:
         return False
     if float(alt_m) < THR_STEEP_ALT_M:
@@ -9722,6 +9739,19 @@ def _blizko_i_vysoko(dep_deg, range_m, alt_m):
     if range_m is None:
         range_m = float(alt_m) / math.tan(math.radians(float(dep_deg)))
     return float(range_m) <= THR_STEEP_RANGE_M
+
+
+def _derzhat_nos(dep_deg, alt_m):
+    """Угол на цель уже крутой и высота ещё есть — нос дальше не опускаем.
+
+    Снижение в этом случае делает газ, когда дальность станет короткой.
+    Пока она ещё сотни метров, дополнительный тангаж только задирает
+    пикирование, а высота стоит.
+    """
+    if dep_deg is None or alt_m is None:
+        return False
+    return (float(alt_m) >= PITCH_DERZH_ALT_M
+            and float(dep_deg) >= PITCH_DERZH_DEP_DEG)
 
 
 def _sbros_integrala(integral, dy_raw):
@@ -11589,9 +11619,12 @@ def _update_control_from_target_impl():
         adx_y = _kadr_oshibka(dx_aim - los_aim_x_px, DEADBAND_X)
 
     dx_raw = box_cx - CENTER_X
+    _vx_ff = target_vx_smoothed
+    if abs(_vx_ff) < ROLL_FF_VEL_DEAD:
+        _vx_ff = 0.0
     roll_offset, prev_adx, roll_integral = _pid_axis_step(
         adx_r, prev_adx, roll_integral,
-        target_vx_smoothed,
+        _vx_ff,
         p_roll_eff, D_GAIN_ROLL, i_roll_eff, ff_roll_eff,
         ROLL_INTEGRAL_MAX, ROLL_INTEGRAL_DECAY,
         ROLL_SIGN, MAX_ROLL_DEFLECT, dbg_key="roll", k=k,
@@ -11842,7 +11875,8 @@ def _update_control_from_target_impl():
         # нынешнем запасе в 39° фильтр с постоянной 0.12 с забрал бы его
         # целиком — вместо мягкости вышла бы раскачка.
         shag_p = min(PITCH_SLEW_PWM_PER_S * _dolya, PITCH_SLEW_MAX_STEP)
-        _slew_roll = _ogranich_skorost(_slew_roll, target_roll, shag)
+        shag_r = min(ROLL_SLEW_PWM_PER_S * _dolya, ROLL_SLEW_MAX_STEP)
+        _slew_roll = _ogranich_skorost(_slew_roll, target_roll, shag_r)
         _slew_pitch = _ogranich_skorost(_slew_pitch, target_pitch, shag_p)
         _slew_yaw = _ogranich_skorost(_slew_yaw, target_yaw, shag)
         target_roll = int(round(_slew_roll))
@@ -11863,12 +11897,14 @@ def _update_control_from_target_impl():
     _geom_mode = None
     _geom_goal = None
     _los_g = None
+    _derzh_nos = False
     if isinstance(closure, dict):
         with state_lock:
             _alt_g = app_state.get("alt_cm")
         _alt_m = None if _alt_g is None else float(_alt_g) / 100.0
         _steep = _blizko_i_vysoko(
             closure.get("depression_deg"), closure.get("range_m"), _alt_m)
+        _derzh_nos = _derzhat_nos(closure.get("depression_deg"), _alt_m)
         _los_g = None
         if (_los_skorost_ts > 0.0
                 and (now_mono - _los_skorost_ts) <= LOS_RATE_STALE_S):
@@ -12190,6 +12226,17 @@ def _update_control_from_target_impl():
     if _vyshe_potolka and target_pitch > 1500:
         target_pitch = 1500
         _slew_pitch = 1500.0
+    # Крутой угол при ещё большой высоте. Стик выше 1500 продолжает
+    # опускать нос, и заход превращается в пикирование вместо снижения.
+    # Если нос уже ушёл ниже захвата, слегка отдаём его назад.
+    if _derzh_nos and target_pitch > 1500:
+        target_pitch = 1500
+        _slew_pitch = 1500.0
+    if (_derzh_nos and _pitch_tek_pot is not None and _pitch_pri_loke is not None
+            and _pitch_tek_pot > _pitch_pri_loke + PITCH_DERZH_LIHOK_DEG
+            and target_pitch > PITCH_DERZH_NAZAD_PWM):
+        target_pitch = PITCH_DERZH_NAZAD_PWM
+        _slew_pitch = float(PITCH_DERZH_NAZAD_PWM)
 
     # --- ПРЕДЕЛ СКОРОСТИ СНИЖЕНИЯ ---
     #

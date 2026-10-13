@@ -73,9 +73,16 @@ print("    круто и высоко — снижение, полого — н�
 print("\n=== 5. Нос вниз ограничен ===")
 assert t._ogranich_nos(1700, "steep") == 1500 + t.PITCH_STEEP_MAX_PWM
 assert t._ogranich_nos(1700, "overshoot") == 1500 + t.PITCH_OVERSHOOT_MAX_PWM
-assert t._ogranich_nos(1520, "steep") == 1520
+assert t._ogranich_nos(1520, "steep") == 1500
 assert t._ogranich_nos(1700, None) == 1700
 assert t.PITCH_STEEP_MAX_PWM < t.PITCH_OVERSHOOT_MAX_PWM < t.MAX_PITCH_DEFLECT
+# 80 м и 35° — около 114 м по земле, уже снижаться, а не клевать носом.
+assert t._blizko_i_vysoko(35.0, None, 80.0)
+# 80 м и 15° — ещё далеко.
+assert not t._blizko_i_vysoko(15.0, None, 80.0)
+assert t._derzhat_nos(25.0, 80.0)
+assert not t._derzhat_nos(12.0, 80.0)
+assert not t._derzhat_nos(25.0, 10.0)
 print("    круто %d, перелёт %d" % (
     1500 + t.PITCH_STEEP_MAX_PWM, 1500 + t.PITCH_OVERSHOOT_MAX_PWM))
 
