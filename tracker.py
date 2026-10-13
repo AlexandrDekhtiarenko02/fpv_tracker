@@ -2207,6 +2207,7 @@ HOVER_VARIO_MAX_CMS = 40          # |вариометр| меньше 0.4 м/с 
 HOVER_THR_MIN = 1150
 HOVER_THR_MAX = 1750
 HOVER_ALPHA = 0.05
+HOVER_TEST_S = 3.0
 # Вписанное висение, ШИМ. None — ещё не задано, закон учится со стика.
 # Меню и local_settings.py пишут сюда число, его можно править без правки кода.
 HOVER_PWM = None
@@ -4821,6 +4822,13 @@ throttle_integral = 0.0
 # Висение, снятое до захвата. None — ещё не видели ровной высоты.
 _hover_pwm = None
 _hover_logged = False
+_hover_test = False
+_hover_test_sum = 0.0
+_hover_test_n = 0
+_hover_test_t = 0.0
+_hover_test_gotovo = False
+_hover_test_status = ""
+_hover_test_disarm_t = 0.0
 _menu_otkryto = False
 _menu_put = []
 _menu_kursor = 0
@@ -9566,6 +9574,91 @@ def _uchit_visenie(thr, vario_cms):
     _hover_pwm += HOVER_ALPHA * (thr - _hover_pwm)
 
 
+def _hover_test_sbros():
+    global _hover_test_sum, _hover_test_n, _hover_test_t
+    global _hover_test_gotovo, _hover_test_disarm_t
+    _hover_test_sum = 0.0
+    _hover_test_n = 0
+    _hover_test_t = 0.0
+    _hover_test_gotovo = False
+    _hover_test_disarm_t = 0.0
+
+
+def _menu_hover_test():
+    """Включить замер висения. Идёт и после арма, захват не нужен."""
+    global _hover_test, _hover_test_status
+    if not _menu_mozhno():
+        return "armed"
+    _hover_test = True
+    _hover_test_sbros()
+    _hover_test_status = "arm and hold"
+    try:
+        flight_log.event("ТЕСТ ВИСЕНИЯ: ждём ровную высоту")
+    except Exception:
+        pass
+    return "arm and hold"
+
+
+def _hover_test_shag(thr, vario_cms, armed, dt):
+    """Копит газ, пока высота стоит. По окончании записывает висение."""
+    global _hover_test, _hover_test_sum, _hover_test_n, _hover_test_t
+    global _hover_test_gotovo, _hover_test_status, _hover_test_disarm_t
+    if not _hover_test:
+        return
+    now = time.monotonic()
+    if _hover_test_gotovo:
+        if not armed:
+            if _hover_test_disarm_t <= 0.0:
+                _hover_test_disarm_t = now
+            elif now - _hover_test_disarm_t > 15.0:
+                _hover_test = False
+        return
+    if not armed:
+        _hover_test_status = "arm and hold"
+        _hover_test_t = 0.0
+        _hover_test_sum = 0.0
+        _hover_test_n = 0.0
+        return
+    if vario_cms is None:
+        _hover_test_status = "no vario"
+        return
+    thr = float(thr)
+    if thr < HOVER_THR_MIN:
+        _hover_test_status = "thr low"
+        return
+    if thr > HOVER_THR_MAX:
+        _hover_test_status = "thr high"
+        return
+    if abs(float(vario_cms)) > HOVER_VARIO_MAX_CMS:
+        _hover_test_status = "not level"
+        return
+    dt = 0.05 if dt is None or dt <= 0.0 or dt > 0.5 else float(dt)
+    _hover_test_sum += thr * dt
+    _hover_test_n += dt
+    _hover_test_t += dt
+    _hover_test_status = "hold  %.1f / %.0fs" % (_hover_test_t, HOVER_TEST_S)
+    if _hover_test_t < HOVER_TEST_S or _hover_test_n <= 0.0:
+        return
+    pwm = int(round(_hover_test_sum / _hover_test_n))
+    _zapisat_visenie(pwm)
+    _hover_test_gotovo = True
+    _hover_test_status = "saved %d" % pwm
+    try:
+        flight_log.event("ТЕСТ ВИСЕНИЯ: %d ШИМ за %.1f с" % (pwm, _hover_test_t))
+    except Exception:
+        pass
+
+
+def _narisovat_hover_test(frame):
+    if not _hover_test or not _hover_test_status:
+        return
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    tekst = "HOVER  " + _hover_test_status
+    (tw, _), _ = cv2.getTextSize(tekst, font, 0.6, 1)
+    x = max(8, (frame.shape[1] - tw) // 2)
+    cv2.putText(frame, tekst, (x, 28), font, 0.6, COLOR_YELLOW, 1, cv2.LINE_AA)
+
+
 def _blizko_i_vysoko(dep_deg, range_m, alt_m):
     """Короткая дальность по земле при ещё большой высоте и крутом угле."""
     if dep_deg is None or alt_m is None:
@@ -9826,6 +9919,7 @@ def _menu_derevo():
         {"imya": "Throttle", "deti": [
             {"imya": "Hover", "min": 1100, "max": 1800, "shag": 10,
              "get": lambda: _hover_pwm, "set": _zapisat_visenie},
+            {"imya": "Hover test", "dejstvie": _menu_hover_test},
         ]},
         {"imya": "Tracker", "deti": [
             {"imya": "Brightness", "min": -10, "max": 10, "shag": 1,
@@ -10639,8 +10733,12 @@ def _update_control_from_target_impl():
         with state_lock:
             _var_h = app_state.get("vario_cms")
             _armed_h = app_state.get("armed")
-        if _armed_h:
+        if _armed_h and not _hover_test:
             _uchit_visenie(base_thr, _var_h)
+        if _hover_test:
+            _hover_test_shag(
+                base_thr, _var_h, bool(_armed_h),
+                _raw_dt if _raw_dt else (1.0 / NOMINAL_FPS))
 
     if not controllable or box is None:
         # Сбрасываем ВСЕ накопители, иначе windup из прошлой сессии вылезет
@@ -13087,6 +13185,7 @@ def draw_overlay_on_frame(frame):
     # отчёт, окажись он раньше.
     draw_sensor_report(frame)
     draw_control_state(frame)
+    _narisovat_hover_test(frame)
     _narisovat_menu(frame)
 
 # --- РУЧНАЯ КОРРЕКЦИЯ РАМКИ ВО ВРЕМЯ TRACKED (ТЗ next-commit spec §11/§12) ---
