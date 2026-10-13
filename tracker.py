@@ -2204,6 +2204,7 @@ TAU_HOLD_S = 1.5
 # Без измеренного висения геометрию газом не трогаем: не зная пола, убавка
 # снова кончается холостым.
 HOVER_VARIO_MAX_CMS = 40          # |вариометр| меньше 0.4 м/с — высота стоит
+HOVER_TEST_VARIO_CMS = 100        # для ручного зависания: 1 м/с ещё можно удержать
 HOVER_THR_MIN = 1150
 HOVER_THR_MAX = 1750
 HOVER_ALPHA = 0.05
@@ -4829,6 +4830,7 @@ _hover_test_t = 0.0
 _hover_test_gotovo = False
 _hover_test_status = ""
 _hover_test_disarm_t = 0.0
+_hover_test_last = 0.0
 _menu_otkryto = False
 _menu_put = []
 _menu_kursor = 0
@@ -9576,12 +9578,13 @@ def _uchit_visenie(thr, vario_cms):
 
 def _hover_test_sbros():
     global _hover_test_sum, _hover_test_n, _hover_test_t
-    global _hover_test_gotovo, _hover_test_disarm_t
+    global _hover_test_gotovo, _hover_test_disarm_t, _hover_test_last
     _hover_test_sum = 0.0
-    _hover_test_n = 0
+    _hover_test_n = 0.0
     _hover_test_t = 0.0
     _hover_test_gotovo = False
     _hover_test_disarm_t = 0.0
+    _hover_test_last = 0.0
 
 
 def _menu_hover_test():
@@ -9622,6 +9625,9 @@ def _hover_test_shag(thr, vario_cms, armed, dt):
     if vario_cms is None:
         _hover_test_status = "no vario"
         return
+    if thr is None:
+        _hover_test_status = "no stick"
+        return
     thr = float(thr)
     if thr < HOVER_THR_MIN:
         _hover_test_status = "thr low"
@@ -9629,8 +9635,8 @@ def _hover_test_shag(thr, vario_cms, armed, dt):
     if thr > HOVER_THR_MAX:
         _hover_test_status = "thr high"
         return
-    if abs(float(vario_cms)) > HOVER_VARIO_MAX_CMS:
-        _hover_test_status = "not level"
+    if abs(float(vario_cms)) > HOVER_TEST_VARIO_CMS:
+        _hover_test_status = "not level %+.0f" % float(vario_cms)
         return
     dt = 0.05 if dt is None or dt <= 0.0 or dt > 0.5 else float(dt)
     _hover_test_sum += thr * dt
@@ -9650,7 +9656,22 @@ def _hover_test_shag(thr, vario_cms, armed, dt):
 
 
 def _narisovat_hover_test(frame):
-    if not _hover_test or not _hover_test_status:
+    global _hover_test_last
+    if not _hover_test:
+        return
+    now = time.monotonic()
+    dt = None if _hover_test_last <= 0.0 else now - _hover_test_last
+    if not _hover_test_gotovo:
+        _hover_test_last = now
+        with state_lock:
+            armed = app_state.get("armed") is True
+            thr = app_state.get("rc_throttle")
+            thr_ts = app_state.get("rc_throttle_ts", 0.0)
+            vario = app_state.get("vario_cms")
+        if not thr_ts or (now - thr_ts) > 1.0:
+            thr = None
+        _hover_test_shag(thr, vario, armed, dt)
+    if not _hover_test_status:
         return
     font = cv2.FONT_HERSHEY_SIMPLEX
     tekst = "HOVER  " + _hover_test_status
@@ -10738,10 +10759,6 @@ def _update_control_from_target_impl():
             _armed_h = app_state.get("armed")
         if _armed_h and not _hover_test:
             _uchit_visenie(base_thr, _var_h)
-        if _hover_test:
-            _hover_test_shag(
-                base_thr, _var_h, bool(_armed_h),
-                _raw_dt if _raw_dt else (1.0 / NOMINAL_FPS))
 
     if not controllable or box is None:
         # Сбрасываем ВСЕ накопители, иначе windup из прошлой сессии вылезет

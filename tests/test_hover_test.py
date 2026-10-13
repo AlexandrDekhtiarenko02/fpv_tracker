@@ -24,8 +24,8 @@ t._hover_test_shag(1000, 0, True, 0.5)
 assert t._hover_test_status == "thr low"
 assert not t._hover_test_gotovo
 
-t._hover_test_shag(1400, 80, True, 0.5)
-assert t._hover_test_status == "not level"
+t._hover_test_shag(1400, 180, True, 0.5)
+assert t._hover_test_status.startswith("not level")
 assert t._hover_test_t == 0.0
 
 for _ in range(5):
