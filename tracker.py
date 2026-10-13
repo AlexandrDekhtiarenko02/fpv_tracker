@@ -2137,15 +2137,17 @@ LOS_THROTTLE_GAIN = 25.0
 LOS_THROTTLE_MAX = 120.0
 # Курс столкновения, предварительный. Знаки те же, что у сдвига прицела:
 # угол растёт — нос вниз, азимут крутится — крен в ту же сторону.
-# Сила намеренно скромная: после вылета её правят по col_p и col_r.
+# 20 ШИМ на градус в секунду упиралось в 80 уже около 4 °/с: нос клевал,
+# картинка дёргалась и рамка срывалась. Теперь тот же замер 2 °/с — это
+# небольшой доворот, а не упор.
 # Пиксели рамки при этом ослаблены, иначе они стягивают прицел в центр
 # ровно тогда, когда курс уже достигнут.
 COLLISION_ENABLED = True
 COLLISION_PITCH_PIXEL = 0.40
 COLLISION_ROLL_PIXEL = 0.20
-COLLISION_PITCH_PWM_DPS = 20.0
+COLLISION_PITCH_PWM_DPS = 8.0
 COLLISION_ROLL_PWM_DPS = 12.0
-COLLISION_PITCH_MAX = 80.0
+COLLISION_PITCH_MAX = 35.0
 COLLISION_ROLL_MAX = 70.0
 
 # --- ПРЕДЕЛ СКОРОСТИ СНИЖЕНИЯ ---
@@ -2196,13 +2198,11 @@ TAU_HOLD_S = 1.5
 # ниже висения, весь захват крутится вокруг слишком малой тяги.
 #
 # Висение учится ДО захвата, по живому стику, и только пока вариометр около
-# нуля. Ниже висения, поправленного на наклон (тяга вверх = газ * cos),
-# команда не опускается. Исключение — перелёт и «близко и высоко»: там газ
-# можно убавить, но только до доли висения, а не к холостому. Прошлый закон
-# по углу уходил на 90 ШИМ ниже стика 1300 и ронял борт.
-#
-# Без измеренного висения геометрию газом не трогаем: не зная пола, убавка
-# снова кончается холостым.
+# нуля. На заходе газ не поднимают из-за опущенного носа: деление висения
+# на косинус как раз раскручивало моторы перед целью (пол доходил до 2500,
+# команда шла следом). Перелёт и «близко и высоко» убавляют от стика
+# захвата вниз, но не ниже доли ровного висения и не выше самого стика.
+# Без измеренного висения геометрию газом не трогаем.
 HOVER_VARIO_MAX_CMS = 40          # |вариометр| меньше 0.4 м/с — высота стоит
 HOVER_TEST_VARIO_CMS = 100        # для ручного зависания: 1 м/с ещё можно удержать
 HOVER_THR_MIN = 1150
@@ -2215,8 +2215,8 @@ HOVER_PWM = None
 # Сдвиг яркости картинки, от -1 до 1. Ноль — как сняла камера.
 # Это не выдержка: экспозиция остаётся замороженной.
 BRIGHTNESS = 0.0
-# Доля висения на текущем наклоне, ниже которой убавка не идёт.
-# 0.90 — управляемое снижение, не провал.
+# Доля РОВНОГО висения, ниже которой убавка не идёт.
+# 0.90 — управляемое снижение, не провал и не холостой.
 THR_DESCEND_FRACTION = 0.90
 # На столько °/с СВЕРХ мёртвой зоны убавка доходит до пола.
 # Замер перелёта 2.1 °/с минус зона 0.3 — как раз этот ход.
@@ -2228,11 +2228,11 @@ THR_GEOM_SLEW_STEEP = 300.0       # ШИМ/с, близко и высоко
 THR_STEEP_ALT_M = 12.0
 THR_STEEP_RANGE_M = 45.0
 THR_STEEP_DEPRESSION_DEG = 30.0
-# Нос вниз (ШИМ выше 1500) в этих режимах ограничен. 40 — небольшой
-# доворот, не пикирование в центр рамки. 70 пропускает поправку прицела
-# на перелёт (20 px * P) и не пускает полный провал носа.
+# Нос вниз (ШИМ выше 1500) в этих режимах ограничен. Крутой заход — небольшой
+# доворот. Перелёт пропускает поправку прицела, но не полный клевок: упор
+# в 70 ШИМ на вылете уводил тангаж к 50–70° и срывал рамку.
 PITCH_STEEP_MAX_PWM = 40
-PITCH_OVERSHOOT_MAX_PWM = 70
+PITCH_OVERSHOOT_MAX_PWM = 50
 DY_INTEGRAL_RATE = 0.04
 DY_INTEGRAL_MAX = 60.0
 DY_INTEGRAL_DECAY = 0.985
@@ -9696,18 +9696,19 @@ def _blizko_i_vysoko(dep_deg, range_m, alt_m):
     return float(range_m) <= THR_STEEP_RANGE_M
 
 
-def _rezhim_gaza(pitched, base_thr, los_rate, steep):
+def _rezhim_gaza(hover, base_thr, los_rate, steep):
     """Куда вести газ геометрией. (режим, цель_ШИМ) или (None, None).
 
-    Цель не ниже доли висения и не выше опоры. Без висения вернёт пусто:
+    Опора — ровное висение, не висение делённое на косинус тангажа.
+    Цель не выше стика захвата и не ниже доли висения. Без висения пусто:
     убавлять от неизвестного пола нельзя.
     """
-    if pitched is None or base_thr is None:
+    if hover is None or base_thr is None:
         return None, None
-    cruise = max(float(base_thr), float(pitched))
-    floor = float(pitched) * THR_DESCEND_FRACTION
-    if floor > cruise:
-        floor = cruise
+    stick = float(base_thr)
+    floor = float(hover) * THR_DESCEND_FRACTION
+    if floor > stick:
+        floor = stick
     if steep:
         return "steep", floor
     if los_rate is None:
@@ -9718,7 +9719,7 @@ def _rezhim_gaza(pitched, base_thr, los_rate, steep):
     dolya = excess / THR_LOS_FULL_DPS
     if dolya > 1.0:
         dolya = 1.0
-    return "overshoot", cruise + (floor - cruise) * dolya
+    return "overshoot", stick + (floor - stick) * dolya
 
 
 def _ogranich_nos(target_pitch, mode):
@@ -11721,15 +11722,9 @@ def _update_control_from_target_impl():
     # команда газа смотрят на один и тот же режим.
     _geom_mode = None
     _geom_goal = None
-    _geom_pitched = None
     if isinstance(closure, dict):
         with state_lock:
             _alt_g = app_state.get("alt_cm")
-            _pitch_g = app_state.get("fc_pitch_deg")
-            _pitch_ts = app_state.get("fc_pitch_ts", 0.0)
-        if _pitch_ts <= 0.0 or (now_mono - _pitch_ts) > 1.0:
-            _pitch_g = None
-        _geom_pitched = _visenie_na_naklone(_hover_pwm, _pitch_g)
         _alt_m = None if _alt_g is None else float(_alt_g) / 100.0
         _steep = _blizko_i_vysoko(
             closure.get("depression_deg"), closure.get("range_m"), _alt_m)
@@ -11738,7 +11733,7 @@ def _update_control_from_target_impl():
                 and (now_mono - _los_skorost_ts) <= LOS_RATE_STALE_S):
             _los_g = _los_skorost
         _geom_mode, _geom_goal = _rezhim_gaza(
-            _geom_pitched, base_thr, _los_g, _steep)
+            _hover_pwm, base_thr, _los_g, _steep)
         # Близко и высоко нос ограничиваем даже без висения: пикировать
         # в центр рамки нельзя, хотя газ без пола не убавляем.
         if _steep and _geom_mode is None:
@@ -11956,6 +11951,13 @@ def _update_control_from_target_impl():
     _final_podtverzhdeno = _vyderzhka_gotova(
         _vyderzhka_final, _hochu_final, now_mono, FINAL_CONFIRM_TIME_S)
     final_pora = _final_zamorozhen or _final_podtverzhdeno
+    # Не замирать, если рамка уже не на цели. Иначе финал консервирует
+    # промах: в заходах 10 и 11 ошибка была 85–87 px, а команда замерла.
+    if (final_pora and not _final_zamorozhen
+            and (abs(dx_aim) > FINAL_HOLD_ABORT_PX
+                 or abs(dy_aim) > FINAL_HOLD_ABORT_PX)):
+        final_pora = False
+        _vyderzhka_sbros(_vyderzhka_final)
 
     # ОТПУСКАЕМ HOLD, ЕСЛИ ТРАЕКТОРИЯ УШЛА. Заморозка задумана держать
     # прицел на цели последние секунды перед контактом. Если после
@@ -12095,11 +12097,13 @@ def _update_control_from_target_impl():
                 _thr_geom_out = float(target_throttle)
             target_throttle = int(round(_thr_geom_out))
             smooth_throttle_out = float(target_throttle)
-        elif (_geom_pitched is not None
-                and target_throttle < _geom_pitched):
+        elif (_hover_pwm is not None
+                and target_throttle < float(_hover_pwm)):
+            # Стик ниже ровного висения поднимаем до него. Наклон носа
+            # сюда не входит: из-за него моторы раскручивались перед целью.
             _thr_geom_out = _podtyanut_gaz(
                 _thr_geom_out if _thr_geom_out is not None else target_throttle,
-                _geom_pitched, THR_GEOM_SLEW_STEEP, k)
+                float(_hover_pwm), THR_GEOM_SLEW_STEEP, k)
             target_throttle = int(round(_thr_geom_out))
             smooth_throttle_out = float(target_throttle)
         else:
@@ -12111,10 +12115,10 @@ def _update_control_from_target_impl():
             try:
                 if _geom_mode is not None:
                     flight_log.event(
-                        "ГАЗ: %s, команда %d, пол висения %s"
+                        "ГАЗ: %s, команда %d, висение %s"
                         % (_geom_mode, target_throttle,
-                           ("%.0f" % _geom_pitched)
-                           if _geom_pitched is not None else "нет"))
+                           ("%.0f" % _hover_pwm)
+                           if _hover_pwm is not None else "нет"))
             except Exception:
                 pass
 

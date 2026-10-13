@@ -1,7 +1,8 @@
 """Три правила газа: пол висения, убавка на перелёте, близко и высоко.
 
-Убавка не уходит к холостому: ниже доли висения на текущем наклоне
-команда не опускается. Без измеренного висения геометрию газом не трогаем.
+Убавка идёт от стика вниз и не поднимает газ из-за наклона носа.
+Ниже доли ровного висения команда не опускается и выше стика не поднимается.
+Без измеренного висения геометрию газом не трогаем.
 """
 import math
 import os
@@ -36,17 +37,21 @@ t._uchit_visenie(1000, 0)            # ниже правдоподобного �
 assert t._hover_pwm == bylo
 print("    висение %.0f, шум и холостой не сдвинули" % t._hover_pwm)
 
-print("\n=== 3. Перелёт убавляет до пола, не до холостого ===")
-pitched = t._visenie_na_naklone(1500, 25.0)
-mode, goal = t._rezhim_gaza(pitched, 1300, 2.13, False)
-floor = pitched * t.THR_DESCEND_FRACTION
+print("\n=== 3. Перелёт убавляет до пола и не поднимает газ ===")
+# Стик выше висения: полный перелёт садится на долю ровного висения.
+mode, goal = t._rezhim_gaza(1500, 1600, 2.13, False)
+floor = 1500 * t.THR_DESCEND_FRACTION
 assert mode == "overshoot"
 assert abs(goal - floor) < 1.0, (goal, floor)
-assert goal > 1200, "убавка ушла к холостому: %.0f" % goal
-# Мёртвая зона и отрицательная скорость угла газ не режут.
-assert t._rezhim_gaza(pitched, 1500, 0.1, False) == (None, None)
-assert t._rezhim_gaza(pitched, 1500, -1.0, False) == (None, None)
-print("    при 2.13 °/с цель %.0f, пол %.0f" % (goal, floor))
+assert goal < 1600
+# Стик уже ниже пола: не поднимаем, даже если нос опущен.
+mode, goal = t._rezhim_gaza(1500, 1300, 2.13, False)
+assert mode == "overshoot" and abs(goal - 1300) < 1.0, goal
+# Наклонное висение в закон больше не подаётся. Прежний пол 1500/cos
+# на 60° был бы 3000 и раскручивал моторы.
+assert t._rezhim_gaza(1500, 1300, 0.1, False) == (None, None)
+assert t._rezhim_gaza(1500, 1500, -1.0, False) == (None, None)
+print("    стик 1600 -> %.0f, стик 1300 остаётся 1300" % floor)
 
 print("\n=== 4. Близко и высоко ===")
 # 40 м и 50° — около 34 м по земле.
@@ -55,7 +60,7 @@ assert t._blizko_i_vysoko(50.0, None, 40.0)
 assert not t._blizko_i_vysoko(15.0, None, 40.0)
 # Низко и близко — обычный конец захода, не этот режим.
 assert not t._blizko_i_vysoko(50.0, 20.0, 8.0)
-mode, goal = t._rezhim_gaza(pitched, 1600, 0.0, True)
+mode, goal = t._rezhim_gaza(1500, 1600, 0.0, True)
 assert mode == "steep" and abs(goal - floor) < 1.0
 # Без висения убавлять нельзя.
 assert t._rezhim_gaza(None, 1300, 3.0, True) == (None, None)
