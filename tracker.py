@@ -1345,6 +1345,10 @@ CMD_SLEW_MAX_STEP = 55.0
 # шум скорости цели через feedforward сразу оказывался на стике.
 ROLL_SLEW_PWM_PER_S = 280.0
 ROLL_SLEW_MAX_STEP = 14.0
+# Рыскание так же медленно. Быстрый шаг после лока раскачивал борт
+# туда-сюда, хотя ошибка была в несколько пикселей.
+YAW_SLEW_PWM_PER_S = 250.0
+YAW_SLEW_MAX_STEP = 12.0
 # Тангаж ведём мягче остальных осей: именно на нём видны рывки, и именно он
 # отвечает за прицеливание, где резкость ничего не даёт. 700 PWM/с — это 29
 # PWM за кадр при 24 к/с, то есть от центра до края (200) за 0.29 с. Замерено,
@@ -1355,10 +1359,10 @@ PITCH_SLEW_MAX_STEP = 32.0
 
 MAX_ROLL_DEFLECT = 200
 MAX_PITCH_DEFLECT = 200
-MAX_YAW_DEFLECT = 180
+MAX_YAW_DEFLECT = 150
 
 # --- ГЭЙНЫ ---
-P_GAIN_YAW = 6.0
+P_GAIN_YAW = 2.5
 P_GAIN_ROLL = 4.0
 # СНИЖЕН по тем же причинам, что и у тангажа: производная берётся с
 # гироскопа, и дублировать её дифференцированием шумного ряда коробки значит
@@ -1600,7 +1604,10 @@ LEAD_MAX_PX = 80.0 * TRACK_SCALE
 # Подбор: 1.5-3.0 для roll, в полёте калибровать на пересекающей цели.
 FF_GAIN_ROLL = 48.0     # PWM на (px/кадр). P на смещении за 0.4 с, не 6–9% от него
 FF_GAIN_PITCH = 1.5     # PWM на (px/кадр) скорости цели по Y
-FF_GAIN_YAW = 12.0      # поворот делает рыскание, не крен
+FF_GAIN_YAW = 1.0       # PWM на (px/кадр). Больше раскачивает нос сразу после лока
+# Ближе этого к центру рыскание молчит. Иначе лок почти в центре
+# сразу начинает крутить борт.
+YAW_QUIET_PX = 8.0
 # Доля следящего крена. Остальное ушло в рыскание: крен на боку
 # сносит борт мимо цели, а не поворачивает его.
 ROLL_TRACK_KEEP = 0.20
@@ -5295,11 +5302,6 @@ def send_msp_set_raw_rc(channels):
 
 _ovr_zhaloba_ts = 0.0
 _ovr_zhaloba_s = 0.0
-# Режим MSP OVERRIDE на борту уже видели включённым в этом захвате.
-# Если после этого он гаснет, а канал AUX залип эхом — трекер всё равно
-# отпускаем, иначе рамка живёт, а стики уже у пилота.
-_videli_overrayd = False
-_ovr_off_since = 0.0
 # Для видимой ошибки отправки: логируем ТОЛЬКО смену состояния (ушло↔не ушло),
 # а не каждый кадр, иначе при обрыве лог зальётся. None — ещё не отправляли.
 _send_ok_prev = None
@@ -11810,6 +11812,12 @@ def _update_control_from_target_impl():
     yaw_error_weighted = filtered_dx_yaw * yaw_weight
     yaw_pd = yaw_error_weighted * P_GAIN_YAW
     yaw_ff = _vx_ff * ff_yaw_eff * yaw_weight
+    # Почти в центре рыскание молчит. Иначе сразу после лока нос
+    # начинает гулять, рамка уезжает, и команда её догоняет.
+    if abs(adx_y) < YAW_QUIET_PX:
+        yaw_pd = 0.0
+        yaw_ff = 0.0
+        yaw_error_weighted = 0.0
     yaw_total_unsat = YAW_SIGN * (yaw_pd + yaw_ff + yaw_integral)
     yaw_sat_pos = yaw_total_unsat >= MAX_YAW_DEFLECT
     yaw_sat_neg = yaw_total_unsat <= -MAX_YAW_DEFLECT
@@ -11822,10 +11830,10 @@ def _update_control_from_target_impl():
         elif yaw_integral < -YAW_INTEGRAL_MAX:
             yaw_integral = -YAW_INTEGRAL_MAX
     yaw_integral *= YAW_INTEGRAL_DECAY ** k
+    if abs(adx_y) < YAW_QUIET_PX:
+        yaw_integral = 0.0
 
     yaw_offset = YAW_SIGN * (yaw_pd + yaw_ff + yaw_integral) * trust_k
-    # Скорость азимута крутит нос, а не кладёт борт на крыло.
-    yaw_offset += col_r
 
     # Демпфирование рыскания по гироскопу — то же, что у тангажа и крена.
     #
@@ -11911,9 +11919,10 @@ def _update_control_from_target_impl():
         # целиком — вместо мягкости вышла бы раскачка.
         shag_p = min(PITCH_SLEW_PWM_PER_S * _dolya, PITCH_SLEW_MAX_STEP)
         shag_r = min(ROLL_SLEW_PWM_PER_S * _dolya, ROLL_SLEW_MAX_STEP)
+        shag_y = min(YAW_SLEW_PWM_PER_S * _dolya, YAW_SLEW_MAX_STEP)
         _slew_roll = _ogranich_skorost(_slew_roll, target_roll, shag_r)
         _slew_pitch = _ogranich_skorost(_slew_pitch, target_pitch, shag_p)
-        _slew_yaw = _ogranich_skorost(_slew_yaw, target_yaw, shag)
+        _slew_yaw = _ogranich_skorost(_slew_yaw, target_yaw, shag_y)
         target_roll = int(round(_slew_roll))
         target_pitch = int(round(_slew_pitch))
         target_yaw = int(round(_slew_yaw))
@@ -14109,7 +14118,6 @@ def process_locked_tracker(gray, cb_t0=None):
     global lost_frames, frame_index, last_match_score, last_flow_ok
     global fps_t0, fps_frames, fps_current
     global prev_aux_on, acq_wait_left, lock_sequence
-    global _videli_overrayd, _ovr_off_since
     global auto_reacq_attempts
     global template_scale_acc, color_axis
     global lock_w0, lock_h0
@@ -14139,32 +14147,12 @@ def process_locked_tracker(gray, cb_t0=None):
     with state_lock:
         aux_on = aux4_state
         live_thr = app_state.get("rc_throttle", 1500)
-        _fc_on = bool(app_state.get("fc_override_on"))
-        _fc_ts = app_state.get("fc_override_ts", 0.0)
-
-    # Канал AUX честен, только пока он не в маске оверрайда. Если тумблер
-    # уже снят, а MSP_RC продолжает отдавать 2000, полётник режим гасит
-    # и стики возвращаются, а рамка остаётся. Смотрим на сам режим.
-    now_aux = time.monotonic()
-    if aux_on and _fc_on:
-        _videli_overrayd = True
-        _ovr_off_since = 0.0
-    elif (_videli_overrayd and _fc_ts > 0.0
-          and (now_aux - _fc_ts) < 1.5 and not _fc_on):
-        if _ovr_off_since <= 0.0:
-            _ovr_off_since = now_aux
-        elif now_aux - _ovr_off_since > 0.45:
-            aux_on = False
-    else:
-        _ovr_off_since = 0.0
 
     rising_aux = aux_on and not prev_aux_on
     falling_aux = (not aux_on) and prev_aux_on
     prev_aux_on = aux_on
 
     if not aux_on:
-        _videli_overrayd = False
-        _ovr_off_since = 0.0
         if falling_aux or track_state != TRACK_STATE_IDLE:
             reset_tracking(to_acq=False)
         auto_reacq_attempts = 0

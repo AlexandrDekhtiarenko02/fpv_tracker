@@ -29,6 +29,7 @@ assert t.COLLISION_ROLL_PIXEL < t.COLLISION_PITCH_PIXEL
 src = open(os.path.join(os.path.dirname(__file__), "..", "tracker.py"),
            encoding="utf-8").read()
 assert "rate_damp_pwm + col_p" in src
-assert "yaw_offset += col_r" in src
+assert "roll_offset += col_r" not in src
+assert "yaw_offset += col_r" not in src
 assert "float(adx_y)" in src
 print("ok  pitch %.0f PWM на 2.13 °/с, рамка даёт %.0f px из 40" % (pwm, kadr))
