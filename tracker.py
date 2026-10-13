@@ -2310,7 +2310,11 @@ HOVER_ALPHA = 0.05
 HOVER_TEST_S = 3.0
 # Вписанное висение, ШИМ. None — ещё не задано, закон учится со стика.
 # Меню и local_settings.py пишут сюда число, его можно править без правки кода.
+# Замер делается на полной батарее. В полёте напряжение падает, и тот же
+# ШИМ уже не держит высоту: тяга примерно (доля стика × вольты)².
+# HOVER_VBAT — вольты в момент замера. Без них поправка молчит.
 HOVER_PWM = None
+HOVER_VBAT = None
 # Сдвиг яркости картинки, от -1 до 1. Ноль — как сняла камера.
 # Это не выдержка: экспозиция остаётся замороженной.
 BRIGHTNESS = 0.0
@@ -4971,7 +4975,9 @@ smooth_throttle_out = None
 throttle_integral = 0.0
 # Висение, снятое до захвата. None — ещё не видели ровной высоты.
 _hover_pwm = None
+_hover_vbat = None          # вольты в момент замера висения
 _hover_logged = False
+_hover_komp_log_t = 0.0
 _hover_test = False
 _hover_test_sum = 0.0
 _hover_test_n = 0
@@ -5545,6 +5551,7 @@ def fc_io_loop():
     next_alt_t = 0.0
     next_imu_t = 0.0
     next_gps_t = 0.0
+    next_bat_t = 0.0
     alt_warned = False
     loop_started = time.monotonic()
     global _startup_t0
@@ -5815,6 +5822,34 @@ def fc_io_loop():
                             flight_log.event(
                                 "ВЫСОТОМЕР отвечает: alt=%d см vario=%d см/с"
                                 % (alt_cm, vario_cms))
+
+            if now >= next_bat_t:
+                next_bat_t = now + 1.0
+                # MSP_ANALOG: первый байт — напряжение в 0.1 В.
+                # 4S полная ≈ 168, 6S ≈ 252. Ниже 8 В или выше 30 В —
+                # не батарея, а мусор или другой формат ответа.
+                bat = msp_request(110)
+                if bat is not None and len(bat) >= 1:
+                    v_des = bat[0]
+                    if 80 <= v_des <= 300:
+                        v = v_des / 10.0
+                        with state_lock:
+                            byl = app_state.get("vbat_v")
+                            app_state["vbat_v"] = v
+                            app_state["vbat_ts"] = now
+                        if byl is None:
+                            try:
+                                flight_log.event("БАТАРЕЯ: %.1f В" % v)
+                            except Exception:
+                                pass
+                            if _hover_pwm is not None and _hover_vbat is None:
+                                try:
+                                    flight_log.event(
+                                        "ВИСЕНИЕ %d ШИМ без напряжения замера: "
+                                        "поправка выключена, повтори тест"
+                                        % int(_hover_pwm))
+                                except Exception:
+                                    pass
 
             if MOTOR_DEBUG_ENABLED and now >= next_motor_t:
                 mot_data = msp_request(104)  # MSP_MOTOR
@@ -9933,6 +9968,53 @@ def _reset_geometry_history(reason):
         pass
 
 
+def _hover_pwm_ot_napryazheniya(pwm, v_ref, v_now):
+    """Висенный газ при другом напряжении.
+
+    Тяга примерно (доля стика × вольты)². Чтобы тяга стояла, долю
+    поднимаем обратно пропорционально просадке. 1000 — ноль тяги,
+    поэтому масштабируется только то, что выше него. Отношение
+    зажато: плохой замер не имеет права увести газ в упор.
+    """
+    if pwm is None or v_ref is None or v_now is None:
+        return None if pwm is None else float(pwm)
+    if v_ref < 8.0 or v_now < 8.0:
+        return float(pwm)
+    otnoshenie = float(v_ref) / float(v_now)
+    if otnoshenie < 0.85:
+        otnoshenie = 0.85
+    elif otnoshenie > 1.35:
+        otnoshenie = 1.35
+    dolya = (float(pwm) - 1000.0) / 1000.0
+    if dolya < 0.0:
+        dolya = 0.0
+    itog = 1000.0 + dolya * 1000.0 * otnoshenie
+    if itog < HOVER_THR_MIN:
+        itog = HOVER_THR_MIN
+    elif itog > HOVER_THR_MAX:
+        itog = HOVER_THR_MAX
+    return itog
+
+
+def _hover_s_napryazheniem():
+    """Замеренный газ висения с поправкой на текущую батарею.
+
+    Без напряжения в момент замера или без свежего замера в полёте
+    отдаёт как есть: лучше лететь по полной батарее, чем по выдуманной.
+    """
+    if _hover_pwm is None:
+        return None
+    baza = float(_hover_pwm)
+    if _hover_vbat is None:
+        return baza
+    with state_lock:
+        v_now = app_state.get("vbat_v")
+        v_ts = app_state.get("vbat_ts", 0.0)
+    if v_now is None or not v_ts or (time.monotonic() - v_ts) > 5.0:
+        return baza
+    return _hover_pwm_ot_napryazheniya(baza, _hover_vbat, v_now)
+
+
 def _visenie_na_naklone(hover_pwm, pitch_deg):
     """Тяга, которая держит высоту при этом тангаже.
 
@@ -10315,8 +10397,12 @@ def _sohranit_nastroiku(imya, znach):
 
 
 def _zapisat_visenie(pwm):
-    """Запомнить висение и сразу отдать его закону газа."""
-    global _hover_pwm, HOVER_PWM, _hover_logged
+    """Запомнить висение и сразу отдать его закону газа.
+
+    Вместе с газом пишется напряжение: замер делается на полной батарее,
+    в полёте поправка поднимает ШИМ обратно пропорционально просадке.
+    """
+    global _hover_pwm, HOVER_PWM, _hover_logged, _hover_vbat, HOVER_VBAT
     pwm = int(round(pwm))
     if pwm < 1100:
         pwm = 1100
@@ -10329,8 +10415,24 @@ def _zapisat_visenie(pwm):
         _sohranit_nastroiku("HOVER_PWM", pwm)
     except Exception:
         pass
+    v = None
+    with state_lock:
+        v_syroy = app_state.get("vbat_v")
+        v_ts = app_state.get("vbat_ts", 0.0)
+    if v_syroy is not None and v_ts and (time.monotonic() - v_ts) < 5.0:
+        v = float(v_syroy)
+    if v is not None and v >= 8.0:
+        _hover_vbat = v
+        HOVER_VBAT = v
+        try:
+            _sohranit_nastroiku("HOVER_VBAT", "%.2f" % v)
+        except Exception:
+            pass
+        tekst = "ВИСЕНИЕ ЗАДАНО: %d ШИМ при %.2f В" % (pwm, v)
+    else:
+        tekst = "ВИСЕНИЕ ЗАДАНО: %d ШИМ (напряжение не прочитано)" % pwm
     try:
-        flight_log.event("ВИСЕНИЕ ЗАДАНО: %d ШИМ" % pwm)
+        flight_log.event(tekst)
     except Exception:
         pass
 
@@ -12733,7 +12835,7 @@ def _update_control_from_target_impl():
             if (_tracked_since_t is not None
                     and (now_mono - _tracked_since_t) >= 1.0):
                 _cel_gaz = _gaz_po_vysote(
-                    _hover_pwm, _alt_pv, _tau_now, _var_pv)
+                    _hover_s_napryazheniem(), _alt_pv, _tau_now, _var_pv)
 
         # Пол висения и геометрическая убавка применяются ПОСЛЕ процентного
         # окна. Окно в 15% как раз и держало ручку в 1-5%: перелёт оно
@@ -12753,12 +12855,13 @@ def _update_control_from_target_impl():
             target_throttle = int(round(_thr_geom_out))
             smooth_throttle_out = float(target_throttle)
         elif (_cel_gaz is None and _hover_pwm is not None
-                and target_throttle < float(_hover_pwm)):
+                and target_throttle < float(_hover_s_napryazheniem())):
             # Стик ниже ровного висения поднимаем до него. Наклон носа
             # сюда не входит: из-за него моторы раскручивались перед целью.
+            # Пол — висение с поправкой на батарею, не замер с полной.
             _thr_geom_out = _podtyanut_gaz(
                 _thr_geom_out if _thr_geom_out is not None else target_throttle,
-                float(_hover_pwm), THR_GEOM_SLEW_STEEP, k)
+                float(_hover_s_napryazheniem()), THR_GEOM_SLEW_STEEP, k)
             target_throttle = int(round(_thr_geom_out))
             smooth_throttle_out = float(target_throttle)
         elif _cel_gaz is None:
@@ -12770,8 +12873,10 @@ def _update_control_from_target_impl():
             try:
                 if _geom_mode is not None:
                     flight_log.event(
-                        "ГАЗ: %s, команда %d, висение %s"
+                        "ГАЗ: %s, команда %d, висение %s (замер %s)"
                         % (_geom_mode, target_throttle,
+                           ("%.0f" % _hover_s_napryazheniem())
+                           if _hover_pwm is not None else "нет",
                            ("%.0f" % _hover_pwm)
                            if _hover_pwm is not None else "нет"))
             except Exception:
@@ -12847,7 +12952,8 @@ def _update_control_from_target_impl():
             _var_pv = None
         _zrel_gaz = (_tracked_since_t is not None
                      and (now_mono - _tracked_since_t) >= 1.0)
-        _cel_gaz = (_gaz_po_vysote(_hover_pwm, _alt_pv, _tau_now, _var_pv)
+        _cel_gaz = (_gaz_po_vysote(_hover_s_napryazheniem(),
+                                   _alt_pv, _tau_now, _var_pv)
                     if _zrel_gaz else None)
         if _cel_gaz is not None:
             _thr_geom_out = _podtyanut_gaz(
@@ -18097,6 +18203,18 @@ if HOVER_PWM is not None:
         _hover_pwm = float(HOVER_PWM)
         _hover_logged = True
     except (TypeError, ValueError):
+        pass
+if HOVER_VBAT is not None:
+    try:
+        _hover_vbat = float(HOVER_VBAT)
+    except (TypeError, ValueError):
+        pass
+if _hover_pwm is not None and _hover_vbat is None:
+    try:
+        flight_log.event(
+            "ВИСЕНИЕ %d ШИМ без напряжения: поправка на батарею "
+            "выключена, повтори тест висения" % int(_hover_pwm))
+    except Exception:
         pass
 try:
     _yarkost_shag = int(round(float(BRIGHTNESS) * 10))
