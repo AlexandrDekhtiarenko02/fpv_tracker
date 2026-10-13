@@ -2221,7 +2221,7 @@ THR_DESCEND_FRACTION = 0.90
 # На столько °/с СВЕРХ мёртвой зоны убавка доходит до пола.
 # Замер перелёта 2.1 °/с минус зона 0.3 — как раз этот ход.
 THR_LOS_FULL_DPS = 1.8
-THR_GEOM_SLEW_OVERSHOOT = 80.0    # ШИМ/с, перелёт
+THR_GEOM_SLEW_OVERSHOOT = 200.0   # ШИМ/с, перелёт. 80 не успевало: борт набирал высоту
 THR_GEOM_SLEW_STEEP = 300.0       # ШИМ/с, близко и высоко
 # Близко и высоко: короткая дальность по земле при ещё большой высоте
 # и крутом угле. Пологий дальний заход сюда не попадает.
@@ -9699,27 +9699,44 @@ def _blizko_i_vysoko(dep_deg, range_m, alt_m):
 def _rezhim_gaza(hover, base_thr, los_rate, steep):
     """Куда вести газ геометрией. (режим, цель_ШИМ) или (None, None).
 
-    Опора — ровное висение, не висение делённое на косинус тангажа.
-    Цель не выше стика захвата и не ниже доли висения. Без висения пусто:
-    убавлять от неизвестного пола нельзя.
+    Опора — ровное висение. Перелёт опускает высокий стик к висению и
+    не уходит ниже него: ниже на подлёте борт не долетает. Ниже висения
+    только близко и высоко. Недолёт с низкого стика чуть поднимает газ
+    над висением. Без висения пусто.
     """
     if hover is None or base_thr is None:
         return None, None
+    hover = float(hover)
     stick = float(base_thr)
-    floor = float(hover) * THR_DESCEND_FRACTION
-    if floor > stick:
-        floor = stick
     if steep:
+        floor = hover * THR_DESCEND_FRACTION
+        if floor > hover:
+            floor = hover
         return "steep", floor
     if los_rate is None:
         return None, None
-    excess = float(los_rate) - LOS_RATE_DEADBAND_DPS
+    rate = float(los_rate)
+    if rate < -LOS_RATE_DEADBAND_DPS:
+        extra = (-rate - LOS_RATE_DEADBAND_DPS) * 15.0
+        if extra > 60.0:
+            extra = 60.0
+        goal = hover + extra
+        if stick > goal:
+            goal = stick
+        return "short", goal
+    excess = rate - LOS_RATE_DEADBAND_DPS
     if excess <= 0.0:
+        # Мёртвая зона. Высокий стик не отпускаем обратно: иначе убавка
+        # сбрасывается на каждом блике угла и газ снова прыгает вверх.
+        if stick > hover:
+            return "hold", hover
         return None, None
     dolya = excess / THR_LOS_FULL_DPS
     if dolya > 1.0:
         dolya = 1.0
-    return "overshoot", stick + (floor - stick) * dolya
+    if stick > hover:
+        return "overshoot", stick + (hover - stick) * dolya
+    return "overshoot", hover
 
 
 def _ogranich_nos(target_pitch, mode):
@@ -11722,6 +11739,7 @@ def _update_control_from_target_impl():
     # команда газа смотрят на один и тот же режим.
     _geom_mode = None
     _geom_goal = None
+    _los_g = None
     if isinstance(closure, dict):
         with state_lock:
             _alt_g = app_state.get("alt_cm")
@@ -11876,6 +11894,12 @@ def _update_control_from_target_impl():
         prev_ady = float(dy_alt)
         thr_adjust += (d_dy / k) * DY_THROTTLE_D_GAIN
 
+    # Прибавка «время большое — добавить газ» на этом вылете раздувала
+    # заход: +120 при угле около нуля, высота росла на десятки метров.
+    # Пока угол не падает, вверх газ не добавляем. Недолёт по-прежнему может.
+    if (_hover_pwm is not None and _los_g is not None
+            and _los_g >= -LOS_RATE_DEADBAND_DPS and thr_adjust > 0.0):
+        thr_adjust = 0.0
 
     # --- ФИНАЛ: ДЕРЖИМ ПОСЛЕДНЮЮ КОМАНДУ ---
     #
@@ -12007,7 +12031,9 @@ def _update_control_from_target_impl():
                     else "не считается",
                     rost_ot_zahvata or 0.0) + _final_komandy
                    + (len(_final_okno), target_roll, target_pitch, target_yaw)))
-        target_roll, target_pitch, target_yaw = _final_komandy
+        target_pitch = _final_komandy[1]
+        # Крен и рыскание не замирают. В заходе 13:22 финал держал крен
+        # на 1481, пока рамка уехала на 30 px, и крен догонял уже поздно.
     else:
         _final_zamorozhen = False
         _final_dx0 = None

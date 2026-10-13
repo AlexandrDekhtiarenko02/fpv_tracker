@@ -37,21 +37,25 @@ t._uchit_visenie(1000, 0)            # ниже правдоподобного �
 assert t._hover_pwm == bylo
 print("    висение %.0f, шум и холостой не сдвинули" % t._hover_pwm)
 
-print("\n=== 3. Перелёт убавляет до пола и не поднимает газ ===")
-# Стик выше висения: полный перелёт садится на долю ровного висения.
-mode, goal = t._rezhim_gaza(1500, 1600, 2.13, False)
+print("\n=== 3. Перелёт садится на висение и не проваливается ниже ===")
 floor = 1500 * t.THR_DESCEND_FRACTION
-assert mode == "overshoot"
-assert abs(goal - floor) < 1.0, (goal, floor)
-assert goal < 1600
-# Стик уже ниже пола: не поднимаем, даже если нос опущен.
+# Высокий стик: полный перелёт — это висение, не доля и не прибавка.
+mode, goal = t._rezhim_gaza(1500, 1600, 2.13, False)
+assert mode == "overshoot" and abs(goal - 1500) < 1.0, (mode, goal)
+# Низкий стик: перелёт не уводит ниже висения, иначе на подлёте не долететь.
 mode, goal = t._rezhim_gaza(1500, 1300, 2.13, False)
-assert mode == "overshoot" and abs(goal - 1300) < 1.0, goal
-# Наклонное висение в закон больше не подаётся. Прежний пол 1500/cos
-# на 60° был бы 3000 и раскручивал моторы.
-assert t._rezhim_gaza(1500, 1300, 0.1, False) == (None, None)
-assert t._rezhim_gaza(1500, 1500, -1.0, False) == (None, None)
-print("    стик 1600 -> %.0f, стик 1300 остаётся 1300" % floor)
+assert mode == "overshoot" and abs(goal - 1500) < 1.0, (mode, goal)
+# Недолёт с низкого стика поднимает чуть выше висения, но не на сотню.
+mode, goal = t._rezhim_gaza(1500, 1300, -2.0, False)
+assert mode == "short" and 1500 < goal <= 1560, (mode, goal)
+# Недолёт с высокого стика этот стик ещё выше не тащит.
+mode, goal = t._rezhim_gaza(1500, 1600, -2.0, False)
+assert mode == "short" and abs(goal - 1600) < 1.0, (mode, goal)
+# Блик угла у высокого стика не отпускает убавку.
+mode, goal = t._rezhim_gaza(1500, 1600, 0.1, False)
+assert mode == "hold" and abs(goal - 1500) < 1.0, (mode, goal)
+assert t._rezhim_gaza(1500, 1500, 0.1, False) == (None, None)
+print("    высокий стик -> 1500, низкий не ниже 1500, недолёт ограничен")
 
 print("\n=== 4. Близко и высоко ===")
 # 40 м и 50° — около 34 м по земле.
