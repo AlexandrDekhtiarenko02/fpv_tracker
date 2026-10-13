@@ -1545,6 +1545,10 @@ LEAD_AIM_ENABLED = True
 # и против раскачки. Дальше поднимать нельзя вслепую: снос считается разностью
 # по кадрам и шумит, а LEAD_MAX_PX ограничивает только величину, не шум.
 LEAD_FRAMES = 8
+# Крен опаздывает на 8 кадрах (~0.18 с): знак ошибки совпадает со знаком
+# скорости рамки 75–95% времени. 0.4 с — горизонт, на котором борт
+# успевает лечь на скорость цели, а не догонять её.
+ROLL_LEAD_S = 0.40
 # Низкочастотный фильтр на скорость цели. РЕЖЕТ НЕ ТОЛЬКО ШУМ — этим числом
 # разделяются два разных дела, которые делает один и тот же член.
 #
@@ -1588,7 +1592,7 @@ LEAD_MAX_PX = 80.0 * TRACK_SCALE
 # (мотор начинает работать ДО появления позиционной ошибки).
 # Работает в паре с LEAD — они не конкурируют, а дополняют друг друга.
 # Подбор: 1.5-3.0 для roll, в полёте калибровать на пересекающей цели.
-FF_GAIN_ROLL = 2.0      # PWM на (px/кадр) скорости цели по X
+FF_GAIN_ROLL = 48.0     # PWM на (px/кадр). P на смещении за 0.4 с, не 6–9% от него
 FF_GAIN_PITCH = 1.5     # PWM на (px/кадр) скорости цели по Y
 FF_GAIN_YAW = 1.0       # PWM на (px/кадр) скорости цели по X (для yaw тоже X)
 
@@ -2233,6 +2237,23 @@ THR_STEEP_DEPRESSION_DEG = 30.0
 # в 70 ШИМ на вылете уводил тангаж к 50–70° и срывал рамку.
 PITCH_STEEP_MAX_PWM = 40
 PITCH_OVERSHOOT_MAX_PWM = 50
+# Выше тангажа захвата на столько градусов нос дальше не опускаем.
+# На удачных заходах угол не рос после лока. На остальных стик стоял
+# выше 1500 и угол набирал ~6 °/с, пока не доходил до 50–60°.
+PITCH_POTOLK_DEG = 10.0
+# Сброс газа заранее, не триммером в последнюю секунду.
+# Условие любое: близко, мало времени, нос уже выше захвата, просадка.
+THR_SREZ_RANGE_M = 120.0
+THR_SREZ_TAU_S = 8.0
+THR_SREZ_PITCH_DEG = 8.0
+THR_SREZ_VARIO_CMS = -300.0       # −3 м/с
+THR_SREZ_PWM = 1280
+THR_SREZ_GLUB_PWM = 1200
+THR_SREZ_GLUB_SINK_CMS = -500.0   # −5 м/с
+THR_SREZ_NOS_DPS = 3.0            # нос ещё растёт — режем глубже
+THR_SREZ_SLEW = 500.0             # ШИМ/с, быстрее подъёма к висению
+# Прибавку газа запрещаем раньше, чем сам сброс.
+THR_PRIBAVKA_BAN_DEG = 5.0
 DY_INTEGRAL_RATE = 0.04
 DY_INTEGRAL_MAX = 60.0
 DY_INTEGRAL_DECAY = 0.985
@@ -8846,7 +8867,7 @@ def _kadr_oshibka(net, deadband):
 def _pid_axis_step(error, prev_error, integral, ff_value,
                    p_gain, d_gain, i_gain, ff_gain,
                    integral_max, integral_decay,
-                   sign, max_deflect, dbg_key=None, k=1.0):
+                   sign, max_deflect, dbg_key=None, k=1.0, i_error=None):
     """Один шаг PID+FF по одной оси с условным anti-windup.
 
     Anti-windup: I-компонент НЕ накапливается, если P+D+FF+I-выход уже
@@ -8857,10 +8878,13 @@ def _pid_axis_step(error, prev_error, integral, ff_value,
     ff_value: упреждающий сигнал (обычно скорость цели в пикселях/кадр).
     ff_gain: коэффициент пересчёта ff_value в PWM-вклад.
     Если ff_gain=0 — FF выключен, ведёт себя как чистый PID.
+    i_error: что копить в интеграторе. None — ту же ошибку, что у P.
+    Крен передаёт сырой dx_raw: лид в интеграле догоняет рамку и перелетает.
 
     Возвращает (offset_clamped, new_prev_error, new_integral).
     """
     err_f = float(error)
+    i_err = err_f if i_error is None else float(i_error)
     d_err = err_f - prev_error
 
     # D и FF делятся на k, I умножается: при удвоенной частоте кадров разница
@@ -8874,11 +8898,11 @@ def _pid_axis_step(error, prev_error, integral, ff_value,
     sat_pos = total_unsat >= max_deflect
     sat_neg = total_unsat <= -max_deflect
     # Знак, в котором новая I-добавка толкнула бы выход.
-    i_dir = sign * err_f
+    i_dir = sign * i_err
     push_further = (sat_pos and i_dir > 0) or (sat_neg and i_dir < 0)
 
-    if err_f != 0.0 and not push_further:
-        integral += err_f * i_gain * k
+    if i_err != 0.0 and not push_further:
+        integral += i_err * i_gain * k
         if integral > integral_max:
             integral = integral_max
         elif integral < -integral_max:
@@ -9694,6 +9718,64 @@ def _blizko_i_vysoko(dep_deg, range_m, alt_m):
     if range_m is None:
         range_m = float(alt_m) / math.tan(math.radians(float(dep_deg)))
     return float(range_m) <= THR_STEEP_RANGE_M
+
+
+def _sbros_integrala(integral, dy_raw):
+    """Интегратор тангажа жив, только пока сырая цель просит ту же сторону.
+
+    Положительный интеграл опускает нос. Если цель уже не ниже центра,
+    копить дальше нечего: иначе на +12° от захвата он сам докручивает нос.
+    """
+    if integral > 0.0 and dy_raw <= 0.0:
+        return 0.0
+    if integral < 0.0 and dy_raw >= 0.0:
+        return 0.0
+    return float(integral)
+
+
+def _potolok_tangazha(pitch_deg, pitch_lock):
+    """Нос уже на PITCH_POTOLK_DEG ниже угла захвата."""
+    if pitch_deg is None or pitch_lock is None:
+        return False
+    return float(pitch_deg) > float(pitch_lock) + PITCH_POTOLK_DEG
+
+
+def _srez_gaza(rc_t, range_m, tau_s, pitch_deg, pitch_lock, vario_cms,
+               nos_rastet):
+    """Потолок газа на заходе. None — условия сброса не выполнены.
+
+    Обычный сброс: min(стик, 1280). Если нос всё ещё растёт или просадка
+    быстрее 5 м/с — min(стик, 1200). Ниже стика не поднимаем.
+    """
+    if rc_t is None:
+        return None
+    nado = False
+    if range_m is not None and float(range_m) < THR_SREZ_RANGE_M:
+        nado = True
+    if tau_s is not None and float(tau_s) < THR_SREZ_TAU_S:
+        nado = True
+    if (pitch_deg is not None and pitch_lock is not None
+            and float(pitch_deg) > float(pitch_lock) + THR_SREZ_PITCH_DEG):
+        nado = True
+    if vario_cms is not None and float(vario_cms) < THR_SREZ_VARIO_CMS:
+        nado = True
+    if not nado:
+        return None
+    potolok = THR_SREZ_PWM
+    if nos_rastet or (vario_cms is not None
+                      and float(vario_cms) < THR_SREZ_GLUB_SINK_CMS):
+        potolok = THR_SREZ_GLUB_PWM
+    return min(float(rc_t), float(potolok))
+
+
+def _pribavka_zapreshchena(pitch_deg, pitch_lock, vario_cms):
+    """Вверх газ не добавляем: нос уже ниже захвата или высота падает."""
+    if vario_cms is not None and float(vario_cms) < 0.0:
+        return True
+    if (pitch_deg is not None and pitch_lock is not None
+            and float(pitch_deg) > float(pitch_lock) + THR_PRIBAVKA_BAN_DEG):
+        return True
+    return False
 
 
 def _rezhim_gaza(hover, base_thr, los_rate, steep):
@@ -10995,7 +11077,9 @@ def _update_control_from_target_impl():
         # target_v* уже приведены к номинальному кадру, поэтому горизонт
         # LEAD_FRAMES тоже трактуется в номинальных кадрах = фиксированное
         # время (LEAD_FRAMES/30 с), независимо от текущего FPS.
-        lead_x = target_vx_smoothed * float(LEAD_FRAMES)
+        # Крен смотрит на 0.4 с вперёд. Тангаж остаётся на LEAD_FRAMES:
+        # ему длинный горизонт уже давал раскачку.
+        lead_x = target_vx_smoothed * (ROLL_LEAD_S * NOMINAL_FPS)
         lead_y = target_vy_smoothed * float(LEAD_FRAMES)
         # Жёсткий потолок чтобы шумы по скорости не унесли прицел через полкадра.
         if lead_x > LEAD_MAX_PX:
@@ -11106,6 +11190,12 @@ def _update_control_from_target_impl():
 
     dy_aim = (box_cy + AIM_OFFSET_Y + pitch_comp_px + lead_y
               + los_aim_px) - CENTER_Y
+    # Тангаж замыкается НЕ по dy_aim. Компенсация своего угла
+    # (pitch_comp_px) гасила как раз тот уход цели, который нос сам
+    # и делал: dy_raw уже выше центра, а ошибка регулятора оставалась
+    # положительной, и интегратор докручивал нос. В контур идёт сырое
+    # положение, статическая точка прицела и упреждение. Компенсация
+    # остаётся в журнале и в теневом прицеле. Крен и рыскание её не видели.
 
     with state_lock:
         _fcp = app_state.get("fc_pitch_deg")
@@ -11470,7 +11560,10 @@ def _update_control_from_target_impl():
     # курс, обнуляясь в момент, когда угол переставал меняться.
     col_p = 0.0
     col_r = 0.0
-    ady_p = ady
+    # Тангаж: dy_raw + прицел + lead_y. Без pitch_comp и без сдвига
+    # прицела по углу — тот срыв курса уже описан выше.
+    dy_pitch = (box_cy - CENTER_Y) + AIM_OFFSET_Y + lead_y
+    ady_p = _kadr_oshibka(dy_pitch, DEADBAND_Y)
     adx_r = adx
     adx_y = adx
     if COLLISION_ENABLED:
@@ -11482,16 +11575,18 @@ def _update_control_from_target_impl():
             _az_skorost, _az_skorost_ts, now_mono,
             LOS_AZ_DEADBAND_DPS, COLLISION_ROLL_PWM_DPS,
             COLLISION_ROLL_MAX, ROLL_SIGN) * trust_k
-        ady_p = _kadr_oshibka(dy_aim - los_aim_px, DEADBAND_Y) * COLLISION_PITCH_PIXEL
+        ady_p *= COLLISION_PITCH_PIXEL
         adx_r = _kadr_oshibka(dx_aim - los_aim_x_px, DEADBAND_X) * COLLISION_ROLL_PIXEL
         adx_y = _kadr_oshibka(dx_aim - los_aim_x_px, DEADBAND_X)
 
+    dx_raw = box_cx - CENTER_X
     roll_offset, prev_adx, roll_integral = _pid_axis_step(
         adx_r, prev_adx, roll_integral,
         target_vx_smoothed,
         p_roll_eff, D_GAIN_ROLL, i_roll_eff, ff_roll_eff,
         ROLL_INTEGRAL_MAX, ROLL_INTEGRAL_DECAY,
         ROLL_SIGN, MAX_ROLL_DEFLECT, dbg_key="roll", k=k,
+        i_error=_kadr_oshibka(dx_raw, DEADBAND_X),
     )
     # ДИАГНОСТИКА ANTI-WINDUP. "requested" (сырой выход _pid_axis_step,
     # уже в _pid_dbg["roll"][4]) считает насыщение по MAX_ROLL_DEFLECT —
@@ -11545,6 +11640,25 @@ def _update_control_from_target_impl():
         PITCH_INTEGRAL_MAX, PITCH_INTEGRAL_DECAY,
         PITCH_SIGN, MAX_PITCH_DEFLECT, dbg_key="pitch", k=k,
     )
+    _p_ch, _d_ch, _i_ch, _ff_ch, _p_out, _p_sat = _pid_dbg.get(
+        "pitch", (0.0, 0.0, 0.0, 0.0, 0.0, False))
+    # Сырая цель уже не просит дальше в сторону интегратора — сброс.
+    pitch_integral = _sbros_integrala(pitch_integral, box_cy - CENTER_Y)
+    _pitch_tek_pot, _ = svezhiy_tangazh(now_mono)
+    _vyshe_potolka = _potolok_tangazha(_pitch_tek_pot, _pitch_pri_loke)
+    if _vyshe_potolka:
+        # Положительные P и I как раз опускают нос. Выше потолка их нет.
+        if _p_ch > 0.0:
+            _p_ch = 0.0
+        if pitch_integral > 0.0:
+            pitch_integral = 0.0
+    pitch_offset = PITCH_SIGN * (_p_ch + _d_ch + _ff_ch + pitch_integral)
+    if pitch_offset > MAX_PITCH_DEFLECT:
+        pitch_offset = MAX_PITCH_DEFLECT
+    elif pitch_offset < -MAX_PITCH_DEFLECT:
+        pitch_offset = -MAX_PITCH_DEFLECT
+    _pid_dbg["pitch"] = (_p_ch, _d_ch, pitch_integral, _ff_ch,
+                         pitch_offset, _p_sat)
     # Поверх PID — launch boost и cruise. Они могут вытолкнуть target_pitch
     # за MAX_PITCH_DEFLECT, но финальный clamp 1000-2000 остаётся.
     # --- ДЕМПФИРОВАНИЕ ПО ГИРОСКОПУ ---
@@ -11900,6 +12014,18 @@ def _update_control_from_target_impl():
     if (_hover_pwm is not None and _los_g is not None
             and _los_g >= -LOS_RATE_DEADBAND_DPS and thr_adjust > 0.0):
         thr_adjust = 0.0
+    # И раньше по самой высоте: нос уже ниже захвата на 5° или вариометр
+    # отрицательный — вверх газ не добавляем вовсе. На 42 в сближении
+    # трекер прибавлял до +140 при просадке −15…−30 м/с.
+    _pitch_dlya_gaza = _pitch_tek_pot
+    with state_lock:
+        _var_g = app_state.get("vario_cms")
+        _var_g_ts = app_state.get("alt_ts", 0.0)
+    if not _var_g_ts or (now_mono - _var_g_ts) > VARIO_FRESH_S:
+        _var_g = None
+    if thr_adjust > 0.0 and _pribavka_zapreshchena(
+            _pitch_dlya_gaza, _pitch_pri_loke, _var_g):
+        thr_adjust = 0.0
 
     # --- ФИНАЛ: ДЕРЖИМ ПОСЛЕДНЮЮ КОМАНДУ ---
     #
@@ -12050,6 +12176,11 @@ def _update_control_from_target_impl():
                     % (_nos_do, target_pitch, _geom_mode))
             except Exception:
                 pass
+    # Потолок от угла захвата. Стик выше 1500 продолжает опускать нос
+    # (~6 °/с, пока стик выше 1508). Выше потолка команда не опускает.
+    if _vyshe_potolka and target_pitch > 1500:
+        target_pitch = 1500
+        _slew_pitch = 1500.0
 
     # --- ПРЕДЕЛ СКОРОСТИ СНИЖЕНИЯ ---
     #
@@ -12167,6 +12298,26 @@ def _update_control_from_target_impl():
         elif boosted < THROTTLE_MIN_PWM:
             boosted = THROTTLE_MIN_PWM
         target_throttle = int(round(boosted))
+
+    # Сброс заранее: дальность, время, угол от захвата или просадка.
+    # Геометрия висения выше по коду может этот газ поднимать — здесь
+    # потолок её перебивает, иначе стик захвата 1548–1560 так и доезжает
+    # до цели и высота растёт.
+    if OVERRIDE_THROTTLE:
+        _srez_cel = _srez_gaza(
+            base_thr,
+            closure.get("range_m") if isinstance(closure, dict) else None,
+            _tau_now if isinstance(closure, dict) else None,
+            _pitch_dlya_gaza, _pitch_pri_loke, _var_g,
+            _gyro_y_sgl is not None and _gyro_y_sgl > THR_SREZ_NOS_DPS)
+        if _srez_cel is not None and target_throttle > _srez_cel:
+            _thr_geom_out = _podtyanut_gaz(
+                _thr_geom_out if _thr_geom_out is not None else target_throttle,
+                _srez_cel, THR_SREZ_SLEW, k)
+            target_throttle = int(round(_thr_geom_out))
+            target_throttle = max(THROTTLE_MIN_PWM,
+                                  min(THROTTLE_MAX_PWM, target_throttle))
+            smooth_throttle_out = float(target_throttle)
 
     # Индикация фазы launch в overlay (имеет приоритет над TRACKED/LOCK).
     if launch_phase in ("RAMP_UP", "HOLD", "RAMP_DOWN"):
