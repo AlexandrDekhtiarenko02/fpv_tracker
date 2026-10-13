@@ -58,6 +58,7 @@ from libcamera import Transform
 import cv2
 import numpy as np
 import serial
+import select
 import struct
 import time
 import threading
@@ -4699,6 +4700,9 @@ MSP_RC_PERIOD = 0.04
 # расчёт газа — 0.35 с; в этом зазоре газ уже брался из dyn_throttle, а
 # passthrough считался живым, и при потере связи поведение расходилось.
 RC_FRESH_WINDOW = 0.35
+# Дольше этого без нового MSP_RC тумблер больше не читается: порт завис,
+# а последнее aux4 осталось поднятым. Рамку снимаем, не ждём ребута.
+RC_LINK_DEAD_S = 0.80
 # Опрос состояния «заармлен» — нужен, чтобы писать разбор вылета по дизарму.
 MSP_STATUS_PERIOD = 0.25
 # Опрос высоты и вариометра. MSP_ALTITUDE отдаёт ОЦЕНКУ Betaflight (баро,
@@ -4774,8 +4778,27 @@ FEATURE_GPS_BIT = 7            # бит GPS в маске функций (MSP_FE
 _box_bits = {}                       # постоянный id -> номер бита
 
 fc = None
+
+
+def _open_fc_port():
+    """Порт, у которого и чтение, и запись обязаны отлипнуть сами.
+
+    timeout=0 — read() не блокируется. Ждать байт будем через select со
+    своим сроком. write_timeout — чтобы забитый USB-буфер ttyACM не заморозил
+    поток опроса навсегда: без него write() ждёт бесконечно, except не
+    случается, и переоткрытие порта так и не начинается.
+    """
+    ser = serial.Serial()
+    ser.port = PORT
+    ser.baudrate = BAUD
+    ser.timeout = 0
+    ser.write_timeout = 0.05
+    ser.open()
+    return ser
+
+
 try:
-    fc = serial.Serial(PORT, baudrate=BAUD, timeout=0.05)
+    fc = _open_fc_port()
 except Exception:
     fc = None
 
@@ -5242,6 +5265,39 @@ def _msp_timing_report():
         flight_log.event("MSP TRANSPORT: " + "; ".join(parts))
 
 
+def _msp_read(n, deadline):
+    """Ровно n байт, но не дольше deadline. None — срок вышел или порт умер.
+
+    select со сроком, а не Serial.read с таймаутом: на ttyACM после сбоя
+    USB драйвер иногда игнорирует VTIME, и read() не возвращается никогда.
+    """
+    if fc is None or n <= 0:
+        return None
+    chunks = []
+    got = 0
+    while got < n:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return None
+        try:
+            ready, _, _ = select.select([fc], [], [], left)
+        except Exception:
+            _fc_reconnect()
+            return None
+        if not ready:
+            return None
+        try:
+            part = fc.read(n - got)
+        except Exception:
+            _fc_reconnect()
+            return None
+        if not part:
+            return None
+        chunks.append(part)
+        got += len(part)
+    return b"".join(chunks)
+
+
 def msp_request(cmd):
     if fc is None:
         return None
@@ -5256,26 +5312,28 @@ def msp_request(cmd):
         packet = b'$M<' + struct.pack('<BBB', 0, cmd, cmd)
         fc.write(packet)
 
+        # Весь ответ, не каждый байт по отдельности: раньше 64 пустых
+        # read по 50 мс могли съесть три секунды одного запроса.
+        deadline = time.monotonic() + 0.08
         sync = b''
-        for _ in range(64):
-            b = fc.read(1)
+        while not sync.endswith(b'$M>'):
+            b = _msp_read(1, deadline)
             if not b:
                 return None
             sync += b
-            if sync.endswith(b'$M>'):
-                break
-        else:
-            return None
+            if len(sync) > 64:
+                return None
 
-        size_b = fc.read(1)
-        cmd_b = fc.read(1)
+        size_b = _msp_read(1, deadline)
+        cmd_b = _msp_read(1, deadline)
         if not size_b or not cmd_b:
             return None
         size_ = size_b[0]
         resp_cmd = cmd_b[0]
-        data_ = fc.read(size_)
-        crc_b = fc.read(1)
-        if resp_cmd != cmd or len(data_) != size_ or len(crc_b) != 1:
+        data_ = _msp_read(size_, deadline) if size_ else b''
+        crc_b = _msp_read(1, deadline)
+        if (data_ is None or crc_b is None or resp_cmd != cmd
+                or len(data_) != size_ or len(crc_b) != 1):
             return None
         checksum = size_ ^ resp_cmd
         for b in data_:
@@ -5302,35 +5360,52 @@ def msp_request(cmd):
 
 _fc_reconnect_ts = 0.0
 FC_RECONNECT_THROTTLE_S = 1.0
+_fc_open_thread = None
 
 
 def _fc_reconnect():
-    """Переоткрыть порт FC после обрыва.
+    """Переоткрыть порт FC после обрыва, не останавливая опрос.
 
-    Порт открывался один раз при старте (см. serial.Serial выше), а любой
-    сбой чтения/записи глушился без переоткрытия. Кратковременный обрыв USB
-    превращался в постоянную потерю связи без следа в логе. Теперь на сбой
-    порт переоткрывается — не чаще раза в FC_RECONNECT_THROTTLE_S, иначе поток
-    забьётся попытками открыть отсутствующее устройство.
+    Раньше Serial() и close() вызывались прямо в fc_io_loop. На ttyACM
+    после сбоя USB они могут не вернуться: поток умирал внутри «переоткрываю»,
+    последнее aux4 навсегда оставалось поднятым, рамка висела до ребута,
+    а полётник по таймауту MSP уже отдал стики пилоту.
 
-    Вызывается только из потока fc_io_loop (msp_request/send_msp_set_raw_rc),
-    поэтому переприсваивание fc без замка безопасно: другой поток порт не трогает.
+    Теперь порт сразу отпускается (fc=None, опрос жив и просто молчит),
+    а открытие идёт в фоне. Зависший open не держит цикл.
     """
-    global fc, _fc_reconnect_ts
+    global fc, _fc_reconnect_ts, _fc_open_thread
     now = time.monotonic()
+    if _fc_open_thread is not None and _fc_open_thread.is_alive():
+        return
     if (now - _fc_reconnect_ts) < FC_RECONNECT_THROTTLE_S:
         return
     _fc_reconnect_ts = now
+    pokolenie = now
     staryy = fc
-    if staryy is not None:
+    fc = None
+
+    def _otkryt():
+        global fc
+        if staryy is not None:
+            try:
+                staryy.close()
+            except Exception:
+                pass
         try:
-            staryy.close()
+            novyy = _open_fc_port()
         except Exception:
-            pass
-    try:
-        fc = serial.Serial(PORT, baudrate=BAUD, timeout=0.05)
-    except Exception:
-        fc = None
+            return
+        if _fc_reconnect_ts != pokolenie:
+            try:
+                novyy.close()
+            except Exception:
+                pass
+            return
+        fc = novyy
+
+    _fc_open_thread = threading.Thread(target=_otkryt, daemon=True)
+    _fc_open_thread.start()
 
 
 def send_msp_set_raw_rc(channels):
@@ -5477,6 +5552,7 @@ def fc_io_loop():
                         # MSP-кадров, поток прервётся прямо посреди лока —
                         # а Betaflight ждёт его непрерывно.
                         app_state["rc_link_ts"] = now_rc
+                        app_state["rc_link_zhil"] = True
                         # AUX-каналы в маску оверрайда не входят, поэтому
                         # приходят с приёмника всегда — читать их можно и при
                         # активном оверрайде.
@@ -13790,7 +13866,8 @@ def draw_overlay_on_frame(frame):
     with state_lock:
         box = target_box_main
         vis = target_visible
-        aux_for_mag = aux4_state
+    aux_for_mag = _aux_zhivoy()
+    with state_lock:
         _menu_kanaly = list(app_state.get("rc_channels") or [])
         _menu_armed = app_state.get("armed")
     _menu_tick(time.monotonic(), _menu_kanaly, _menu_armed)
@@ -14439,6 +14516,39 @@ def reanchor_tracker_at_current_box(gray, reason):
 # =========================================================
 # 10. TRACKING CORE (без изменений)
 # =========================================================
+_svyaz_propal_uzhe = False
+
+
+def _aux_zhivoy():
+    """AUX4, пока от полётника приходят свежие MSP_RC.
+
+    На борту (вылет 142951, третий лок, t≈90 с) запись в ttyACM один раз
+    упала, поток опроса из неё не вернулся. aux4 так и остался 1, рамка
+    висела до ребута, а стики пилоту полётник вернул сам — кадры MSP
+    перестали приходить. Пока опрос ещё ни разу не был живым (стенд без
+    порта), тумблер не трогаем.
+    """
+    global _svyaz_propal_uzhe
+    with state_lock:
+        aux = bool(aux4_state)
+        zhil = bool(app_state.get("rc_link_zhil"))
+        ts = app_state.get("rc_link_ts", 0.0) or 0.0
+    if not zhil:
+        return aux
+    age = time.monotonic() - ts
+    if age <= RC_LINK_DEAD_S:
+        if _svyaz_propal_uzhe:
+            _svyaz_propal_uzhe = False
+            flight_log.event("СВЯЗЬ С ПОЛЁТНИКОМ ВОССТАНОВИЛАСЬ")
+        return aux
+    if not _svyaz_propal_uzhe:
+        _svyaz_propal_uzhe = True
+        flight_log.event(
+            "СВЯЗЬ С ПОЛЁТНИКОМ ПРОПАЛА (%.2f с): рамка снята, "
+            "стики снова у пилота" % age)
+    return False
+
+
 def process_locked_tracker(gray, cb_t0=None):
     """cb_t0: момент начала камерного колбэка (time.monotonic()), нужен для
     бюджета вторичных этапов (см. FRAME_BUDGET_MS). None — как в offline-
@@ -14479,8 +14589,8 @@ def process_locked_tracker(gray, cb_t0=None):
     frame_index += 1
     _stand_begin_step()
 
+    aux_on = _aux_zhivoy()
     with state_lock:
-        aux_on = aux4_state
         live_thr = app_state.get("rc_throttle", 1500)
 
     rising_aux = aux_on and not prev_aux_on
@@ -17702,8 +17812,7 @@ def camera_callback(request):
     # сравнение диагностирует тик без отдельного таймера.
     _diag_1hz_tick = (_cma_read_t == _cb_t0)
     try:
-        with state_lock:
-            aux_snapshot = aux4_state
+        aux_snapshot = _aux_zhivoy()
 
         if not aux_snapshot:
             fast_idle_update()
@@ -17712,7 +17821,9 @@ def camera_callback(request):
             # буфер YUV уже был виден на диске, а часть строк индекса ещё жила
             # только в памяти. Именно так запись выглядела как 299/166 кадров.
             if frame_recorder.active:
-                frame_recorder.stop("AUX4 выключен")
+                frame_recorder.stop(
+                    "связь с полётником пропала" if _svyaz_propal_uzhe
+                    else "AUX4 выключен")
             print_debug_once_per_second()
             with MappedArray(request, "main") as mm:
                 # СРЕДНЯЯ ЯРКОСТЬ ДО ОВЕРЛЕЯ. После — в неё войдут наши линии
