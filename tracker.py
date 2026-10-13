@@ -1359,7 +1359,9 @@ PITCH_SLEW_MAX_STEP = 32.0
 
 MAX_ROLL_DEFLECT = 200
 MAX_PITCH_DEFLECT = 200
-MAX_YAW_DEFLECT = 150
+# Рыскание только помогает крену, не ведёт само. 45 ШИМ — это слабый
+# доворот. 150 крутило борт носом, пока крен был срезан.
+MAX_YAW_DEFLECT = 45
 
 # --- ГЭЙНЫ ---
 P_GAIN_YAW = 2.5
@@ -11655,11 +11657,11 @@ def _update_control_from_target_impl():
         _vx_ff = 0.0
     roll_offset, prev_adx, roll_integral = _pid_axis_step(
         adx_r, prev_adx, roll_integral,
-        0.0,
-        p_roll_eff, D_GAIN_ROLL, i_roll_eff, 0.0,
+        _vx_ff,
+        p_roll_eff, D_GAIN_ROLL, i_roll_eff, ff_roll_eff,
         ROLL_INTEGRAL_MAX, ROLL_INTEGRAL_DECAY,
         ROLL_SIGN, MAX_ROLL_DEFLECT, dbg_key="roll", k=k,
-        i_error=0.0,
+        i_error=_kadr_oshibka(dx_raw, DEADBAND_X),
     )
     # ДИАГНОСТИКА ANTI-WINDUP. "requested" (сырой выход _pid_axis_step,
     # уже в _pid_dbg["roll"][4]) считает насыщение по MAX_ROLL_DEFLECT —
@@ -11692,15 +11694,11 @@ def _update_control_from_target_impl():
         # Доверие применяется ДО демпфирования: гироскоп к качеству
         # слежения отношения не имеет, и при плохом слежении именно
         # демпфирование удерживает аппарат — резать его было бы наоборот.
-        roll_offset = roll_offset * trust_k
+        roll_offset = roll_offset * trust_k + roll_damp_pwm
 
     else:
         roll_offset *= trust_k
-    # Интегратор крена держал бок. Копить его больше нечем: поворот на рыскании.
-    roll_integral = 0.0
-    with state_lock:
-        _bank_deg = app_state.get("fc_roll_deg")
-    roll_offset = _kren_k_gorizontu(roll_offset, _bank_deg) + roll_damp_pwm
+    roll_offset += col_r
     target_roll = max(1000, min(2000, 1500 + roll_offset))
     # ЕДИНИЦЫ — ОТКЛОНЕНИЕ ОТ ЦЕНТРА (PWM offset), А НЕ АБСОЛЮТНЫЙ RC.
     # roll_off/roll_after_trust уже в offset — target_roll-1500 приводит
