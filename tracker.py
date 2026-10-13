@@ -2241,18 +2241,22 @@ PITCH_OVERSHOOT_MAX_PWM = 50
 # На удачных заходах угол не рос после лока. На остальных стик стоял
 # выше 1500 и угол набирал ~6 °/с, пока не доходил до 50–60°.
 PITCH_POTOLK_DEG = 10.0
-# Сброс газа заранее, не триммером в последнюю секунду.
-# Условие любое: близко, мало времени, нос уже выше захвата, просадка.
-THR_SREZ_RANGE_M = 120.0
-THR_SREZ_TAU_S = 8.0
+# Сброс газа только когда заход уже реально близко или нос ушёл вниз.
+# Просадка сама по себе — нормальный заход, не повод сажать газ:
+# на 8efea18 варио < 0 и короткий tau при 400 м сажали стик в 1200,
+# и борт падал, не долетая.
+THR_SREZ_RANGE_M = 90.0
+THR_SREZ_TAU_S = 4.0
+THR_SREZ_TAU_RANGE_M = 150.0      # tau без малой дальности не верим
 THR_SREZ_PITCH_DEG = 8.0
-THR_SREZ_VARIO_CMS = -300.0       # −3 м/с
 THR_SREZ_PWM = 1280
 THR_SREZ_GLUB_PWM = 1200
-THR_SREZ_GLUB_SINK_CMS = -500.0   # −5 м/с
-THR_SREZ_NOS_DPS = 3.0            # нос ещё растёт — режем глубже
-THR_SREZ_SLEW = 500.0             # ШИМ/с, быстрее подъёма к висению
-# Прибавку газа запрещаем раньше, чем сам сброс.
+THR_SREZ_GLUB_PITCH_DEG = 12.0    # нос явно ушёл — режем глубже
+THR_SREZ_GLUB_SINK_CMS = -800.0   # и только уже близко
+THR_SREZ_NOS_DPS = 3.0
+THR_SREZ_SLEW = 180.0
+# Прибавку газа запрещаем, когда нос уже ниже захвата. Падение высоты
+# само по себе не запрещает: иначе сброс запирает набор и борт не долетает.
 THR_PRIBAVKA_BAN_DEG = 5.0
 DY_INTEGRAL_RATE = 0.04
 DY_INTEGRAL_MAX = 60.0
@@ -9744,34 +9748,39 @@ def _srez_gaza(rc_t, range_m, tau_s, pitch_deg, pitch_lock, vario_cms,
                nos_rastet):
     """Потолок газа на заходе. None — условия сброса не выполнены.
 
-    Обычный сброс: min(стик, 1280). Если нос всё ещё растёт или просадка
-    быстрее 5 м/с — min(стик, 1200). Ниже стика не поднимаем.
+    1280: уже ближе 90 м, либо tau < 4 с и дальность < 150 м, либо нос
+    ниже захвата на 8°. Короткий tau при 300–400 м не считается —
+    оценка врёт, и на таком сбросе борт падает далеко до цели.
+    1200 только если нос ушёл на 12° или уже близко и просадка быстрее
+    8 м/с. Обычное снижение газ не трогает.
     """
     if rc_t is None:
         return None
-    nado = False
-    if range_m is not None and float(range_m) < THR_SREZ_RANGE_M:
-        nado = True
-    if tau_s is not None and float(tau_s) < THR_SREZ_TAU_S:
-        nado = True
-    if (pitch_deg is not None and pitch_lock is not None
-            and float(pitch_deg) > float(pitch_lock) + THR_SREZ_PITCH_DEG):
-        nado = True
-    if vario_cms is not None and float(vario_cms) < THR_SREZ_VARIO_CMS:
-        nado = True
-    if not nado:
+    rng = None if range_m is None else float(range_m)
+    blizko = rng is not None and rng < THR_SREZ_RANGE_M
+    tau_blizko = (tau_s is not None and float(tau_s) < THR_SREZ_TAU_S
+                  and rng is not None and rng < THR_SREZ_TAU_RANGE_M)
+    nos = (pitch_deg is not None and pitch_lock is not None
+           and float(pitch_deg) > float(pitch_lock) + THR_SREZ_PITCH_DEG)
+    if not (blizko or tau_blizko or nos):
         return None
     potolok = THR_SREZ_PWM
-    if nos_rastet or (vario_cms is not None
-                      and float(vario_cms) < THR_SREZ_GLUB_SINK_CMS):
+    nos_glub = (pitch_deg is not None and pitch_lock is not None
+                and float(pitch_deg) > float(pitch_lock) + THR_SREZ_GLUB_PITCH_DEG)
+    proval = (blizko and vario_cms is not None
+              and float(vario_cms) < THR_SREZ_GLUB_SINK_CMS)
+    if nos_glub or proval or (nos and nos_rastet and blizko):
         potolok = THR_SREZ_GLUB_PWM
     return min(float(rc_t), float(potolok))
 
 
 def _pribavka_zapreshchena(pitch_deg, pitch_lock, vario_cms):
-    """Вверх газ не добавляем: нос уже ниже захвата или высота падает."""
-    if vario_cms is not None and float(vario_cms) < 0.0:
-        return True
+    """Вверх газ не добавляем только когда нос уже ниже захвата.
+
+    Отрицательный вариометр не запрещает прибавку: набор нужен,
+    чтобы вытянуть заход, если борт уже просел.
+    """
+    del vario_cms
     if (pitch_deg is not None and pitch_lock is not None
             and float(pitch_deg) > float(pitch_lock) + THR_PRIBAVKA_BAN_DEG):
         return True
