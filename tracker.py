@@ -1355,10 +1355,10 @@ PITCH_SLEW_MAX_STEP = 32.0
 
 MAX_ROLL_DEFLECT = 200
 MAX_PITCH_DEFLECT = 200
-MAX_YAW_DEFLECT = 150
+MAX_YAW_DEFLECT = 180
 
 # --- ГЭЙНЫ ---
-P_GAIN_YAW = 2.5
+P_GAIN_YAW = 6.0
 P_GAIN_ROLL = 4.0
 # СНИЖЕН по тем же причинам, что и у тангажа: производная берётся с
 # гироскопа, и дублировать её дифференцированием шумного ряда коробки значит
@@ -1600,7 +1600,14 @@ LEAD_MAX_PX = 80.0 * TRACK_SCALE
 # Подбор: 1.5-3.0 для roll, в полёте калибровать на пересекающей цели.
 FF_GAIN_ROLL = 48.0     # PWM на (px/кадр). P на смещении за 0.4 с, не 6–9% от него
 FF_GAIN_PITCH = 1.5     # PWM на (px/кадр) скорости цели по Y
-FF_GAIN_YAW = 1.0       # PWM на (px/кадр) скорости цели по X (для yaw тоже X)
+FF_GAIN_YAW = 12.0      # поворот делает рыскание, не крен
+# Доля следящего крена. Остальное ушло в рыскание: крен на боку
+# сносит борт мимо цели, а не поворачивает его.
+ROLL_TRACK_KEEP = 0.20
+# ШИМ на градус крена, назад к горизонту. 10° банка — это 60 ШИМ,
+# и борт не остаётся лежать на боку.
+ROLL_LEVEL_PWM_PER_DEG = 6.0
+ROLL_LEVEL_MAX = 80.0
 
 # --- РЕЖИМ СБЛИЖЕНИЯ ---
 # Когда до контакта остаются секунды — мы в финальной фазе. Времени на
@@ -2288,9 +2295,9 @@ DY_INTEGRAL_DECAY = 0.985
 #       дальность = высота / tg(угол снижения)
 #    Точность растёт при сближении, то есть там, где она и нужна.
 RANGE_ESTIMATE_ENABLED = True
-# Показывать дальность и время до контакта текстом у рамки цели. Только
-# показ: в управление эти величины по-прежнему не подаются.
-RANGE_READOUT_ENABLED = True
+# Показывать дальность и время текстом у рамки больше не нужно:
+# строки закрывали цель.
+RANGE_READOUT_ENABLED = False
 # --- ПУТЕВАЯ СКОРОСТЬ ПО БЕГУ ЗЕМЛИ (работает без GPS) ---
 # Точка на земле уходит назад тем быстрее, чем быстрее летим и чем ниже. Зная
 # высоту и угол, под которым точка видна, получаем дальность до неё, а из неё
@@ -5288,6 +5295,11 @@ def send_msp_set_raw_rc(channels):
 
 _ovr_zhaloba_ts = 0.0
 _ovr_zhaloba_s = 0.0
+# Режим MSP OVERRIDE на борту уже видели включённым в этом захвате.
+# Если после этого он гаснет, а канал AUX залип эхом — трекер всё равно
+# отпускаем, иначе рамка живёт, а стики уже у пилота.
+_videli_overrayd = False
+_ovr_off_since = 0.0
 # Для видимой ошибки отправки: логируем ТОЛЬКО смену состояния (ушло↔не ушло),
 # а не каждый кадр, иначе при обрыве лог зальётся. None — ещё не отправляли.
 _send_ok_prev = None
@@ -9741,6 +9753,23 @@ def _blizko_i_vysoko(dep_deg, range_m, alt_m):
     return float(range_m) <= THR_STEEP_RANGE_M
 
 
+def _kren_k_gorizontu(roll_offset, bank_deg):
+    """Слабый следящий крен плюс возврат крыльев в горизонт.
+
+    Поворот к цели делает рыскание. Крен, который копится и держит бок,
+    сносит аппарат мимо, потом его перекладывает на другой бок.
+    """
+    sled = float(roll_offset) * ROLL_TRACK_KEEP
+    if bank_deg is None:
+        return sled
+    uroven = -ROLL_LEVEL_PWM_PER_DEG * float(bank_deg)
+    if uroven > ROLL_LEVEL_MAX:
+        uroven = ROLL_LEVEL_MAX
+    elif uroven < -ROLL_LEVEL_MAX:
+        uroven = -ROLL_LEVEL_MAX
+    return sled + uroven
+
+
 def _derzhat_nos(dep_deg, alt_m):
     """Угол на цель уже крутой и высота ещё есть — нос дальше не опускаем.
 
@@ -11624,11 +11653,11 @@ def _update_control_from_target_impl():
         _vx_ff = 0.0
     roll_offset, prev_adx, roll_integral = _pid_axis_step(
         adx_r, prev_adx, roll_integral,
-        _vx_ff,
-        p_roll_eff, D_GAIN_ROLL, i_roll_eff, ff_roll_eff,
+        0.0,
+        p_roll_eff, D_GAIN_ROLL, i_roll_eff, 0.0,
         ROLL_INTEGRAL_MAX, ROLL_INTEGRAL_DECAY,
         ROLL_SIGN, MAX_ROLL_DEFLECT, dbg_key="roll", k=k,
-        i_error=_kadr_oshibka(dx_raw, DEADBAND_X),
+        i_error=0.0,
     )
     # ДИАГНОСТИКА ANTI-WINDUP. "requested" (сырой выход _pid_axis_step,
     # уже в _pid_dbg["roll"][4]) считает насыщение по MAX_ROLL_DEFLECT —
@@ -11661,11 +11690,15 @@ def _update_control_from_target_impl():
         # Доверие применяется ДО демпфирования: гироскоп к качеству
         # слежения отношения не имеет, и при плохом слежении именно
         # демпфирование удерживает аппарат — резать его было бы наоборот.
-        roll_offset = roll_offset * trust_k + roll_damp_pwm
+        roll_offset = roll_offset * trust_k
 
     else:
         roll_offset *= trust_k
-    roll_offset += col_r
+    # Интегратор крена держал бок. Копить его больше нечем: поворот на рыскании.
+    roll_integral = 0.0
+    with state_lock:
+        _bank_deg = app_state.get("fc_roll_deg")
+    roll_offset = _kren_k_gorizontu(roll_offset, _bank_deg) + roll_damp_pwm
     target_roll = max(1000, min(2000, 1500 + roll_offset))
     # ЕДИНИЦЫ — ОТКЛОНЕНИЕ ОТ ЦЕНТРА (PWM offset), А НЕ АБСОЛЮТНЫЙ RC.
     # roll_off/roll_after_trust уже в offset — target_roll-1500 приводит
@@ -11776,7 +11809,7 @@ def _update_control_from_target_impl():
 
     yaw_error_weighted = filtered_dx_yaw * yaw_weight
     yaw_pd = yaw_error_weighted * P_GAIN_YAW
-    yaw_ff = target_vx_smoothed * ff_yaw_eff * yaw_weight
+    yaw_ff = _vx_ff * ff_yaw_eff * yaw_weight
     yaw_total_unsat = YAW_SIGN * (yaw_pd + yaw_ff + yaw_integral)
     yaw_sat_pos = yaw_total_unsat >= MAX_YAW_DEFLECT
     yaw_sat_neg = yaw_total_unsat <= -MAX_YAW_DEFLECT
@@ -11791,6 +11824,8 @@ def _update_control_from_target_impl():
     yaw_integral *= YAW_INTEGRAL_DECAY ** k
 
     yaw_offset = YAW_SIGN * (yaw_pd + yaw_ff + yaw_integral) * trust_k
+    # Скорость азимута крутит нос, а не кладёт борт на крыло.
+    yaw_offset += col_r
 
     # Демпфирование рыскания по гироскопу — то же, что у тангажа и крена.
     #
@@ -13431,11 +13466,10 @@ def draw_overlay_on_frame(frame):
     #
     # Возвращается сразу, как только захвата нет: без лока перекрестье снова
     # единственный ориентир, по нему цель и наводят перед локом.
-    if not (vis and box is not None):
+    if not (vis and box is not None) or not aux_for_mag:
         draw_crosshair(frame)
-    if vis and box is not None:
+    if vis and box is not None and aux_for_mag:
         draw_corners(frame, box, COLOR_WHITE, 2)
-        draw_range_readout(frame, box)
     if MAG_ENABLED and ((not MAG_ONLY_WHEN_AUX) or aux_for_mag):
         draw_magnifier(frame, box if vis else None)
     # Строго после лупы: она пишет прямоугольник поверх кадра и затёрла бы
@@ -14075,6 +14109,7 @@ def process_locked_tracker(gray, cb_t0=None):
     global lost_frames, frame_index, last_match_score, last_flow_ok
     global fps_t0, fps_frames, fps_current
     global prev_aux_on, acq_wait_left, lock_sequence
+    global _videli_overrayd, _ovr_off_since
     global auto_reacq_attempts
     global template_scale_acc, color_axis
     global lock_w0, lock_h0
@@ -14104,12 +14139,32 @@ def process_locked_tracker(gray, cb_t0=None):
     with state_lock:
         aux_on = aux4_state
         live_thr = app_state.get("rc_throttle", 1500)
+        _fc_on = bool(app_state.get("fc_override_on"))
+        _fc_ts = app_state.get("fc_override_ts", 0.0)
+
+    # Канал AUX честен, только пока он не в маске оверрайда. Если тумблер
+    # уже снят, а MSP_RC продолжает отдавать 2000, полётник режим гасит
+    # и стики возвращаются, а рамка остаётся. Смотрим на сам режим.
+    now_aux = time.monotonic()
+    if aux_on and _fc_on:
+        _videli_overrayd = True
+        _ovr_off_since = 0.0
+    elif (_videli_overrayd and _fc_ts > 0.0
+          and (now_aux - _fc_ts) < 1.5 and not _fc_on):
+        if _ovr_off_since <= 0.0:
+            _ovr_off_since = now_aux
+        elif now_aux - _ovr_off_since > 0.45:
+            aux_on = False
+    else:
+        _ovr_off_since = 0.0
 
     rising_aux = aux_on and not prev_aux_on
     falling_aux = (not aux_on) and prev_aux_on
     prev_aux_on = aux_on
 
     if not aux_on:
+        _videli_overrayd = False
+        _ovr_off_since = 0.0
         if falling_aux or track_state != TRACK_STATE_IDLE:
             reset_tracking(to_acq=False)
         auto_reacq_attempts = 0

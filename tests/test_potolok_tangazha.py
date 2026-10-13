@@ -77,4 +77,10 @@ assert ff >= p_na_snose * 0.5, (ff, p_na_snose)
 assert t.ROLL_LEAD_S >= 0.4 - 1e-9
 assert t.LEAD_FRAMES == 8
 
+print("=== 7. Крен возвращает горизонт, а не держит бок ===")
+# 20 ШИМ слежения при банке +15°: уровень тянет назад на 80, не даёт лежать.
+uroven = t._kren_k_gorizontu(100.0, 15.0)
+assert uroven < 0.0, uroven
+assert t._kren_k_gorizontu(0.0, 0.0) == 0.0
+assert t._kren_k_gorizontu(100.0, None) == 20.0
 print("ok")
