@@ -40,28 +40,39 @@ for f in found:
     print("   ", f)
 assert found, "нигде не видно связи оверрайда с режимом наблюдения"
 
-print("\n=== 3. В режиме наблюдения RC-команды по MSP не отправляются ===")
+print("\n=== 3. В режиме пилота на моторы уходят только стики, не команды ===")
+# Молчание здесь вредно: на Betaflight 4.5 при включённом MSP OVERRIDE
+# последняя команда держится бесконечно. Поэтому поток есть, но оси
+# трекера в него не подставляются.
 lines = src.splitlines()
-# Вызов теперь присваивается (sent_ok = send_msp_set_raw_rc(...)), поэтому
-# ищем строку с вызовом, исключая определение функции.
 send_lines = [i for i, line in enumerate(lines)
               if "send_msp_set_raw_rc(channels)" in line
               and not line.strip().startswith("def ")]
 assert send_lines, "в коде не найден вызов send_msp_set_raw_rc"
-for send_i in send_lines:
-    guards = [i for i in range(send_i)
-              if lines[i].strip() ==
-              "if have_fresh_rc and not OBSERVE_ONLY:"]
-    assert guards, (
-        "send_msp_set_raw_rc не защищён условием not OBSERVE_ONLY")
-    guard_i = guards[-1]
-    guard_indent = len(lines[guard_i]) - len(lines[guard_i].lstrip())
-    for line in lines[guard_i + 1:send_i + 1]:
-        if line.strip() and not line.lstrip().startswith("#"):
-            indent = len(line) - len(line.lstrip())
-            assert indent > guard_indent, (
-                "send_msp_set_raw_rc оказался вне защиты OBSERVE_ONLY")
-print("    все отправки MSP RC отключены")
+observe_passthrough = []
+for i, line in enumerate(lines):
+    if "build_output_channels(" not in line:
+        continue
+    window = "\n".join(lines[i:i + 3])
+    prev = "\n".join(lines[max(0, i - 20):i])
+    if "False)" in window and "OBSERVE_ONLY" in prev:
+        observe_passthrough.append(i)
+assert observe_passthrough, (
+    "в режиме пилота нет пасстру стиков (build_output_channels с apply_ov=False)")
+# Команды трекера собираются только в обычной ветке, не под OBSERVE_ONLY.
+for i, line in enumerate(lines):
+    if line.strip().startswith("def "):
+        continue
+    if "build_output_channels(" not in line:
+        continue
+    block = "\n".join(lines[i:i + 2])
+    if "r_cmd" not in block:
+        continue
+    window = "\n".join(lines[max(0, i - 20):i + 1])
+    assert "elif have_fresh_rc:" in window, (
+        "команды трекера собираются вне обычной ветки, их может унести "
+        "режим пилота")
+print("    команды трекера в режим пилота не входят")
 
 print("\n=== 4. Флаг существует и по умолчанию ВЫКЛЮЧЕН ===")
 m = re.search(r"^OBSERVE_ONLY = (.+?)(?:\s+#.*)?$", src, re.M)
@@ -80,4 +91,4 @@ assigns = [n for n in tree.body
 print("    присваиваний OBSERVE_ONLY на верхнем уровне:", len(assigns))
 assert len(assigns) == 1, "флаг задан больше одного раза — легко перепутать"
 
-print("\nOK: наблюдение не отправляет команды и не может включить управление")
+print("\nOK: в режиме пилота на моторы уходят стики, не команды трекера")

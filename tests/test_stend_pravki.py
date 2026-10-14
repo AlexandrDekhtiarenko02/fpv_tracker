@@ -26,8 +26,10 @@ print("=== 1. Устаревший статус override НЕ пускает э�
 # Приём в кеш приёмника — только когда override точно не маскирует.
 assert "override_maybe_masking = aux4_state and (fc_ovr or stale_ovr)" in src, (
     "признак возможной маскировки собран не по AUX4 и статусу")
-assert "if OBSERVE_ONLY or not override_maybe_masking:" in src, (
+assert "if not override_maybe_masking:" in src, (
     "приём MSP_RC в кеш приёмника не закрыт при возможной маскировке")
+assert "if OBSERVE_ONLY or not override_maybe_masking:" not in src, (
+    "режим пилота снова принимает MSP_RC за стики при включённом OVERRIDE")
 # Старая дырявая форма (stale_ovr как РАЗРЕШЕНИЕ на приём) не должна вернуться.
 assert "or not fc_ovr or stale_ovr:" not in src, (
     "вернулась старая логика: устаревший статус снова ПУСКАЕТ приём MSP_RC")

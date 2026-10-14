@@ -1222,10 +1222,16 @@ _auto_tref_total_count = 0
 # в логе оказалось бы эхо трекера вместо действий человека, и выглядело бы это
 # совершенно правдоподобно. Вся кампания вылетов ушла бы впустую.
 #
-# Здесь оверрайд не включается вовсе. Заодно это гарантия безопасности: машина
-# физически не может вмешаться в управление, пока пилот заходит на цель.
+# Здесь команды трекера на моторы не уходят никогда. Но замолкать тоже нельзя:
+# на Betaflight 4.5 и 2025.12, пока режим MSP OVERRIDE включён, полётник
+# держит последнюю присланную команду бесконечно. Молчание после кадра
+# трекера или после меню (центр и холостой газ) и есть тот захват стиков.
+# Поэтому в этом режиме поток MSP продолжается, но в нём только живые стики,
+# снятые пока режим OVERRIDE выключен. Тумблер лока этот режим включает —
+# для записи он должен быть опущен, слежение идёт и без него.
 # Включается из меню Tools → Pilot log, настройка остаётся после перезапуска.
 OBSERVE_ONLY = False
+_pilot_tumbler_uzhe = False
 
 OVERRIDE_ROLL = True
 OVERRIDE_PITCH = True
@@ -5610,7 +5616,11 @@ def fc_io_loop():
                         # неизвестном — устаревшем — статусе). Опущенный AUX4 =
                         # переключатель снят = MSP_RC честный по всем каналам.
                         override_maybe_masking = aux4_state and (fc_ovr or stale_ovr)
-                        if OBSERVE_ONLY or not override_maybe_masking:
+                        # В режиме пилота MSP_RC при включённом OVERRIDE — это наша
+                        # же прошлая посылка или замороженная команда, не стик.
+                        # Принимать её за приёмник нельзя: следующим кадром
+                        # она уедет на моторы.
+                        if not override_maybe_masking:
                             app_state["receiver_channels"] = list(ch[:8])
                             app_state["receiver_ts"] = now_rc
                             app_state["rc_throttle"] = ch[3]
@@ -5875,6 +5885,8 @@ def fc_io_loop():
                 # держал последний манёвр до опускания AUX4.
                 live = list(app_state.get("receiver_channels", [1500] * 8))
                 rc_ts = app_state.get("rc_link_ts", 0.0)
+                rx_ts = app_state.get("receiver_ts", 0.0) or 0.0
+                fc_ovr_now = bool(app_state.get("fc_override_on"))
                 r_cmd = global_roll_cmd
                 p_cmd = global_pitch_cmd
                 y_cmd = global_yaw_cmd
@@ -5888,12 +5900,30 @@ def fc_io_loop():
             # Passthrough идёт из кэша приёмника. Оси подменяются только
             # когда AUX4 поднят И трекер в TRACKED (override_active=True).
             #
-            # В OBSERVE_ONLY не шлём MSP_SET_RAW_RC вообще. Даже кадр с
-            # «passthrough» остаётся для Betaflight свежим MSP override и при
-            # активном mode box замораживает маскируемые каналы на значениях
-            # из кэша вместо живых стиков пилота.
+            # В режиме пилота команды трекера не подменяются никогда. Поток
+            # при этом НЕ обрывается: на Betaflight 4.5 молчание при включённом
+            # MSP OVERRIDE замораживает последний кадр навсегда, и это был
+            # захват моторов. Шлём только стики, снятые пока OVERRIDE выключен.
+            # Пока такого снимка нет — не шлём выдуманный холостой газ.
             have_fresh_rc = (time.monotonic() - rc_ts) <= RC_FRESH_WINDOW
-            if have_fresh_rc and not OBSERVE_ONLY:
+            channels = None
+            apply_ov = False
+            if have_fresh_rc and OBSERVE_ONLY:
+                global _pilot_tumbler_uzhe
+                if aux_now or fc_ovr_now:
+                    if not _pilot_tumbler_uzhe:
+                        _pilot_tumbler_uzhe = True
+                        flight_log.event(
+                            "РЕЖИМ ПИЛОТА: тумблер MSP OVERRIDE поднят. "
+                            "Стики замерли. Опусти тумблер — управление "
+                            "вернётся сразу.")
+                else:
+                    _pilot_tumbler_uzhe = False
+                if rx_ts > 0.0:
+                    apply_ov = False
+                    channels = build_output_channels(
+                        live, 1500.0, 1500.0, 1500.0, 1000.0, False)
+            elif have_fresh_rc:
                 apply_ov = ov and aux_now
                 # Меню съедает стики. На борт в это время уходит центр и
                 # холостой, иначе набор висения крутил бы моторы.
@@ -5905,6 +5935,7 @@ def fc_io_loop():
                     t_cmd = float(THROTTLE_MIN_PWM)
                 channels = build_output_channels(
                     live, r_cmd, p_cmd, y_cmd, t_cmd, apply_ov)
+            if channels is not None:
                 # СНАЧАЛА отправляем, ПОТОМ помечаем отправленным. Раньше было
                 # наоборот: last_sent_channels писался до send, и при потерянном
                 # порте лог показывал ушедшую команду, которой не было.
@@ -10734,8 +10765,10 @@ def _menu_zapis():
 def _menu_pilot():
     """Режим сбора: трекер пишет лог, пилот рулит сам.
 
-    Оверрайд не включается вовсе — см. OBSERVE_ONLY. Настройка остаётся
-    после перезапуска. Перед обычным вылетом выключить.
+    Оверрайд команд трекера не включается. Тумблер лока должен быть опущен:
+    он включает MSP OVERRIDE, и на Betaflight 4.5 стики тогда замирают.
+    Слежение и запись идут без тумблера. Настройка остаётся после перезапуска.
+    Перед обычным вылетом выключить.
     """
     global OBSERVE_ONLY
     if not _menu_mozhno():
@@ -14015,16 +14048,23 @@ _metka_bylo_vidno = False
 
 
 def _narisovat_pilot(frame):
-    """Метка режима сбора. В очках должно быть видно, что борт не рулит."""
+    """Метка режима сбора. В очках должно быть видно, что борт не рулит.
+
+    Тумблер лока включает MSP OVERRIDE. Пока он поднят, стики пилота
+    полётник не видит — это и есть захват моторов.
+    """
     try:
         h, w = frame.shape[0], frame.shape[1]
-        tekst = "PILOT"
+        with state_lock:
+            tumbler = bool(aux4_state) or bool(app_state.get("fc_override_on"))
+        tekst = "PILOT  SWITCH OFF" if tumbler else "PILOT"
+        col = COLOR_RED if tumbler else COLOR_YELLOW
         x = int(w * 0.04)
         y = int(h * 0.12)
         cv2.putText(frame, tekst, (x, y), cv2.FONT_HERSHEY_PLAIN,
                     1.6, COLOR_BLACK, 3, cv2.LINE_AA)
         cv2.putText(frame, tekst, (x, y), cv2.FONT_HERSHEY_PLAIN,
-                    1.6, COLOR_YELLOW, 1, cv2.LINE_AA)
+                    1.6, col, 1, cv2.LINE_AA)
     except Exception:
         pass
 
@@ -14759,7 +14799,7 @@ def process_locked_tracker(gray, cb_t0=None):
     frame_index += 1
     _stand_begin_step()
 
-    aux_on = _aux_zhivoy()
+    aux_on = _aux_zhivoy() or bool(OBSERVE_ONLY)
     with state_lock:
         live_thr = app_state.get("rc_throttle", 1500)
 
@@ -17982,7 +18022,7 @@ def camera_callback(request):
     # сравнение диагностирует тик без отдельного таймера.
     _diag_1hz_tick = (_cma_read_t == _cb_t0)
     try:
-        aux_snapshot = _aux_zhivoy()
+        aux_snapshot = _aux_zhivoy() or bool(OBSERVE_ONLY)
 
         if not aux_snapshot:
             fast_idle_update()
