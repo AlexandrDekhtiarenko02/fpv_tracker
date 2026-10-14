@@ -21,6 +21,10 @@ find . -maxdepth 2 -type f -size 0 -not -path "./.git/*" -not -path "./flight_lo
 echo "==> Выбрасываю пустые объекты"
 find .git/objects -type f -size 0 -delete 2>/dev/null
 echo "==> Беру код заново с origin"
+if [ -e .git/index.lock ] && ! ps -eo args= | grep -F "$DIR" | grep -q '[g]it'; then
+    echo "    снимаю застрявший замок git"
+    rm -f .git/index.lock
+fi
 VETKA="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo control-tuning)"
 git fetch origin || { echo "    сеть недоступна — без неё не починить"; exit 1; }
 git reset --hard "origin/${VETKA}" || exit 1

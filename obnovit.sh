@@ -15,6 +15,24 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$DIR"
 
 echo "==> Забираю код"
+# Замок остаётся, если git убили посередине (меню, обрыв ssh, пропажа
+# питания). Пока файл лежит, любая команда git падает, и это не порча
+# объектов. Живой процесс не трогаем.
+_snyat_zamok() {
+    local lock="${DIR}/.git/index.lock"
+    if [ ! -e "$lock" ]; then
+        return 0
+    fi
+    if ps -eo args= | grep -F "$DIR" | grep -q '[g]it'; then
+        echo "    git ещё работает в этом каталоге. Замок не трогаю."
+        return 1
+    fi
+    echo "    снимаю застрявший замок git"
+    rm -f "$lock"
+}
+if ! _snyat_zamok; then
+    exit 1
+fi
 if ! git fetch origin; then
     echo "    НЕ ВЫШЛО. Сеть недоступна либо репозиторий повреждён."
     echo "    Если повреждён — ./pochinit.sh"
@@ -43,6 +61,9 @@ if [ $? -ne 0 ]; then
     elif echo "$VYVOD" | grep -qi "not possible to fast-forward\|diverge"; then
         echo "    На борту есть свои коммиты, которых нет в origin."
         echo "        git log --oneline origin/${VETKA}..HEAD"
+    elif echo "$VYVOD" | grep -q "index.lock"; then
+        echo "    Застрял замок git, репозиторий цел."
+        echo "        rm -f .git/index.lock && ./obnovit.sh"
     else
         echo "    Похоже на повреждение репозитория:"
         echo "        ./pochinit.sh"
