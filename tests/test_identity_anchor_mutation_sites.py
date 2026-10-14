@@ -42,6 +42,7 @@ import cv2
 import offline  # noqa: E402
 
 t = offline.load_tracker()
+t.MANUAL_NUDGE_ENABLED = True
 
 AUX2_IDX = t.MANUAL_NUDGE_ROLL_AUX_IDX
 AUX3_IDX = t.MANUAL_NUDGE_PITCH_AUX_IDX

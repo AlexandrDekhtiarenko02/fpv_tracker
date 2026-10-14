@@ -36,6 +36,7 @@ import cv2
 import offline  # noqa: E402
 
 t = offline.load_tracker()
+t.MANUAL_NUDGE_ENABLED = True
 
 
 class _Chasy:

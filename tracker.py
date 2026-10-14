@@ -10598,6 +10598,8 @@ def _menu_derevo():
             {"imya": "Brightness", "min": -10, "max": 10, "shag": 1,
              "get": lambda: _yarkost_shag, "set": _zapisat_yarkost},
             {"imya": "Lock light", "dejstvie": _menu_svet},
+            {"imya": "Frame stick", "dejstvie": _menu_ramka,
+             "get": lambda: "on" if MANUAL_NUDGE_ENABLED else "off"},
         ]},
         {"imya": "Tools", "deti": [
             {"imya": "Update", "dejstvie": _menu_obnovit},
@@ -10760,6 +10762,30 @@ def _menu_zapis():
     except Exception:
         pass
     return "record on" if RECORD_FRAMES else "record off"
+
+
+def _menu_ramka():
+    """Правый стик двигает рамку. По умолчанию выключено.
+
+    Нужно только когда рамку поправляют руками. В заходе пилота мешает:
+    стик уводит рамку с цели, лог потом врёт. Настройка остаётся после
+    перезапуска.
+    """
+    global MANUAL_NUDGE_ENABLED
+    if not _menu_mozhno():
+        return "armed"
+    MANUAL_NUDGE_ENABLED = not bool(MANUAL_NUDGE_ENABLED)
+    try:
+        _sohranit_nastroiku("MANUAL_NUDGE_ENABLED",
+                            True if MANUAL_NUDGE_ENABLED else False)
+    except Exception:
+        pass
+    try:
+        flight_log.event("РАМКА СТИКОМ: %s" % (
+            "вкл" if MANUAL_NUDGE_ENABLED else "выкл"))
+    except Exception:
+        pass
+    return "stick on" if MANUAL_NUDGE_ENABLED else "stick off"
 
 
 def _menu_pilot():
@@ -14150,7 +14176,9 @@ def draw_overlay_on_frame(frame):
 # Стик дошёл до дедбенда — жест кончился, reanchor как раньше, следующий
 # бросок считается уже от новой точки. Смена стороны без этого — новый
 # бросок той же оси от исходной точки жеста, не добавка к старому пику.
-MANUAL_NUDGE_ENABLED = True
+# Выключено, пока не включено в меню Tracker → Frame stick. Иначе правый
+# стик во время захода пилота утаскивает рамку с цели.
+MANUAL_NUDGE_ENABLED = False
 # Индексы AUX2/AUX3 в массиве rc_channels/ch (RPYT+AUX1..4, 0-based):
 # ch[0]=Roll ch[1]=Pitch ch[2]=Yaw ch[3]=Throttle ch[4]=AUX1 ch[5]=AUX2
 # ch[6]=AUX3 ch[7]=AUX4 (AUX4 уже используется как ch[7] для тумблера
