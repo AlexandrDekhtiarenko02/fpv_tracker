@@ -153,15 +153,18 @@ t._pn_nos_tek = 30.0
 nizhe = t._nos_na_kurs(0.0, now, 30.0, 16.0, 0.0, now, 1.0, 18.0)
 assert nizhe > 0.0, nizhe
 
-print("=== 8b. Газ держит стик входа, путь его не двигает ===")
+print("=== 8b. Газ ведёт путь к линии, опора — стик входа ===")
 rovno_g = t._gaz_po_linii(
     1350, 20.0, 8.0, -8.0 * math.tan(math.radians(20.0)) * 100.0)
 assert rovno_g == 1350.0, rovno_g
+# Провал: путь 45° при линии 20° — газ выше стика, но не дальше +80.
 proval = t._gaz_po_linii(1350, 20.0, 6.0, -600.0)
-assert proval == 1350.0, proval
+assert proval == 1350.0 + t.GAZ_LINII_VYSHE, proval
+# Дуга: почти нет снижения при линии 25° — газ ниже, не дальше −120.
 duga = t._gaz_po_linii(1350, 25.0, 10.0, -100.0)
-assert duga == 1350.0, duga
-assert t._gaz_po_linii(1350, 20.0, None, -300.0) == 1350.0
+assert duga == 1350.0 - t.GAZ_LINII_NIZHE, duga
+# Нет путевой или стика — ручку не выдумываем.
+assert t._gaz_po_linii(1350, 20.0, None, -300.0) is None
 assert t._gaz_po_linii(None, 20.0, 8.0, -100.0) is None
 assert t._nizhe_linii(34.0) == 0.0
 assert t._nizhe_linii(10.0) == t.PN_AIM_LEAD_MAX

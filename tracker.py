@@ -2215,10 +2215,16 @@ PN_PITCH_I_DEG_PER_S = 0.6
 PN_PITCH_I_MAX = 4.0
 PN_PITCH_PWM_PER_DEG = 8.0
 PN_PITCH_PWM_MAX = 80.0
-# Газ — стик, которым вошли. Выше него не поднимаем: на 9e3a760 опора
-# читалась со своего эха и доехала до 1530. Ниже тоже не режем:
-# на 4910596 убавка «линия растёт» сажала газ, а борт всё равно
-# перелетал. На коптере прямую держит нос, не сброс газа.
+# Газ держит путь на линии визирования. Опора — стик входа, один раз,
+# не собственная команда: на 9e3a760 опора читалась с эха и доехала до 1530.
+# Путь круче линии — газ выше, борт не проваливается перед целью.
+# Путь положе — газ ниже, заход не загибается в дугу. Заморозить ручку
+# совсем нельзя: без этой поправки высота так и остаётся, какой вошли.
+GAZ_LINII_PWM_PER_DEG = 8.0
+GAZ_LINII_VYSHE = 80.0
+GAZ_LINII_NIZHE = 120.0
+GAZ_LINII_GS_MIN = 1.5
+GAZ_LINII_DEADBAND_DEG = 1.5   # шум вариометра ручку не дёргает
 # Рыскание курс не строит. На удачных заходах эталона стик рыскания
 # сидит в 3 ШИМ — это триммер. Нос доворачивается вместе с креном,
 # и только немного: отдельная тяга рамки рысканием уводит курс.
@@ -9285,17 +9291,38 @@ def _gaz_po_vysote(hover, alt_m, tau_s, vario_cms):
 
 
 def _gaz_po_linii(opora, depression_deg, ground_speed_ms, vario_cms):
-    """Стик, которым вошли в заход. Путь и вариометр его не двигают.
+    """Газ, при котором путь совпадает с линией на цель.
 
-    Прибавка по «пути круче линии» на 9e3a760 доехала до 1530: опора
-    читалась со своего эха. Убавка по растущей линии на 4910596 сажала
-    газ, а перелёт не убирала — на коптере прямую держит нос.
-    Нет стика входа — None, ручку не выдумываем.
+    Опора — стик входа, не висение и не прошлая команда. Её нельзя
+    подменять собственным выходом: поправка тогда копится сама на себя.
+    Путь круче линии: борт проваливается, газ выше опоры.
+    Путь положе: дуга и перелёт, газ ниже. Нет путевой, угла или
+    вариометра — None, ручку не выдумываем, снаружи остаётся стик входа.
     """
-    del depression_deg, ground_speed_ms, vario_cms
-    if opora is None:
+    if opora is None or depression_deg is None:
         return None
-    return float(opora)
+    if ground_speed_ms is None or vario_cms is None:
+        return None
+    gs = float(ground_speed_ms)
+    if gs < GAZ_LINII_GS_MIN:
+        return None
+    sink = -float(vario_cms) / 100.0
+    path = math.degrees(math.atan2(sink, gs))
+    err = path - float(depression_deg)
+    if abs(err) <= GAZ_LINII_DEADBAND_DEG:
+        return float(opora)
+    if err > 0.0:
+        err -= GAZ_LINII_DEADBAND_DEG
+    else:
+        err += GAZ_LINII_DEADBAND_DEG
+    pwm = float(opora) + GAZ_LINII_PWM_PER_DEG * err
+    verh = float(opora) + GAZ_LINII_VYSHE
+    niz = float(opora) - GAZ_LINII_NIZHE
+    if pwm > verh:
+        pwm = verh
+    if pwm < niz:
+        pwm = niz
+    return pwm
 
 
 def _kadr_oshibka(net, deadband):
@@ -13026,7 +13053,7 @@ def _update_control_from_target_impl():
     # Газ по высоте и времени. Старые пороги и геометрия выше посчитаны,
     # но если есть висение, высота и вменяемое время — команда эта, а не они.
     # Иначе снова срез до 1200 далеко от цели или стик захвата до самого конца.
-    # Газ — стик входа, без убавки по линии и без прибавки по пути.
+    # Газ прямой: путь против линии, опора — замороженный стик входа.
     # Старый закон высоты и срез «нос ниже захвата» сюда не входят.
     if OVERRIDE_THROTTLE and COLLISION_ENABLED:
         if _gaz_vhod is None and rc_fresh:
