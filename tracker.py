@@ -2190,10 +2190,18 @@ COLLISION_ROLL_MAX = 28.0
 # в неё входит собственное рыскание, и на 9e3a760 она клала крен
 # против цели, которая всю дорогу была справа.
 # 4 px — тишина. Дальше 0.5° крена на пиксель: при 12 px это около 4°,
-# потолок 12°, не поздний удар в 22°.
+# потолок 12°. Если рамка ещё и бежит в сторону быстрее шума кадра,
+# крен добавляется от этой скорости и потолок поднимается до 16°.
+# На logs-24 при 50 px/с и |dx| около 60 положение уже упиралось в 12°,
+# фактический крен оставался около 8°, стик около 10 ШИМ, и рамка уходила.
+# Это не поздний удар в 22°.
 PN_ROLL_HOLD_PX = 4.0
 PN_ROLL_HOLD_DEG = 0.50
 PN_ROLL_HOLD_MAX = 12.0
+PN_ROLL_RATE_DEAD_PX_S = 25.0  # ниже — шум удержания, не бег рамки
+PN_ROLL_RATE_DEG = 0.10        # ° крена на px/с сверх мёртвой зоны
+PN_ROLL_RATE_MAX = 8.0         # вклад скорости сам по себе
+PN_ROLL_HOLD_FAST = 16.0       # потолок, только пока рамка бежит
 PN_ROLL_HOLD_I = 0.15
 PN_ROLL_HOLD_I_MAX = 4.0
 PN_ROLL_BANK_SLEW = 12.0
@@ -2201,22 +2209,33 @@ PN_ROLL_I_HALF_S = 4.0
 PN_ROLL_PWM_PER_DEG = 6.0
 PN_ROLL_PWM_MAX = 110.0
 # Тангаж держит цель выше центра. На обычной линии это около 9°.
-# Если угол линии растёт — перелёт — нос добирается ещё, даже когда
-# картинка уже на этих 9°. На 4dc8597 линия росла на 0.5–2 °/с, а стик
-# тангажа стоял в центре: запас к этому моменту уже обнулялся, потому
-# что угол стал «крутым». Крутым он стал от перелёта, не от захода.
-# Отрицательная скорость линии нос не поднимает.
+# Если угол линии растёт и картинка УЖЕ на этих 9° — нос добирается
+# ещё немного. На cfe6537 добор включался сразу: оценка в первую
+# секунду всплёскивала на +4…+9 °/с, сверху 9° ложилось ещё до +8°,
+# и нос уходил на 16–20° раньше, чем цель садилась на запас.
+# Пока цель не на запасе, командуем только сам запас. Дальше чем на
+# пару градусов глубже запаса добор молчит: иначе клевок кормит
+# оценку скорости, а та снова просит клевок. Отрицательная скорость
+# линии нос не поднимает. Потолок 45° не поднимается.
 PN_AIM_HOLD_UNTIL_DEG = 22.0   # досюда полный запас, если линия не растёт
 PN_AIM_STEEP_DEG = 30.0        # круче и линия спокойна — цель в центре
 PN_AIM_LEAD_MAX = 9.0
-PN_PITCH_LOS_PER_DPS = 2.5     # градусов запаса на °/с роста линии
-PN_PITCH_LOS_EXTRA_MAX = 8.0   # сверху запаса, не упор в 45° за один шаг
+PN_PITCH_LOS_PER_DPS = 1.5     # градусов сверх запаса на °/с роста линии
+PN_PITCH_LOS_EXTRA_MAX = 4.0   # и только когда картинка уже на запасе
+PN_PITCH_LOS_AIM_PAST = 2.0    # глубже запаса на столько — добор молчит
 PN_PITCH_ABS_MAX = 45.0
 PN_PITCH_SLEW = 12.0
 PN_PITCH_I_DEG_PER_S = 0.6
 PN_PITCH_I_MAX = 4.0
 PN_PITCH_PWM_PER_DEG = 8.0
 PN_PITCH_PWM_MAX = 80.0
+# Близко к цели сброс газа без носа — дуга. На z08 logs-24 газ ушёл
+# 1413→1333 около 100 м, стик тангажа остался в центре. Несколько градусов
+# вниз вместе со сбросом, не новый клевок и не подъём потолка 45°.
+PN_PITCH_BLIZKO_M = 110.0
+PN_PITCH_BLIZKO_GAZ = 25.0     # сброс меньше этого нос не трогает
+PN_PITCH_BLIZKO_PER_PWM = 40.0 # ШИМ сброса на один градус
+PN_PITCH_BLIZKO_MAX = 3.0
 # Газ держит путь на линии визирования. Опора — стик входа, один раз,
 # не собственная команда: на 9e3a760 опора читалась с эха и доехала до 1530.
 # Путь круче линии — газ выше, борт не проваливается перед целью.
@@ -5017,8 +5036,12 @@ yaw_integral = 0.0
 # к которому стик уже едет. Сбрасываются вместе с интегратором рамки.
 _pn_bank_i = 0.0
 _pn_bank_tek = 0.0
+_pn_dx_pred = None
+_pn_dx_t = 0.0
+_pn_dx_rate = 0.0
 _pn_nos_i = 0.0
 _pn_nos_tek = None
+_pn_nos_blizko = 0.0
 
 # Сглаженное значение fc_pitch_deg для расчёта компенсации тангажа.
 smoothed_pitch_deg = 0.0
@@ -8860,7 +8883,8 @@ def reset_tracking(to_acq=False):
     global filtered_dx_yaw, prev_adx, prev_ady_ctrl
     global smooth_throttle_out, throttle_integral, prev_ady
     global roll_integral, pitch_integral, yaw_integral
-    global _pn_bank_i, _pn_bank_tek, _pn_nos_i, _pn_nos_tek
+    global _pn_bank_i, _pn_bank_tek, _pn_dx_pred, _pn_dx_t, _pn_dx_rate
+    global _pn_nos_i, _pn_nos_tek, _pn_nos_blizko
     global smoothed_pitch_deg
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
@@ -8970,8 +8994,12 @@ def reset_tracking(to_acq=False):
     yaw_integral = 0.0
     _pn_bank_i = 0.0
     _pn_bank_tek = 0.0
+    _pn_dx_pred = None
+    _pn_dx_t = 0.0
+    _pn_dx_rate = 0.0
     _pn_nos_i = 0.0
     _pn_nos_tek = None
+    _pn_nos_blizko = 0.0
 
     smoothed_pitch_deg = 0.0
 
@@ -9112,18 +9140,22 @@ def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k):
     """Стик, который держит цель у центра по горизонтали.
 
     Желаемый крен — от смещения рамки, несколько градусов, с медленным
-    добором если смещение не уходит. Стик в ACRO задаёт скорость, поэтому
-    у нужного крена он отпускается. Скорость азимута крен не задаёт.
-    Без крена с полётника команда ноль.
+    добором если смещение не уходит. Если рамка бежит в сторону быстрее
+    шума кадра, крен добавляется от этой скорости и потолок поднимается:
+    иначе при уже упёртом положении стик остаётся почти в центре, а рамка
+    уходит. Стик в ACRO задаёт скорость, поэтому у нужного крена он
+    отпускается. Скорость азимута крен не задаёт. Без крена с полётника
+    команда ноль.
     """
-    global _pn_bank_i, _pn_bank_tek
-    del az, az_ts, now
+    global _pn_bank_i, _pn_bank_tek, _pn_dx_pred, _pn_dx_t, _pn_dx_rate
+    del az, az_ts
     if bank_deg is None:
         return 0.0
     dt_s = k / NOMINAL_FPS
     err = 0.0
     if dx_px is not None and abs(float(dx_px)) > PN_ROLL_HOLD_PX:
         err = float(dx_px) - math.copysign(PN_ROLL_HOLD_PX, float(dx_px))
+    rate = _skorost_ramki(dx_px, now)
     if err != 0.0:
         _pn_bank_i *= 0.5 ** (dt_s / PN_ROLL_I_HALF_S)
         _pn_bank_i += err * PN_ROLL_HOLD_I * dt_s
@@ -9133,11 +9165,22 @@ def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k):
             _pn_bank_i = -PN_ROLL_HOLD_I_MAX
     else:
         _pn_bank_i *= 0.5 ** dt_s
-    zhel = ROLL_SIGN * (err * PN_ROLL_HOLD_DEG + _pn_bank_i)
-    if zhel > PN_ROLL_HOLD_MAX:
-        zhel = PN_ROLL_HOLD_MAX
-    elif zhel < -PN_ROLL_HOLD_MAX:
-        zhel = -PN_ROLL_HOLD_MAX
+    rate_dob = 0.0
+    if abs(rate) > PN_ROLL_RATE_DEAD_PX_S:
+        izb = rate - math.copysign(PN_ROLL_RATE_DEAD_PX_S, rate)
+        rate_dob = ROLL_SIGN * izb * PN_ROLL_RATE_DEG
+        if rate_dob > PN_ROLL_RATE_MAX:
+            rate_dob = PN_ROLL_RATE_MAX
+        elif rate_dob < -PN_ROLL_RATE_MAX:
+            rate_dob = -PN_ROLL_RATE_MAX
+    zhel = ROLL_SIGN * (err * PN_ROLL_HOLD_DEG + _pn_bank_i) + rate_dob
+    potolok = PN_ROLL_HOLD_MAX
+    if abs(rate) > PN_ROLL_RATE_DEAD_PX_S:
+        potolok = PN_ROLL_HOLD_FAST
+    if zhel > potolok:
+        zhel = potolok
+    elif zhel < -potolok:
+        zhel = -potolok
     shag = PN_ROLL_BANK_SLEW * (k / NOMINAL_FPS)
     if _pn_bank_tek < zhel - shag:
         _pn_bank_tek += shag
@@ -9151,6 +9194,37 @@ def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k):
     if pwm < -PN_ROLL_PWM_MAX:
         return -PN_ROLL_PWM_MAX
     return pwm
+
+
+def _skorost_ramki(dx_px, now):
+    """Сглаженная скорость рамки по горизонтали, px/с.
+
+    Кадр короче нуля или длиннее полусекунды скоростью не считается:
+    откат часов и пауза иначе выглядят как рывок на сотни пикселей.
+    Один шумный кадр сглаживается, рамку от него не качает.
+    """
+    global _pn_dx_pred, _pn_dx_t, _pn_dx_rate
+    if dx_px is None:
+        _pn_dx_rate *= 0.5
+        return _pn_dx_rate
+    dx = float(dx_px)
+    if _pn_dx_pred is None or _pn_dx_t <= 0.0:
+        _pn_dx_pred = dx
+        _pn_dx_t = float(now)
+        return _pn_dx_rate
+    dt_r = float(now) - _pn_dx_t
+    if dt_r <= 0.0:
+        return _pn_dx_rate
+    if dt_r > 0.5:
+        _pn_dx_pred = dx
+        _pn_dx_t = float(now)
+        _pn_dx_rate *= 0.5
+        return _pn_dx_rate
+    syroy = (dx - _pn_dx_pred) / dt_r
+    _pn_dx_rate = 0.7 * _pn_dx_rate + 0.3 * syroy
+    _pn_dx_pred = dx
+    _pn_dx_t = float(now)
+    return _pn_dx_rate
 
 
 def _nizhe_linii(depression_deg):
@@ -9182,9 +9256,10 @@ def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k,
     """Стик тангажа: цель выше центра, и ещё ниже, если линия растёт.
 
     Запас по углу линии отпускается только когда линия спокойна или
-    закрывается. Растущая линия — это перелёт: на 4dc8597 она росла,
-    цель ещё была выше центра, стик уже стоял в нуле, и борт прошёл
-    сверху. Отрицательная скорость нос не поднимает. pitch_lock в
+    закрывается. Растущая линия — это перелёт, но добор сверх запаса
+    включается только когда картинка уже на этом запасе. Иначе всплеск
+    оценки сразу после лока клюёт нос ещё до того, как цель села выше
+    центра. Отрицательная скорость нос не поднимает. pitch_lock в
     расчёт не входит.
     """
     global _pn_nos_i, _pn_nos_tek
@@ -9198,17 +9273,22 @@ def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k,
     aim_below = 0.0 if dy_px is None else -float(dy_px) * dpp
     lead = _nizhe_linii(depression_deg)
     fresh = (los_ts > 0.0) and ((now - los_ts) <= LOS_RATE_STALE_S)
-    extra = 0.0
     if fresh and los > LOS_RATE_DEADBAND_DPS:
         # Угол «уже крутой» здесь — сам перелёт. Запас не обнуляем.
         if lead < PN_AIM_LEAD_MAX:
             lead = PN_AIM_LEAD_MAX
-        extra = (float(los) - LOS_RATE_DEADBAND_DPS) * PN_PITCH_LOS_PER_DPS
-        if extra > PN_PITCH_LOS_EXTRA_MAX:
-            extra = PN_PITCH_LOS_EXTRA_MAX
     picture = lead - aim_below
     if picture < 0.0:
         picture = 0.0
+    # Добор — только на запасе и не глубже пары градусов от него.
+    # Пока цель в центре, командуем сам запас, не запас плюс всплеск.
+    extra = 0.0
+    if (fresh and los > LOS_RATE_DEADBAND_DPS
+            and aim_below + 0.5 >= lead
+            and aim_below <= lead + PN_PITCH_LOS_AIM_PAST):
+        extra = (float(los) - LOS_RATE_DEADBAND_DPS) * PN_PITCH_LOS_PER_DPS
+        if extra > PN_PITCH_LOS_EXTRA_MAX:
+            extra = PN_PITCH_LOS_EXTRA_MAX
     dt_s = k / NOMINAL_FPS
     # Интеграл только по картинке. Скорость линии в него не копится:
     # иначе собственный клевок снова доезжает до упора.
@@ -9221,7 +9301,7 @@ def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k,
         _pn_nos_i *= 0.5 ** dt_s
         if _pn_nos_i < 0.0:
             _pn_nos_i = 0.0
-    zhel = pitch_deg + picture + extra + _pn_nos_i
+    zhel = pitch_deg + picture + extra + _pn_nos_i + _pn_nos_blizko
     if zhel > PN_PITCH_ABS_MAX:
         zhel = PN_PITCH_ABS_MAX
     elif zhel < 0.0:
@@ -9240,6 +9320,50 @@ def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k,
     if pwm < -PN_PITCH_PWM_MAX:
         return -PN_PITCH_PWM_MAX
     return pwm
+
+
+def _dobor_nosa_u_sbrosa(opora, cel, range_m):
+    """Сколько градусов добавить к носу, когда близко газ уже ниже стика.
+
+    Далеко, без дальности или сброс меньше мёртвой зоны — ноль.
+    Больше трёх градусов не просим: это помощь сбросу, не новый клевок.
+    """
+    if opora is None or cel is None or range_m is None:
+        return 0.0
+    if float(range_m) >= PN_PITCH_BLIZKO_M:
+        return 0.0
+    sbro = float(opora) - float(cel)
+    if sbro <= PN_PITCH_BLIZKO_GAZ:
+        return 0.0
+    dob = sbro / PN_PITCH_BLIZKO_PER_PWM
+    if dob > PN_PITCH_BLIZKO_MAX:
+        return PN_PITCH_BLIZKO_MAX
+    if dob < 0.0:
+        return 0.0
+    return dob
+
+
+def _primenit_nos_u_sbrosa(opora, cel, range_m, k):
+    """Подвести добавку носа к сбросу газа. Не быстрее наклона тангажа.
+
+    Добавка входит в желаемый угол на этом же кадре. Когда сброс
+    кончился или цель снова далеко, она спадает к нулю и нос
+    возвращается к картинке, а не остаётся клюнутым.
+    """
+    global _pn_nos_blizko
+    nuzhno = _dobor_nosa_u_sbrosa(opora, cel, range_m)
+    shag = PN_PITCH_SLEW * (k / NOMINAL_FPS)
+    if _pn_nos_blizko < nuzhno - shag:
+        _pn_nos_blizko += shag
+    elif _pn_nos_blizko > nuzhno + shag:
+        _pn_nos_blizko -= shag
+    else:
+        _pn_nos_blizko = nuzhno
+    if _pn_nos_blizko < 0.0:
+        _pn_nos_blizko = 0.0
+    elif _pn_nos_blizko > PN_PITCH_BLIZKO_MAX:
+        _pn_nos_blizko = PN_PITCH_BLIZKO_MAX
+    return _pn_nos_blizko
 
 
 def _ryaskan_na_kurs(bank_deg, dx_px):
@@ -11365,7 +11489,8 @@ def _update_control_from_target_impl():
     global smooth_throttle_out, throttle_integral, prev_ady
     global _hover_pwm, _thr_geom_out, _geom_mode_log, _gaz_vhod
     global roll_integral, pitch_integral, yaw_integral
-    global _pn_bank_i, _pn_bank_tek, _pn_nos_i, _pn_nos_tek
+    global _pn_bank_i, _pn_bank_tek, _pn_dx_pred, _pn_dx_t, _pn_dx_rate
+    global _pn_nos_i, _pn_nos_tek, _pn_nos_blizko
     global smoothed_pitch_deg
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
@@ -11565,8 +11690,12 @@ def _update_control_from_target_impl():
         yaw_integral = 0.0
         _pn_bank_i = 0.0
         _pn_bank_tek = 0.0
+        _pn_dx_pred = None
+        _pn_dx_t = 0.0
+        _pn_dx_rate = 0.0
         _pn_nos_i = 0.0
         _pn_nos_tek = None
+        _pn_nos_blizko = 0.0
         # SHADOW-состояние — своё, отдельное от live-интеграторов выше, но
         # сбрасывается по тому же событию (новый/потерянный захват): иначе
         # диагностика windup тянула бы накопление прошлой цели в новую.
@@ -12296,6 +12425,29 @@ def _update_control_from_target_impl():
         # а высота при этом не снижалась.
         pitch_integral = 0.0
         col_p = 0.0
+        # Сброс газа считается до тангажа: добавка носа должна войти
+        # в тот же желаемый угол, а не догонять его отдельным стиком
+        # после ограничителя скорости команды.
+        _opora_bl = (float(_gaz_vhod) if _gaz_vhod is not None
+                     else float(base_thr))
+        with state_lock:
+            _var_bl = app_state.get("vario_cms")
+            _var_bl_ts = app_state.get("alt_ts", 0.0)
+        if not _var_bl_ts or (now_mono - _var_bl_ts) > VARIO_FRESH_S:
+            _var_bl = None
+        _los_bl = None
+        if (_los_skorost_ts > 0.0
+                and (now_mono - _los_skorost_ts) <= LOS_RATE_STALE_S):
+            _los_bl = _los_skorost
+        _dep_bl = (closure.get("depression_deg")
+                   if isinstance(closure, dict) else None)
+        _dal_bl = (closure.get("range_m")
+                   if isinstance(closure, dict) else None)
+        _cel_bl = _gaz_po_linii(
+            _opora_bl, _dep_bl, ground_speed_mps, _var_bl, _los_bl)
+        if _cel_bl is None:
+            _cel_bl = _opora_bl
+        _primenit_nos_u_sbrosa(_opora_bl, _cel_bl, _dal_bl, k)
         pitch_offset = _nos_na_kurs(
             _los_skorost, _los_skorost_ts, _pitch_tek_pot, _pitch_pri_loke,
             box_cy - CENTER_Y, now_mono, k,

@@ -104,6 +104,47 @@ assert t.FF_GAIN_ROLL == 0.0
 assert t.ROLL_LEAD_S >= 0.4 - 1e-9
 assert t.LEAD_FRAMES == 8
 
+print("=== 6b. Бегущая рамка — крен больше, но не удар ===")
+t._pn_bank_i = 0.0
+t._pn_bank_tek = 0.0
+t._pn_dx_pred = None
+t._pn_dx_t = 0.0
+t._pn_dx_rate = 0.0
+now_r = 2000.0
+dx_r = 20.0
+for _ in range(int(1.6 * t.NOMINAL_FPS)):
+    now_r += 1.0 / t.NOMINAL_FPS
+    dx_r += 80.0 / t.NOMINAL_FPS
+    t._kren_na_kurs(0.0, now_r, 0.0, dx_r, now_r, 1.0)
+# Положение одно уже упёрлось бы в 12°. Скорость поднимает потолок, не до 22°.
+assert t.PN_ROLL_HOLD_MAX < t._pn_bank_tek <= t.PN_ROLL_HOLD_FAST + 1e-6, (
+    t._pn_bank_tek)
+# Откат часов огромную скорость не рисует: оценка остаётся прежней.
+rate_do = t._pn_dx_rate
+t._kren_na_kurs(0.0, now_r - 0.01, 0.0, dx_r + 500.0, now_r - 0.01, 1.0)
+assert t._pn_dx_rate == rate_do, t._pn_dx_rate
+# Дырка больше полусекунды — не рывок, а новый отсчёт.
+t._kren_na_kurs(0.0, now_r + 2.0, 0.0, dx_r + 500.0, now_r + 2.0, 1.0)
+assert abs(t._pn_dx_rate) <= abs(rate_do) * 0.5 + 1.0, t._pn_dx_rate
+# Постоянное смещение после всплеска кадра возвращается к обычному потолку.
+t._pn_bank_i = 0.0
+t._pn_bank_tek = 0.0
+t._pn_dx_pred = None
+t._pn_dx_t = 0.0
+t._pn_dx_rate = 0.0
+now_s = 3000.0
+for _ in range(int(2 * t.NOMINAL_FPS)):
+    now_s += 1.0 / t.NOMINAL_FPS
+    t._kren_na_kurs(0.0, now_s, 0.0, 30.0, now_s, 1.0)
+assert 4.0 <= t._pn_bank_tek <= t.PN_ROLL_HOLD_MAX + 1e-6, t._pn_bank_tek
+# Один кадр далеко — не оставляем крен на быстром потолке.
+now_s += 1.0 / t.NOMINAL_FPS
+t._kren_na_kurs(0.0, now_s, 0.0, 230.0, now_s, 1.0)
+for _ in range(int(2 * t.NOMINAL_FPS)):
+    now_s += 1.0 / t.NOMINAL_FPS
+    t._kren_na_kurs(0.0, now_s, 0.0, 30.0, now_s, 1.0)
+assert t._pn_bank_tek <= t.PN_ROLL_HOLD_MAX + 1e-6, t._pn_bank_tek
+
 print("=== 7. Крен возвращает горизонт, а не держит бок ===")
 # 20 ШИМ слежения при банке +15°: уровень тянет назад на 80, не даёт лежать.
 uroven = t._kren_k_gorizontu(100.0, 15.0)
@@ -162,6 +203,40 @@ t._pn_nos_i = 0.0
 t._pn_nos_tek = 30.0
 nizhe = t._nos_na_kurs(0.0, now, 30.0, 16.0, 0.0, now, 1.0, 18.0)
 assert nizhe > 0.0, nizhe
+# Всплеск скорости сразу после лока, цель ещё в центре: добор не включается.
+# На cfe6537 +6 °/с клали ещё до +8° и нос уходил на 16–20° за три секунды.
+pitch0 = 18.0
+t._pn_nos_i = 0.0
+t._pn_nos_tek = pitch0
+t._pn_nos_blizko = 0.0
+now_v = 4000.0
+for _ in range(int(1.5 * t.NOMINAL_FPS)):
+    now_v += 1.0 / t.NOMINAL_FPS
+    t._nos_na_kurs(6.0, now_v, pitch0, pitch0, 0.0, now_v, 1.0, 18.0)
+assert t._pn_nos_tek <= pitch0 + t.PN_AIM_LEAD_MAX + t.PN_PITCH_I_MAX + 0.3, (
+    t._pn_nos_tek)
+assert t._pn_nos_tek > pitch0 + 6.0, t._pn_nos_tek
+# Картинка уже на запасе, линия растёт: нос ещё на пару градусов, не на +8.
+t._pn_nos_i = 0.0
+t._pn_nos_tek = 30.0
+t._pn_nos_blizko = 0.0
+now_e = 5000.0
+for _ in range(int(0.8 * t.NOMINAL_FPS)):
+    now_e += 1.0 / t.NOMINAL_FPS
+    t._nos_na_kurs(2.0, now_e, 30.0, 16.0, dy_lead, now_e, 1.0, 18.0)
+assert 30.0 + 1.5 < t._pn_nos_tek < 30.0 + t.PN_PITCH_LOS_EXTRA_MAX + 0.5, (
+    t._pn_nos_tek)
+# Уже глубже запаса на 3° — добор молчит, нос сам себя не кормит.
+dpp = t.CAMERA_VFOV_DEG / float(t.MAIN_H)
+dy_glub = -(lead + 3.0) / dpp
+t._pn_nos_i = 0.0
+t._pn_nos_tek = 30.0
+t._pn_nos_blizko = 0.0
+now_g = 6000.0
+for _ in range(int(0.5 * t.NOMINAL_FPS)):
+    now_g += 1.0 / t.NOMINAL_FPS
+    t._nos_na_kurs(2.0, now_g, 30.0, 16.0, dy_glub, now_g, 1.0, 18.0)
+assert abs(t._pn_nos_tek - 30.0) < 0.4, t._pn_nos_tek
 
 print("=== 8b. Газ ведёт путь к линии, опора — стик входа ===")
 rovno_g = t._gaz_po_linii(
@@ -183,6 +258,39 @@ assert t._gaz_po_linii(None, 20.0, 8.0, -100.0) is None
 assert t._nizhe_linii(34.0) == 0.0
 assert t._nizhe_linii(10.0) == t.PN_AIM_LEAD_MAX
 assert t._nizhe_linii(24.0) > 0.0
+
+print("=== 8c. Близко сброс газа — нос чуть ниже, потолок тот же ===")
+assert t._dobor_nosa_u_sbrosa(1400, 1320, 90.0) == 80.0 / 40.0
+assert t._dobor_nosa_u_sbrosa(1400, 1200, 90.0) == t.PN_PITCH_BLIZKO_MAX
+assert t._dobor_nosa_u_sbrosa(1400, 1390, 90.0) == 0.0
+assert t._dobor_nosa_u_sbrosa(1400, 1300, 200.0) == 0.0
+assert t._dobor_nosa_u_sbrosa(1400, 1300, None) == 0.0
+t._pn_nos_blizko = 0.0
+for _ in range(int(1.0 * t.NOMINAL_FPS)):
+    t._primenit_nos_u_sbrosa(1400, 1280, 80.0, 1.0)
+assert abs(t._pn_nos_blizko - t.PN_PITCH_BLIZKO_MAX) < 1e-6, t._pn_nos_blizko
+# Добавка не клюёт навсегда: далеко она спадает, и тангаж её держит.
+for _ in range(int(1.0 * t.NOMINAL_FPS)):
+    t._primenit_nos_u_sbrosa(1400, 1280, 200.0, 1.0)
+assert t._pn_nos_blizko < 0.3, t._pn_nos_blizko
+t._pn_nos_blizko = 3.0
+t._pn_nos_i = 0.0
+t._pn_nos_tek = 33.0
+now_b = 7000.0
+for _ in range(int(1.0 * t.NOMINAL_FPS)):
+    now_b += 1.0 / t.NOMINAL_FPS
+    t._nos_na_kurs(0.0, now_b, 30.0, 16.0, dy_lead, now_b, 1.0, 18.0)
+assert abs(t._pn_nos_tek - 33.0) < 0.5, t._pn_nos_tek
+# Упор 45° добавка не поднимает.
+t._pn_nos_blizko = 3.0
+t._pn_nos_i = 0.0
+t._pn_nos_tek = 44.0
+now_c = 8000.0
+for _ in range(10):
+    now_c += 1.0 / t.NOMINAL_FPS
+    t._nos_na_kurs(2.0, now_c, 44.0, 16.0, dy_lead, now_c, 1.0, 18.0)
+assert t._pn_nos_tek <= t.PN_PITCH_ABS_MAX + 1e-6, t._pn_nos_tek
+t._pn_nos_blizko = 0.0
 
 print("=== 9. Рыскание молчит без крена и цели у края ===")
 assert t._ryaskan_na_kurs(0.0, 10.0) == 0.0
@@ -255,11 +363,15 @@ t._az_skorost = 0.0
 t._az_skorost_ts = 0.0
 t._pn_bank_i = 0.0
 t._pn_bank_tek = 0.0
+t._pn_dx_pred = None
+t._pn_dx_t = 0.0
+t._pn_dx_rate = 0.0
 t._pn_nos_i = 0.0
 t._pn_nos_tek = None
+t._pn_nos_blizko = 0.0
 
 
-def _kadr(pitch=20.0, roll=0.0, dx=0.0):
+def _kadr(pitch=20.0, roll=0.0, dx=0.0, vario=0):
     t.target_box_main = (CX - 20 + dx, CY - 20, CX + 20 + dx, CY + 20)
     t.target_controllable = True
     t.target_visible = True
@@ -274,7 +386,7 @@ def _kadr(pitch=20.0, roll=0.0, dx=0.0):
         t.app_state["fc_roll_deg"] = roll
         t.app_state["alt_cm"] = 4000
         t.app_state["alt_ts"] = _clk.t
-        t.app_state["vario_cms"] = 0
+        t.app_state["vario_cms"] = vario
         t.app_state["gyro"] = (0.0, 0.0, 0.0)
         t.app_state["imu_ts"] = _clk.t
         t.app_state["armed"] = False
@@ -301,6 +413,31 @@ print("    крен %s при банке +12, рыскание %s" % (
 # Крен выравнивает крыло. Рыскание идёт за банком, не против него.
 assert t.global_roll_cmd < 1480, t.global_roll_cmd
 assert t.global_yaw_cmd > 1510, t.global_yaw_cmd
+
+
+def _podmena_blizko(*a, **kw):
+    out = dict(_zamena(*a, **kw))
+    out["tau_s"] = 10.0
+    out["depression_deg"] = 18.0
+    out["range_m"] = 80.0
+    out["tau_sigma_s"] = 0.2
+    return out
+
+
+# Близко, путь положе линии: газ ниже стика и нос добирается на пару градусов.
+# На z08 газ падал, стик тангажа стоял в центре.
+t._estimate_closure = _podmena_blizko
+t.ground_speed_mps = 10.0
+tek_do = t._pn_nos_tek
+for _ in range(45):
+    _kadr(pitch=20.0, roll=0.0, dx=0.0, vario=0)
+print("    близко нос %.2f (было %.2f), добавка %.2f, газ %s" % (
+    t._pn_nos_tek, tek_do, t._pn_nos_blizko, t.global_throttle_cmd))
+assert t._pn_nos_blizko >= 2.5, t._pn_nos_blizko
+assert t._pn_nos_tek >= tek_do + 2.0, (t._pn_nos_tek, tek_do)
+assert t._pn_nos_tek <= t.PN_PITCH_ABS_MAX
+assert t.global_throttle_cmd <= 1450, t.global_throttle_cmd
+t.ground_speed_mps = None
 t.time.monotonic = _vremya
 t._estimate_closure = _zamena
 print("ok")
