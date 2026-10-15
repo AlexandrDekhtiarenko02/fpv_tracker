@@ -89,6 +89,15 @@ povodok = t._kren_na_kurs(0.0, now, 0.0, 160.0, now, 1.0)
 assert 0 < povodok < 50.0, povodok
 # Без крена с полётника стик молчит.
 assert t._kren_na_kurs(4.0, now, None, 0.0, now, 1.0) == 0.0
+# Азимут влево, а цель справа: крен не кладётся в сторону оценки.
+t._pn_bank_i = 0.0
+t._pn_bank_tek = 0.0
+now_v = now
+for _ in range(int(2 * t.NOMINAL_FPS)):
+    now_v += 1.0 / t.NOMINAL_FPS
+    t._kren_na_kurs(-1.5, now_v, 0.0, 80.0, now_v, 1.0)
+assert t._pn_bank_tek > 0.0, t._pn_bank_tek
+assert t._pn_bank_tek < 8.0, t._pn_bank_tek
 # Далёкий ровный увод: крен есть и набирается плавно, но не в потолок.
 # Шум ниже мёртвой зоны крен не растит.
 t._pn_bank_i = 0.0

@@ -9186,6 +9186,14 @@ def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k):
                 leash = -leash
         zhel = ROLL_SIGN * (
             PN_ROLL_BANK_PER_DPS * izb + _pn_bank_i + leash)
+        # Скорость азимута включает наш же курс. На 9e3a760 нос уходил
+        # влево, оценка из-за этого была минус, и крен дожимал ещё левее,
+        # пока цель весь заход стояла справа. Против картинки крен не кладём:
+        # это уже не увод линии, а петля собственного рыскания.
+        if (dx_px is not None and abs(float(dx_px)) > PN_ROLL_LEASH_PX
+                and zhel * float(dx_px) < 0.0):
+            zhel = ROLL_SIGN * leash
+            _pn_bank_i *= 0.5 ** dt_s
     else:
         _pn_bank_i *= 0.5 ** (k / NOMINAL_FPS)
         zhel = 0.0
