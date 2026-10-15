@@ -3,6 +3,7 @@
 Заходы 34–43: стик тангажа выше 1500 докручивал нос до 50–60°,
 газ держал стик захвата, крен догонял рамку.
 """
+import math
 import os
 import sys
 
@@ -128,24 +129,48 @@ assert uroven < 0.0, uroven
 assert t._kren_k_gorizontu(0.0, 0.0) == 0.0
 assert t._kren_k_gorizontu(100.0, None) == 20.0
 
-print("=== 8. Тангаж держит угол курса, не рамку ===")
+print("=== 8. Тангаж держит прямую, не угол захвата ===")
 t._pn_nos_i = 0.0
 t._pn_nos_tek = None
-# Угол растёт, нос ещё на захвате: стик опускает нос, но не в упор.
-pwm_n = t._nos_na_kurs(2.5, now, 12.0, 12.0, 0.0, now, 1.0)
-assert 0 < pwm_n <= t.PN_PITCH_PWM_MAX, pwm_n
-# Нос уже на желаемом: стик отпущен. Рамка в 10 px ничего не добавляет.
-zhel_n = 12.0 + t.PN_PITCH_DEG_PER_DPS * (2.5 - t.LOS_RATE_DEADBAND_DPS)
+# Пологая линия, цель в центре: нос надо опустить ниже линии, стик вниз.
+pwm_n = t._nos_na_kurs(0.0, now, 18.0, 18.0, 0.0, now, 1.0, 18.0)
+assert pwm_n > 0.0, pwm_n
+# Уже на запасе «ниже линии», скорость линии ноль: стик отпущен.
+dpp = t.CAMERA_VFOV_DEG / float(t.MAIN_H)
+lead = t._nizhe_linii(18.0)
+dy_lead = -lead / dpp
 t._pn_nos_i = 0.0
-t._pn_nos_tek = zhel_n
-derzh_n = t._nos_na_kurs(2.5, now, zhel_n, 12.0, 0.0, now, 1.0)
+t._pn_nos_tek = 18.0 + lead
+derzh_n = t._nos_na_kurs(0.0, now, 18.0 + lead, 18.0, dy_lead, now, 1.0, 18.0)
 assert abs(derzh_n) < 8.0, derzh_n
+# Крутая линия, цель в центре: вниз не дожимаем.
 t._pn_nos_i = 0.0
-t._pn_nos_tek = zhel_n
-u_centra_n = t._nos_na_kurs(2.5, now, zhel_n, 12.0, 10.0, now, 1.0)
-assert abs(u_centra_n - derzh_n) < 1.0, (u_centra_n, derzh_n)
-# Добор не больше 10° от захвата.
-assert t.PN_PITCH_FROM_LOCK_MAX <= t.PITCH_POTOLK_DEG + 1e-6
+t._pn_nos_tek = 32.0
+krut = t._nos_na_kurs(0.0, now, 32.0, 18.0, 0.0, now, 1.0, 32.0)
+assert abs(krut) < 8.0, krut
+# Нос далеко ниже захвата, линия спокойная и цель уже где надо:
+# назад к захвату не тянем.
+t._pn_nos_i = 0.0
+t._pn_nos_tek = 34.0
+nazad = t._nos_na_kurs(0.0, now, 34.0, 16.0, dy_lead, now, 1.0, 18.0)
+assert nazad > -8.0, nazad
+# Угол линии растёт — нос вниз, даже если картинка уже на запасе.
+t._pn_nos_i = 0.0
+t._pn_nos_tek = 30.0
+rost = t._nos_na_kurs(2.5, now, 30.0, 16.0, dy_lead, now, 1.0, 18.0)
+assert rost > 0.0, rost
+
+print("=== 8b. Газ прямой: провал — выше стика, дуга — ниже, без скорости молчит ===")
+rovno_g = t._gaz_po_linii(
+    1350, 20.0, 8.0, -8.0 * math.tan(math.radians(20.0)) * 100.0)
+assert rovno_g is not None and abs(rovno_g - 1350) < 15.0, rovno_g
+proval = t._gaz_po_linii(1350, 20.0, 6.0, -600.0)
+assert proval > 1350, proval
+duga = t._gaz_po_linii(1350, 25.0, 10.0, -100.0)
+assert duga < 1350, duga
+assert t._gaz_po_linii(1350, 20.0, None, -300.0) is None
+assert t._nizhe_linii(34.0) == 0.0
+assert t._nizhe_linii(10.0) == t.PN_AIM_LEAD_MAX
 
 print("=== 9. Рыскание молчит без крена и цели у края ===")
 assert t._ryaskan_na_kurs(0.0, 10.0) == 0.0
@@ -255,8 +280,8 @@ print("    тангаж %s рыскание %s газ %s крен %s" % (
 assert t.global_pitch_cmd >= 1560, t.global_pitch_cmd
 # Без крена и без цели у края нос не крутим.
 assert abs(t.global_yaw_cmd - 1500) <= 2, t.global_yaw_cmd
-# 40 м / 10 с = 4 м/с, снижения нет: 1500 − 4×25 = 1400. Не в пол и не выше висения.
-assert 1370 <= t.global_throttle_cmd <= 1430, t.global_throttle_cmd
+# Без путевой газ прямой молчит и оставляет стик входа, а не сажает в 1400.
+assert abs(t.global_throttle_cmd - 1500) <= 40, t.global_throttle_cmd
 for _ in range(6):
     _kadr(pitch=20.0, roll=12.0, dx=0.0)
 print("    крен %s при банке +12, рыскание %s" % (
