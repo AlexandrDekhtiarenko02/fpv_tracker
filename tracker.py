@@ -2203,6 +2203,11 @@ COLLISION_ROLL_MAX = 28.0
 # Шум 0.15 °/с (ровный заход 15:08 вдали) по-прежнему ноль.
 # Потолок 22° оставлен: на 4 °/с крен тот же, что был, не больше.
 PN_ROLL_AZ_DEADBAND_DPS = 0.25
+# Интеграл видит и более тихий увод. Пропорция от 0.25 молчит,
+# чтобы шум не качал крыло, но 0.3–0.5 °/с на дальней цели — это
+# уже будущий промах: в 1811c5f рамка уползала на 30 px при скорости
+# внутри мёртвой зоны, крен стоял 1°, а у цели азимут был уже 3–8 °/с.
+PN_ROLL_I_DEADBAND_DPS = 0.12
 PN_ROLL_BANK_PER_DPS = 10.0
 PN_ROLL_BANK_MAX = 22.0
 # Было 40 °/с — желаемый крен прыгал следом за оценкой, на заходе
@@ -2213,14 +2218,17 @@ PN_ROLL_BANK_SLEW = 12.0
 # долго. Раньше он упирался в +8° и не отпускал борт: на 15:09 в конце
 # азимут уже около 1 °/с, а крен всё ещё 10°. Утечка не даёт ему
 # сидеть в упоре после того, как скорость спала.
-PN_ROLL_I_DEG_PER_S = 0.8
-PN_ROLL_I_MAX = 4.0
+PN_ROLL_I_DEG_PER_S = 2.2
+PN_ROLL_I_MAX = 6.0
 PN_ROLL_I_HALF_S = 4.0
 PN_ROLL_PWM_PER_DEG = 6.0
 PN_ROLL_PWM_MAX = 110.0
 # Поводок рамки молчит, пока цель не у края. Смещение в центре — это
 # и есть курс столкновения, стягивать его обратно значит снова лететь дугой.
-PN_ROLL_LEASH_PX = 70.0
+# Поводок рамки. В 1811c5f цель по 10–15 с сидела в 20–40 px от центра,
+# скорость азимута была около нуля, поводок молчал до 70 px — то есть
+# до самого конца. 30 px уже не шум кадра и ещё не удар.
+PN_ROLL_LEASH_PX = 30.0
 PN_ROLL_LEASH_DEG = 0.06
 PN_ROLL_LEASH_MAX = 6.0
 # Тангаж держит прямую на цель, а не угол в момент захвата.
@@ -2233,7 +2241,7 @@ PN_ROLL_LEASH_MAX = 6.0
 PN_AIM_SHALLOW_DEG = 16.0      # положе этого — полный запас «ниже линии»
 PN_AIM_STEEP_DEG = 28.0        # круче этого — цель держим в центре
 PN_AIM_LEAD_MAX = 12.0         # градусов выше центра, не крайние 16° одного захода
-PN_PITCH_DEG_PER_DPS = 4.0
+PN_PITCH_DEG_PER_DPS = 2.0
 PN_PITCH_ABS_MAX = 45.0        # ниже этого нос не командовать: в заходах было до ~40
 PN_PITCH_SLEW = 12.0
 PN_PITCH_I_DEG_PER_S = 0.6
@@ -2250,8 +2258,11 @@ GAZ_LINII_NIZHE = 120.0
 GAZ_LINII_GS_MIN = 1.5
 # Рыскание не строит курс. Оно доворачивает нос в сторону крена,
 # чтобы борт не летел боком, и слабо подтягивает цель только у края кадра.
-YAW_S_BANK = 1.5
-YAW_BANK_QUIET_DEG = 4.0
+# Рыскание не строит курс. Оно доворачивает нос в сторону крена,
+# в том числе малого: на дальних заходах крен 2–4°, и при пороге 4°
+# нос не поворачивался вообще, пока промах не становился поздним.
+YAW_S_BANK = 3.0
+YAW_BANK_QUIET_DEG = 1.5
 YAW_BANK_PWM_MAX = 30.0
 YAW_LEASH_PX = 50.0
 YAW_LEASH_PWM = 0.3
@@ -9145,12 +9156,19 @@ def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k):
             izb = az + PN_ROLL_AZ_DEADBAND_DPS
         else:
             izb = 0.0
+        if az > PN_ROLL_I_DEADBAND_DPS:
+            izb_i = az - PN_ROLL_I_DEADBAND_DPS
+        elif az < -PN_ROLL_I_DEADBAND_DPS:
+            izb_i = az + PN_ROLL_I_DEADBAND_DPS
+        else:
+            izb_i = 0.0
         dt_s = k / NOMINAL_FPS
-        if izb != 0.0:
-            # Утечка и в работе: долгий увод добирает крен до равновесия,
-            # а не копится до упора и не держит борт, когда скорость спала.
+        if izb_i != 0.0:
+            # Утечка и в работе: долгий тихий увод добирает несколько
+            # градусов вдали, а не копится до упора и не держит борт,
+            # когда скорость спала.
             _pn_bank_i *= 0.5 ** (dt_s / PN_ROLL_I_HALF_S)
-            _pn_bank_i += izb * PN_ROLL_I_DEG_PER_S * dt_s
+            _pn_bank_i += izb_i * PN_ROLL_I_DEG_PER_S * dt_s
             if _pn_bank_i > PN_ROLL_I_MAX:
                 _pn_bank_i = PN_ROLL_I_MAX
             elif _pn_bank_i < -PN_ROLL_I_MAX:
@@ -9230,6 +9248,12 @@ def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k,
     dpp = CAMERA_VFOV_DEG / float(MAIN_H)
     aim_below = 0.0 if dy_px is None else -float(dy_px) * dpp
     lead = _nizhe_linii(depression_deg)
+    # Запас «ниже линии» только опускает нос, если цель ещё не там.
+    # Поднимать нос, потому что целишься ниже формулы, нельзя: на 1811c5f
+    # так и было, линия в середине отпускалась, а у цели носа уже не хватало.
+    gap = lead - aim_below
+    if gap < 0.0:
+        gap = 0.0
     fresh = (los_ts > 0.0) and ((now - los_ts) <= LOS_RATE_STALE_S)
     if fresh:
         if los > LOS_RATE_DEADBAND_DPS:
@@ -9252,7 +9276,7 @@ def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k,
     else:
         _pn_nos_i *= 0.5 ** (k / NOMINAL_FPS)
         dobor = 0.0
-    zhel = pitch_deg + (lead - aim_below) + dobor
+    zhel = pitch_deg + gap + dobor
     if zhel > PN_PITCH_ABS_MAX:
         zhel = PN_PITCH_ABS_MAX
     elif zhel < 0.0:
