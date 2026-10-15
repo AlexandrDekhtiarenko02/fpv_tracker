@@ -2200,15 +2200,17 @@ PN_ROLL_BANK_SLEW = 12.0
 PN_ROLL_I_HALF_S = 4.0
 PN_ROLL_PWM_PER_DEG = 6.0
 PN_ROLL_PWM_MAX = 110.0
-# Тангаж держит цель выше центра, а не угол захвата и не скорость линии.
-# В эталоне запас почти ровный: около 9° на линии 12–26°, и только
-# круче ~30° цель садится в центр. Прежняя формула обнуляла запас
-# уже к 28°, нос в середине поднимался, у цели докрутить вниз
-# не успевал. Отрицательная скорость линии нос не поднимает:
-# на заходе пилота она как раз отрицательная, когда прямая закрывается.
-PN_AIM_HOLD_UNTIL_DEG = 22.0   # досюда полный запас «выше центра»
-PN_AIM_STEEP_DEG = 30.0        # круче этого — цель в центре, не пикировать
+# Тангаж держит цель выше центра. На обычной линии это около 9°.
+# Если угол линии растёт — перелёт — нос добирается ещё, даже когда
+# картинка уже на этих 9°. На 4dc8597 линия росла на 0.5–2 °/с, а стик
+# тангажа стоял в центре: запас к этому моменту уже обнулялся, потому
+# что угол стал «крутым». Крутым он стал от перелёта, не от захода.
+# Отрицательная скорость линии нос не поднимает.
+PN_AIM_HOLD_UNTIL_DEG = 22.0   # досюда полный запас, если линия не растёт
+PN_AIM_STEEP_DEG = 30.0        # круче и линия спокойна — цель в центре
 PN_AIM_LEAD_MAX = 9.0
+PN_PITCH_LOS_PER_DPS = 2.5     # градусов запаса на °/с роста линии
+PN_PITCH_LOS_EXTRA_MAX = 8.0   # сверху запаса, не упор в 45° за один шаг
 PN_PITCH_ABS_MAX = 45.0
 PN_PITCH_SLEW = 12.0
 PN_PITCH_I_DEG_PER_S = 0.6
@@ -9177,17 +9179,16 @@ def _nizhe_linii(depression_deg):
 
 def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k,
                  depression_deg=None):
-    """Стик тангажа: цель выше центра на запас линии, потом стик отпущен.
+    """Стик тангажа: цель выше центра, и ещё ниже, если линия растёт.
 
-    Скорость линии сюда не входит. Положительная вместе с собственным
-    клевком доезжала носом до упора. Отрицательная — а на закрывающейся
-    прямой пилота она отрицательная — поднимала нос в середине, и у
-    цели вниз уже не хватало. Если цель падает к центру, запас снова
-    открывается и нос опускается. Выше, чем цель уже сидит, нос не тянем.
-    los и pitch_lock оставлены, чтобы старые вызовы не падали.
+    Запас по углу линии отпускается только когда линия спокойна или
+    закрывается. Растущая линия — это перелёт: на 4dc8597 она росла,
+    цель ещё была выше центра, стик уже стоял в нуле, и борт прошёл
+    сверху. Отрицательная скорость нос не поднимает. pitch_lock в
+    расчёт не входит.
     """
     global _pn_nos_i, _pn_nos_tek
-    del los, los_ts, pitch_lock, now
+    del pitch_lock
     if pitch_deg is None:
         return 0.0
     pitch_deg = float(pitch_deg)
@@ -9196,20 +9197,31 @@ def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k,
     dpp = CAMERA_VFOV_DEG / float(MAIN_H)
     aim_below = 0.0 if dy_px is None else -float(dy_px) * dpp
     lead = _nizhe_linii(depression_deg)
-    gap = lead - aim_below
-    if gap < 0.0:
-        gap = 0.0
+    fresh = (los_ts > 0.0) and ((now - los_ts) <= LOS_RATE_STALE_S)
+    extra = 0.0
+    if fresh and los > LOS_RATE_DEADBAND_DPS:
+        # Угол «уже крутой» здесь — сам перелёт. Запас не обнуляем.
+        if lead < PN_AIM_LEAD_MAX:
+            lead = PN_AIM_LEAD_MAX
+        extra = (float(los) - LOS_RATE_DEADBAND_DPS) * PN_PITCH_LOS_PER_DPS
+        if extra > PN_PITCH_LOS_EXTRA_MAX:
+            extra = PN_PITCH_LOS_EXTRA_MAX
+    picture = lead - aim_below
+    if picture < 0.0:
+        picture = 0.0
     dt_s = k / NOMINAL_FPS
-    if gap > 0.5:
+    # Интеграл только по картинке. Скорость линии в него не копится:
+    # иначе собственный клевок снова доезжает до упора.
+    if picture > 0.5:
         _pn_nos_i *= 0.5 ** (dt_s / 4.0)
-        _pn_nos_i += gap * PN_PITCH_I_DEG_PER_S * dt_s
+        _pn_nos_i += picture * PN_PITCH_I_DEG_PER_S * dt_s
         if _pn_nos_i > PN_PITCH_I_MAX:
             _pn_nos_i = PN_PITCH_I_MAX
     else:
         _pn_nos_i *= 0.5 ** dt_s
         if _pn_nos_i < 0.0:
             _pn_nos_i = 0.0
-    zhel = pitch_deg + gap + _pn_nos_i
+    zhel = pitch_deg + picture + extra + _pn_nos_i
     if zhel > PN_PITCH_ABS_MAX:
         zhel = PN_PITCH_ABS_MAX
     elif zhel < 0.0:
@@ -9290,14 +9302,15 @@ def _gaz_po_vysote(hover, alt_m, tau_s, vario_cms):
     return pwm
 
 
-def _gaz_po_linii(opora, depression_deg, ground_speed_ms, vario_cms):
+def _gaz_po_linii(opora, depression_deg, ground_speed_ms, vario_cms,
+                  los_rate=None):
     """Газ, при котором путь совпадает с линией на цель.
 
-    Опора — стик входа, не висение и не прошлая команда. Её нельзя
-    подменять собственным выходом: поправка тогда копится сама на себя.
-    Путь круче линии: борт проваливается, газ выше опоры.
-    Путь положе: дуга и перелёт, газ ниже. Нет путевой, угла или
-    вариометра — None, ручку не выдумываем, снаружи остаётся стик входа.
+    Опора — стик входа, не висение и не прошлая команда.
+    Путь круче линии: газ выше, но не когда сама линия растёт. На
+    4dc8597 путевая занижалась, путь выглядел круче линии, газ в конце
+    поднимался (1416 при стике 1377), а борт всё равно перелетал.
+    Путь положе — газ ниже. Нет путевой, угла или вариометра — None.
     """
     if opora is None or depression_deg is None:
         return None
@@ -9322,6 +9335,9 @@ def _gaz_po_linii(opora, depression_deg, ground_speed_ms, vario_cms):
         pwm = verh
     if pwm < niz:
         pwm = niz
+    if (los_rate is not None and float(los_rate) > LOS_RATE_DEADBAND_DPS
+            and pwm > float(opora)):
+        pwm = float(opora)
     return pwm
 
 
@@ -13061,8 +13077,12 @@ def _update_control_from_target_impl():
         _opora_gaz = float(_gaz_vhod) if _gaz_vhod is not None else float(base_thr)
         _dep_lin = (closure.get("depression_deg")
                     if isinstance(closure, dict) else None)
+        _los_lin = None
+        if (_los_skorost_ts > 0.0
+                and (now_mono - _los_skorost_ts) <= LOS_RATE_STALE_S):
+            _los_lin = _los_skorost
         _cel_lin = _gaz_po_linii(
-            _opora_gaz, _dep_lin, ground_speed_mps, _var_g)
+            _opora_gaz, _dep_lin, ground_speed_mps, _var_g, _los_lin)
         if _cel_lin is None:
             _cel_lin = _opora_gaz
         _thr_geom_out = _podtyanut_gaz(
