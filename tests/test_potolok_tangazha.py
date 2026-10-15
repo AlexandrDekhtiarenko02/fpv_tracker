@@ -97,7 +97,7 @@ for _ in range(int(2 * t.NOMINAL_FPS)):
     now_v += 1.0 / t.NOMINAL_FPS
     t._kren_na_kurs(-1.5, now_v, 0.0, 80.0, now_v, 1.0)
 assert t._pn_bank_tek > 0.0, t._pn_bank_tek
-assert t._pn_bank_tek < 8.0, t._pn_bank_tek
+assert t._pn_bank_tek <= t.PN_ROLL_LEASH_MAX + 0.5, t._pn_bank_tek
 # Далёкий ровный увод: крен есть и набирается плавно, но не в потолок.
 # Шум ниже мёртвой зоны крен не растит.
 t._pn_bank_i = 0.0
@@ -163,12 +163,19 @@ t._pn_nos_i = 0.0
 t._pn_nos_tek = 34.0
 nazad = t._nos_na_kurs(0.0, now, 34.0, 16.0, dy_lead, now, 1.0, 18.0)
 assert nazad > -8.0, nazad
-# Угол линии растёт, но цель уже на запасе: это скорость самого носа,
-# вниз из-за неё не дожимаем.
+# Линия растёт, а нос стоит (гироскоп ноль): это перелёт, нос вниз.
 t._pn_nos_i = 0.0
 t._pn_nos_tek = 30.0
+t._gyro_y_sgl = 0.0
 rost = t._nos_na_kurs(2.5, now, 30.0, 16.0, dy_lead, now, 1.0, 18.0)
-assert abs(rost) < 8.0, rost
+assert rost > 0.0, rost
+# Та же скорость линии, но нос сам клюёт с той же скоростью: вниз не дожимаем.
+t._pn_nos_i = 0.0
+t._pn_nos_tek = 30.0
+t._gyro_y_sgl = 2.5
+svoj = t._nos_na_kurs(2.5, now, 30.0, 16.0, dy_lead, now, 1.0, 18.0)
+assert abs(svoj) < 8.0, svoj
+t._gyro_y_sgl = None
 # Цель провалилась ниже запаса — нос вниз.
 t._pn_nos_i = 0.0
 t._pn_nos_tek = 30.0
@@ -291,13 +298,12 @@ for _ in range(90):
 print("    тангаж %s рыскание %s газ %s крен %s" % (
     t.global_pitch_cmd, t.global_yaw_cmd, t.global_throttle_cmd,
     t.global_roll_cmd))
-# Картинка уже в центре на крутой линии: растущий угол из самого носа
-# стик вниз не толкает.
-assert abs(t.global_pitch_cmd - 1500) <= 40, t.global_pitch_cmd
+# Линия в подмене реально растёт, нос при этом стоит: стик опускает его.
+assert t.global_pitch_cmd >= 1520, t.global_pitch_cmd
 # Без крена и без цели у края нос не крутим.
 assert abs(t.global_yaw_cmd - 1500) <= 2, t.global_yaw_cmd
-# Без путевой газ прямой молчит и оставляет стик входа, а не сажает в 1400.
-assert abs(t.global_throttle_cmd - 1500) <= 40, t.global_throttle_cmd
+# Линия в подмене растёт: газ ниже стика входа, но не в пол.
+assert 1500 - t.GAZ_PERELET_MAX - 5 <= t.global_throttle_cmd < 1500, t.global_throttle_cmd
 for _ in range(6):
     _kadr(pitch=20.0, roll=12.0, dx=0.0)
 print("    крен %s при банке +12, рыскание %s" % (
