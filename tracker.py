@@ -2184,92 +2184,47 @@ COLLISION_PITCH_PWM_DPS = 8.0
 COLLISION_ROLL_PWM_DPS = 6.0
 COLLISION_PITCH_MAX = 35.0
 COLLISION_ROLL_MAX = 28.0
-# Крен держит КРЕН курса столкновения, а не догоняет рамку.
-# Стик в ACRO задаёт скорость крена. Желаемый крен пропорционален
-# скорости азимута: стик доводит борт до этого крена и отпускается.
-# Рамка около центра стик не двигает — иначе собственный крен
-# перекладывает борт на другой бок.
-#
-# Заходы 195ce74, 13.10. Дальше 220 м азимут уже устойчиво 0.4–0.8 °/с
-# в сторону будущего промаха (15:09 — 94% кадров в один знак), а крен
-# был 1–2°. Мёртвая зона 0.5 °/с обнуляла этот увод, и 5° на °/с
-# превращали остаток в почти ноль. 12–19° появлялись только внутри
-# 150 м, инерция доносила мимо. Потолок при этом не виноват: его
-# поднимать — значит усилить как раз поздний толчок.
-#
-# Вдали нужен небольшой ровный крен, не удар и не ноль. Сильный крен
-# на 0.5 °/с переложит борт и снова раскачает. 0.8 °/с → около 6°
-# сразу, плюс пара градуса, если та же скорость держится секундами.
-# Шум 0.15 °/с (ровный заход 15:08 вдали) по-прежнему ноль.
-# Потолок 22° оставлен: на 4 °/с крен тот же, что был, не больше.
-PN_ROLL_AZ_DEADBAND_DPS = 0.25
-# Интеграл видит и более тихий увод. Пропорция от 0.25 молчит,
-# чтобы шум не качал крыло, но 0.3–0.5 °/с на дальней цели — это
-# уже будущий промах: в 1811c5f рамка уползала на 30 px при скорости
-# внутри мёртвой зоны, крен стоял 1°, а у цели азимут был уже 3–8 °/с.
-PN_ROLL_I_DEADBAND_DPS = 0.12
-PN_ROLL_BANK_PER_DPS = 10.0
-PN_ROLL_BANK_MAX = 22.0
-# Было 40 °/с — желаемый крен прыгал следом за оценкой, на заходе
-# 15:11 стик метнулся до +86 и борт качнуло. 12 °/с набирает те же
-# 6–8° меньше чем за секунду и не дёргает крыло.
+# Крен держит рамку у центра. В эталоне 17–18 |dx| около 7 px весь заход,
+# p90 14–18, крен 3–5° в её сторону, стик крена в основном отпущен
+# (p90 10–30 ШИМ — короткая поправка). Скорость азимута крен не задаёт:
+# в неё входит собственное рыскание, и на 9e3a760 она клала крен
+# против цели, которая всю дорогу была справа.
+# 4 px — тишина. Дальше 0.5° крена на пиксель: при 12 px это около 4°,
+# потолок 12°, не поздний удар в 22°.
+PN_ROLL_HOLD_PX = 4.0
+PN_ROLL_HOLD_DEG = 0.50
+PN_ROLL_HOLD_MAX = 12.0
+PN_ROLL_HOLD_I = 0.15
+PN_ROLL_HOLD_I_MAX = 4.0
 PN_ROLL_BANK_SLEW = 12.0
-# Интеграл только добирает крен, если одна и та же скорость стоит
-# долго. Раньше он упирался в +8° и не отпускал борт: на 15:09 в конце
-# азимут уже около 1 °/с, а крен всё ещё 10°. Утечка не даёт ему
-# сидеть в упоре после того, как скорость спала.
-PN_ROLL_I_DEG_PER_S = 2.2
-PN_ROLL_I_MAX = 6.0
 PN_ROLL_I_HALF_S = 4.0
 PN_ROLL_PWM_PER_DEG = 6.0
 PN_ROLL_PWM_MAX = 110.0
-# Поводок рамки молчит, пока цель не у края. Смещение в центре — это
-# и есть курс столкновения, стягивать его обратно значит снова лететь дугой.
-# Поводок с 10 px, не с 30. На 2c7d04d рамка уползала на 15–25 px,
-# пока цель была ещё далеко, азимут при этом был около нуля, и крена
-# не было вовсе. Пилот в этом же месте уже подправляет. Потолок поводка
-# 8°: это ранняя поправка, не поздний удар.
-PN_ROLL_LEASH_PX = 10.0
-PN_ROLL_LEASH_DEG = 0.22
-PN_ROLL_LEASH_MAX = 8.0
-# Тангаж держит прямую на цель, а не угол в момент захвата.
-# Захваты 15.10: линия визирования стоит около 16–25°, нос ставится
-# сразу и не добирается в конце. На пологой линии цель выше центра
-# кадра (нос ниже линии — так набирается ход). На уже крутой, около 30°,
-# цель в центре: ниже её опускать некуда, иначе это пикирование перед
-# целью. Опора на угол захвата с потолком +10° тянула нос обратно вверх
-# и загибала дугу. Потолок теперь абсолютный, не от захвата.
-PN_AIM_SHALLOW_DEG = 16.0      # положе этого — полный запас «ниже линии»
-PN_AIM_STEEP_DEG = 28.0        # круче этого — цель держим в центре
-PN_AIM_LEAD_MAX = 12.0         # градусов выше центра, не крайние 16° одного захода
-PN_PITCH_DEG_PER_DPS = 2.0
-PN_PITCH_ABS_MAX = 45.0        # ниже этого нос не командовать: в заходах было до ~40
+# Тангаж держит цель выше центра, а не угол захвата и не скорость линии.
+# В эталоне запас почти ровный: около 9° на линии 12–26°, и только
+# круче ~30° цель садится в центр. Прежняя формула обнуляла запас
+# уже к 28°, нос в середине поднимался, у цели докрутить вниз
+# не успевал. Отрицательная скорость линии нос не поднимает:
+# на заходе пилота она как раз отрицательная, когда прямая закрывается.
+PN_AIM_HOLD_UNTIL_DEG = 22.0   # досюда полный запас «выше центра»
+PN_AIM_STEEP_DEG = 30.0        # круче этого — цель в центре, не пикировать
+PN_AIM_LEAD_MAX = 9.0
+PN_PITCH_ABS_MAX = 45.0
 PN_PITCH_SLEW = 12.0
 PN_PITCH_I_DEG_PER_S = 0.6
 PN_PITCH_I_MAX = 4.0
 PN_PITCH_PWM_PER_DEG = 8.0
 PN_PITCH_PWM_MAX = 80.0
-# Газ — вторая половина той же прямой, не отдельный закон высоты.
-# Путь круче линии (провал вниз) — газ выше стика, которым вошли.
-# Путь положе линии (дуга, перелёт) — газ ниже. Без путевой и вариометра
-# стик не трогаем: резать его из-за «нос ниже захвата» как раз и роняло ход.
-GAZ_LINII_PWM_PER_DEG = 8.0
-GAZ_LINII_VYSHE = 80.0
-GAZ_LINII_NIZHE = 120.0
-GAZ_LINII_GS_MIN = 1.5
-# Перелёт: линия реально растёт, не из-за собственного клевка.
-# На 2c7d04d нос стоял, угол рос на 1–2 °/с весь заход, газ держал
-# стик входа, и борт приходил сверху. Ниже стика, не в пол.
-GAZ_PERELET_PWM_PER_DPS = 35.0
-GAZ_PERELET_MAX = 100.0
-# Рыскание не строит курс. Оно доворачивает нос в сторону крена,
-# чтобы борт не летел боком, и слабо подтягивает цель только у края кадра.
-# Рыскание не строит курс. Оно доворачивает нос в сторону крена,
-# в том числе малого: на дальних заходах крен 2–4°, и при пороге 4°
-# нос не поворачивался вообще, пока промах не становился поздним.
-YAW_S_BANK = 4.0
-YAW_BANK_QUIET_DEG = 1.5
-YAW_BANK_PWM_MAX = 30.0
+# Газ — стик, которым вошли. Выше него не поднимаем: на 9e3a760 опора
+# читалась со своего эха и доехала до 1530. Ниже тоже не режем:
+# на 4910596 убавка «линия растёт» сажала газ, а борт всё равно
+# перелетал. На коптере прямую держит нос, не сброс газа.
+# Рыскание курс не строит. На удачных заходах эталона стик рыскания
+# сидит в 3 ШИМ — это триммер. Нос доворачивается вместе с креном,
+# и только немного: отдельная тяга рамки рысканием уводит курс.
+YAW_S_BANK = 1.5
+YAW_BANK_QUIET_DEG = 3.0
+YAW_BANK_PWM_MAX = 15.0
 YAW_LEASH_PX = 50.0
 YAW_LEASH_PWM = 0.3
 YAW_LEASH_MAX = 15.0
@@ -9146,67 +9101,35 @@ def _stolknovenie_pwm(skorost, ts, now, deadband, gain, limit, sign):
 
 
 def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k):
-    """Стик, который держит крен курса столкновения.
+    """Стик, который держит цель у центра по горизонтали.
 
-    Желаемый крен пропорционален скорости азимута. Пока борт до него
-    не дошёл, стик отклонён; когда дошёл — стик у центра, крен стоит.
-    Рамка около центра стик не двигает. Без свежего крена команда ноль:
-    вслепую крутить скорость крена нельзя, борт ляжет и не выровняется.
+    Желаемый крен — от смещения рамки, несколько градусов, с медленным
+    добором если смещение не уходит. Стик в ACRO задаёт скорость, поэтому
+    у нужного крена он отпускается. Скорость азимута крен не задаёт.
+    Без крена с полётника команда ноль.
     """
-    global _pn_bank_i, _pn_bank_tek, _pn_nos_i, _pn_nos_tek
+    global _pn_bank_i, _pn_bank_tek
+    del az, az_ts, now
     if bank_deg is None:
         return 0.0
-    fresh = (az_ts > 0.0) and ((now - az_ts) <= LOS_RATE_STALE_S)
-    leash = 0.0
-    if fresh:
-        if az > PN_ROLL_AZ_DEADBAND_DPS:
-            izb = az - PN_ROLL_AZ_DEADBAND_DPS
-        elif az < -PN_ROLL_AZ_DEADBAND_DPS:
-            izb = az + PN_ROLL_AZ_DEADBAND_DPS
-        else:
-            izb = 0.0
-        if az > PN_ROLL_I_DEADBAND_DPS:
-            izb_i = az - PN_ROLL_I_DEADBAND_DPS
-        elif az < -PN_ROLL_I_DEADBAND_DPS:
-            izb_i = az + PN_ROLL_I_DEADBAND_DPS
-        else:
-            izb_i = 0.0
-        dt_s = k / NOMINAL_FPS
-        if izb_i != 0.0:
-            # Утечка и в работе: долгий тихий увод добирает несколько
-            # градусов вдали, а не копится до упора и не держит борт,
-            # когда скорость спала.
-            _pn_bank_i *= 0.5 ** (dt_s / PN_ROLL_I_HALF_S)
-            _pn_bank_i += izb_i * PN_ROLL_I_DEG_PER_S * dt_s
-            if _pn_bank_i > PN_ROLL_I_MAX:
-                _pn_bank_i = PN_ROLL_I_MAX
-            elif _pn_bank_i < -PN_ROLL_I_MAX:
-                _pn_bank_i = -PN_ROLL_I_MAX
-        else:
-            _pn_bank_i *= 0.5 ** dt_s
-        if dx_px is not None and abs(dx_px) > PN_ROLL_LEASH_PX:
-            leash = (abs(dx_px) - PN_ROLL_LEASH_PX) * PN_ROLL_LEASH_DEG
-            if leash > PN_ROLL_LEASH_MAX:
-                leash = PN_ROLL_LEASH_MAX
-            if dx_px < 0.0:
-                leash = -leash
-        zhel = ROLL_SIGN * (
-            PN_ROLL_BANK_PER_DPS * izb + _pn_bank_i + leash)
-        # Скорость азимута включает наш же курс. На 9e3a760 нос уходил
-        # влево, оценка из-за этого была минус, и крен дожимал ещё левее,
-        # пока цель весь заход стояла справа. Против картинки крен не кладём:
-        # это уже не увод линии, а петля собственного рыскания.
-        if (dx_px is not None and abs(float(dx_px)) > PN_ROLL_LEASH_PX
-                and zhel * float(dx_px) < 0.0):
-            zhel = ROLL_SIGN * leash
-            _pn_bank_i *= 0.5 ** dt_s
+    dt_s = k / NOMINAL_FPS
+    err = 0.0
+    if dx_px is not None and abs(float(dx_px)) > PN_ROLL_HOLD_PX:
+        err = float(dx_px) - math.copysign(PN_ROLL_HOLD_PX, float(dx_px))
+    if err != 0.0:
+        _pn_bank_i *= 0.5 ** (dt_s / PN_ROLL_I_HALF_S)
+        _pn_bank_i += err * PN_ROLL_HOLD_I * dt_s
+        if _pn_bank_i > PN_ROLL_HOLD_I_MAX:
+            _pn_bank_i = PN_ROLL_HOLD_I_MAX
+        elif _pn_bank_i < -PN_ROLL_HOLD_I_MAX:
+            _pn_bank_i = -PN_ROLL_HOLD_I_MAX
     else:
-        _pn_bank_i *= 0.5 ** (k / NOMINAL_FPS)
-        zhel = 0.0
-    if zhel > PN_ROLL_BANK_MAX:
-        zhel = PN_ROLL_BANK_MAX
-    elif zhel < -PN_ROLL_BANK_MAX:
-        zhel = -PN_ROLL_BANK_MAX
+        _pn_bank_i *= 0.5 ** dt_s
+    zhel = ROLL_SIGN * (err * PN_ROLL_HOLD_DEG + _pn_bank_i)
+    if zhel > PN_ROLL_HOLD_MAX:
+        zhel = PN_ROLL_HOLD_MAX
+    elif zhel < -PN_ROLL_HOLD_MAX:
+        zhel = -PN_ROLL_HOLD_MAX
     shag = PN_ROLL_BANK_SLEW * (k / NOMINAL_FPS)
     if _pn_bank_tek < zhel - shag:
         _pn_bank_tek += shag
@@ -9225,16 +9148,17 @@ def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k):
 def _nizhe_linii(depression_deg):
     """На сколько градусов цель должна сидеть выше центра.
 
-    Пологая линия — нос ниже неё, иначе нет хода и заход загибается в дугу.
-    Уже крутая — цель в центре: дальше вниз это удар перед целью, не прямая.
-    Нет угла — не выдумываем запас.
+    На обычной линии эталон держит около 9° и не отпускает этот запас,
+    пока линия не станет крутой. Нет угла — запас не выдумываем.
     """
     if depression_deg is None:
         return 0.0
     dep = float(depression_deg)
     if dep >= PN_AIM_STEEP_DEG:
         return 0.0
-    shirina = PN_AIM_STEEP_DEG - PN_AIM_SHALLOW_DEG
+    if dep <= PN_AIM_HOLD_UNTIL_DEG:
+        return PN_AIM_LEAD_MAX
+    shirina = PN_AIM_STEEP_DEG - PN_AIM_HOLD_UNTIL_DEG
     if shirina <= 1e-6:
         return 0.0
     dolya = (PN_AIM_STEEP_DEG - dep) / shirina
@@ -9247,16 +9171,17 @@ def _nizhe_linii(depression_deg):
 
 def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k,
                  depression_deg=None):
-    """Стик тангажа прямой на цель.
+    """Стик тангажа: цель выше центра на запас линии, потом стик отпущен.
 
-    Опора — не угол захвата. Желаемый нос ставит цель на столько выше
-    центра, сколько просит линия, и добирает, если сама линия растёт
-    (перелёт) или убывает (недолёт). Стик в ACRO задаёт скорость, поэтому
-    у желаемого угла он отпускается. pitch_lock оставлен в аргументах,
-    чтобы старые вызовы не падали: в расчёт он больше не входит.
+    Скорость линии сюда не входит. Положительная вместе с собственным
+    клевком доезжала носом до упора. Отрицательная — а на закрывающейся
+    прямой пилота она отрицательная — поднимала нос в середине, и у
+    цели вниз уже не хватало. Если цель падает к центру, запас снова
+    открывается и нос опускается. Выше, чем цель уже сидит, нос не тянем.
+    los и pitch_lock оставлены, чтобы старые вызовы не падали.
     """
-    global _pn_nos_i, _pn_nos_tek, _gyro_y_sgl
-    del pitch_lock
+    global _pn_nos_i, _pn_nos_tek
+    del los, los_ts, pitch_lock, now
     if pitch_deg is None:
         return 0.0
     pitch_deg = float(pitch_deg)
@@ -9265,41 +9190,20 @@ def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k,
     dpp = CAMERA_VFOV_DEG / float(MAIN_H)
     aim_below = 0.0 if dy_px is None else -float(dy_px) * dpp
     lead = _nizhe_linii(depression_deg)
-    # Запас «ниже линии» только опускает нос, если цель ещё не там.
-    # Поднимать нос, потому что целишься ниже формулы, нельзя: на 1811c5f
-    # так и было, линия в середине отпускалась, а у цели носа уже не хватало.
     gap = lead - aim_below
     if gap < 0.0:
         gap = 0.0
-    fresh = (los_ts > 0.0) and ((now - los_ts) <= LOS_RATE_STALE_S)
-    # Из скорости линии вычитаем скорость самого носа. Иначе клевок
-    # сам себе пишет «линия растёт» и доезжает до упора, как на 9e3a760.
-    # Если нос стоит, а линия всё равно растёт — это перелёт, его не глушим.
-    los_lin = float(los)
-    if _gyro_y_sgl is not None:
-        los_lin -= float(_gyro_y_sgl)
-    if fresh:
-        if los_lin > LOS_RATE_DEADBAND_DPS:
-            izb = los_lin - LOS_RATE_DEADBAND_DPS
-        elif los_lin < -LOS_RATE_DEADBAND_DPS:
-            izb = los_lin + LOS_RATE_DEADBAND_DPS
-        else:
-            izb = 0.0
-        dt_s = k / NOMINAL_FPS
-        if izb != 0.0:
-            _pn_nos_i *= 0.5 ** (dt_s / 4.0)
-            _pn_nos_i += izb * PN_PITCH_I_DEG_PER_S * dt_s
-            if _pn_nos_i > PN_PITCH_I_MAX:
-                _pn_nos_i = PN_PITCH_I_MAX
-            elif _pn_nos_i < -PN_PITCH_I_MAX:
-                _pn_nos_i = -PN_PITCH_I_MAX
-        else:
-            _pn_nos_i *= 0.5 ** dt_s
-        dobor = PN_PITCH_DEG_PER_DPS * izb + _pn_nos_i
+    dt_s = k / NOMINAL_FPS
+    if gap > 0.5:
+        _pn_nos_i *= 0.5 ** (dt_s / 4.0)
+        _pn_nos_i += gap * PN_PITCH_I_DEG_PER_S * dt_s
+        if _pn_nos_i > PN_PITCH_I_MAX:
+            _pn_nos_i = PN_PITCH_I_MAX
     else:
-        _pn_nos_i *= 0.5 ** (k / NOMINAL_FPS)
-        dobor = 0.0
-    zhel = pitch_deg + gap + dobor
+        _pn_nos_i *= 0.5 ** dt_s
+        if _pn_nos_i < 0.0:
+            _pn_nos_i = 0.0
+    zhel = pitch_deg + gap + _pn_nos_i
     if zhel > PN_PITCH_ABS_MAX:
         zhel = PN_PITCH_ABS_MAX
     elif zhel < 0.0:
@@ -9381,37 +9285,17 @@ def _gaz_po_vysote(hover, alt_m, tau_s, vario_cms):
 
 
 def _gaz_po_linii(opora, depression_deg, ground_speed_ms, vario_cms):
-    """Газ, при котором путь совпадает с линией на цель.
+    """Стик, которым вошли в заход. Путь и вариометр его не двигают.
 
-    Опора — стик, которым вошли в заход, не висение и не угол захвата.
-    Путь круче линии: борт проваливается перед целью, газ выше.
-    Путь положе: дуга и перелёт, газ ниже. Нет путевой или вариометра —
-    None, ручку не выдумываем.
+    Прибавка по «пути круче линии» на 9e3a760 доехала до 1530: опора
+    читалась со своего эха. Убавка по растущей линии на 4910596 сажала
+    газ, а перелёт не убирала — на коптере прямую держит нос.
+    Нет стика входа — None, ручку не выдумываем.
     """
-    if opora is None or depression_deg is None:
+    del depression_deg, ground_speed_ms, vario_cms
+    if opora is None:
         return None
-    if ground_speed_ms is None or vario_cms is None:
-        return None
-    gs = float(ground_speed_ms)
-    if gs < GAZ_LINII_GS_MIN:
-        return None
-    sink = -float(vario_cms) / 100.0
-    path = math.degrees(math.atan2(sink, gs))
-    err = path - float(depression_deg)
-    # Выше стика входа не поднимаем. На 9e3a760 путь выходил круче
-    # посчитанной линии весь заход, газ прибавлялся и ещё и полз вместе
-    # с эхом своей команды до 1530. Борт приходил сверху. Ниже — можно:
-    # слишком крутой путь перед целью надо придержать.
-    if err > 0.0:
-        err = 0.0
-    pwm = float(opora) + GAZ_LINII_PWM_PER_DEG * err
-    verh = float(opora) + GAZ_LINII_VYSHE
-    niz = float(opora) - GAZ_LINII_NIZHE
-    if pwm > verh:
-        pwm = verh
-    if pwm < niz:
-        pwm = niz
-    return pwm
+    return float(opora)
 
 
 def _kadr_oshibka(net, deadband):
@@ -13142,9 +13026,8 @@ def _update_control_from_target_impl():
     # Газ по высоте и времени. Старые пороги и геометрия выше посчитаны,
     # но если есть висение, высота и вменяемое время — команда эта, а не они.
     # Иначе снова срез до 1200 далеко от цели или стик захвата до самого конца.
-    # Газ прямой: путь против линии, опора — стик входа. Старый закон высоты
-    # и срез «нос ниже захвата» сюда не входят: они убирали газ именно тогда,
-    # когда нос опущен ниже линии и газу надо держать ход.
+    # Газ — стик входа, без убавки по линии и без прибавки по пути.
+    # Старый закон высоты и срез «нос ниже захвата» сюда не входят.
     if OVERRIDE_THROTTLE and COLLISION_ENABLED:
         if _gaz_vhod is None and rc_fresh:
             _gaz_vhod = float(base_thr)
@@ -13155,18 +13038,6 @@ def _update_control_from_target_impl():
             _opora_gaz, _dep_lin, ground_speed_mps, _var_g)
         if _cel_lin is None:
             _cel_lin = _opora_gaz
-        # Линия растёт сама, нос при этом не клюёт — перелёт. Газ ниже
-        # стика входа, чтобы путь просел. Выше стика по-прежнему не лезем.
-        _los_lin = _los_g
-        if _los_lin is not None and _gyro_y_sgl is not None:
-            _los_lin = float(_los_lin) - float(_gyro_y_sgl)
-        if _los_lin is not None and _los_lin > LOS_RATE_DEADBAND_DPS:
-            _srez_per = (_los_lin - LOS_RATE_DEADBAND_DPS) * GAZ_PERELET_PWM_PER_DPS
-            if _srez_per > GAZ_PERELET_MAX:
-                _srez_per = GAZ_PERELET_MAX
-            _nizhe = _opora_gaz - _srez_per
-            if _cel_lin > _nizhe:
-                _cel_lin = _nizhe
         _thr_geom_out = _podtyanut_gaz(
             _thr_geom_out if _thr_geom_out is not None else target_throttle,
             _cel_lin, THR_GEOM_SLEW_OVERSHOOT, k)
