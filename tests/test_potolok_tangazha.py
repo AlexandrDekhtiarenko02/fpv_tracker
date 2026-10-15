@@ -154,18 +154,24 @@ t._pn_nos_i = 0.0
 t._pn_nos_tek = 34.0
 nazad = t._nos_na_kurs(0.0, now, 34.0, 16.0, dy_lead, now, 1.0, 18.0)
 assert nazad > -8.0, nazad
-# Угол линии растёт — нос вниз, даже если картинка уже на запасе.
+# Угол линии растёт, но цель уже на запасе: это скорость самого носа,
+# вниз из-за неё не дожимаем.
 t._pn_nos_i = 0.0
 t._pn_nos_tek = 30.0
 rost = t._nos_na_kurs(2.5, now, 30.0, 16.0, dy_lead, now, 1.0, 18.0)
-assert rost > 0.0, rost
+assert abs(rost) < 8.0, rost
+# Цель провалилась ниже запаса — нос вниз.
+t._pn_nos_i = 0.0
+t._pn_nos_tek = 30.0
+nizhe = t._nos_na_kurs(0.0, now, 30.0, 16.0, 0.0, now, 1.0, 18.0)
+assert nizhe > 0.0, nizhe
 
-print("=== 8b. Газ прямой: провал — выше стика, дуга — ниже, без скорости молчит ===")
+print("=== 8b. Газ прямой: выше стика входа не поднимается, дуга — ниже ===")
 rovno_g = t._gaz_po_linii(
     1350, 20.0, 8.0, -8.0 * math.tan(math.radians(20.0)) * 100.0)
 assert rovno_g is not None and abs(rovno_g - 1350) < 15.0, rovno_g
 proval = t._gaz_po_linii(1350, 20.0, 6.0, -600.0)
-assert proval > 1350, proval
+assert proval <= 1350.0, proval
 duga = t._gaz_po_linii(1350, 25.0, 10.0, -100.0)
 assert duga < 1350, duga
 assert t._gaz_po_linii(1350, 20.0, None, -300.0) is None
@@ -276,9 +282,9 @@ for _ in range(90):
 print("    тангаж %s рыскание %s газ %s крен %s" % (
     t.global_pitch_cmd, t.global_yaw_cmd, t.global_throttle_cmd,
     t.global_roll_cmd))
-# Потолок перелёта старого кода — 1550. Растущая линия просит нос вниз,
-# без удара: доля скорости теперь меньше, тренд добирает интеграл.
-assert t.global_pitch_cmd >= 1545, t.global_pitch_cmd
+# Картинка уже в центре на крутой линии: растущий угол из самого носа
+# стик вниз не толкает.
+assert abs(t.global_pitch_cmd - 1500) <= 40, t.global_pitch_cmd
 # Без крена и без цели у края нос не крутим.
 assert abs(t.global_yaw_cmd - 1500) <= 2, t.global_yaw_cmd
 # Без путевой газ прямой молчит и оставляет стик входа, а не сажает в 1400.

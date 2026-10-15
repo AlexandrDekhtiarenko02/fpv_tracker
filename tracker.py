@@ -5034,6 +5034,9 @@ _nastroiki_put = None
 # Сглаженная геометрическая команда газа. None — геометрия молчит.
 _thr_geom_out = None
 _geom_mode_log = None
+# Стик газа в момент входа в захват. Во время оверрайда приёмник
+# возвращает нашу же команду, и «опора = текущий стик» ползёт вверх.
+_gaz_vhod = None
 prev_ady = 0.0
 
 # Интеграторы прицельных осей. Копят остаточную ошибку P+D, чтобы крестик
@@ -9276,6 +9279,14 @@ def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k,
     else:
         _pn_nos_i *= 0.5 ** (k / NOMINAL_FPS)
         dobor = 0.0
+    # Скорость угла визирования собрана из самого тангажа. Пока цель уже
+    # сидит не ниже запаса, положительная скорость — это наш же нос, а не
+    # уход линии. На 9e3a760 она 63% времени была плюсовой при стабильной
+    # рамке, и нос доезжал до упора 45°. Дальше стика уже не оставалось.
+    if gap <= 0.0 and dobor > 0.0:
+        dobor = 0.0
+        if _pn_nos_i > 0.0:
+            _pn_nos_i *= 0.5 ** (k / NOMINAL_FPS)
     zhel = pitch_deg + gap + dobor
     if zhel > PN_PITCH_ABS_MAX:
         zhel = PN_PITCH_ABS_MAX
@@ -9375,6 +9386,12 @@ def _gaz_po_linii(opora, depression_deg, ground_speed_ms, vario_cms):
     sink = -float(vario_cms) / 100.0
     path = math.degrees(math.atan2(sink, gs))
     err = path - float(depression_deg)
+    # Выше стика входа не поднимаем. На 9e3a760 путь выходил круче
+    # посчитанной линии весь заход, газ прибавлялся и ещё и полз вместе
+    # с эхом своей команды до 1530. Борт приходил сверху. Ниже — можно:
+    # слишком крутой путь перед целью надо придержать.
+    if err > 0.0:
+        err = 0.0
     pwm = float(opora) + GAZ_LINII_PWM_PER_DEG * err
     verh = float(opora) + GAZ_LINII_VYSHE
     niz = float(opora) - GAZ_LINII_NIZHE
@@ -11407,7 +11424,7 @@ def _update_control_from_target_impl():
     global _gyro_y_sgl, _gyro_x_sgl
     global filtered_dx_yaw, prev_adx, prev_ady_ctrl
     global smooth_throttle_out, throttle_integral, prev_ady
-    global _hover_pwm, _thr_geom_out, _geom_mode_log
+    global _hover_pwm, _thr_geom_out, _geom_mode_log, _gaz_vhod
     global roll_integral, pitch_integral, yaw_integral
     global _pn_bank_i, _pn_bank_tek, _pn_nos_i, _pn_nos_tek
     global smoothed_pitch_deg
@@ -11603,6 +11620,7 @@ def _update_control_from_target_impl():
         throttle_integral = 0.0
         _thr_geom_out = None
         _geom_mode_log = None
+        _gaz_vhod = None
         roll_integral = 0.0
         pitch_integral = 0.0
         yaw_integral = 0.0
@@ -13116,12 +13134,15 @@ def _update_control_from_target_impl():
     # и срез «нос ниже захвата» сюда не входят: они убирали газ именно тогда,
     # когда нос опущен ниже линии и газу надо держать ход.
     if OVERRIDE_THROTTLE and COLLISION_ENABLED:
+        if _gaz_vhod is None and rc_fresh:
+            _gaz_vhod = float(base_thr)
+        _opora_gaz = float(_gaz_vhod) if _gaz_vhod is not None else float(base_thr)
         _dep_lin = (closure.get("depression_deg")
                     if isinstance(closure, dict) else None)
         _cel_lin = _gaz_po_linii(
-            float(base_thr), _dep_lin, ground_speed_mps, _var_g)
+            _opora_gaz, _dep_lin, ground_speed_mps, _var_g)
         if _cel_lin is None:
-            _cel_lin = float(base_thr)
+            _cel_lin = _opora_gaz
         _thr_geom_out = _podtyanut_gaz(
             _thr_geom_out if _thr_geom_out is not None else target_throttle,
             _cel_lin, THR_GEOM_SLEW_OVERSHOOT, k)
