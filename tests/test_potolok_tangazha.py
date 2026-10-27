@@ -207,13 +207,20 @@ t._pn_nos_ugol = None
 t._pn_nos_tek = None
 pwm_n = t._nos_na_kurs(0.0, now, 10.0, 10.0, 0.0, now, 1.0, 8.0)
 assert pwm_n > 0.0, pwm_n
-# Уже ниже цели, высота стоит: стик отпущен, угол держится.
+# Уже ниже цели, высота стоит: стик отпущен (acro держит угол).
 dpp = t.CAMERA_VFOV_DEG / float(t.MAIN_H)
 dy_nizhe = -5.0 / dpp
 t._pn_nos_ugol = 23.0
 t._pn_nos_tek = 23.0
 derzh = t._nos_na_kurs(0.0, now, 23.0, 18.0, dy_nizhe, now, 1.0, 18.0, 0.0)
-assert abs(derzh) < 8.0, derzh
+assert derzh == 0.0, derzh
+# Поставил и отпустил: картинка на запасе, высота ровная — pwm=0,
+# уставка привязана к факту, не жмёт фантом.
+t._pn_nos_ugol = 30.0
+t._pn_nos_tek = 30.0
+otp = t._nos_na_kurs(0.0, now, 27.0, 18.0, dy_nizhe, now, 1.0, 18.0, 0.0)
+assert otp == 0.0, otp
+assert abs(t._pn_nos_ugol - 27.0) < 1e-6, t._pn_nos_ugol
 # Крутая линия, цель в центре: запас не нужен, вниз не дожимаем.
 t._pn_nos_ugol = None
 t._pn_nos_tek = 32.0

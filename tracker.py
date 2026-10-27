@@ -2235,6 +2235,9 @@ PN_VARIO_DEAD_CMS = 30.0       # смещение вариометра на пр
                                # было −26 / −11 / +9 см/с, тише этого не верим
 PN_NOS_NIZHE_DPS = 4.0         # как быстро опускаем нос, пока он не ниже цели
 PN_NOS_TRIM_DPS = 2.0          # правка угла по высоте
+# Угол пойман — стик в центр. В acro центр держит угол, не горизонт.
+# Эталон: после настройки |rc_p|≈0 при носе 25–35°.
+PN_NOS_HOLD_DEG = 1.5
 PN_PITCH_ABS_MAX = 45.0
 PN_PITCH_SLEW = 12.0
 PN_PITCH_I_DEG_PER_S = 0.6
@@ -9271,16 +9274,16 @@ def _nizhe_linii(depression_deg):
 
 def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k,
                  depression_deg=None, vario_cms=None):
-    """Стик тангажа: нос ниже цели, угол держит высота.
+    """Стик тангажа: поставил угол — отпустил. Acro держит.
 
     После лока нос опускается ниже цели — ради скорости. На сколько,
-    каждый раз своё: фиксированных 9° нет. Как только нос ниже цели,
-    стик отпускается, acro угол держит. Дальше угол правит высота.
-    Подымается — носа мало, угол растёт. Снижается при крутом носе —
-    нос лишний, угол убывает. Снижение при некрутом носе нос не
-    трогает: это газ. Крутая линия — нос и есть линия, запас не нужен.
-    Скорость линии в расчёт не входит: первую секунду она врёт.
-    Потолок 45° не поднимается. los и pitch_lock не используются.
+    каждый раз своё: фиксированных 9° нет. Угол пойман (в пределах
+    PN_NOS_HOLD_DEG) — стик в центр: в acro центр держит угол, не
+    горизонт. Дальше угол правит высота: подымается — носа мало,
+    уставка растёт и стик снова жмёт, пока угол не пойман. Снижается
+    при крутом носе — нос лишний. Снижение при некрутом — газ.
+    Крутая линия / на линии — запас не добираем. Скорость линии в
+    расчёт не входит. Потолок 45° не поднимается.
     """
     global _pn_nos_i, _pn_nos_tek, _pn_nos_ugol
     del los, los_ts, pitch_lock
@@ -9303,6 +9306,9 @@ def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k,
                 and depression_deg is not None
                 and float(depression_deg) >= PN_AIM_KRUTO_DEG)
     dt_s = k / NOMINAL_FPS
+    vysota_ok = (vario_cms is None
+                 or abs(float(vario_cms)) <= PN_VARIO_DEAD_CMS)
+    kartinka_ok = (aim_below >= PN_AIM_NIZHE_DEG) or na_linii or krutaya
     # Нос ещё не ниже цели и не на линии — опускаем. Это не уставка,
     # а само действие пилота после лока. Остановится, когда цель сядет
     # выше центра.
@@ -9319,6 +9325,12 @@ def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k,
         _pn_nos_ugol = PN_PITCH_ABS_MAX
     elif _pn_nos_ugol < 0.0:
         _pn_nos_ugol = 0.0
+    # Картинка уже та, высота не просит — принимаем угол, который
+    # держит acro. Иначе фантомная уставка выше факта снова жмёт стик.
+    if kartinka_ok and vysota_ok and _pn_nos_blizko <= 0.0:
+        _pn_nos_ugol = pitch_deg
+        _pn_nos_tek = pitch_deg
+        return 0.0
     zhel = _pn_nos_ugol + _pn_nos_blizko
     if zhel > PN_PITCH_ABS_MAX:
         zhel = PN_PITCH_ABS_MAX
@@ -9331,8 +9343,15 @@ def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k,
         _pn_nos_tek -= shag
     else:
         _pn_nos_tek = zhel
+    err = _pn_nos_tek - pitch_deg
+    # Угол пойман — стик в центр (acro держит). Пока ещё добираем
+    # запас ниже цели, не отпускаем: иначе ugol ползёт, а стик молчит.
+    still_dumping = (not krutaya and not na_linii
+                     and aim_below < PN_AIM_NIZHE_DEG)
+    if abs(err) <= PN_NOS_HOLD_DEG and not still_dumping:
+        return 0.0
     pwm = (PITCH_PWM_TO_FC_ANGLE_SIGN
-           * (_pn_nos_tek - pitch_deg) * PN_PITCH_PWM_PER_DEG)
+           * err * PN_PITCH_PWM_PER_DEG)
     if pwm > PN_PITCH_PWM_MAX:
         return PN_PITCH_PWM_MAX
     if pwm < -PN_PITCH_PWM_MAX:
