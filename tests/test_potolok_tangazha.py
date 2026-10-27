@@ -202,8 +202,10 @@ t._pn_nos_i = 0.0
 t._pn_nos_tek = None
 t._pn_nos_ugol = None
 t._pn_nos_blizko = 0.0
-# Цель в центре, линия не крутая: нос опускается ниже цели.
-pwm_n = t._nos_na_kurs(0.0, now, 18.0, 18.0, 0.0, now, 1.0, 18.0)
+# Цель в центре, линия пологая: нос опускается ниже цели.
+t._pn_nos_ugol = None
+t._pn_nos_tek = None
+pwm_n = t._nos_na_kurs(0.0, now, 10.0, 10.0, 0.0, now, 1.0, 8.0)
 assert pwm_n > 0.0, pwm_n
 # Уже ниже цели, высота стоит: стик отпущен, угол держится.
 dpp = t.CAMERA_VFOV_DEG / float(t.MAIN_H)
@@ -217,6 +219,14 @@ t._pn_nos_ugol = None
 t._pn_nos_tek = 32.0
 krut = t._nos_na_kurs(0.0, now, 32.0, 18.0, 0.0, now, 1.0, 32.0, 0.0)
 assert abs(krut) < 8.0, krut
+# Близко круто (эталон close): aim≈0, линия ≥12° — не клюём к 45°.
+t._pn_nos_ugol = 18.0
+t._pn_nos_tek = 18.0
+now_cl = 3500.0
+for _ in range(int(2.0 * t.NOMINAL_FPS)):
+    now_cl += 1.0 / t.NOMINAL_FPS
+    t._nos_na_kurs(0.0, now_cl, 18.0, 18.0, 0.0, now_cl, 1.0, 18.0, -400.0)
+assert t._pn_nos_ugol <= 18.0 + 1e-6, t._pn_nos_ugol
 # Всплеск скорости линии сразу после лока нос не клюёт.
 # На cfe6537 +6 °/с клали ещё до +8° за три секунды.
 t._pn_nos_ugol = 23.0
@@ -264,9 +274,12 @@ print("=== 8b. Газ компенсирует высоту, опора — ст
 # Высота стоит — газ на стике входа.
 rovno = t._gaz_po_linii(1350, 0.0)
 assert rovno == 1350.0, rovno
-# Снижаемся — газ выше, но не дальше потолка прибавки.
-proval = t._gaz_po_linii(1350, -600.0)
+# Снижаемся при носе ниже цели — газ выше, не дальше потолка прибавки.
+proval = t._gaz_po_linii(1350, -600.0, aim_below=5.0)
 assert 1350.0 < proval <= 1350.0 + t.GAZ_VYSHE, proval
+# Снижаемся при цели у центра — глиссада, газ не добираем (эталон close).
+gliss = t._gaz_po_linii(1350, -600.0, aim_below=0.0)
+assert gliss == 1350.0, gliss
 # Подымаемся — это нос: газ на опоре, вверх не идёт и вниз не режет.
 nabor = t._gaz_po_linii(1350, 200.0)
 assert nabor == 1350.0, nabor
@@ -276,9 +289,10 @@ assert rannee == 1350.0, rannee
 # Перелёт после двух секунд — можно убавить, если не снижаемся.
 pozze = t._gaz_po_linii(1350, 0.0, aim_below=5.0, los_rate=2.0, age_s=3.0)
 assert pozze == 1350.0 - t.GAZ_PERELET_PWM, pozze
-# Снижаемся и перелетаем — газ не режем, снижение просит прибавку.
+# Снижаемся и перелетаем: при цели ниже центра газ не добираем
+# (глиссада), а перелёт при просадке газ не режет — остаёмся на опоре.
 vmeste = t._gaz_po_linii(1350, -200.0, aim_below=-5.0, los_rate=2.0, age_s=3.0)
-assert vmeste > 1350.0, vmeste
+assert vmeste == 1350.0, vmeste
 # Нет вариометра или стика — ручку не выдумываем.
 assert t._gaz_po_linii(1350, None) is None
 assert t._gaz_po_linii(None, -100.0) is None
@@ -370,7 +384,9 @@ _dep = {"v": 18.0}
 def _podmena(*a, **kw):
     out = dict(_zamena(*a, **kw))
     out["tau_s"] = 10.0
-    out["depression_deg"] = 18.0
+    # Пологая линия: запас ниже цели ещё нужен. На dep≥12 при aim≈0
+    # нос уже линия (эталон close) — добор молчит.
+    out["depression_deg"] = 8.0
     out["range_m"] = 200.0
     out["tau_sigma_s"] = 0.2
     return out
@@ -395,6 +411,7 @@ t._pn_dx_t = 0.0
 t._pn_dx_rate = 0.0
 t._pn_nos_i = 0.0
 t._pn_nos_tek = None
+t._pn_nos_ugol = None
 t._pn_nos_blizko = 0.0
 
 
@@ -422,11 +439,11 @@ def _kadr(pitch=20.0, roll=0.0, dx=0.0, vario=0, dy=0.0):
 
 
 for _ in range(90):
-    _kadr(pitch=20.0, roll=0.0, dx=0.0)
+    _kadr(pitch=14.0, roll=0.0, dx=0.0)
 print("    тангаж %s рыскание %s газ %s крен %s" % (
     t.global_pitch_cmd, t.global_yaw_cmd, t.global_throttle_cmd,
     t.global_roll_cmd))
-# Обычная линия, цель в центре: стик опускает нос на запас выше центра.
+# Пологая линия, цель в центре: стик опускает нос на запас выше центра.
 assert t.global_pitch_cmd >= 1520, t.global_pitch_cmd
 # Без крена и без цели у края нос не крутим.
 assert abs(t.global_yaw_cmd - 1500) <= 2, t.global_yaw_cmd

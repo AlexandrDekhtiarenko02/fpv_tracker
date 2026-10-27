@@ -9295,17 +9295,25 @@ def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k,
     aim_below = 0.0 if dy_px is None else -float(dy_px) * dpp
     krutaya = (depression_deg is not None
                and float(depression_deg) >= PN_AIM_STEEP_DEG)
+    # Близко и круто (эталон close): цель у центра, нос уже и есть линия.
+    # Запас ниже цели там не нужен — иначе клюём до упора при aim≈0.
+    # Порог — по углу линии, не по тангажу: после лока на пологой
+    # линии нос как раз надо опустить ниже цели.
+    na_linii = (aim_below > -1.0 and aim_below < PN_AIM_NIZHE_DEG
+                and depression_deg is not None
+                and float(depression_deg) >= PN_AIM_KRUTO_DEG)
     dt_s = k / NOMINAL_FPS
-    # Нос ещё не ниже цели и линия не крутая — опускаем. Это не уставка,
+    # Нос ещё не ниже цели и не на линии — опускаем. Это не уставка,
     # а само действие пилота после лока. Остановится, когда цель сядет
     # выше центра.
-    if not krutaya and aim_below < PN_AIM_NIZHE_DEG:
+    if not krutaya and not na_linii and aim_below < PN_AIM_NIZHE_DEG:
         _pn_nos_ugol += PN_NOS_NIZHE_DPS * dt_s
     # Высота. Тише мёртвой зоны — смещение вариометра, не сигнал.
     if vario_cms is not None and abs(float(vario_cms)) > PN_VARIO_DEAD_CMS:
         if float(vario_cms) > PN_VARIO_DEAD_CMS:
             _pn_nos_ugol += PN_NOS_TRIM_DPS * dt_s
         elif aim_below > PN_AIM_KRUTO_DEG or krutaya:
+            # На линии (close) снижение — глиссада, нос не убираем.
             _pn_nos_ugol -= PN_NOS_TRIM_DPS * dt_s
     if _pn_nos_ugol > PN_PITCH_ABS_MAX:
         _pn_nos_ugol = PN_PITCH_ABS_MAX
@@ -9452,7 +9460,11 @@ def _gaz_po_linii(opora, vario_cms, aim_below=0.0, los_rate=None,
     if hover is not None and float(hover) > opora:
         opora = float(hover)
     pwm = float(opora)
-    if var < -GAZ_VARIO_DEAD_CMS:
+    # Снижение при цели у центра — глиссада (эталон close: газ ниже,
+    # 1230–1290), не недобор газа. Газ добираем только когда нос уже
+    # ниже цели, а борт всё равно проседает.
+    aim = 0.0 if aim_below is None else float(aim_below)
+    if var < -GAZ_VARIO_DEAD_CMS and aim >= PN_AIM_NIZHE_DEG:
         nedobor = (-var - GAZ_VARIO_DEAD_CMS) / 100.0
         pwm = float(opora) + GAZ_VARIO_PWM_PER_MPS * nedobor
     # Набор высоты — нос, не газ. Ручку на опоре оставляем.
