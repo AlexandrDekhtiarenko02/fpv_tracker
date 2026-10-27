@@ -64,21 +64,29 @@ assert t._pribavka_zapreshchena(24.0, 18.0, 10.0) is True   # +6°
 assert t._pribavka_zapreshchena(20.0, 18.0, -500.0) is False  # просадка — можно
 assert t._pribavka_zapreshchena(20.0, 18.0, 10.0) is False
 
-print("=== 6. Крен правит курс: рамка и бег, азимут молчит ===")
+print("=== 6. Крен правит курс: рамка, бег, az только в тишине ===")
 now = 1000.0
 t._pn_bank_i = 0.0
 t._pn_bank_tek = 0.0
 t._pn_dx_pred = None
 t._pn_dx_t = 0.0
 t._pn_dx_rate = 0.0
-# Крестик в центре, азимут крутится — азимут крен не кладёт.
+# Крестик в центре, курс крутится, рыскание тихое — крен от курса.
 for _ in range(int(2 * t.NOMINAL_FPS)):
     now += 1.0 / t.NOMINAL_FPS
-    t._kren_na_kurs(2.0, now, 0.0, 0.0, now, 1.0)
+    t._kren_na_kurs(2.0, now, 0.0, 0.0, now, 1.0, yaw_rate_dps=0.0)
+assert t._pn_bank_tek > 4.0, t._pn_bank_tek
+assert t._pn_bank_tek <= t.PN_ROLL_HOLD_MAX + 1e-6, t._pn_bank_tek
+# То же, но своё рыскание быстрое — az не берём (окно ещё врёт).
+t._pn_bank_i = 0.0
+t._pn_bank_tek = 0.0
+now_g = now
+for _ in range(int(2 * t.NOMINAL_FPS)):
+    now_g += 1.0 / t.NOMINAL_FPS
+    t._kren_na_kurs(2.0, now_g, 0.0, 0.0, now_g, 1.0,
+                    yaw_rate_dps=t.PN_ROLL_AZ_YAW_MAX_DPS + 5.0)
 assert abs(t._pn_bank_tek) < 1.0, t._pn_bank_tek
 # Крестик почти в центре, но рамка бежит — курс мимо, крен нужен.
-# |dx| держим в тихой зоне, а pred каждый кадр отстаёт — так оценка
-# скорости остаётся выше мёртвой, как при уводе с носом на цели.
 t._pn_bank_i = 0.0
 t._pn_bank_tek = 0.0
 t._pn_dx_rate = 0.0
@@ -87,10 +95,10 @@ for _ in range(int(1.0 * t.NOMINAL_FPS)):
     now_b += 1.0 / t.NOMINAL_FPS
     t._pn_dx_pred = 3.0 - 50.0 / t.NOMINAL_FPS
     t._pn_dx_t = now_b - 1.0 / t.NOMINAL_FPS
-    t._kren_na_kurs(0.0, now_b, 0.0, 3.0, now_b, 1.0)
+    t._kren_na_kurs(0.0, now_b, 0.0, 3.0, now_b, 1.0, 0.0)
 assert t._pn_bank_tek > 2.0, t._pn_bank_tek
 assert t._pn_bank_tek <= t.PN_ROLL_HOLD_FAST + 1e-6, t._pn_bank_tek
-# Крестик в центре и бег тихий — крен в горизонт.
+# Крестик в центре, бег и курс тихие — крен в горизонт.
 t._pn_bank_i = 0.0
 t._pn_bank_tek = 8.0
 t._pn_dx_pred = 1.0
@@ -99,9 +107,9 @@ t._pn_dx_rate = 0.0
 now_q = now
 for _ in range(int(2 * t.NOMINAL_FPS)):
     now_q += 1.0 / t.NOMINAL_FPS
-    t._kren_na_kurs(0.1, now_q, 0.0, 1.0, now_q, 1.0)
+    t._kren_na_kurs(0.1, now_q, 0.0, 1.0, now_q, 1.0, 0.0)
 assert abs(t._pn_bank_tek) < 1.0, t._pn_bank_tek
-# Рамка справа — крен вправо, плавно, не поздний удар. Азимут влево молчит.
+# Рамка справа — крен вправо, плавно. Азимут влево знак не перебивает.
 t._pn_bank_i = 0.0
 t._pn_bank_tek = 0.0
 t._pn_dx_pred = None
@@ -112,7 +120,7 @@ shag = t.PN_ROLL_BANK_SLEW / t.NOMINAL_FPS + 1e-6
 pred = 0.0
 for _ in range(int(2 * t.NOMINAL_FPS)):
     now_d += 1.0 / t.NOMINAL_FPS
-    t._kren_na_kurs(-4.0, now_d, 0.0, 30.0, now_d, 1.0)
+    t._kren_na_kurs(-4.0, now_d, 0.0, 30.0, now_d, 1.0, 0.0)
     assert abs(t._pn_bank_tek - pred) <= shag + 1e-6
     pred = t._pn_bank_tek
 assert 4.0 <= t._pn_bank_tek <= t.PN_ROLL_HOLD_MAX, t._pn_bank_tek
@@ -122,7 +130,7 @@ t._pn_bank_tek = 0.0
 now_l = now
 for _ in range(int(2 * t.NOMINAL_FPS)):
     now_l += 1.0 / t.NOMINAL_FPS
-    t._kren_na_kurs(4.0, now_l, 0.0, -30.0, now_l, 1.0)
+    t._kren_na_kurs(4.0, now_l, 0.0, -30.0, now_l, 1.0, 0.0)
 assert t._pn_bank_tek < -4.0, t._pn_bank_tek
 # Середина захода |dx| 5–15 не должна оставаться с креном 1–4°.
 t._pn_bank_i = 0.0
@@ -133,7 +141,7 @@ t._pn_dx_rate = 0.0
 now_m = now
 for _ in range(int(2 * t.NOMINAL_FPS)):
     now_m += 1.0 / t.NOMINAL_FPS
-    t._kren_na_kurs(0.0, now_m, 0.0, 12.0, now_m, 1.0)
+    t._kren_na_kurs(0.0, now_m, 0.0, 12.0, now_m, 1.0, 0.0)
 assert t._pn_bank_tek > 4.0, t._pn_bank_tek
 assert t._pn_bank_tek <= t.PN_ROLL_HOLD_MAX + 1e-6, t._pn_bank_tek
 assert t._kren_na_kurs(4.0, now, None, 40.0, now, 1.0) == 0.0

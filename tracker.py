@@ -2185,19 +2185,24 @@ COLLISION_ROLL_PWM_DPS = 6.0
 COLLISION_PITCH_MAX = 35.0
 COLLISION_ROLL_MAX = 28.0
 # Крен правит курс, не кадр. Сторона — от рамки (знак уже верный).
-# Азимут крен не кормит: в нём собственное рыскание, на 9e3a760 оно
-# клало крен против цели справа. Курс без азимута — смещение и бег
-# рамки: малый dx при беге это не «ошибки нет», это параллельный
-# пролёт с носом на цели. Выравнивать крен только когда и положение,
-# и бег тихие — иначе при dx=0 и скорости мимо останется промах.
-# В эталоне 17–18 |dx| около 7, p90 14–18, крен 3–5°. 0.7°/px сверх
-# 4 px: при 12 px это около 5.6°, потолок 12°. Бег поднимает потолок
-# до 16°, не до позднего удара 22°. На logs-24 при 50 px/с и |dx|~60
-# положение упиралось в 12°, стик около 10 ШИМ — этого мало; скорость
-# рамки как раз и поднимает банк, пока увод не гасится.
+# Курс столкновения: азимут цели в мире стоит. _az_skorost уже
+# d(yaw + dx°)/dt — инерциальная скорость линии, не «сырой азимут
+# кадра». При носе на цели и параллельном пролёте dx≈0, а эта
+# скорость не ноль: её и кормим в крен, но ТОЛЬКО в тихой зоне кадра.
+# Вне тишины азимут молчит и знак рамки не перебивает — на 9e3a760
+# член скорости как раз перебил поводок, цель была справа.
+# Своё рыскание всё ещё портит окно, пока картинка не догнала нос:
+# если |gyro_z| выше порога, азимуту не верим (знак gyro_z для этого
+# не нужен). Вычитать рыскание из az нельзя: получится d(dx°)/dt,
+# снова кадр. Горизонт — когда тихие положение, бег и курс.
+# В эталоне 17–18 |dx|~7, крен 3–5°. 0.7°/px сверх 4 px; бег поднимает
+# потолок до 16°, не до позднего удара 22°.
 PN_ROLL_HOLD_PX = 4.0
 PN_ROLL_HOLD_DEG = 0.70
 PN_ROLL_HOLD_MAX = 12.0
+PN_ROLL_AZ_DEAD_DPS = 0.4     # ниже — шум курса, не промах
+PN_ROLL_AZ_DEG = 4.0          # ° крена на °/с курса, только в тишине
+PN_ROLL_AZ_YAW_MAX_DPS = 25.0 # своё рыскание быстрее — az не берём
 PN_ROLL_RATE_DEAD_PX_S = 25.0  # ниже — шум удержания, не бег рамки
 PN_ROLL_RATE_DEG = 0.10        # ° крена на px/с сверх мёртвой зоны
 PN_ROLL_RATE_MAX = 8.0         # вклад скорости сам по себе
@@ -9143,19 +9148,17 @@ def _stolknovenie_pwm(skorost, ts, now, deadband, gain, limit, sign):
     return pwm
 
 
-def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k):
+def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k, yaw_rate_dps=None):
     """Стик, который правит курс, а не только держит крестик.
 
-    Сторона и величина — от рамки. Бег рамки кормит крен и при малом
-    dx: иначе нос на цели, а борт летит параллельно, и крен видит
-    «ошибки нет». Азимут молчит всегда — в нём собственное рыскание.
-    Курс выправлен, когда положение и бег тихие: тогда крен в горизонт,
-    банк не висит. Обнулять крен по одному dx=0 нельзя — скорость ещё
-    может быть мимо. Стик в ACRO задаёт скорость, у нужного крена он
-    отпускается. Без крена с полётника команда ноль.
+    Вне центра — рамка: сторона и величина, плюс бег. В тишине кадра
+    курс — инерциальная скорость линии (az), пока своё рыскание не
+    быстрее порога: иначе окно az врёт, как на 9e3a760. Вычитать
+    yaw из az нельзя — останется бег крестика. Горизонт, когда тихие
+    положение, бег и курс. Стик в ACRO задаёт скорость; у нужного
+    крена отпускается. Без крена с полётника команда ноль.
     """
     global _pn_bank_i, _pn_bank_tek, _pn_dx_pred, _pn_dx_t, _pn_dx_rate
-    del az, az_ts
     if bank_deg is None:
         return 0.0
     dt_s = k / NOMINAL_FPS
@@ -9182,7 +9185,15 @@ def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k):
             rate_dob = PN_ROLL_RATE_MAX
         elif rate_dob < -PN_ROLL_RATE_MAX:
             rate_dob = -PN_ROLL_RATE_MAX
-    zhel = ROLL_SIGN * (err * PN_ROLL_HOLD_DEG + _pn_bank_i) + rate_dob
+    az_dob = 0.0
+    az_svezh = (az_ts > 0.0) and ((now - az_ts) <= LOS_RATE_STALE_S)
+    yaw_ok = (yaw_rate_dps is None
+              or abs(float(yaw_rate_dps)) <= PN_ROLL_AZ_YAW_MAX_DPS)
+    if (tiho and az_svezh and yaw_ok and az is not None
+            and abs(float(az)) > PN_ROLL_AZ_DEAD_DPS):
+        izb_az = float(az) - math.copysign(PN_ROLL_AZ_DEAD_DPS, float(az))
+        az_dob = ROLL_SIGN * izb_az * PN_ROLL_AZ_DEG
+    zhel = ROLL_SIGN * (err * PN_ROLL_HOLD_DEG + _pn_bank_i) + rate_dob + az_dob
     potolok = PN_ROLL_HOLD_MAX
     if abs(rate) > PN_ROLL_RATE_DEAD_PX_S:
         potolok = PN_ROLL_HOLD_FAST
@@ -12359,11 +12370,21 @@ def _update_control_from_target_impl():
         with state_lock:
             _bank = app_state.get("fc_roll_deg")
             _bank_ts = app_state.get("fc_pitch_ts", 0.0)
+            _gz = app_state.get("gyro")
+            _gz_ts = app_state.get("imu_ts", 0.0)
         if (_bank is None or _bank_ts <= 0.0
                 or (now_mono - _bank_ts) > LAUNCH_ATT_TIMEOUT):
             _bank = None
+        # |gyro_z| для гейта курса: знак оси тут не нужен. Несвежий —
+        # как «рыскания не видно», az можно брать.
+        _yaw_r = None
+        if (_gz is not None and _gz[2] is not None
+                and _gz_ts > 0.0
+                and (now_mono - _gz_ts) <= GYRO_FRESH_S):
+            _yaw_r = float(_gz[2]) * GYRO_UNIT_DPS
         col_r = _kren_na_kurs(
-            _az_skorost, _az_skorost_ts, _bank, dx_raw, now_mono, k) * trust_k
+            _az_skorost, _az_skorost_ts, _bank, dx_raw, now_mono, k,
+            _yaw_r) * trust_k
         roll_integral = 0.0
         roll_offset = 0.0
         _pid_dbg["roll"] = (
