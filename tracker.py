@@ -2188,16 +2188,22 @@ COLLISION_ROLL_MAX = 28.0
 # p90 14–18, крен 3–5° в её сторону, стик крена в основном отпущен
 # (p90 10–30 ШИМ — короткая поправка). Скорость азимута крен не задаёт:
 # в неё входит собственное рыскание, и на 9e3a760 она клала крен
-# против цели, которая всю дорогу была справа.
-# 4 px — тишина. Дальше 0.5° крена на пиксель: при 12 px это около 4°,
-# потолок 12°. Если рамка ещё и бежит в сторону быстрее шума кадра,
-# крен добавляется от этой скорости и потолок поднимается до 16°.
+# против цели, которая всю дорогу была справа. Поэтому азимут говорит
+# только когда крестик уже в тихой зоне, и не перебивает знак кадра.
+# 4 px — тишина кадра. Дальше 0.5° крена на пиксель: при 12 px это
+# около 4°, потолок 12°. Если рамка ещё и бежит в сторону быстрее шума
+# кадра, крен добавляется от этой скорости и потолок поднимается до 16°.
 # На logs-24 при 50 px/с и |dx| около 60 положение уже упиралось в 12°,
 # фактический крен оставался около 8°, стик около 10 ШИМ, и рамка уходила.
 # Это не поздний удар в 22°.
+# В тихой зоне кадр молчит. Если при этом азимут крутится, картинку
+# держит рыскание, курса нет: крен от скорости азимута, 4° на °/с,
+# тот же потолок 12°. Оба тихие — крен в горизонт.
 PN_ROLL_HOLD_PX = 4.0
 PN_ROLL_HOLD_DEG = 0.50
 PN_ROLL_HOLD_MAX = 12.0
+PN_ROLL_AZ_DEAD_DPS = 0.4     # ниже — шум, не доворот носа
+PN_ROLL_AZ_DEG = 4.0          # ° крена на °/с, только в тихой зоне
 PN_ROLL_RATE_DEAD_PX_S = 25.0  # ниже — шум удержания, не бег рамки
 PN_ROLL_RATE_DEG = 0.10        # ° крена на px/с сверх мёртвой зоны
 PN_ROLL_RATE_MAX = 8.0         # вклад скорости сам по себе
@@ -2217,12 +2223,19 @@ PN_ROLL_PWM_MAX = 110.0
 # пару градусов глубже запаса добор молчит: иначе клевок кормит
 # оценку скорости, а та снова просит клевок. Отрицательная скорость
 # линии нос не поднимает. Потолок 45° не поднимается.
-PN_AIM_HOLD_UNTIL_DEG = 22.0   # досюда полный запас, если линия не растёт
-PN_AIM_STEEP_DEG = 30.0        # круче и линия спокойна — цель в центре
-PN_AIM_LEAD_MAX = 9.0
-PN_PITCH_LOS_PER_DPS = 1.5     # градусов сверх запаса на °/с роста линии
-PN_PITCH_LOS_EXTRA_MAX = 4.0   # и только когда картинка уже на запасе
-PN_PITCH_LOS_AIM_PAST = 2.0    # глубже запаса на столько — добор молчит
+# 9° — середина дальних заходов в логах 17, не уставка. Нос опускается
+# ниже цели ради скорости, угол каждый раз свой: его держит пара
+# «нос + газ», при которой высота стоит. Поставил — стик в центр.
+# Подымается — носа мало. Снижается при крутом носе — нос лишний.
+# Снижение при некрутом носе нос не трогает, это газ. Скорость линии
+# в нос не входит: первую секунду она врёт на +4…+9 °/с.
+PN_AIM_NIZHE_DEG = 2.0         # нос ниже цели: не уставка, порог «уже ниже»
+PN_AIM_KRUTO_DEG = 12.0        # глубже и снижаемся — нос лишний
+PN_AIM_STEEP_DEG = 30.0        # крутая линия: нос и есть линия, запас не нужен
+PN_VARIO_DEAD_CMS = 30.0       # смещение вариометра на проверенных заходах
+                               # было −26 / −11 / +9 см/с, тише этого не верим
+PN_NOS_NIZHE_DPS = 4.0         # как быстро опускаем нос, пока он не ниже цели
+PN_NOS_TRIM_DPS = 2.0          # правка угла по высоте
 PN_PITCH_ABS_MAX = 45.0
 PN_PITCH_SLEW = 12.0
 PN_PITCH_I_DEG_PER_S = 0.6
@@ -2236,25 +2249,23 @@ PN_PITCH_BLIZKO_M = 110.0
 PN_PITCH_BLIZKO_GAZ = 25.0     # сброс меньше этого нос не трогает
 PN_PITCH_BLIZKO_PER_PWM = 40.0 # ШИМ сброса на один градус
 PN_PITCH_BLIZKO_MAX = 3.0
-# Газ держит путь на линии визирования. Опора — стик входа, один раз,
-# не собственная команда: на 9e3a760 опора читалась с эха и доехала до 1530.
-# Путь круче линии — газ выше, борт не проваливается перед целью.
-# Путь положе — газ ниже, заход не загибается в дугу. Заморозить ручку
-# совсем нельзя: без этой поправки высота так и остаётся, какой вошли.
-GAZ_LINII_PWM_PER_DEG = 8.0
-GAZ_LINII_VYSHE = 80.0
-GAZ_LINII_NIZHE = 120.0
-GAZ_LINII_GS_MIN = 1.5
-GAZ_LINII_DEADBAND_DEG = 1.5   # шум вариометра ручку не дёргает
-# Рыскание курс не строит. На удачных заходах эталона стик рыскания
-# сидит в 3 ШИМ — это триммер. Нос доворачивается вместе с креном,
-# и только немного: отдельная тяга рамки рысканием уводит курс.
-YAW_S_BANK = 1.5
+# Газ компенсирует высоту под выбранный нос. Опора — стик входа, один
+# раз, не эхо: на 9e3a760 опора читалась с эха и доехала до 1530.
+# Снижаемся — не добрал газ, даёт больше. Подымаемся — это нос, газ
+# вверх не идёт. Выше стика входа по заниженной путевой не поднимаем:
+# путевая по оптике низкая и на 4dc8597 поднимала газ в настоящий
+# перелёт. Ниже — когда перелетает. Заморозить ручку нельзя.
+GAZ_VARIO_DEAD_CMS = 30.0
+GAZ_VARIO_PWM_PER_MPS = 40.0   # 1 м/с снижения — +40 ШИМ к стику входа
+GAZ_VYSHE = 80.0               # потолок прибавки на снижение
+GAZ_NIZHE = 120.0              # потолок убавки
+GAZ_PERELET_PWM = 40.0         # убавка на перелёте, если не снижаемся
+# Рыскание курс не строит. На чистых заходах это триммер: p90 3–5 ШИМ,
+# курс за заход 2–6°. Согласованно с креном, чтобы нос не уехал.
+# Отдельная тяга рамки рысканием уводит нос и дерётся с банком — её нет.
+YAW_S_BANK = 0.5               # 8° банка — 4 ШИМ, в полосе чистых заходов
 YAW_BANK_QUIET_DEG = 3.0
-YAW_BANK_PWM_MAX = 15.0
-YAW_LEASH_PX = 50.0
-YAW_LEASH_PWM = 0.3
-YAW_LEASH_MAX = 15.0
+YAW_BANK_PWM_MAX = 8.0
 # Газ держит снижение = высота / время до цели, вокруг висения.
 # 40 м и 10 с — это 4 м/с вниз. Выше висения этот закон не поднимает:
 # набор уносит заход. Ниже висения не больше чем на 120 ШИМ, иначе
@@ -5042,6 +5053,7 @@ _pn_dx_rate = 0.0
 _pn_nos_i = 0.0
 _pn_nos_tek = None
 _pn_nos_blizko = 0.0
+_pn_nos_ugol = None
 
 # Сглаженное значение fc_pitch_deg для расчёта компенсации тангажа.
 smoothed_pitch_deg = 0.0
@@ -8884,7 +8896,7 @@ def reset_tracking(to_acq=False):
     global smooth_throttle_out, throttle_integral, prev_ady
     global roll_integral, pitch_integral, yaw_integral
     global _pn_bank_i, _pn_bank_tek, _pn_dx_pred, _pn_dx_t, _pn_dx_rate
-    global _pn_nos_i, _pn_nos_tek, _pn_nos_blizko
+    global _pn_nos_i, _pn_nos_tek, _pn_nos_blizko, _pn_nos_ugol
     global smoothed_pitch_deg
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
@@ -9137,23 +9149,24 @@ def _stolknovenie_pwm(skorost, ts, now, deadband, gain, limit, sign):
 
 
 def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k):
-    """Стик, который держит цель у центра по горизонтали.
+    """Стик, который правит курс, а не только держит крестик.
 
-    Желаемый крен — от смещения рамки, несколько градусов, с медленным
-    добором если смещение не уходит. Если рамка бежит в сторону быстрее
-    шума кадра, крен добавляется от этой скорости и потолок поднимается:
-    иначе при уже упёртом положении стик остаётся почти в центре, а рамка
-    уходит. Стик в ACRO задаёт скорость, поэтому у нужного крена он
-    отпускается. Скорость азимута крен не задаёт. Без крена с полётника
-    команда ноль.
+    Пока крестик не в центре — крен от рамки: сторона и величина от
+    смещения, больше если рамка бежит. Азимут тут молчит и знак не
+    перебивает: в нём собственное рыскание, на 9e3a760 оно клало крен
+    против цели в кадре. Когда крестик уже в тихой зоне, кадр молчит.
+    Если азимут при этом крутится, картинку держит рыскание и курса
+    нет — крен от этой скорости, чтобы её гасить. Оба тихие — курс
+    есть, крен в горизонт. Стик в ACRO задаёт скорость, у нужного
+    крена он отпускается. Без крена с полётника команда ноль.
     """
     global _pn_bank_i, _pn_bank_tek, _pn_dx_pred, _pn_dx_t, _pn_dx_rate
-    del az, az_ts
     if bank_deg is None:
         return 0.0
     dt_s = k / NOMINAL_FPS
+    tiho = dx_px is not None and abs(float(dx_px)) <= PN_ROLL_HOLD_PX
     err = 0.0
-    if dx_px is not None and abs(float(dx_px)) > PN_ROLL_HOLD_PX:
+    if dx_px is not None and not tiho:
         err = float(dx_px) - math.copysign(PN_ROLL_HOLD_PX, float(dx_px))
     rate = _skorost_ramki(dx_px, now)
     if err != 0.0:
@@ -9166,14 +9179,19 @@ def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k):
     else:
         _pn_bank_i *= 0.5 ** dt_s
     rate_dob = 0.0
-    if abs(rate) > PN_ROLL_RATE_DEAD_PX_S:
+    if not tiho and abs(rate) > PN_ROLL_RATE_DEAD_PX_S:
         izb = rate - math.copysign(PN_ROLL_RATE_DEAD_PX_S, rate)
         rate_dob = ROLL_SIGN * izb * PN_ROLL_RATE_DEG
         if rate_dob > PN_ROLL_RATE_MAX:
             rate_dob = PN_ROLL_RATE_MAX
         elif rate_dob < -PN_ROLL_RATE_MAX:
             rate_dob = -PN_ROLL_RATE_MAX
-    zhel = ROLL_SIGN * (err * PN_ROLL_HOLD_DEG + _pn_bank_i) + rate_dob
+    az_dob = 0.0
+    az_svezh = (az_ts > 0.0) and ((now - az_ts) <= LOS_RATE_STALE_S)
+    if tiho and az_svezh and az is not None and abs(float(az)) > PN_ROLL_AZ_DEAD_DPS:
+        izb_az = float(az) - math.copysign(PN_ROLL_AZ_DEAD_DPS, float(az))
+        az_dob = ROLL_SIGN * izb_az * PN_ROLL_AZ_DEG
+    zhel = ROLL_SIGN * (err * PN_ROLL_HOLD_DEG + _pn_bank_i) + rate_dob + az_dob
     potolok = PN_ROLL_HOLD_MAX
     if abs(rate) > PN_ROLL_RATE_DEAD_PX_S:
         potolok = PN_ROLL_HOLD_FAST
@@ -9228,80 +9246,70 @@ def _skorost_ramki(dx_px, now):
 
 
 def _nizhe_linii(depression_deg):
-    """На сколько градусов цель должна сидеть выше центра.
+    """Оставлено для старых тестов. Закон нос по этому запасу не ставит.
 
-    На обычной линии эталон держит около 9° и не отпускает этот запас,
-    пока линия не станет крутой. Нет угла — запас не выдумываем.
+    9° — середина дальних заходов, не уставка. Угол задаёт пара
+    «нос + газ» по высоте, см. _nos_na_kurs.
     """
     if depression_deg is None:
         return 0.0
     dep = float(depression_deg)
     if dep >= PN_AIM_STEEP_DEG:
         return 0.0
-    if dep <= PN_AIM_HOLD_UNTIL_DEG:
-        return PN_AIM_LEAD_MAX
-    shirina = PN_AIM_STEEP_DEG - PN_AIM_HOLD_UNTIL_DEG
-    if shirina <= 1e-6:
-        return 0.0
+    if dep <= 22.0:
+        return 9.0
+    shirina = PN_AIM_STEEP_DEG - 22.0
     dolya = (PN_AIM_STEEP_DEG - dep) / shirina
-    if dolya > 1.0:
-        dolya = 1.0
     if dolya < 0.0:
         dolya = 0.0
-    return PN_AIM_LEAD_MAX * dolya
+    if dolya > 1.0:
+        dolya = 1.0
+    return 9.0 * dolya
 
 
 def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k,
-                 depression_deg=None):
-    """Стик тангажа: цель выше центра, и ещё ниже, если линия растёт.
+                 depression_deg=None, vario_cms=None):
+    """Стик тангажа: нос ниже цели, угол держит высота.
 
-    Запас по углу линии отпускается только когда линия спокойна или
-    закрывается. Растущая линия — это перелёт, но добор сверх запаса
-    включается только когда картинка уже на этом запасе. Иначе всплеск
-    оценки сразу после лока клюёт нос ещё до того, как цель села выше
-    центра. Отрицательная скорость нос не поднимает. pitch_lock в
-    расчёт не входит.
+    После лока нос опускается ниже цели — ради скорости. На сколько,
+    каждый раз своё: фиксированных 9° нет. Как только нос ниже цели,
+    стик отпускается, acro угол держит. Дальше угол правит высота.
+    Подымается — носа мало, угол растёт. Снижается при крутом носе —
+    нос лишний, угол убывает. Снижение при некрутом носе нос не
+    трогает: это газ. Крутая линия — нос и есть линия, запас не нужен.
+    Скорость линии в расчёт не входит: первую секунду она врёт.
+    Потолок 45° не поднимается. los и pitch_lock не используются.
     """
-    global _pn_nos_i, _pn_nos_tek
-    del pitch_lock
+    global _pn_nos_i, _pn_nos_tek, _pn_nos_ugol
+    del los, los_ts, pitch_lock
     if pitch_deg is None:
         return 0.0
     pitch_deg = float(pitch_deg)
+    if _pn_nos_ugol is None:
+        _pn_nos_ugol = pitch_deg
     if _pn_nos_tek is None:
         _pn_nos_tek = pitch_deg
     dpp = CAMERA_VFOV_DEG / float(MAIN_H)
     aim_below = 0.0 if dy_px is None else -float(dy_px) * dpp
-    lead = _nizhe_linii(depression_deg)
-    fresh = (los_ts > 0.0) and ((now - los_ts) <= LOS_RATE_STALE_S)
-    if fresh and los > LOS_RATE_DEADBAND_DPS:
-        # Угол «уже крутой» здесь — сам перелёт. Запас не обнуляем.
-        if lead < PN_AIM_LEAD_MAX:
-            lead = PN_AIM_LEAD_MAX
-    picture = lead - aim_below
-    if picture < 0.0:
-        picture = 0.0
-    # Добор — только на запасе и не глубже пары градусов от него.
-    # Пока цель в центре, командуем сам запас, не запас плюс всплеск.
-    extra = 0.0
-    if (fresh and los > LOS_RATE_DEADBAND_DPS
-            and aim_below + 0.5 >= lead
-            and aim_below <= lead + PN_PITCH_LOS_AIM_PAST):
-        extra = (float(los) - LOS_RATE_DEADBAND_DPS) * PN_PITCH_LOS_PER_DPS
-        if extra > PN_PITCH_LOS_EXTRA_MAX:
-            extra = PN_PITCH_LOS_EXTRA_MAX
+    krutaya = (depression_deg is not None
+               and float(depression_deg) >= PN_AIM_STEEP_DEG)
     dt_s = k / NOMINAL_FPS
-    # Интеграл только по картинке. Скорость линии в него не копится:
-    # иначе собственный клевок снова доезжает до упора.
-    if picture > 0.5:
-        _pn_nos_i *= 0.5 ** (dt_s / 4.0)
-        _pn_nos_i += picture * PN_PITCH_I_DEG_PER_S * dt_s
-        if _pn_nos_i > PN_PITCH_I_MAX:
-            _pn_nos_i = PN_PITCH_I_MAX
-    else:
-        _pn_nos_i *= 0.5 ** dt_s
-        if _pn_nos_i < 0.0:
-            _pn_nos_i = 0.0
-    zhel = pitch_deg + picture + extra + _pn_nos_i + _pn_nos_blizko
+    # Нос ещё не ниже цели и линия не крутая — опускаем. Это не уставка,
+    # а само действие пилота после лока. Остановится, когда цель сядет
+    # выше центра.
+    if not krutaya and aim_below < PN_AIM_NIZHE_DEG:
+        _pn_nos_ugol += PN_NOS_NIZHE_DPS * dt_s
+    # Высота. Тише мёртвой зоны — смещение вариометра, не сигнал.
+    if vario_cms is not None and abs(float(vario_cms)) > PN_VARIO_DEAD_CMS:
+        if float(vario_cms) > PN_VARIO_DEAD_CMS:
+            _pn_nos_ugol += PN_NOS_TRIM_DPS * dt_s
+        elif aim_below > PN_AIM_KRUTO_DEG or krutaya:
+            _pn_nos_ugol -= PN_NOS_TRIM_DPS * dt_s
+    if _pn_nos_ugol > PN_PITCH_ABS_MAX:
+        _pn_nos_ugol = PN_PITCH_ABS_MAX
+    elif _pn_nos_ugol < 0.0:
+        _pn_nos_ugol = 0.0
+    zhel = _pn_nos_ugol + _pn_nos_blizko
     if zhel > PN_PITCH_ABS_MAX:
         zhel = PN_PITCH_ABS_MAX
     elif zhel < 0.0:
@@ -9361,36 +9369,32 @@ def _primenit_nos_u_sbrosa(opora, cel, range_m, k):
         _pn_nos_blizko = nuzhno
     if _pn_nos_blizko < 0.0:
         _pn_nos_blizko = 0.0
+        _pn_nos_ugol = None
     elif _pn_nos_blizko > PN_PITCH_BLIZKO_MAX:
         _pn_nos_blizko = PN_PITCH_BLIZKO_MAX
     return _pn_nos_blizko
 
 
 def _ryaskan_na_kurs(bank_deg, dx_px):
-    """Рыскание в сторону крена и слабый поводок у края кадра.
+    """Рыскание в сторону крена. Курс им не строится.
 
-    Курс им не строится. Нос без крена и без цели у края стоит.
+    Триммер, чтобы нос не уехал на крене. Без крена нос стоит.
+    Рамку рысканием не тянем: отдельная тяга уводит нос и дерётся
+    с банком. dx_px оставлен в подписи, чтобы вызов не менять.
     """
-    pwm = 0.0
-    if bank_deg is not None and abs(float(bank_deg)) >= YAW_BANK_QUIET_DEG:
-        dob = float(bank_deg) * YAW_S_BANK
-        if dob > YAW_BANK_PWM_MAX:
-            dob = YAW_BANK_PWM_MAX
-        elif dob < -YAW_BANK_PWM_MAX:
-            dob = -YAW_BANK_PWM_MAX
-        pwm += dob
-    if dx_px is not None and abs(dx_px) > YAW_LEASH_PX:
-        hv = (abs(dx_px) - YAW_LEASH_PX) * YAW_LEASH_PWM
-        if hv > YAW_LEASH_MAX:
-            hv = YAW_LEASH_MAX
-        if dx_px < 0.0:
-            hv = -hv
-        pwm += YAW_SIGN * hv
-    if pwm > MAX_YAW_DEFLECT:
+    del dx_px
+    if bank_deg is None or abs(float(bank_deg)) < YAW_BANK_QUIET_DEG:
+        return 0.0
+    dob = float(bank_deg) * YAW_S_BANK
+    if dob > YAW_BANK_PWM_MAX:
+        dob = YAW_BANK_PWM_MAX
+    elif dob < -YAW_BANK_PWM_MAX:
+        dob = -YAW_BANK_PWM_MAX
+    if dob > MAX_YAW_DEFLECT:
         return float(MAX_YAW_DEFLECT)
-    if pwm < -MAX_YAW_DEFLECT:
+    if dob < -MAX_YAW_DEFLECT:
         return float(-MAX_YAW_DEFLECT)
-    return pwm
+    return dob
 
 
 def _gaz_po_vysote(hover, alt_m, tau_s, vario_cms):
@@ -9426,42 +9430,45 @@ def _gaz_po_vysote(hover, alt_m, tau_s, vario_cms):
     return pwm
 
 
-def _gaz_po_linii(opora, depression_deg, ground_speed_ms, vario_cms,
-                  los_rate=None):
-    """Газ, при котором путь совпадает с линией на цель.
+def _gaz_po_linii(opora, vario_cms, aim_below=0.0, los_rate=None,
+                  age_s=None, hover=None):
+    """Газ под выбранный нос: высота стоит.
 
-    Опора — стик входа, не висение и не прошлая команда.
-    Путь круче линии: газ выше, но не когда сама линия растёт. На
-    4dc8597 путевая занижалась, путь выглядел круче линии, газ в конце
-    поднимался (1416 при стике 1377), а борт всё равно перелетал.
-    Путь положе — газ ниже. Нет путевой, угла или вариометра — None.
+    Опора — стик входа, но не ниже ховера. Ниже ховера высота не
+    стоит ни при каком носе: пилот мог залочить, не добавив газ, и
+    весь заход сел бы. Ховер — пол, не замена. Выше входа по путевой
+    не поднимаем. Снижаемся — не добрал газ. Подымаемся — это нос,
+    газ вверх не идёт. Перелёт — можно убавить, если не снижаемся.
+    Первые две секунды скорость линии не слушаем. Нет опоры или
+    вариометра — None.
     """
-    if opora is None or depression_deg is None:
+    if opora is None or vario_cms is None:
         return None
-    if ground_speed_ms is None or vario_cms is None:
-        return None
-    gs = float(ground_speed_ms)
-    if gs < GAZ_LINII_GS_MIN:
-        return None
-    sink = -float(vario_cms) / 100.0
-    path = math.degrees(math.atan2(sink, gs))
-    err = path - float(depression_deg)
-    if abs(err) <= GAZ_LINII_DEADBAND_DEG:
-        return float(opora)
-    if err > 0.0:
-        err -= GAZ_LINII_DEADBAND_DEG
-    else:
-        err += GAZ_LINII_DEADBAND_DEG
-    pwm = float(opora) + GAZ_LINII_PWM_PER_DEG * err
-    verh = float(opora) + GAZ_LINII_VYSHE
-    niz = float(opora) - GAZ_LINII_NIZHE
+    var = float(vario_cms)
+    opora = float(opora)
+    if hover is not None and float(hover) > opora:
+        opora = float(hover)
+    pwm = float(opora)
+    if var < -GAZ_VARIO_DEAD_CMS:
+        nedobor = (-var - GAZ_VARIO_DEAD_CMS) / 100.0
+        pwm = float(opora) + GAZ_VARIO_PWM_PER_MPS * nedobor
+    elif var > GAZ_VARIO_DEAD_CMS:
+        lishnee = (var - GAZ_VARIO_DEAD_CMS) / 100.0
+        pwm = float(opora) - GAZ_VARIO_PWM_PER_MPS * lishnee
+    perelet = aim_below is not None and float(aim_below) < -1.0
+    if (not perelet and los_rate is not None and age_s is not None
+            and float(age_s) >= 2.0
+            and float(los_rate) > LOS_RATE_DEADBAND_DPS):
+        perelet = True
+    if (perelet and var >= -GAZ_VARIO_DEAD_CMS
+            and pwm > float(opora) - GAZ_PERELET_PWM):
+        pwm = float(opora) - GAZ_PERELET_PWM
+    verh = float(opora) + GAZ_VYSHE
+    niz = float(opora) - GAZ_NIZHE
     if pwm > verh:
         pwm = verh
     if pwm < niz:
         pwm = niz
-    if (los_rate is not None and float(los_rate) > LOS_RATE_DEADBAND_DPS
-            and pwm > float(opora)):
-        pwm = float(opora)
     return pwm
 
 
@@ -11481,6 +11488,7 @@ def _update_control_from_target_impl():
     global _los_aim_x_tek, _az_skorost, _az_nakop, _az_pred
     global _los_skorost_ts, _az_skorost_ts
     global _tau_ubyvanie
+    global _pn_nos_ugol
     global _final_zamorozhen, _final_komandy, _final_okno, _final_dx0, _final_dy0
     global _dover_score_ema, _dover_psr_ema
     global _rassh_nakop, _flow_rasshirenie
@@ -11490,7 +11498,7 @@ def _update_control_from_target_impl():
     global _hover_pwm, _thr_geom_out, _geom_mode_log, _gaz_vhod
     global roll_integral, pitch_integral, yaw_integral
     global _pn_bank_i, _pn_bank_tek, _pn_dx_pred, _pn_dx_t, _pn_dx_rate
-    global _pn_nos_i, _pn_nos_tek, _pn_nos_blizko
+    global _pn_nos_i, _pn_nos_tek, _pn_nos_blizko, _pn_nos_ugol
     global smoothed_pitch_deg
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
@@ -11696,6 +11704,7 @@ def _update_control_from_target_impl():
         _pn_nos_i = 0.0
         _pn_nos_tek = None
         _pn_nos_blizko = 0.0
+        _pn_nos_ugol = None
         # SHADOW-состояние — своё, отдельное от live-интеграторов выше, но
         # сбрасывается по тому же событию (новый/потерянный захват): иначе
         # диагностика windup тянула бы накопление прошлой цели в новую.
@@ -12443,15 +12452,20 @@ def _update_control_from_target_impl():
                    if isinstance(closure, dict) else None)
         _dal_bl = (closure.get("range_m")
                    if isinstance(closure, dict) else None)
+        _aim_bl = -(box_cy - CENTER_Y) * CAMERA_VFOV_DEG / float(MAIN_H)
+        _age_bl = (None if _tracked_since_t is None
+                   else now_mono - _tracked_since_t)
         _cel_bl = _gaz_po_linii(
-            _opora_bl, _dep_bl, ground_speed_mps, _var_bl, _los_bl)
+            _opora_bl, _var_bl, _aim_bl, _los_bl, _age_bl,
+            _hover_s_napryazheniem())
         if _cel_bl is None:
             _cel_bl = _opora_bl
         _primenit_nos_u_sbrosa(_opora_bl, _cel_bl, _dal_bl, k)
         pitch_offset = _nos_na_kurs(
             _los_skorost, _los_skorost_ts, _pitch_tek_pot, _pitch_pri_loke,
             box_cy - CENTER_Y, now_mono, k,
-            closure.get("depression_deg") if isinstance(closure, dict) else None)
+            closure.get("depression_deg") if isinstance(closure, dict) else None,
+            _var_bl)
         _p_sat = abs(pitch_offset) >= PN_PITCH_PWM_MAX - 1e-6
         _pid_dbg["pitch"] = (
             pitch_offset, 0.0, _pn_nos_i * PN_PITCH_PWM_PER_DEG, 0.0,
@@ -13233,8 +13247,12 @@ def _update_control_from_target_impl():
         if (_los_skorost_ts > 0.0
                 and (now_mono - _los_skorost_ts) <= LOS_RATE_STALE_S):
             _los_lin = _los_skorost
+        _aim_lin = -(box_cy - CENTER_Y) * CAMERA_VFOV_DEG / float(MAIN_H)
+        _age_lin = (None if _tracked_since_t is None
+                    else now_mono - _tracked_since_t)
         _cel_lin = _gaz_po_linii(
-            _opora_gaz, _dep_lin, ground_speed_mps, _var_g, _los_lin)
+            _opora_gaz, _var_g, _aim_lin, _los_lin, _age_lin,
+            _hover_s_napryazheniem())
         if _cel_lin is None:
             _cel_lin = _opora_gaz
         _thr_geom_out = _podtyanut_gaz(
