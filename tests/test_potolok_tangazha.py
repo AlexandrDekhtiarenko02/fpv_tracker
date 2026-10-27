@@ -64,19 +64,38 @@ assert t._pribavka_zapreshchena(24.0, 18.0, 10.0) is True   # +6°
 assert t._pribavka_zapreshchena(20.0, 18.0, -500.0) is False  # просадка — можно
 assert t._pribavka_zapreshchena(20.0, 18.0, 10.0) is False
 
-print("=== 6. Крен: кадр вне центра, азимут только в тишине ===")
+print("=== 6. Крен правит курс: рамка и бег, азимут молчит ===")
 now = 1000.0
 t._pn_bank_i = 0.0
 t._pn_bank_tek = 0.0
-# Крестик в центре и азимут крутится — картинку держит yaw, крен нужен.
+t._pn_dx_pred = None
+t._pn_dx_t = 0.0
+t._pn_dx_rate = 0.0
+# Крестик в центре, азимут крутится — азимут крен не кладёт.
 for _ in range(int(2 * t.NOMINAL_FPS)):
     now += 1.0 / t.NOMINAL_FPS
     t._kren_na_kurs(2.0, now, 0.0, 0.0, now, 1.0)
-assert t._pn_bank_tek > 4.0, t._pn_bank_tek
-assert t._pn_bank_tek <= t.PN_ROLL_HOLD_MAX + 1e-6, t._pn_bank_tek
-# Крестик в центре и нос стоит — крен в горизонт.
+assert abs(t._pn_bank_tek) < 1.0, t._pn_bank_tek
+# Крестик почти в центре, но рамка бежит — курс мимо, крен нужен.
+# |dx| держим в тихой зоне, а pred каждый кадр отстаёт — так оценка
+# скорости остаётся выше мёртвой, как при уводе с носом на цели.
+t._pn_bank_i = 0.0
+t._pn_bank_tek = 0.0
+t._pn_dx_rate = 0.0
+now_b = now
+for _ in range(int(1.0 * t.NOMINAL_FPS)):
+    now_b += 1.0 / t.NOMINAL_FPS
+    t._pn_dx_pred = 3.0 - 50.0 / t.NOMINAL_FPS
+    t._pn_dx_t = now_b - 1.0 / t.NOMINAL_FPS
+    t._kren_na_kurs(0.0, now_b, 0.0, 3.0, now_b, 1.0)
+assert t._pn_bank_tek > 2.0, t._pn_bank_tek
+assert t._pn_bank_tek <= t.PN_ROLL_HOLD_FAST + 1e-6, t._pn_bank_tek
+# Крестик в центре и бег тихий — крен в горизонт.
 t._pn_bank_i = 0.0
 t._pn_bank_tek = 8.0
+t._pn_dx_pred = 1.0
+t._pn_dx_t = now
+t._pn_dx_rate = 0.0
 now_q = now
 for _ in range(int(2 * t.NOMINAL_FPS)):
     now_q += 1.0 / t.NOMINAL_FPS
@@ -85,6 +104,9 @@ assert abs(t._pn_bank_tek) < 1.0, t._pn_bank_tek
 # Рамка справа — крен вправо, плавно, не поздний удар. Азимут влево молчит.
 t._pn_bank_i = 0.0
 t._pn_bank_tek = 0.0
+t._pn_dx_pred = None
+t._pn_dx_t = 0.0
+t._pn_dx_rate = 0.0
 now_d = now
 shag = t.PN_ROLL_BANK_SLEW / t.NOMINAL_FPS + 1e-6
 pred = 0.0
@@ -102,6 +124,18 @@ for _ in range(int(2 * t.NOMINAL_FPS)):
     now_l += 1.0 / t.NOMINAL_FPS
     t._kren_na_kurs(4.0, now_l, 0.0, -30.0, now_l, 1.0)
 assert t._pn_bank_tek < -4.0, t._pn_bank_tek
+# Середина захода |dx| 5–15 не должна оставаться с креном 1–4°.
+t._pn_bank_i = 0.0
+t._pn_bank_tek = 0.0
+t._pn_dx_pred = None
+t._pn_dx_t = 0.0
+t._pn_dx_rate = 0.0
+now_m = now
+for _ in range(int(2 * t.NOMINAL_FPS)):
+    now_m += 1.0 / t.NOMINAL_FPS
+    t._kren_na_kurs(0.0, now_m, 0.0, 12.0, now_m, 1.0)
+assert t._pn_bank_tek > 4.0, t._pn_bank_tek
+assert t._pn_bank_tek <= t.PN_ROLL_HOLD_MAX + 1e-6, t._pn_bank_tek
 assert t._kren_na_kurs(4.0, now, None, 40.0, now, 1.0) == 0.0
 assert t.FF_GAIN_ROLL == 0.0
 assert t.ROLL_LEAD_S >= 0.4 - 1e-9
@@ -225,9 +259,9 @@ assert rovno == 1350.0, rovno
 # Снижаемся — газ выше, но не дальше потолка прибавки.
 proval = t._gaz_po_linii(1350, -600.0)
 assert 1350.0 < proval <= 1350.0 + t.GAZ_VYSHE, proval
-# Подымаемся — газ не выше стика.
+# Подымаемся — это нос: газ на опоре, вверх не идёт и вниз не режет.
 nabor = t._gaz_po_linii(1350, 200.0)
-assert nabor < 1350.0, nabor
+assert nabor == 1350.0, nabor
 # Перелёт в первую секунду по скорости линии газ не режет.
 rannee = t._gaz_po_linii(1350, 0.0, aim_below=5.0, los_rate=6.0, age_s=0.5)
 assert rannee == 1350.0, rannee
