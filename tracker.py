@@ -2231,7 +2231,12 @@ PN_ROLL_PWM_MAX = 110.0
 # «нос + газ», при которой высота стоит. Поставил — стик в центр.
 # Подымается — носа мало. Снижается при крутом носе — нос лишний.
 # Снижение при некрутом носе нос не трогает, это газ. Скорость линии
-# в нос не входит: первую секунду она врёт на +4…+9 °/с.
+# Скорость линии в первую секунду врёт на +4…+9 °/с и нос от неё не клюёт.
+# После PN_NOS_LOS_MIN_AGE_S устойчивый рост линии (пройдём выше) добавляет
+# несколько градусов к уставке. Отрицательная скорость нос не поднимает.
+PN_NOS_LOS_MIN_AGE_S = 2.0
+PN_NOS_LOS_DPS = 0.35          # ° уставки в секунду на °/с сверх мёртвой зоны
+PN_NOS_LOS_MAX = 3.0           # не выше, чем на столько над уже держащимся углом
 PN_AIM_NIZHE_DEG = 2.0         # нос ниже цели: не уставка, порог «уже ниже»
 PN_AIM_KRUTO_DEG = 12.0        # запас ниже цели: глубже и снижаемся — нос лишний
 PN_AIM_STEEP_DEG = 30.0        # крутая линия: нос и есть линия, запас не нужен
@@ -9160,11 +9165,12 @@ def _stolknovenie_pwm(skorost, ts, now, deadband, gain, limit, sign):
 def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k, yaw_rate_dps=None):
     """Стик, который правит курс, а не только держит крестик.
 
-    Основной сигнал — скорость азимута цели в мире (az_rate -> 0).
-    Пиксели в кадре — только trim, и их вес падает, когда курс ещё
-    не выровнен. Раньше az применялся только в «тишине» (|dx|<=4 px):
-    при нулевой ошибке в кадре дрон мог лететь параллельно, потому что
-    пиксельный контур был доволен, а курсовая поправка не включалась.
+    В центре кадра главный сигнал — скорость азимута (az_rate -> 0):
+    перекрестье на цели ещё не значит, что курс столкновения есть.
+    Чем дальше рамка от центра, тем меньше вес азимута: явная ошибка
+    в кадре не должна менять знак из-за курса. Раньше az включался
+    только при |dx|<=4 px, и параллельный пролёт с нулевой ошибкой
+    не доворачивался вовсе.
 
     Вычитать yaw из az нельзя — останется бег крестика. Горизонт, когда
     тихие положение, бег и курс. Стик в ACRO задаёт скорость; у нужного
@@ -9201,33 +9207,31 @@ def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k, yaw_rate_dps=None):
     az_svezh = (az_ts > 0.0) and ((now - az_ts) <= LOS_RATE_STALE_S)
     yaw_ok = (yaw_rate_dps is None
               or abs(float(yaw_rate_dps)) <= PN_ROLL_AZ_YAW_MAX_DPS)
-    az_active = False
+    # В центре азимут ведёт курс. Далеко от центра рамка важнее:
+    # иначе 4 °/с против 30 px перекладывают крен не в ту сторону.
+    dx_abs = 0.0 if dx_px is None else abs(float(dx_px))
+    if dx_abs <= PN_ROLL_HOLD_PX:
+        az_w = 1.0
+    else:
+        az_w = max(0.25, 1.0 - (dx_abs - PN_ROLL_HOLD_PX) / 40.0)
     if az_svezh and yaw_ok and az is not None:
         az_f = float(az)
         if abs(az_f) > PN_ROLL_AZ_DEAD_DPS:
             izb_az = az_f - math.copysign(PN_ROLL_AZ_DEAD_DPS, az_f)
-            az_dob = ROLL_SIGN * izb_az * PN_ROLL_AZ_DEG
-            # Интеграл по избытку азимута: постоянный параллельный полёт
-            # должен доворачивать курс, даже если мгновенный rate маленький.
-            _pn_az_i += izb_az * PN_ROLL_AZ_I * dt_s
+            az_dob = ROLL_SIGN * izb_az * PN_ROLL_AZ_DEG * az_w
+            # Интеграл по избытку азимута, с тем же весом: параллельный
+            # полёт в центре доворачивается, явная рамка интеграл не копит.
+            _pn_az_i += izb_az * PN_ROLL_AZ_I * az_w * dt_s
             if _pn_az_i > PN_ROLL_AZ_I_MAX:
                 _pn_az_i = PN_ROLL_AZ_I_MAX
             elif _pn_az_i < -PN_ROLL_AZ_I_MAX:
                 _pn_az_i = -PN_ROLL_AZ_I_MAX
-            az_active = True
         else:
             # В мёртвой зоне интеграл медленно сбрасывается.
             _pn_az_i *= 0.5 ** (dt_s / 2.0)
     else:
         _pn_az_i *= 0.5 ** dt_s
-    # Когда курс ещё не выровнен — пиксели не должны перебивать доворот.
-    # Чем сильнее az, тем меньше вес ошибки в кадре.
-    pixel_w = 1.0
-    if az_active and az is not None:
-        az_abs = abs(float(az))
-        # от 1.0 при deadband до ~0.2 при 4 °/с и выше
-        pixel_w = max(0.2, 1.0 - 0.2 * (az_abs - PN_ROLL_AZ_DEAD_DPS))
-    zhel = (ROLL_SIGN * (err * PN_ROLL_HOLD_DEG * pixel_w + _pn_bank_i * pixel_w)
+    zhel = (ROLL_SIGN * (err * PN_ROLL_HOLD_DEG + _pn_bank_i)
             + rate_dob + az_dob + ROLL_SIGN * _pn_az_i)
     potolok = PN_ROLL_HOLD_MAX
     if abs(rate) > PN_ROLL_RATE_DEAD_PX_S:
@@ -9304,8 +9308,70 @@ def _nizhe_linii(depression_deg):
     return 9.0 * dolya
 
 
+def _tau_nadyozhen(tau_s, n_tochek, sigma_s=None):
+    """Оптическому времени можно верить в управлении, а не только в логе.
+
+    Одного числа мало: сразу после захвата окно ещё не набралось, и tau
+    всплёскивает. Пока точек меньше окна убывания или погрешность
+    сравнима с самим временем — для глисады, финала и газа это «нет оценки».
+    """
+    if tau_s is None:
+        return False
+    tau = float(tau_s)
+    if tau <= 0.2:
+        return False
+    if n_tochek < TAU_UBYV_MIN_TOCHEK:
+        return False
+    if sigma_s is not None and tau > 0.1 and float(sigma_s) / tau > 0.8:
+        return False
+    return True
+
+
+def _tau_soglasovan(tau_s, range_m, speed_mps):
+    """Оптическое время и дальность/путевая не должны расходиться в разы.
+
+    Второго источника нет — оптике не перечим. Есть оба и они разошлись
+    сильнее чем в 2.5 раза — оптическому времени в контур нельзя.
+    """
+    if tau_s is None or range_m is None or speed_mps is None:
+        return True
+    sp = float(speed_mps)
+    rg = float(range_m)
+    if sp < 2.0 or rg < 8.0:
+        return True
+    geom = rg / sp
+    if geom < 0.5:
+        return True
+    otn = float(tau_s) / geom
+    return 0.4 <= otn <= 2.5
+
+
+def _tau_zakrytie_godno(tau_s, ubyv, n_tochek):
+    """Финал по времени: не однокадровый выброс и не растущее время.
+
+    Растущее tau — дёрг рамки, а не сближение. Пока окна нет, финала нет.
+    """
+    if not _tau_nadyozhen(tau_s, n_tochek):
+        return False
+    if ubyv is not None and float(ubyv) > 0.25:
+        return False
+    return True
+
+
+def _los_prosit_nizhe(los, los_ts, now, vozrast_s):
+    """Устойчивый рост линии визирования после прогрева, не первый всплеск."""
+    if vozrast_s is None or float(vozrast_s) < PN_NOS_LOS_MIN_AGE_S:
+        return False
+    if los is None or los_ts is None:
+        return False
+    if float(los_ts) <= 0.0 or (float(now) - float(los_ts)) > LOS_RATE_STALE_S:
+        return False
+    return float(los) > LOS_RATE_DEADBAND_DPS
+
+
 def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k,
-                 depression_deg=None, vario_cms=None):
+                 depression_deg=None, vario_cms=None, min_ugol=0.0,
+                 vozrast_s=None):
     """Стик тангажа: поставил угол — отпустил. Acro держит.
 
     После лока нос опускается ниже цели — ради скорости. На сколько,
@@ -9314,11 +9380,14 @@ def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k,
     горизонт. Дальше угол правит высота: подымается — носа мало,
     уставка растёт и стик снова жмёт, пока угол не пойман. Снижается
     при крутом носе — нос лишний. Снижение при некрутом — газ.
-    Крутая линия / на линии — запас не добираем. Скорость линии в
-    расчёт не входит. Потолок 45° не поднимается.
+    Крутая линия / на линии — запас не добираем. Потолок 45° не поднимается.
+
+    Пол min_ugol только поднимает уставку (глисада: не положе, чем нужно),
+    никогда не тянет нос обратно. Скорость линии в первую секунду не
+    слушаем; дальше устойчивый рост добавляет не больше PN_NOS_LOS_MAX.
     """
     global _pn_nos_i, _pn_nos_tek, _pn_nos_ugol
-    del los, los_ts, pitch_lock
+    del pitch_lock
     if pitch_deg is None:
         return 0.0
     pitch_deg = float(pitch_deg)
@@ -9353,16 +9422,31 @@ def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k,
         elif aim_below > PN_AIM_KRUTO_DEG or krutaya:
             # На линии (close) снижение — глиссада, нос не убираем.
             _pn_nos_ugol -= PN_NOS_TRIM_DPS * dt_s
+    los_prosit = _los_prosit_nizhe(los, los_ts, now, vozrast_s)
+    # Картинка уже та, высота не просит — принимаем угол, который
+    # держит acro. Иначе фантомная уставка выше факта снова жмёт стик.
+    # Пол глисады и устойчивый перелёт этот ранний отпуск не отменяют:
+    # иначе нос остаётся на пологой картинке, пока время до цели большое
+    # или линия визирования продолжает расти.
+    if kartinka_ok and vysota_ok and _pn_nos_blizko <= 0.0:
+        if float(min_ugol) <= pitch_deg + 0.5 and not los_prosit:
+            _pn_nos_ugol = pitch_deg
+            _pn_nos_tek = pitch_deg
+            return 0.0
+        if _pn_nos_ugol < pitch_deg:
+            _pn_nos_ugol = pitch_deg
+    if _pn_nos_ugol < float(min_ugol):
+        _pn_nos_ugol = float(min_ugol)
+    # Добавка только вверх и только пока уставка не ушла далеко от факта.
+    # Первую секунду los_prosit ложен: всплеск +4…+9 °/с нос не клюёт.
+    if los_prosit and (_pn_nos_ugol - pitch_deg) < PN_NOS_LOS_MAX:
+        izb = float(los) - LOS_RATE_DEADBAND_DPS
+        if izb > 0.0:
+            _pn_nos_ugol += izb * PN_NOS_LOS_DPS * dt_s
     if _pn_nos_ugol > PN_PITCH_ABS_MAX:
         _pn_nos_ugol = PN_PITCH_ABS_MAX
     elif _pn_nos_ugol < 0.0:
         _pn_nos_ugol = 0.0
-    # Картинка уже та, высота не просит — принимаем угол, который
-    # держит acro. Иначе фантомная уставка выше факта снова жмёт стик.
-    if kartinka_ok and vysota_ok and _pn_nos_blizko <= 0.0:
-        _pn_nos_ugol = pitch_deg
-        _pn_nos_tek = pitch_deg
-        return 0.0
     zhel = _pn_nos_ugol + _pn_nos_blizko
     if zhel > PN_PITCH_ABS_MAX:
         zhel = PN_PITCH_ABS_MAX
@@ -12227,9 +12311,14 @@ def _update_control_from_target_impl():
         _vyderzhka_sbros(_vyderzhka_closing)
         in_closing = False
     elif _tau_now is not None:
-        in_closing = _vyderzhka_gotova(
-            _vyderzhka_closing, _tau_now <= CLOSING_TAU_S,
-            now_mono, CLOSING_CONFIRM_TIME_S)
+        # Окно не набралось или время растёт — это дёрг рамки, не финал.
+        if _tau_zakrytie_godno(_tau_now, _tau_ubyvanie, len(_tau_hist)):
+            in_closing = _vyderzhka_gotova(
+                _vyderzhka_closing, _tau_now <= CLOSING_TAU_S,
+                now_mono, CLOSING_CONFIRM_TIME_S)
+        else:
+            _vyderzhka_sbros(_vyderzhka_closing)
+            in_closing = False
     else:
         # Времени нет — режима сближения нет (почему, написано у настройки).
         _vyderzhka_sbros(_vyderzhka_closing)
@@ -12264,6 +12353,14 @@ def _update_control_from_target_impl():
         else:
             ves = ((_tau_now - GLIDE_TAU_OFF_S)
                    / max(0.1, GLIDE_TAU_FULL_S - GLIDE_TAU_OFF_S))
+        # Плохое время — не повод наклонять. Окна ещё нет, погрешность
+        # сравнима с самим tau, или оптика разошлась с дальностью и
+        # путевой больше чем в 2.5 раза: вес в ноль, slew уведёт пол плавно.
+        _sig_gl = closure.get("tau_sigma_s") if isinstance(closure, dict) else None
+        _rng_gl = closure.get("range_m") if isinstance(closure, dict) else None
+        if not (_tau_nadyozhen(_tau_now, len(_tau_hist), _sig_gl)
+                and _tau_soglasovan(_tau_now, _rng_gl, ground_speed_mps)):
+            ves = 0.0
         # ВЕС МЕНЯЕТСЯ ПЛАВНО. Переключение наклона скачком — это ступенька
         # в 120 PWM за кадр, то есть тот самый рывок, от которого и лечимся.
         # Полный ход за GLIDE_SLEW_S: наклон правит режим полёта, а он
@@ -12535,11 +12632,21 @@ def _update_control_from_target_impl():
         if _cel_bl is None:
             _cel_bl = _opora_bl
         _primenit_nos_u_sbrosa(_opora_bl, _cel_bl, _dal_bl, k)
+        # Глисада в живом контуре — пол угла, не второй ШИМ. В столкновении
+        # launch_pitch_pwm в команду не входит: он поднимал нос обратно к 15°.
+        # Здесь пол только добавляет пикирование, и только по надёжному tau
+        # (вес уже обнулён, если оценке верить нельзя). В финале пол снят.
+        _pol_nosa = 0.0
+        if (GLIDE_ENABLED and not OBSERVE_ONLY and not in_closing
+                and glide_ves > 0.0):
+            _pol_nosa = GLIDE_MIN_PITCH_DEG * glide_ves
         pitch_offset = _nos_na_kurs(
             _los_skorost, _los_skorost_ts, _pitch_tek_pot, _pitch_pri_loke,
             box_cy - CENTER_Y, now_mono, k,
             closure.get("depression_deg") if isinstance(closure, dict) else None,
-            _var_bl)
+            _var_bl,
+            min_ugol=_pol_nosa,
+            vozrast_s=_age_bl)
         _p_sat = abs(pitch_offset) >= PN_PITCH_PWM_MAX - 1e-6
         _pid_dbg["pitch"] = (
             pitch_offset, 0.0, _pn_nos_i * PN_PITCH_PWM_PER_DEG, 0.0,
@@ -12880,7 +12987,14 @@ def _update_control_from_target_impl():
             else:
                 _tau_hold_val = None
         thr_adjust = 0.0
-        if tau_now is not None:
+        _tau_sig_g = closure.get("tau_sigma_s") if isinstance(closure, dict) else None
+        _rng_g = closure.get("range_m") if isinstance(closure, dict) else None
+        # Ненадёжное время ручку не двигает: ни сброс на ложных 0.6 с,
+        # ни упор вверх, пока окно ещё не набралось или оптика врёт
+        # относительно дальности и путевой.
+        _goden_g = (_tau_nadyozhen(tau_now, len(_tau_hist), _tau_sig_g)
+                    and _tau_soglasovan(tau_now, _rng_g, ground_speed_mps))
+        if tau_now is not None and _goden_g:
             if tau_now < TAU_THROTTLE_LO_S:
                 # Слишком быстро: не успеем довернуть — сбрасываем.
                 thr_adjust = -(TAU_THROTTLE_LO_S - tau_now) * TAU_THROTTLE_GAIN
