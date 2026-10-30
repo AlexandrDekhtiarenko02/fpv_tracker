@@ -197,76 +197,78 @@ assert uroven < 0.0, uroven
 assert t._kren_k_gorizontu(0.0, 0.0) == 0.0
 assert t._kren_k_gorizontu(100.0, None) == 20.0
 
-print("=== 8. Тангаж: нос ниже цели, угол по высоте, не по скорости линии ===")
+print("=== 8. Тангаж: запас ниже цели по крутизне линии, не по скорости ===")
 t._pn_nos_i = 0.0
 t._pn_nos_tek = None
 t._pn_nos_ugol = None
 t._pn_nos_blizko = 0.0
-# Цель в центре, линия пологая: нос опускается ниже цели.
+# Пологая линия, цель в центре: нос опускается на запас ~10°.
 t._pn_nos_ugol = None
 t._pn_nos_tek = None
 pwm_n = t._nos_na_kurs(0.0, now, 10.0, 10.0, 0.0, now, 1.0, 8.0)
 assert pwm_n > 0.0, pwm_n
-# Уже ниже цели, высота стоит: стик отпущен (acro держит угол).
+assert t._zapas_nosa(8.0) == t.PN_ZAPAS_DEG
+assert t._zapas_nosa(24.0) == 0.0
+assert t._zapas_nosa(21.0) == t.PN_ZAPAS_DEG * 0.5
+# Запас набран, высота стоит: стик отпущен.
 dpp = t.CAMERA_VFOV_DEG / float(t.MAIN_H)
-dy_nizhe = -5.0 / dpp
+dy_zapas = -t.PN_ZAPAS_DEG / dpp
 t._pn_nos_ugol = 23.0
 t._pn_nos_tek = 23.0
-derzh = t._nos_na_kurs(0.0, now, 23.0, 18.0, dy_nizhe, now, 1.0, 18.0, 0.0)
+derzh = t._nos_na_kurs(0.0, now, 23.0, 18.0, dy_zapas, now, 1.0, 8.0, 0.0)
 assert derzh == 0.0, derzh
 # Поставил и отпустил: картинка на запасе, высота ровная — pwm=0,
 # уставка привязана к факту, не жмёт фантом.
 t._pn_nos_ugol = 30.0
 t._pn_nos_tek = 30.0
-otp = t._nos_na_kurs(0.0, now, 27.0, 18.0, dy_nizhe, now, 1.0, 18.0, 0.0)
+otp = t._nos_na_kurs(0.0, now, 27.0, 18.0, dy_zapas, now, 1.0, 8.0, 0.0)
 assert otp == 0.0, otp
 assert abs(t._pn_nos_ugol - 27.0) < 1e-6, t._pn_nos_ugol
-# Крутая линия, цель в центре: запас не нужен, вниз не дожимаем.
+# Крутая линия, цель в центре: запас ноль, вниз не дожимаем.
 t._pn_nos_ugol = None
 t._pn_nos_tek = 32.0
-krut = t._nos_na_kurs(0.0, now, 32.0, 18.0, 0.0, now, 1.0, 32.0, 0.0)
+krut = t._nos_na_kurs(0.0, now, 32.0, 18.0, 0.0, now, 1.0, 26.0, 0.0)
 assert abs(krut) < 8.0, krut
-# Близко круто (эталон close): aim≈0, линия ≥12° — не клюём к 45°.
+# Крутая линия и снижение: нос не клюём к 45°.
 t._pn_nos_ugol = 18.0
 t._pn_nos_tek = 18.0
 now_cl = 3500.0
 for _ in range(int(2.0 * t.NOMINAL_FPS)):
     now_cl += 1.0 / t.NOMINAL_FPS
-    t._nos_na_kurs(0.0, now_cl, 18.0, 18.0, 0.0, now_cl, 1.0, 18.0, -400.0)
+    t._nos_na_kurs(0.0, now_cl, 18.0, 18.0, 0.0, now_cl, 1.0, 26.0, -400.0)
 assert t._pn_nos_ugol <= 18.0 + 1e-6, t._pn_nos_ugol
-# Всплеск скорости линии сразу после лока нос не клюёт.
-# На cfe6537 +6 °/с клали ещё до +8° за три секунды.
+# Всплеск скорости линии нос не клюёт, запас уже набран.
 t._pn_nos_ugol = 23.0
 t._pn_nos_tek = 23.0
 now_v = 4000.0
 for _ in range(int(1.5 * t.NOMINAL_FPS)):
     now_v += 1.0 / t.NOMINAL_FPS
-    t._nos_na_kurs(6.0, now_v, 23.0, 18.0, dy_nizhe, now_v, 1.0, 18.0, 0.0)
+    t._nos_na_kurs(6.0, now_v, 23.0, 18.0, dy_zapas, now_v, 1.0, 8.0, 0.0)
 assert abs(t._pn_nos_ugol - 23.0) < 0.3, t._pn_nos_ugol
-# Подымается — носа мало, угол растёт.
+# Подымается на пологой линии — носа мало, угол растёт.
 t._pn_nos_ugol = 23.0
 t._pn_nos_tek = 23.0
 now_c = 5000.0
 for _ in range(int(1.0 * t.NOMINAL_FPS)):
     now_c += 1.0 / t.NOMINAL_FPS
-    t._nos_na_kurs(0.0, now_c, 23.0, 18.0, dy_nizhe, now_c, 1.0, 18.0, 80.0)
+    t._nos_na_kurs(0.0, now_c, 23.0, 18.0, dy_zapas, now_c, 1.0, 8.0, 80.0)
 assert t._pn_nos_ugol > 24.5, t._pn_nos_ugol
-# Снижается при крутом носе — нос лишний, угол убывает.
-dy_kruto = -16.0 / dpp
+# Снижается глубже запаса — нос лишний, угол убывает.
+dy_glubzhe = -(t.PN_ZAPAS_DEG + 6.0) / dpp
 t._pn_nos_ugol = 34.0
 t._pn_nos_tek = 34.0
 now_s = 6000.0
 for _ in range(int(1.0 * t.NOMINAL_FPS)):
     now_s += 1.0 / t.NOMINAL_FPS
-    t._nos_na_kurs(0.0, now_s, 34.0, 18.0, dy_kruto, now_s, 1.0, 18.0, -80.0)
+    t._nos_na_kurs(0.0, now_s, 34.0, 18.0, dy_glubzhe, now_s, 1.0, 8.0, -80.0)
 assert t._pn_nos_ugol < 32.5, t._pn_nos_ugol
-# Снижается при некрутом носе — нос не трогаем, это газ.
+# Снижается ровно на запасе — нос не трогаем, это газ.
 t._pn_nos_ugol = 23.0
 t._pn_nos_tek = 23.0
 now_m = 6500.0
 for _ in range(int(1.0 * t.NOMINAL_FPS)):
     now_m += 1.0 / t.NOMINAL_FPS
-    t._nos_na_kurs(0.0, now_m, 23.0, 18.0, dy_nizhe, now_m, 1.0, 18.0, -80.0)
+    t._nos_na_kurs(0.0, now_m, 23.0, 18.0, dy_zapas, now_m, 1.0, 8.0, -80.0)
 assert abs(t._pn_nos_ugol - 23.0) < 0.3, t._pn_nos_ugol
 # Потолок 45° не поднимается.
 t._pn_nos_ugol = 44.5
@@ -274,8 +276,12 @@ t._pn_nos_tek = 44.5
 now_p = 7000.0
 for _ in range(int(2.0 * t.NOMINAL_FPS)):
     now_p += 1.0 / t.NOMINAL_FPS
-    t._nos_na_kurs(0.0, now_p, 44.5, 18.0, 0.0, now_p, 1.0, 18.0, 200.0)
+    t._nos_na_kurs(0.0, now_p, 44.5, 18.0, 0.0, now_p, 1.0, 8.0, 200.0)
 assert t._pn_nos_ugol <= t.PN_PITCH_ABS_MAX + 1e-6, t._pn_nos_ugol
+# Газ: 0° запаса → уровень линии, 10° → на 100 ШИМ выше. Не от тангажа.
+assert t._gaz_ot_zapasa(8.0) == t.GAZ_NA_LINII + t.GAZ_NA_ZAPAS * t.PN_ZAPAS_DEG
+assert t._gaz_ot_zapasa(26.0) == t.GAZ_NA_LINII
+assert t._gaz_ot_zapasa(30.0) == t._gaz_ot_zapasa(40.0)
 
 print("=== 8b. Газ компенсирует высоту, опора — стик входа ===")
 # Высота стоит — газ на стике входа.
@@ -330,7 +336,7 @@ t._pn_nos_tek = 33.0
 now_b = 7000.0
 for _ in range(int(1.0 * t.NOMINAL_FPS)):
     now_b += 1.0 / t.NOMINAL_FPS
-    t._nos_na_kurs(0.0, now_b, 30.0, 16.0, dy_nizhe, now_b, 1.0, 18.0, 0.0)
+    t._nos_na_kurs(0.0, now_b, 30.0, 16.0, dy_zapas, now_b, 1.0, 18.0, 0.0)
 assert abs(t._pn_nos_tek - 33.0) < 0.5, t._pn_nos_tek
 t._pn_nos_blizko = 3.0
 t._pn_nos_ugol = 44.0
@@ -338,7 +344,7 @@ t._pn_nos_tek = 44.0
 now_c = 8000.0
 for _ in range(10):
     now_c += 1.0 / t.NOMINAL_FPS
-    t._nos_na_kurs(2.0, now_c, 44.0, 16.0, dy_nizhe, now_c, 1.0, 18.0, 0.0)
+    t._nos_na_kurs(2.0, now_c, 44.0, 16.0, dy_zapas, now_c, 1.0, 18.0, 0.0)
 assert t._pn_nos_tek <= t.PN_PITCH_ABS_MAX + 1e-6, t._pn_nos_tek
 t._pn_nos_blizko = 0.0
 
@@ -454,9 +460,9 @@ print("    тангаж %s рыскание %s газ %s крен %s" % (
 assert t.global_pitch_cmd >= 1520, t.global_pitch_cmd
 # Без крена и без цели у края нос не крутим.
 assert abs(t.global_yaw_cmd - 1500) <= 2, t.global_yaw_cmd
-# Без путевой газ остаётся на стике входа. Убавка «линия растёт» снята:
-# на 4910596 она только сажала газ и перелёт не убирала.
-assert abs(t.global_throttle_cmd - 1500) <= 40, t.global_throttle_cmd
+# Пологая линия, запас 10°: газ 1260 + 100, не стик входа и не tau.
+_gaz_zapas = t.GAZ_NA_LINII + t.GAZ_NA_ZAPAS * t.PN_ZAPAS_DEG
+assert abs(t.global_throttle_cmd - _gaz_zapas) <= 15, t.global_throttle_cmd
 for _ in range(6):
     _kadr(pitch=20.0, roll=12.0, dx=0.0)
 print("    крен %s при банке +12, рыскание %s" % (
