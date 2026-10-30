@@ -2200,8 +2200,12 @@ COLLISION_ROLL_MAX = 28.0
 PN_ROLL_HOLD_PX = 4.0
 PN_ROLL_HOLD_DEG = 0.70
 PN_ROLL_HOLD_MAX = 12.0
-PN_ROLL_AZ_DEAD_DPS = 0.4     # ниже — шум курса, не промах
-PN_ROLL_AZ_DEG = 4.0          # ° крена на °/с курса, только в тишине
+PN_ROLL_AZ_DEAD_DPS = 0.25    # ниже — шум курса, не промах (было 0.4)
+PN_ROLL_AZ_DEG = 6.0          # ° крена на °/с курса (было 4.0, только в тишине)
+# Интеграл по скорости азимута: постоянный параллельный снос должен
+# накапливать доворот курса, а не сидеть в мёртвой зоне.
+PN_ROLL_AZ_I = 0.8            # ° банка в секунду на °/с азимута
+PN_ROLL_AZ_I_MAX = 8.0        # потолок накопленного добора, °
 PN_ROLL_AZ_YAW_MAX_DPS = 25.0 # своё рыскание быстрее — az не берём
 PN_ROLL_RATE_DEAD_PX_S = 25.0  # ниже — шум удержания, не бег рамки
 PN_ROLL_RATE_DEG = 0.10        # ° крена на px/с сверх мёртвой зоны
@@ -5049,6 +5053,7 @@ yaw_integral = 0.0
 # Накопленный добор крена (градусы, знак скорости азимута) и крен,
 # к которому стик уже едет. Сбрасываются вместе с интегратором рамки.
 _pn_bank_i = 0.0
+_pn_az_i = 0.0
 _pn_bank_tek = 0.0
 _pn_dx_pred = None
 _pn_dx_t = 0.0
@@ -9008,6 +9013,7 @@ def reset_tracking(to_acq=False):
     pitch_integral = 0.0
     yaw_integral = 0.0
     _pn_bank_i = 0.0
+    _pn_az_i = 0.0
     _pn_bank_tek = 0.0
     _pn_dx_pred = None
     _pn_dx_t = 0.0
@@ -9154,14 +9160,17 @@ def _stolknovenie_pwm(skorost, ts, now, deadband, gain, limit, sign):
 def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k, yaw_rate_dps=None):
     """Стик, который правит курс, а не только держит крестик.
 
-    Вне центра — рамка: сторона и величина, плюс бег. В тишине кадра
-    курс — инерциальная скорость линии (az), пока своё рыскание не
-    быстрее порога: иначе окно az врёт, как на 9e3a760. Вычитать
-    yaw из az нельзя — останется бег крестика. Горизонт, когда тихие
-    положение, бег и курс. Стик в ACRO задаёт скорость; у нужного
+    Основной сигнал — скорость азимута цели в мире (az_rate -> 0).
+    Пиксели в кадре — только trim, и их вес падает, когда курс ещё
+    не выровнен. Раньше az применялся только в «тишине» (|dx|<=4 px):
+    при нулевой ошибке в кадре дрон мог лететь параллельно, потому что
+    пиксельный контур был доволен, а курсовая поправка не включалась.
+
+    Вычитать yaw из az нельзя — останется бег крестика. Горизонт, когда
+    тихие положение, бег и курс. Стик в ACRO задаёт скорость; у нужного
     крена отпускается. Без крена с полётника команда ноль.
     """
-    global _pn_bank_i, _pn_bank_tek, _pn_dx_pred, _pn_dx_t, _pn_dx_rate
+    global _pn_bank_i, _pn_az_i, _pn_bank_tek, _pn_dx_pred, _pn_dx_t, _pn_dx_rate
     if bank_deg is None:
         return 0.0
     dt_s = k / NOMINAL_FPS
@@ -9192,11 +9201,34 @@ def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k, yaw_rate_dps=None):
     az_svezh = (az_ts > 0.0) and ((now - az_ts) <= LOS_RATE_STALE_S)
     yaw_ok = (yaw_rate_dps is None
               or abs(float(yaw_rate_dps)) <= PN_ROLL_AZ_YAW_MAX_DPS)
-    if (tiho and az_svezh and yaw_ok and az is not None
-            and abs(float(az)) > PN_ROLL_AZ_DEAD_DPS):
-        izb_az = float(az) - math.copysign(PN_ROLL_AZ_DEAD_DPS, float(az))
-        az_dob = ROLL_SIGN * izb_az * PN_ROLL_AZ_DEG
-    zhel = ROLL_SIGN * (err * PN_ROLL_HOLD_DEG + _pn_bank_i) + rate_dob + az_dob
+    az_active = False
+    if az_svezh and yaw_ok and az is not None:
+        az_f = float(az)
+        if abs(az_f) > PN_ROLL_AZ_DEAD_DPS:
+            izb_az = az_f - math.copysign(PN_ROLL_AZ_DEAD_DPS, az_f)
+            az_dob = ROLL_SIGN * izb_az * PN_ROLL_AZ_DEG
+            # Интеграл по избытку азимута: постоянный параллельный полёт
+            # должен доворачивать курс, даже если мгновенный rate маленький.
+            _pn_az_i += izb_az * PN_ROLL_AZ_I * dt_s
+            if _pn_az_i > PN_ROLL_AZ_I_MAX:
+                _pn_az_i = PN_ROLL_AZ_I_MAX
+            elif _pn_az_i < -PN_ROLL_AZ_I_MAX:
+                _pn_az_i = -PN_ROLL_AZ_I_MAX
+            az_active = True
+        else:
+            # В мёртвой зоне интеграл медленно сбрасывается.
+            _pn_az_i *= 0.5 ** (dt_s / 2.0)
+    else:
+        _pn_az_i *= 0.5 ** dt_s
+    # Когда курс ещё не выровнен — пиксели не должны перебивать доворот.
+    # Чем сильнее az, тем меньше вес ошибки в кадре.
+    pixel_w = 1.0
+    if az_active and az is not None:
+        az_abs = abs(float(az))
+        # от 1.0 при deadband до ~0.2 при 4 °/с и выше
+        pixel_w = max(0.2, 1.0 - 0.2 * (az_abs - PN_ROLL_AZ_DEAD_DPS))
+    zhel = (ROLL_SIGN * (err * PN_ROLL_HOLD_DEG * pixel_w + _pn_bank_i * pixel_w)
+            + rate_dob + az_dob + ROLL_SIGN * _pn_az_i)
     potolok = PN_ROLL_HOLD_MAX
     if abs(rate) > PN_ROLL_RATE_DEAD_PX_S:
         potolok = PN_ROLL_HOLD_FAST
