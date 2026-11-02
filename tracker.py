@@ -5030,6 +5030,10 @@ _menu_status_t = 0.0
 _menu_ekran = []
 _menu_wifi_kesh = ("", 0.0)
 _menu_wifi_seti = ([], 0.0)
+# Имя текущей ветки и список origin. Меню строится каждый кадр,
+# git из камерного потока на каждом кадре звать нельзя.
+_menu_vetka_kesh = ("", 0.0)
+_menu_vetki_kesh = ([], 0.0)
 _yarkost_shag = 0
 _picam2 = None
 _nastroiki_put = None
@@ -10808,6 +10812,8 @@ def _menu_derevo():
         ]},
         {"imya": "Tools", "deti": [
             {"imya": "Update", "dejstvie": _menu_obnovit},
+            {"imya": "Branch", "deti": _menu_vetki_deti,
+             "get": _menu_vetka_seychas},
             {"imya": "Restart", "dejstvie": _menu_perezapusk},
             {"imya": "Record", "dejstvie": _menu_zapis,
              "get": lambda: "on" if RECORD_FRAMES else "off"},
@@ -10880,22 +10886,17 @@ def _menu_tekushchiy_commit():
     return korotkiy
 
 
-def _menu_obnovit():
-    """Забрать текущую ветку, показать коммит и выйти.
-
-    systemd поднимет службу уже с новым файлом. Паузы нужны, чтобы кадр
-    успел нарисовать каждую строку до перезапуска.
-    """
+def _menu_razbor_obnovleniya(kod, tekst):
+    """Итог obnovit.sh: строка на экран, при успехе коммит и перезапуск."""
     global _menu_ekran
-    if not _menu_mozhno():
-        return "armed"
-    kod, tekst = _menu_skript("obnovit.sh")
     if kod != 0:
         niz = (tekst or "").lower()
         if "timeout" in niz or "сеть недоступна" in niz:
             return "no network"
         if "local changes" in niz or "правили прямо" in niz:
             return "local edits"
+        if "нет такой ветки" in niz or "плохое имя" in niz:
+            return "no branch"
         return "update failed"
     if not _menu_mozhno():
         return "armed"
@@ -10911,6 +10912,144 @@ def _menu_obnovit():
     time.sleep(1.2)
     os.kill(os.getpid(), signal.SIGTERM)
     return "restarting"
+
+
+def _menu_obnovit():
+    """Забрать текущую ветку, показать коммит и выйти.
+
+    systemd поднимет службу уже с новым файлом. Паузы нужны, чтобы кадр
+    успел нарисовать каждую строку до перезапуска.
+    """
+    if not _menu_mozhno():
+        return "armed"
+    kod, tekst = _menu_skript("obnovit.sh")
+    return _menu_razbor_obnovleniya(kod, tekst)
+
+
+def _menu_imya_vetki(imya):
+    """То же правило, что в obnovit.sh: имя уходит в git аргументом."""
+    if not isinstance(imya, str) or not imya or len(imya) > 60:
+        return False
+    if imya[0] in "-." or imya.endswith(".") or imya.endswith("/"):
+        return False
+    if ".." in imya or imya.endswith(".lock"):
+        return False
+    for ch in imya:
+        if not (ch.isalnum() or ch in "._/-"):
+            return False
+    return True
+
+
+def _menu_git(argv, timeout=20):
+    koren = os.path.dirname(os.path.abspath(__file__))
+    try:
+        p = subprocess.run(
+            ["git", "-C", koren, *list(argv)],
+            capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return 1, "timeout"
+    except Exception as exc:
+        return 1, str(exc)
+    out = p.stdout or ""
+    if p.returncode != 0:
+        return p.returncode, out + (p.stderr or "")
+    return 0, out
+
+
+def _menu_vetka_seychas():
+    """Короткое имя текущей ветки. Пусто, если git молчит или HEAD отцеплен."""
+    global _menu_vetka_kesh
+    now = time.monotonic()
+    imya, kogda = _menu_vetka_kesh
+    if kogda and now - kogda < 2.0:
+        return imya
+    kod, tekst = _menu_git(["rev-parse", "--abbrev-ref", "HEAD"], timeout=3)
+    imya = ""
+    if kod == 0:
+        imya = (tekst or "").strip().splitlines()[-1].strip() if tekst.strip() else ""
+    if imya == "HEAD" or not _menu_imya_vetki(imya):
+        imya = ""
+    _menu_vetka_kesh = (imya, now)
+    return imya
+
+
+def _menu_vetki_spisok():
+    """Ветки origin. Кэш на несколько секунд: дерево строится каждый кадр."""
+    global _menu_vetki_kesh
+    now = time.monotonic()
+    spisok, kogda = _menu_vetki_kesh
+    if kogda and now - kogda < 5.0:
+        return list(spisok)
+    kod, tekst = _menu_git(
+        ["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin"],
+        timeout=3)
+    imena = []
+    if kod == 0:
+        for lin in (tekst or "").splitlines():
+            lin = lin.strip()
+            if not lin.startswith("origin/"):
+                continue
+            imya = lin[len("origin/"):]
+            if imya == "HEAD" or not _menu_imya_vetki(imya) or imya in imena:
+                continue
+            imena.append(imya)
+    _menu_vetki_kesh = (imena, now)
+    return imena
+
+
+def _menu_vetki_osvezhit():
+    """Забрать список веток с origin, службу не перезапускать."""
+    global _menu_vetki_kesh, _menu_vetka_kesh
+    if not _menu_mozhno():
+        return "armed"
+    kod, tekst = _menu_git(["fetch", "--prune", "origin"], timeout=40)
+    _menu_vetki_kesh = ([], 0.0)
+    _menu_vetka_kesh = ("", 0.0)
+    if kod != 0:
+        niz = (tekst or "").lower()
+        if ("timeout" in niz or "network" in niz or "unable to access" in niz
+                or "could not resolve" in niz):
+            return "no network"
+        return "fetch failed"
+    return "fetched"
+
+
+def _menu_na_vetku(imya):
+    """Перейти на ветку и обновиться. Правки на борту скрипт не затирает."""
+    if not _menu_mozhno():
+        return "armed"
+    if not _menu_imya_vetki(imya):
+        return "bad branch"
+    kod, tekst = _menu_skript("obnovit.sh", imya, timeout=180)
+    return _menu_razbor_obnovleniya(kod, tekst)
+
+
+def _menu_vetka_vybor(imya):
+    def dejstvie(imya=imya):
+        return _menu_na_vetku(imya)
+    return dejstvie
+
+
+def _menu_vetki_deti():
+    deti = [{"imya": "Refresh", "dejstvie": _menu_vetki_osvezhit}]
+    seychas = _menu_vetka_seychas()
+    imena = _menu_vetki_spisok()
+    if seychas and seychas not in imena:
+        imena = [seychas] + imena
+    else:
+        imena = sorted(imena)
+        if seychas in imena:
+            imena.remove(seychas)
+            imena.insert(0, seychas)
+    for imya in imena:
+        if imya == seychas:
+            # Уже на ней: то же, что Update, без лишнего checkout.
+            deti.append({
+                "imya": imya, "dejstvie": _menu_obnovit, "get": lambda: "on",
+            })
+        else:
+            deti.append({"imya": imya, "dejstvie": _menu_vetka_vybor(imya)})
+    return deti
 
 
 def _menu_ochistit_logi():

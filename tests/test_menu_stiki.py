@@ -87,7 +87,10 @@ assert vybr == ["Tools"], (vybr, t._menu_stroki())
 t._menu_tick(4000.6, stiki(), False)
 t._menu_tick(4000.8, stiki(kren=2000), False)
 imena = [s[0] for s in t._menu_stroki()]
-assert imena == ["Update", "Restart", "Record  off", "Clear logs", "Wi-Fi"], imena
+assert imena[0] == "Update", imena
+assert imena[1].startswith("Branch  "), imena
+assert imena[2:] == [
+    "Restart", "Record  off", "Pilot log  off", "Clear logs", "Wi-Fi"], imena
 vyzovy = []
 t._menu_zapustit(lambda: vyzovy.append(1) or "ok")
 import time as _time
@@ -111,6 +114,76 @@ t.time.sleep = lambda s: None
 assert t._menu_obnovit() == "restarting"
 assert t._menu_ekran == ["updated", "abc1234", "restarting"], t._menu_ekran
 assert ubity, "процесс не перезапускается"
+
+print("\n=== 7b. Branch: список, плохое имя, переход и обновление ===")
+vyzovy_git = []
+
+
+def falsh_git(argv, timeout=20):
+    vyzovy_git.append(list(argv))
+    if list(argv[:2]) == ["rev-parse", "--abbrev-ref"]:
+        return 0, "control-loop\n"
+    if argv and argv[0] == "for-each-ref":
+        return 0, "origin/HEAD\norigin/main\norigin/control-loop\norigin/../x\n"
+    if list(argv[:2]) == ["fetch", "--prune"]:
+        return 0, ""
+    return 1, "no"
+
+
+t._menu_vetka_kesh = ("", 0.0)
+t._menu_vetki_kesh = ([], 0.0)
+t._menu_git = falsh_git
+assert t._menu_vetka_seychas() == "control-loop"
+assert t._menu_vetki_spisok() == ["main", "control-loop"], t._menu_vetki_spisok()
+# Повтор из кэша git не зовёт.
+bylo = len(vyzovy_git)
+assert t._menu_vetki_spisok() == ["main", "control-loop"]
+assert len(vyzovy_git) == bylo
+deti = t._menu_vetki_deti()
+imena_v = [d["imya"] for d in deti]
+assert imena_v == ["Refresh", "control-loop", "main"], imena_v
+assert deti[1]["get"]() == "on"
+assert t._menu_imya_vetki("control-loop")
+assert t._menu_imya_vetki("feature/gaz")
+assert not t._menu_imya_vetki("foo bar")
+assert not t._menu_imya_vetki("-main")
+assert not t._menu_imya_vetki("a..b")
+assert t._menu_na_vetku("foo bar") == "bad branch"
+with t.state_lock:
+    t.app_state["armed"] = True
+assert t._menu_na_vetku("main") == "armed"
+assert t._menu_vetki_osvezhit() == "armed"
+with t.state_lock:
+    t.app_state["armed"] = False
+skript = []
+t._menu_skript = lambda *a, **k: skript.append(a) or (0, "")
+t._menu_ekran = []
+ubity.clear()
+assert t._menu_na_vetku("main") == "restarting"
+assert skript == [("obnovit.sh", "main")], skript
+assert t._menu_ekran == ["updated", "abc1234", "restarting"], t._menu_ekran
+assert ubity
+t._menu_vetki_kesh = (["stale"], t.time.monotonic())
+assert t._menu_vetki_osvezhit() == "fetched"
+assert ["fetch", "--prune", "origin"] in vyzovy_git
+t._menu_skript = lambda *a, **k: (1, "Нет такой ветки: netu\n")
+assert t._menu_na_vetku("main") == "no branch"
+t._menu_skript = lambda *a, **k: (1, "Файлы правили прямо на борту\n")
+assert t._menu_na_vetku("main") == "local edits"
+t._menu_skript = lambda *a, **k: (1, "НЕ ВЫШЛО. Сеть недоступна\n")
+assert t._menu_na_vetku("main") == "no network"
+
+print("\n=== 7c. Плохое имя ветки не доходит до fetch ===")
+import subprocess as _sp
+sk = os.path.join(_ROOT, "obnovit.sh")
+ploh = _sp.run(["bash", sk, "foo bar"], capture_output=True, text=True, timeout=10)
+assert ploh.returncode != 0, ploh.returncode
+assert "Забираю" not in ploh.stdout, ploh.stdout
+assert "Плохое имя" in ploh.stdout, ploh.stdout
+fl = _sp.run(["bash", sk, "-main"], capture_output=True, text=True, timeout=10)
+assert fl.returncode != 0 and "Забираю" not in fl.stdout
+tochki = _sp.run(["bash", sk, "a..b"], capture_output=True, text=True, timeout=10)
+assert tochki.returncode != 0 and "Забираю" not in tochki.stdout
 
 print("\n=== 8. Restart и Record ===")
 t._menu_ekran = []

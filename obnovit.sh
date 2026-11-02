@@ -14,6 +14,25 @@ set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$DIR"
 
+# Имя ветки с пульта. Пусто — остаёмся на текущей и только перематываем.
+# Буквы, цифры, точка, подчёркивание, дефис и слэш между частями.
+# Никаких «..», флагов и хвостовой точки: это уходит в git как аргумент.
+_imya_godno() {
+    local imya="$1"
+    [ -n "$imya" ] || return 1
+    [ "${#imya}" -le 60 ] || return 1
+    printf '%s' "$imya" | grep -Eq '^[A-Za-z0-9._/-]+$' || return 1
+    case "$imya" in
+        -*|.*|*.|*/|*/.|*..*|*.lock) return 1 ;;
+    esac
+    return 0
+}
+IMYA="${1:-}"
+if [ -n "$IMYA" ] && ! _imya_godno "$IMYA"; then
+    echo "    Плохое имя ветки."
+    exit 1
+fi
+
 echo "==> Забираю код"
 # Замок остаётся, если git убили посередине (меню, обрыв ssh, пропажа
 # питания). Пока файл лежит, любая команда git падает, и это не порча
@@ -30,13 +49,39 @@ _snyat_zamok() {
     echo "    снимаю застрявший замок git"
     rm -f "$lock"
 }
+# Без вопроса в терминал: меню ждёт не дольше своего таймаута.
+export GIT_TERMINAL_PROMPT=0
 if ! _snyat_zamok; then
     exit 1
 fi
-if ! git fetch origin; then
+if ! git fetch --prune origin; then
     echo "    НЕ ВЫШЛО. Сеть недоступна либо репозиторий повреждён."
     echo "    Если повреждён — ./pochinit.sh"
     exit 1
+fi
+if [ -n "$IMYA" ]; then
+    if ! git rev-parse --verify --quiet "refs/remotes/origin/${IMYA}" >/dev/null; then
+        echo "    Нет такой ветки: ${IMYA}"
+        exit 1
+    fi
+    TEK="$(git rev-parse --abbrev-ref HEAD)"
+    if [ "$TEK" != "$IMYA" ]; then
+        echo "==> Перехожу на ${IMYA}"
+        PEREHOD=""
+        if git show-ref --verify --quiet "refs/heads/${IMYA}"; then
+            PEREHOD="$(git checkout "$IMYA" 2>&1)" || {
+                echo "$PEREHOD" | sed 's/^/    /'
+                echo "    Файлы правили прямо на борту. Смена ветки их затёрла бы."
+                exit 1
+            }
+        else
+            PEREHOD="$(git checkout -b "$IMYA" --track "origin/${IMYA}" 2>&1)" || {
+                echo "$PEREHOD" | sed 's/^/    /'
+                echo "    Файлы правили прямо на борту. Смена ветки их затёрла бы."
+                exit 1
+            }
+        fi
+    fi
 fi
 VETKA="$(git rev-parse --abbrev-ref HEAD)"
 VYVOD="$(git merge --ff-only "origin/${VETKA}" 2>&1)"
