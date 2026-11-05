@@ -2269,6 +2269,31 @@ GAZ_PERELET_PWM = 40.0         # убавка на перелёте, если н
 YAW_S_BANK = 0.5               # 8° банка — 4 ШИМ, в полосе чистых заходов
 YAW_BANK_QUIET_DEG = 3.0
 YAW_BANK_PWM_MAX = 8.0
+# Ручки, которые пилот крутит с земли: промахнулся, сел, сдвинул, взлетел.
+# Имена в меню короткие, в файл и в итог захода пишется имя константы.
+# Заводское значение снимается ЗДЕСЬ, до local_settings: Reset к нему и
+# возвращает, а не к тому, что уже лежит на борту.
+_MENU_AIM = (
+    ("Bank px", "PN_ROLL_HOLD_DEG", 0.2, 2.0, 0.1, "%.2f",
+     "more = harder bank"),
+    ("Bank max", "PN_ROLL_HOLD_MAX", 4.0, 24.0, 1.0, "%.0f",
+     "bank ceiling, deg"),
+    ("Bank run", "PN_ROLL_HOLD_FAST", 8.0, 28.0, 1.0, "%.0f",
+     "ceiling while target runs"),
+    ("Yaw trim", "YAW_S_BANK", 0.0, 1.5, 0.05, "%.2f",
+     "PWM per deg of bank"),
+    ("Nose dps", "PN_NOS_NIZHE_DPS", 0.5, 12.0, 0.5, "%.1f",
+     "faster nose down"),
+    ("Aim low", "PN_AIM_NIZHE_DEG", 0.0, 8.0, 0.5, "%.1f",
+     "deg, target above center"),
+    ("Nose trim", "PN_NOS_TRIM_DPS", 0.0, 6.0, 0.5, "%.1f",
+     "climb adds nose"),
+    ("Gas add", "GAZ_VARIO_PWM_PER_MPS", 0.0, 120.0, 5.0, "%.0f",
+     "PWM per m/s of sink"),
+    ("Gas cut", "GAZ_PERELET_PWM", 0.0, 120.0, 10.0, "%.0f",
+     "overshoot cuts throttle"),
+)
+_MENU_AIM_BAZA = {r[1]: globals()[r[1]] for r in _MENU_AIM}
 # Газ держит снижение = высота / время до цели, вокруг висения.
 # 40 м и 10 с — это 4 м/с вниз. Выше висения этот закон не поднимает:
 # набор уносит заход. Ниже висения не больше чем на 120 ШИМ, иначе
@@ -4536,6 +4561,10 @@ class LockLogger:
             self._hvost.clear()
             self._state_counts.clear()
             self.active = True
+            try:
+                self.event("AIM " + _aim_tekst())
+            except Exception:
+                pass
             # Условия захода известны ПРЯМО СЕЙЧАС — записываем их немедленно,
             # не дожидаясь конца. Прерывается всегда последний заход (сняли
             # питание, перезапустили службу), и именно его условия ценнее
@@ -4646,6 +4675,10 @@ class LockLogger:
                         % ("да, спутников %s" % gps_sats if gps_fix
                            else "НЕТ — разбор пойдёт по высоте и бегу земли"))
                 f.write("  код: %s\n" % _VERSIYA_PRI_STARTE)
+                try:
+                    f.write("подкрутка: %s\n" % _aim_tekst())
+                except Exception:
+                    pass
         except Exception:
             pass
         finally:
@@ -10796,6 +10829,84 @@ def _menu_svet():
     return tekst
 
 
+def _aim_tekst():
+    """Одна строка текущих ручек. Пишется в итог захода и в события лока."""
+    chasti = []
+    for _imya, glob, _a, _b, _c, fmt, _d in _MENU_AIM:
+        chasti.append("%s=%s" % (glob, fmt % globals()[glob]))
+    return " ".join(chasti)
+
+
+def _menu_aim_postavit(imya, znach, mini, maxi, shag, fmt):
+    """Поставить ручку в границы и на сетку шага. Файл переживёт перезапуск."""
+    znach = float(znach)
+    if znach < mini:
+        znach = float(mini)
+    elif znach > maxi:
+        znach = float(maxi)
+    n = int(round((znach - mini) / float(shag)))
+    znach = float(mini) + n * float(shag)
+    if znach < mini:
+        znach = float(mini)
+    elif znach > maxi:
+        znach = float(maxi)
+    if shag >= 1.0:
+        znach = float(int(round(znach)))
+    else:
+        znakov = 0
+        s = float(shag)
+        while s < 0.999 and znakov < 4:
+            s *= 10.0
+            znakov += 1
+        znach = round(znach, znakov)
+    globals()[imya] = znach
+    tekst = fmt % znach
+    try:
+        _sohranit_nastroiku(imya, tekst)
+    except Exception:
+        pass
+    try:
+        flight_log.event("НАСТРОЙКА %s = %s" % (imya, tekst))
+    except Exception:
+        pass
+
+
+def _menu_aim_setter(imya, mini, maxi, shag, fmt):
+    def zapis(znach, imya=imya, mini=mini, maxi=maxi, shag=shag, fmt=fmt):
+        _menu_aim_postavit(imya, znach, mini, maxi, shag, fmt)
+    return zapis
+
+
+def _menu_aim_deti():
+    deti = []
+    for imya, glob, mini, maxi, shag, fmt, podskaz in _MENU_AIM:
+        deti.append({
+            "imya": imya, "min": mini, "max": maxi, "shag": shag,
+            "fmt": fmt, "podskaz": podskaz,
+            "get": lambda g=glob: globals()[g],
+            "set": _menu_aim_setter(glob, mini, maxi, shag, fmt),
+        })
+    deti.append({"imya": "Reset", "dejstvie": _menu_aim_sbros})
+    return deti
+
+
+def _menu_aim_sbros():
+    """Заводские ручки. То, что пилот накрутил на этом борту, стирается."""
+    if not _menu_mozhno():
+        return "armed"
+    for imya, glob, mini, maxi, shag, fmt, _podskaz in _MENU_AIM:
+        _menu_aim_postavit(glob, _MENU_AIM_BAZA[glob], mini, maxi, shag, fmt)
+    return "reset"
+
+
+def _menu_podskazka(tekst):
+    """Одна строка подсказки. Новая заменяет старые, а не копится."""
+    global _menu_status, _menu_status_t, _menu_ekran
+    _menu_ekran = [str(tekst)]
+    _menu_status = str(tekst)
+    _menu_status_t = time.monotonic()
+
+
 def _menu_derevo():
     return [
         {"imya": "Throttle", "deti": [
@@ -10822,6 +10933,7 @@ def _menu_derevo():
             {"imya": "Clear logs", "dejstvie": _menu_ochistit_logi},
             {"imya": "Wi-Fi", "deti": _menu_wifi_deti},
         ]},
+        {"imya": "Aim", "deti": _menu_aim_deti},
     ]
 
 
@@ -11502,6 +11614,8 @@ def _menu_tick(now, kanaly, armed):
             if tek is None:
                 tek = 1400
             punkt["set"](float(tek) + shagov * punkt["shag"])
+            if punkt.get("podskaz"):
+                _menu_podskazka(punkt["podskaz"])
         if shag_kren < 0:
             _menu_pravka = False
             _menu_derzh_z = 0
@@ -11528,6 +11642,8 @@ def _menu_tick(now, kanaly, armed):
             if punkt["get"]() is None:
                 punkt["set"](1400)
             _menu_pravka = True
+            if punkt.get("podskaz"):
+                _menu_podskazka(punkt["podskaz"])
         elif punkt.get("dejstvie"):
             _menu_zapustit(punkt["dejstvie"])
         _menu_derzh_z = 0
@@ -11557,9 +11673,12 @@ def _menu_stroki():
             zn = p["get"]()
             if isinstance(zn, str):
                 tekst = "%s  %s" % (p["imya"], zn)
+            elif zn is None:
+                tekst = "%s  none" % p["imya"]
+            elif p.get("fmt"):
+                tekst = "%s  %s" % (p["imya"], p["fmt"] % float(zn))
             else:
-                tekst = "%s  %s" % (
-                    p["imya"], "none" if zn is None else "%d" % int(zn))
+                tekst = "%s  %d" % (p["imya"], int(zn))
         out.append((tekst, i == _menu_kursor, _menu_pravka and i == _menu_kursor))
     return out
 

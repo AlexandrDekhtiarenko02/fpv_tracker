@@ -369,4 +369,45 @@ polosa = pustoj[70:140, 500:700]
 krasnyj = (polosa[:, :, 2] > 180) & (polosa[:, :, 1] < 80)
 assert krasnyj.any()
 
+print("\n=== 15. Aim: шаг пишется в закон и в файл, Reset возвращает ===")
+sbros()
+t._nastroiki_put = put
+baza_bank = t.PN_ROLL_HOLD_DEG
+t._menu_tick(7000.0, stiki(gaz=2000, tang=2000), False)
+t._menu_tick(7000.2, stiki(), False)
+for t0 in (7000.4, 7000.8, 7001.2):
+    t._menu_tick(t0, stiki(tang=1000), False)
+    t._menu_tick(t0 + 0.2, stiki(), False)
+vybr = [s[0] for s in t._menu_stroki() if s[1]]
+assert vybr == ["Aim"], (vybr, t._menu_stroki())
+t._menu_tick(7001.6, stiki(), False)
+t._menu_tick(7001.8, stiki(kren=2000), False)
+stroka = [s[0] for s in t._menu_stroki() if s[1]][0]
+assert stroka.startswith("Bank px  0.70"), stroka
+t._menu_tick(7002.0, stiki(), False)
+t._menu_tick(7002.2, stiki(kren=2000), False)
+assert t._menu_pravka
+assert "harder bank" in t._menu_status, t._menu_status
+t._menu_tick(7002.4, stiki(), False)
+t._menu_tick(7002.6, stiki(tang=2000), False)
+assert abs(t.PN_ROLL_HOLD_DEG - (baza_bank + 0.1)) < 1e-6, t.PN_ROLL_HOLD_DEG
+tekst = open(put, encoding="utf-8").read()
+assert "PN_ROLL_HOLD_DEG = 0.80" in tekst, tekst
+assert "PN_ROLL_HOLD_DEG=0.80" in t._aim_tekst(), t._aim_tekst()
+t.PN_ROLL_HOLD_DEG = 2.0
+t._menu_tick(7002.8, stiki(), False)
+t._menu_tick(7003.0, stiki(tang=2000), False)
+assert t.PN_ROLL_HOLD_DEG == 2.0, t.PN_ROLL_HOLD_DEG
+assert t._menu_aim_sbros() == "reset"
+assert abs(t.PN_ROLL_HOLD_DEG - baza_bank) < 1e-9, t.PN_ROLL_HOLD_DEG
+assert "PN_ROLL_HOLD_DEG = 0.70" in open(put, encoding="utf-8").read()
+with t.state_lock:
+    t.app_state["armed"] = True
+t.PN_ROLL_HOLD_DEG = 1.0
+assert t._menu_aim_sbros() == "armed"
+assert t.PN_ROLL_HOLD_DEG == 1.0
+t.PN_ROLL_HOLD_DEG = baza_bank
+with t.state_lock:
+    t.app_state["armed"] = False
+
 print("\nOK: меню на земле, висение пишется")
