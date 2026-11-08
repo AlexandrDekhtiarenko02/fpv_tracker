@@ -197,19 +197,23 @@ assert uroven < 0.0, uroven
 assert t._kren_k_gorizontu(0.0, 0.0) == 0.0
 assert t._kren_k_gorizontu(100.0, None) == 20.0
 
-print("=== 8. Тангаж: запас ниже цели по крутизне линии, не по скорости ===")
+print("=== 8. Тангаж: запас из режима захвата, не из угла линии ===")
 t._pn_nos_i = 0.0
 t._pn_nos_tek = None
 t._pn_nos_ugol = None
 t._pn_nos_blizko = 0.0
-# Пологая линия, цель в центре: нос опускается на запас ~10°.
+t._pn_rezhim = "speed"
+# Режим скорости, цель в центре: нос опускается на запас.
 t._pn_nos_ugol = None
 t._pn_nos_tek = None
 pwm_n = t._nos_na_kurs(0.0, now, 10.0, 10.0, 0.0, now, 1.0, 8.0)
 assert pwm_n > 0.0, pwm_n
-assert t._zapas_nosa(8.0) == t.PN_ZAPAS_DEG
-assert t._zapas_nosa(24.0) == 0.0
-assert t._zapas_nosa(21.0) == t.PN_ZAPAS_DEG * 0.5
+assert t._zapas_nosa() == t.PN_ZAPAS_DEG
+assert t._vybrat_rezhim(8.0, 200.0) == "speed"
+assert t._vybrat_rezhim(14.0, 300.0) == "speed"
+assert t._vybrat_rezhim(26.0, 150.0) == "line"
+assert t._konec_zahoda(50.0, 20.0, None, 0, None)
+assert not t._konec_zahoda(150.0, 60.0, None, 0, None)
 # Запас набран, высота стоит: стик отпущен.
 dpp = t.CAMERA_VFOV_DEG / float(t.MAIN_H)
 dy_zapas = -t.PN_ZAPAS_DEG / dpp
@@ -224,12 +228,13 @@ t._pn_nos_tek = 30.0
 otp = t._nos_na_kurs(0.0, now, 27.0, 18.0, dy_zapas, now, 1.0, 8.0, 0.0)
 assert otp == 0.0, otp
 assert abs(t._pn_nos_ugol - 27.0) < 1e-6, t._pn_nos_ugol
-# Крутая линия, цель в центре: запас ноль, вниз не дожимаем.
+# Режим линии, цель в центре: запас ноль, вниз не дожимаем.
+t._pn_rezhim = "line"
 t._pn_nos_ugol = None
 t._pn_nos_tek = 32.0
 krut = t._nos_na_kurs(0.0, now, 32.0, 18.0, 0.0, now, 1.0, 26.0, 0.0)
 assert abs(krut) < 8.0, krut
-# Крутая линия и снижение: нос не клюём к 45°.
+# Режим линии и снижение: нос не клюём к 45°.
 t._pn_nos_ugol = 18.0
 t._pn_nos_tek = 18.0
 now_cl = 3500.0
@@ -238,6 +243,7 @@ for _ in range(int(2.0 * t.NOMINAL_FPS)):
     t._nos_na_kurs(0.0, now_cl, 18.0, 18.0, 0.0, now_cl, 1.0, 26.0, -400.0)
 assert t._pn_nos_ugol <= 18.0 + 1e-6, t._pn_nos_ugol
 # Всплеск скорости линии нос не клюёт, запас уже набран.
+t._pn_rezhim = "speed"
 t._pn_nos_ugol = 23.0
 t._pn_nos_tek = 23.0
 now_v = 4000.0
@@ -245,7 +251,7 @@ for _ in range(int(1.5 * t.NOMINAL_FPS)):
     now_v += 1.0 / t.NOMINAL_FPS
     t._nos_na_kurs(6.0, now_v, 23.0, 18.0, dy_zapas, now_v, 1.0, 8.0, 0.0)
 assert abs(t._pn_nos_ugol - 23.0) < 0.3, t._pn_nos_ugol
-# Подымается на пологой линии — носа мало, угол растёт.
+# Подымается в режиме скорости — носа мало, угол растёт.
 t._pn_nos_ugol = 23.0
 t._pn_nos_tek = 23.0
 now_c = 5000.0
@@ -278,10 +284,16 @@ for _ in range(int(2.0 * t.NOMINAL_FPS)):
     now_p += 1.0 / t.NOMINAL_FPS
     t._nos_na_kurs(0.0, now_p, 44.5, 18.0, 0.0, now_p, 1.0, 8.0, 200.0)
 assert t._pn_nos_ugol <= t.PN_PITCH_ABS_MAX + 1e-6, t._pn_nos_ugol
-# Газ: 0° запаса → уровень линии, 10° → на 100 ШИМ выше. Не от тангажа.
-assert t._gaz_ot_zapasa(8.0) == t.GAZ_NA_LINII + t.GAZ_NA_ZAPAS * t.PN_ZAPAS_DEG
-assert t._gaz_ot_zapasa(26.0) == t.GAZ_NA_LINII
-assert t._gaz_ot_zapasa(30.0) == t._gaz_ot_zapasa(40.0)
+# Газ от фактического запаса. Нос на запасе — уровень дальнего.
+# Нос на цели — уровень линии. Выше запаса режима не добавляем.
+assert t._gaz_ot_zapasa(t.PN_ZAPAS_DEG) == t.GAZ_NA_LINII + t.GAZ_NA_ZAPAS * t.PN_ZAPAS_DEG
+t._pn_rezhim = "line"
+assert t._gaz_ot_zapasa(9.0) == t.GAZ_NA_LINII
+t._pn_rezhim = "speed"
+assert t._gaz_ot_zapasa(0.0) == t.GAZ_NA_LINII
+assert t._gaz_ot_zapasa(20.0) == t.GAZ_NA_LINII + t.GAZ_NA_ZAPAS * t.PN_ZAPAS_DEG
+assert t._gaz_ot_zapasa(5.0, hover=1400) == 1400.0 + t.GAZ_NA_ZAPAS * 5.0
+t._pn_rezhim = "speed"
 
 print("=== 8b. Газ компенсирует высоту, опора — стик входа ===")
 # Высота стоит — газ на стике входа.
@@ -460,9 +472,10 @@ print("    тангаж %s рыскание %s газ %s крен %s" % (
 assert t.global_pitch_cmd >= 1520, t.global_pitch_cmd
 # Без крена и без цели у края нос не крутим.
 assert abs(t.global_yaw_cmd - 1500) <= 2, t.global_yaw_cmd
-# Пологая линия, запас 10°: газ 1260 + 100, не стик входа и не tau.
-_gaz_zapas = t.GAZ_NA_LINII + t.GAZ_NA_ZAPAS * t.PN_ZAPAS_DEG
-assert abs(t.global_throttle_cmd - _gaz_zapas) <= 15, t.global_throttle_cmd
+# Режим скорости выбран по пологой линии. Цель в центре — фактический
+# запас ноль, газ на висении, не на желаемых 9°.
+assert t._pn_rezhim == "speed", t._pn_rezhim
+assert abs(t.global_throttle_cmd - 1500) <= 15, t.global_throttle_cmd
 for _ in range(6):
     _kadr(pitch=20.0, roll=12.0, dx=0.0)
 print("    крен %s при банке +12, рыскание %s" % (
@@ -481,8 +494,8 @@ def _podmena_blizko(*a, **kw):
     return out
 
 
-# Близко и перелёт (цель ниже центра), высота стоит: газ можно убавить,
-# и нос чуть помогает, чтобы не вышло дуги. Путевую не слушаем.
+# Близко, но режим уже выбран и конец ещё не наступил (80 м, 40 м):
+# добор носа по старому газу снят, режим не прыгает от угла линии.
 t._estimate_closure = _podmena_blizko
 t.ground_speed_mps = 10.0
 tek_do = t._pn_nos_tek
@@ -490,9 +503,10 @@ for _ in range(45):
     _kadr(pitch=20.0, roll=0.0, dx=0.0, vario=0, dy=60.0)
 print("    близко нос %.2f (было %.2f), добавка %.2f, газ %s" % (
     t._pn_nos_tek, tek_do, t._pn_nos_blizko, t.global_throttle_cmd))
-assert t._pn_nos_blizko > 0.5, t._pn_nos_blizko
+assert t._pn_nos_blizko == 0.0, t._pn_nos_blizko
+assert t._pn_rezhim == "speed", t._pn_rezhim
 assert t._pn_nos_tek <= t.PN_PITCH_ABS_MAX
-assert t.global_throttle_cmd < 1500, t.global_throttle_cmd
+assert abs(t.global_throttle_cmd - 1500) <= 15, t.global_throttle_cmd
 t.ground_speed_mps = None
 t.time.monotonic = _vremya
 t._estimate_closure = _zamena

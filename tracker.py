@@ -2201,7 +2201,7 @@ PN_ROLL_HOLD_PX = 4.0
 PN_ROLL_HOLD_DEG = 0.70
 PN_ROLL_HOLD_MAX = 12.0
 PN_ROLL_AZ_DEAD_DPS = 1.0     # эталон: |az| до 1 °/с пилот не трогает
-PN_ROLL_AZ_DEG = 6.0          # ° крена на °/с курса (было 4.0, только в тишине)
+PN_ROLL_AZ_DEG = 2.5          # ° крена на °/с курса. Эталон: пилот на 1–2 °/с стик почти не кладёт
 # Интеграл по скорости азимута: постоянный параллельный снос должен
 # накапливать доворот курса, а не сидеть в мёртвой зоне.
 PN_ROLL_AZ_I = 0.8            # ° банка в секунду на °/с азимута
@@ -2218,15 +2218,19 @@ PN_ROLL_I_HALF_S = 4.0
 PN_ROLL_PWM_PER_DEG = 6.0
 PN_ROLL_PWM_MAX = 110.0
 # Нос ниже цели — ради скорости, не ради выравнивания вектора.
-# На пологой линии запас около 10° (дальний эталон), газ выше.
-# От 18° до 24° угла линии запас уходит в ноль: вблизи нос на цели,
-# хотя сам тангаж большой. Газ идёт за запасом, не за тангажем,
+# Режим выбирается на захвате и держится: на дальнем эталоне запас
+# ~9° при любом угле линии, на ближнем нос на цели. Мгновенный угол
+# линии режим не переключает — дальний заход с линии 23° всё равно
+# набирал запас. Снимается скорость только когда реально близко.
+# Газ идёт за фактическим запасом, не за тангажем и не за желаемым:
 # иначе в конце тяга растёт вместе с углом и выходит перелёт.
-# Скорость линии нос не добирает: на перелёте она как раз растёт.
-PN_ZAPAS_DEG = 10.0            # нос ниже цели на пологой линии
-PN_ZAPAS_OFF_DEP = 18.0        # отсюда запас убывает
-PN_ZAPAS_GONE_DEP = 24.0       # крутая линия: запаса нет
+PN_ZAPAS_DEG = 9.0             # нос ниже цели в режиме скорости
 PN_ZAPAS_POL_DEG = 1.0         # ближе этого к запасу — картинка уже та
+PN_REZHIM_DEP = 20.0           # на захвате положе — режим скорости
+PN_REZHIM_RANGE_M = 220.0      # на захвате дальше — режим скорости
+PN_KONEC_RANGE_M = 70.0        # ближе этого и низко — скорость снята
+PN_KONEC_ALT_M = 25.0
+PN_KONEC_TAU_S = 4.0           # надёжное время до контакта короче — конец
 PN_AIM_NIZHE_DEG = 2.0         # старый порог газа по линии, нос его не держит
 PN_AIM_KRUTO_DEG = 12.0
 PN_AIM_STEEP_DEG = 30.0
@@ -2243,10 +2247,11 @@ PN_PITCH_I_DEG_PER_S = 0.6
 PN_PITCH_I_MAX = 4.0
 PN_PITCH_PWM_PER_DEG = 8.0
 PN_PITCH_PWM_MAX = 80.0
-# Газ за запасом под целью. Ноль запаса — уровень близкого эталона.
-# 10° запаса — около 1360, как на дальнем. Абсолютный тангаж сюда не входит.
+# Газ за фактическим запасом под целью. Ноль запаса — уровень ближнего
+# эталона. 9° — около 1350, как на дальнем. Абсолютный тангаж сюда не входит.
+# Пол — висение, если оно известно и выше: ниже висения заход садится.
 GAZ_NA_LINII = 1260.0
-GAZ_NA_ZAPAS = 10.0            # ШИМ на градус запаса
+GAZ_NA_ZAPAS = 10.0            # ШИМ на градус фактического запаса
 # Близко к цели сброс газа без носа — дуга. На z08 logs-24 газ ушёл
 # 1413→1333 около 100 м, стик тангажа остался в центре. Несколько градусов
 # вниз вместе со сбросом, не новый клевок и не подъём потолка 45°.
@@ -5061,6 +5066,9 @@ _pn_nos_i = 0.0
 _pn_nos_tek = None
 _pn_nos_blizko = 0.0
 _pn_nos_ugol = None
+# Режим запаса на этот захват: None пока нет геометрии захвата,
+# "speed" — нос ниже цели, "line" — нос на цели. Выбирается один раз.
+_pn_rezhim = None
 
 # Сглаженное значение fc_pitch_deg для расчёта компенсации тангажа.
 smoothed_pitch_deg = 0.0
@@ -8903,7 +8911,7 @@ def reset_tracking(to_acq=False):
     global smooth_throttle_out, throttle_integral, prev_ady
     global roll_integral, pitch_integral, yaw_integral
     global _pn_bank_i, _pn_bank_tek, _pn_dx_pred, _pn_dx_t, _pn_dx_rate
-    global _pn_nos_i, _pn_nos_tek, _pn_nos_blizko, _pn_nos_ugol
+    global _pn_nos_i, _pn_nos_tek, _pn_nos_blizko, _pn_nos_ugol, _pn_rezhim
     global smoothed_pitch_deg
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
@@ -9020,6 +9028,8 @@ def reset_tracking(to_acq=False):
     _pn_nos_i = 0.0
     _pn_nos_tek = None
     _pn_nos_blizko = 0.0
+    _pn_nos_ugol = None
+    _pn_rezhim = None
 
     smoothed_pitch_deg = 0.0
 
@@ -9352,31 +9362,68 @@ def _tau_zakrytie_godno(tau_s, ubyv, n_tochek):
     return True
 
 
-def _zapas_nosa(depression_deg):
-    """На сколько градусов нос ниже цели. Это скорость, не курс.
+def _vybrat_rezhim(depression_deg, range_m):
+    """Режим запаса на захват. Один раз, по геометрии захвата.
 
-    Пологая линия — полный запас. Между порогами он тает. Крутая
-    линия — ноль: нос на цели, даже если тангаж уже большой.
-    Угла линии нет — запас не выдумываем.
+    Пологая линия или большая дальность — скорость: нос ниже цели.
+    Крутая и близкая — нос на цели. Чего нет, то не решает.
     """
-    if depression_deg is None:
-        return 0.0
-    dep = float(depression_deg)
-    if dep <= PN_ZAPAS_OFF_DEP:
+    dep = None if depression_deg is None else float(depression_deg)
+    dal = None if range_m is None else float(range_m)
+    if dep is not None and dep < PN_REZHIM_DEP:
+        return "speed"
+    if dal is not None and dal > PN_REZHIM_RANGE_M:
+        return "speed"
+    if dep is not None and dep >= PN_REZHIM_DEP and (dal is None or dal <= PN_REZHIM_RANGE_M):
+        return "line"
+    return None
+
+
+def _konec_zahoda(range_m, alt_m, tau_s, n_tau, tau_sigma):
+    """Скорость снимается, только когда реально близко.
+
+    Угол линии сюда не входит: на дальнем эталоне линия доходила до 30°,
+    а запас пилот держал. Конец — короткая дальность при малой высоте
+    или надёжное время до контакта короче порога финала.
+    """
+    if (range_m is not None and alt_m is not None
+            and float(range_m) < PN_KONEC_RANGE_M
+            and float(alt_m) < PN_KONEC_ALT_M):
+        return True
+    if (tau_s is not None and float(tau_s) < PN_KONEC_TAU_S
+            and _tau_nadyozhen(tau_s, n_tau, tau_sigma)):
+        return True
+    return False
+
+
+def _zapas_nosa():
+    """Сколько градусов нос ниже цели в текущем режиме.
+
+    Режим выбирается на захвате и держится. Пока геометрии нет —
+    запас не выдумываем. Конец захода снимает скорость.
+    """
+    if _pn_rezhim == "speed":
         return PN_ZAPAS_DEG
-    if dep >= PN_ZAPAS_GONE_DEP:
-        return 0.0
-    dolya = (PN_ZAPAS_GONE_DEP - dep) / (PN_ZAPAS_GONE_DEP - PN_ZAPAS_OFF_DEP)
-    return PN_ZAPAS_DEG * dolya
+    return 0.0
 
 
-def _gaz_ot_zapasa(depression_deg):
-    """Газ от запаса под целью, не от тангажа и не от времени до контакта.
+def _gaz_ot_zapasa(aim_below, hover=None):
+    """Газ от фактического запаса под целью, не от тангажа и не от желаемого.
 
-    Ноль запаса — уровень близкого эталона. Десять градусов — уровень
-    дальнего. В конце запас снят, тяга падает, хотя нос ещё крутой.
+    Нос ещё не опустился — газ на уровне линии. Сел на запас режима —
+    уровень дальнего эталона. Выше запаса режима не добавляем: лишний
+    нос в конце не должен разгонять тягу. Пол — висение, если известно.
     """
-    return GAZ_NA_LINII + GAZ_NA_ZAPAS * _zapas_nosa(depression_deg)
+    zapas = _zapas_nosa()
+    aim = 0.0 if aim_below is None else float(aim_below)
+    if aim < 0.0:
+        aim = 0.0
+    if aim > zapas:
+        aim = zapas
+    base = GAZ_NA_LINII
+    if hover is not None and float(hover) > base:
+        base = float(hover)
+    return base + GAZ_NA_ZAPAS * aim
 
 
 def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k,
@@ -9384,14 +9431,13 @@ def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k,
                  vozrast_s=None):
     """Стик тангажа: поставил угол — отпустил. Acro держит.
 
-    Запас ниже цели задаёт скорость и зависит от крутизны линии.
-    Угол пойман — стик в центр. Подымаемся на пологой линии — носа мало.
-    Снижаемся глубже запаса — нос лишний. На крутой линии запас ноль,
-    добирать нечего. Скорость линии и пол глисады сюда не входят:
-    оба добирали нос там, где в конце как раз нужен сброс.
+    Запас ниже цели задаёт скорость и берётся из режима захвата,
+    не из текущего угла линии. Угол пойман — стик в центр.
+    Подымаемся в режиме скорости — носа мало. Снижаемся глубже
+    запаса — нос лишний. На линии запас ноль, добирать нечего.
     """
     global _pn_nos_i, _pn_nos_tek, _pn_nos_ugol
-    del los, los_ts, pitch_lock, min_ugol, vozrast_s
+    del los, los_ts, pitch_lock, min_ugol, vozrast_s, depression_deg
     if pitch_deg is None:
         return 0.0
     pitch_deg = float(pitch_deg)
@@ -9401,7 +9447,7 @@ def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k,
         _pn_nos_tek = pitch_deg
     dpp = CAMERA_VFOV_DEG / float(MAIN_H)
     aim_below = 0.0 if dy_px is None else -float(dy_px) * dpp
-    zapas = _zapas_nosa(depression_deg)
+    zapas = _zapas_nosa()
     dt_s = k / NOMINAL_FPS
     vysota_ok = (vario_cms is None
                  or abs(float(vario_cms)) <= PN_VARIO_DEAD_CMS)
@@ -11625,7 +11671,7 @@ def _update_control_from_target_impl():
     global _hover_pwm, _thr_geom_out, _geom_mode_log, _gaz_vhod
     global roll_integral, pitch_integral, yaw_integral
     global _pn_bank_i, _pn_bank_tek, _pn_dx_pred, _pn_dx_t, _pn_dx_rate
-    global _pn_nos_i, _pn_nos_tek, _pn_nos_blizko, _pn_nos_ugol
+    global _pn_nos_i, _pn_nos_tek, _pn_nos_blizko, _pn_nos_ugol, _pn_rezhim
     global smoothed_pitch_deg
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
@@ -11832,6 +11878,7 @@ def _update_control_from_target_impl():
         _pn_nos_tek = None
         _pn_nos_blizko = 0.0
         _pn_nos_ugol = None
+        _pn_rezhim = None
         # SHADOW-состояние — своё, отдельное от live-интеграторов выше, но
         # сбрасывается по тому же событию (новый/потерянный захват): иначе
         # диагностика windup тянула бы накопление прошлой цели в новую.
@@ -12605,14 +12652,24 @@ def _update_control_from_target_impl():
         _aim_bl = -(box_cy - CENTER_Y) * CAMERA_VFOV_DEG / float(MAIN_H)
         _age_bl = (None if _tracked_since_t is None
                    else now_mono - _tracked_since_t)
-        _cel_bl = _gaz_po_linii(
-            _opora_bl, _var_bl, _aim_bl, _los_bl, _age_bl,
-            _hover_s_napryazheniem())
-        if _cel_bl is None:
-            _cel_bl = _opora_bl
-        _primenit_nos_u_sbrosa(_opora_bl, _cel_bl, _dal_bl, k)
-        # Запас задаёт _zapas_nosa по углу линии. Пол глисады сюда не
-        # входит: это абсолютный тангаж, и в конце он снова просит газ.
+        # Режим запаса — один раз на захват, по геометрии захвата.
+        # Снимается только когда реально близко, не от угла линии.
+        if _pn_rezhim is None:
+            _pn_rezhim = _vybrat_rezhim(_dep_bl, _dal_bl)
+        if _pn_rezhim == "speed":
+            _alt_bl = None
+            with state_lock:
+                _alt_syroy = app_state.get("alt_cm")
+            if _alt_syroy is not None:
+                _alt_bl = float(_alt_syroy) / 100.0
+            _tau_bl = (closure.get("tau_s")
+                       if isinstance(closure, dict) else None)
+            _sig_bl = (closure.get("tau_sigma_s")
+                       if isinstance(closure, dict) else None)
+            if _konec_zahoda(_dal_bl, _alt_bl, _tau_bl, len(_tau_hist), _sig_bl):
+                _pn_rezhim = "line"
+        # Добор носа ближе 110 м по старому газу снят: он добавлял нос
+        # там, где в конце его как раз надо возвращать на цель.
         pitch_offset = _nos_na_kurs(
             _los_skorost, _los_skorost_ts, _pitch_tek_pot, _pitch_pri_loke,
             box_cy - CENTER_Y, now_mono, k,
@@ -13401,10 +13458,12 @@ def _update_control_from_target_impl():
             _gaz_vhod = float(base_thr)
         _dep_lin = (closure.get("depression_deg")
                     if isinstance(closure, dict) else None)
-        # Газ от запаса под целью. Время до контакта и стик входа
-        # уровень не задают: на крутой линии запас ноль и тяга падает,
-        # хотя тангаж ещё большой.
-        _cel_lin = _gaz_ot_zapasa(_dep_lin)
+        # Газ от фактического запаса под целью. Желаемый запас и
+        # тангаж уровень не задают: нос ещё не опустился — газ на
+        # линии, нос вернулся на цель — тяга падает, хотя угол большой.
+        _aim_lin = -(box_cy - CENTER_Y) * CAMERA_VFOV_DEG / float(MAIN_H)
+        _cel_lin = _gaz_ot_zapasa(_aim_lin, _hover_s_napryazheniem())
+        del _dep_lin
         _thr_geom_out = _podtyanut_gaz(
             _thr_geom_out if _thr_geom_out is not None else target_throttle,
             _cel_lin, THR_GEOM_SLEW_OVERSHOOT, k)
