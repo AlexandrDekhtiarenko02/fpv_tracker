@@ -2226,6 +2226,16 @@ PN_ROLL_PWM_MAX = 110.0
 # иначе в конце тяга растёт вместе с углом и выходит перелёт.
 PN_ZAPAS_DEG = 9.0             # нос ниже цели в режиме скорости
 PN_ZAPAS_POL_DEG = 1.0         # ближе этого к запасу — картинка уже та
+# Недолет: снижаемся быстрее, чем высота / время до контакта.
+# Высота кончится раньше дальности. Добавляем запас, газ идёт за ним.
+# Мёртвая зона — чтобы шум барометра не клевал. Потолок — чтобы
+# недолет не уводил нос к 45°.
+PN_NEDOLET_DEAD_MPS = 1.0      # быстрее нужного на столько — уже недолет
+PN_NEDOLET_DEG_PER_MPS = 2.0   # градус запаса на каждый лишний м/с
+PN_NEDOLET_MAX_DEG = 6.0       # добавка не больше этого, всего 15°
+# Рамка у края кадра обрезается, размер врёт, tau мусор. Ближе этого
+# к краю время до контакта для недолета не берём.
+PN_NEDOLET_KRAI_PX = 20.0
 PN_REZHIM_DEP = 20.0           # на захвате положе — режим скорости
 PN_REZHIM_RANGE_M = 220.0      # на захвате дальше — режим скорости
 PN_KONEC_RANGE_M = 70.0        # ближе этого и низко — скорость снята
@@ -5068,6 +5078,9 @@ _pn_nos_ugol = None
 # Режим запаса на этот захват: None пока нет геометрии захвата,
 # "speed" — нос ниже цели, "line" — нос на цели. Выбирается один раз.
 _pn_rezhim = None
+# Добавка запаса на недолет, градусы. Считается каждый кадр из
+# высоты, времени до контакта и вариометра. Ноль — летит в цель.
+_pn_nedolet = 0.0
 
 # Сглаженное значение fc_pitch_deg для расчёта компенсации тангажа.
 smoothed_pitch_deg = 0.0
@@ -8910,7 +8923,7 @@ def reset_tracking(to_acq=False):
     global smooth_throttle_out, throttle_integral, prev_ady
     global roll_integral, pitch_integral, yaw_integral
     global _pn_bank_i, _pn_bank_tek, _pn_dx_pred, _pn_dx_t, _pn_dx_rate
-    global _pn_nos_i, _pn_nos_tek, _pn_nos_blizko, _pn_nos_ugol, _pn_rezhim
+    global _pn_nos_i, _pn_nos_tek, _pn_nos_blizko, _pn_nos_ugol, _pn_rezhim, _pn_nedolet
     global smoothed_pitch_deg
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
@@ -9029,6 +9042,7 @@ def reset_tracking(to_acq=False):
     _pn_nos_blizko = 0.0
     _pn_nos_ugol = None
     _pn_rezhim = None
+    _pn_nedolet = 0.0
 
     smoothed_pitch_deg = 0.0
 
@@ -9395,14 +9409,50 @@ def _konec_zahoda(range_m, alt_m, tau_s, n_tau, tau_sigma):
     return False
 
 
+def _nedolet_deg(alt_m, tau_s, n_tau, sigma_s, vario_cms,
+                 box_cy=None, box_h=None):
+    """Сколько градусов добавить к запасу, если высота кончается раньше.
+
+    Нужное снижение — высота / время до контакта: столько, чтобы оба
+    кончились вместе. Снижаемся заметно быстрее — недолет, носа мало.
+    Время ненадёжно, высоты нет или рамка у края кадра — ноль: там
+    размер обрезан и tau мусор, уставку режима не трогаем.
+    Перелёт здесь не лечится: его снимает конец захода.
+    """
+    if alt_m is None or tau_s is None or vario_cms is None:
+        return 0.0
+    if box_cy is not None and box_h is not None:
+        pol = float(box_h) / 2.0
+        verh = float(box_cy) - pol
+        niz = float(box_cy) + pol
+        if verh < PN_NEDOLET_KRAI_PX or niz > MAIN_H - PN_NEDOLET_KRAI_PX:
+            return 0.0
+    if not _tau_nadyozhen(tau_s, n_tau, sigma_s):
+        return 0.0
+    alt = float(alt_m)
+    tau = float(tau_s)
+    if alt <= 1.0 or tau <= 0.2:
+        return 0.0
+    nuzhno = alt / tau
+    fakt = -float(vario_cms) / 100.0
+    lishnee = fakt - nuzhno - PN_NEDOLET_DEAD_MPS
+    if lishnee <= 0.0:
+        return 0.0
+    dob = lishnee * PN_NEDOLET_DEG_PER_MPS
+    if dob > PN_NEDOLET_MAX_DEG:
+        return PN_NEDOLET_MAX_DEG
+    return dob
+
+
 def _zapas_nosa():
     """Сколько градусов нос ниже цели в текущем режиме.
 
     Режим выбирается на захвате и держится. Пока геометрии нет —
-    запас не выдумываем. Конец захода снимает скорость.
+    запас не выдумываем. Конец захода снимает скорость. Недолет
+    добавляет к запасу, газ идёт за ним.
     """
     if _pn_rezhim == "speed":
-        return PN_ZAPAS_DEG
+        return PN_ZAPAS_DEG + _pn_nedolet
     return 0.0
 
 
@@ -11668,7 +11718,7 @@ def _update_control_from_target_impl():
     global _hover_pwm, _thr_geom_out, _geom_mode_log, _gaz_vhod
     global roll_integral, pitch_integral, yaw_integral
     global _pn_bank_i, _pn_bank_tek, _pn_dx_pred, _pn_dx_t, _pn_dx_rate
-    global _pn_nos_i, _pn_nos_tek, _pn_nos_blizko, _pn_nos_ugol, _pn_rezhim
+    global _pn_nos_i, _pn_nos_tek, _pn_nos_blizko, _pn_nos_ugol, _pn_rezhim, _pn_nedolet
     global smoothed_pitch_deg
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
@@ -11876,6 +11926,7 @@ def _update_control_from_target_impl():
         _pn_nos_blizko = 0.0
         _pn_nos_ugol = None
         _pn_rezhim = None
+        _pn_nedolet = 0.0
         # SHADOW-состояние — своё, отдельное от live-интеграторов выше, но
         # сбрасывается по тому же событию (новый/потерянный захват): иначе
         # диагностика windup тянула бы накопление прошлой цели в новую.
@@ -12665,6 +12716,13 @@ def _update_control_from_target_impl():
                        if isinstance(closure, dict) else None)
             if _konec_zahoda(_dal_bl, _alt_bl, _tau_bl, len(_tau_hist), _sig_bl):
                 _pn_rezhim = "line"
+        # Недолет: высота кончается раньше дальности. Добавляем запас,
+        # газ идёт за ним. Рамка у края или tau ненадёжен — ноль.
+        _pn_nedolet = 0.0
+        if _pn_rezhim == "speed":
+            _pn_nedolet = _nedolet_deg(
+                _alt_bl, _tau_bl, len(_tau_hist), _sig_bl, _var_bl,
+                box_cy, box[3] - box[1])
         # Добор носа ближе 110 м по старому газу снят: он добавлял нос
         # там, где в конце его как раз надо возвращать на цель.
         pitch_offset = _nos_na_kurs(

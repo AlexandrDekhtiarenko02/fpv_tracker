@@ -295,6 +295,27 @@ assert t._gaz_ot_zapasa(20.0, 1260) == 1260 + t.GAZ_NA_ZAPAS * t.PN_ZAPAS_DEG
 assert t._gaz_ot_zapasa(5.0, 1400) == 1400.0 + t.GAZ_NA_ZAPAS * 5.0
 t._pn_rezhim = "speed"
 
+print("=== 8d. Недолет: высота кончается раньше дальности ===")
+# 40 м, 10 с — нужно 4 м/с. Снижаемся 7 м/с: лишние 2 выше мёртвой зоны.
+ned = t._nedolet_deg(40.0, 10.0, 20, 1.0, -700.0, 240.0, 40.0)
+assert abs(ned - 4.0) < 1e-6, ned
+# Ровно на нужном — ноль.
+rov = t._nedolet_deg(40.0, 10.0, 20, 1.0, -400.0, 240.0, 40.0)
+assert rov == 0.0, rov
+# Рамка у края кадра — ноль, размер обрезан.
+kra = t._nedolet_deg(40.0, 10.0, 20, 1.0, -700.0, 10.0, 40.0)
+assert kra == 0.0, kra
+# Время ненадёжно — ноль.
+plo = t._nedolet_deg(40.0, 10.0, 3, 9.0, -700.0, 240.0, 40.0)
+assert plo == 0.0, plo
+# Потолок добавки.
+pot = t._nedolet_deg(40.0, 10.0, 20, 1.0, -2000.0, 240.0, 40.0)
+assert pot == t.PN_NEDOLET_MAX_DEG, pot
+t._pn_rezhim = "speed"
+t._pn_nedolet = 4.0
+assert t._zapas_nosa() == t.PN_ZAPAS_DEG + 4.0
+t._pn_nedolet = 0.0
+
 print("=== 8b. Газ компенсирует высоту, опора — стик входа ===")
 # Высота стоит — газ на стике входа.
 rovno = t._gaz_po_linii(1350, 0.0)
