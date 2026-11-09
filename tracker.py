@@ -2233,7 +2233,6 @@ PN_ROLL_PWM_MAX = 110.0
 # говорит «в цель», пока пилот держит запас ради скорости.
 # Подбор по эталонам: дальность на захвате больше 200 м отделяет
 # заходы с запасом от заходов без, ошибка 4° против 8° без него.
-PN_ZAPAS_POL_DEG = 1.0         # ближе этого к запасу — картинка уже та
 # Недолет: снижаемся быстрее, чем высота / время до контакта.
 # Высота кончится раньше дальности. Добавляем запас, газ идёт за ним.
 # Мёртвая зона — чтобы шум барометра не клевал. Потолок — чтобы
@@ -2245,13 +2244,7 @@ PN_ZAPAS_POL_DEG = 1.0         # ближе этого к запасу — ка�
 # Рамка у края кадра обрезается, размер врёт, tau мусор. Ближе этого
 # к краю время до контакта для недолета не берём.
 PN_NEDOLET_KRAI_PX = 20.0
-PN_AIM_NIZHE_DEG = 2.0         # старый порог газа по линии, нос его не держит
-PN_AIM_KRUTO_DEG = 12.0
-PN_AIM_STEEP_DEG = 30.0
-PN_VARIO_DEAD_CMS = 30.0       # смещение вариометра на проверенных заходах
                                # было −26 / −11 / +9 см/с, тише этого не верим
-PN_NOS_NIZHE_DPS = 4.0         # как быстро опускаем нос, пока запас не набран
-PN_NOS_TRIM_DPS = 2.0          # правка угла по высоте
 # Угол пойман — стик в центр. В acro центр держит угол, не горизонт.
 # Эталон: после настройки |rc_p|≈0 при носе 25–35°.
 PN_NOS_HOLD_DEG = 1.5
@@ -2267,10 +2260,6 @@ PN_PITCH_PWM_MAX = 80.0
 # Близко к цели сброс газа без носа — дуга. На z08 logs-24 газ ушёл
 # 1413→1333 около 100 м, стик тангажа остался в центре. Несколько градусов
 # вниз вместе со сбросом, не новый клевок и не подъём потолка 45°.
-PN_PITCH_BLIZKO_M = 110.0
-PN_PITCH_BLIZKO_GAZ = 25.0     # сброс меньше этого нос не трогает
-PN_PITCH_BLIZKO_PER_PWM = 40.0 # ШИМ сброса на один градус
-PN_PITCH_BLIZKO_MAX = 3.0
 # Газ компенсирует высоту под выбранный нос. Опора — стик входа, один
 # раз, не эхо: на 9e3a760 опора читалась с эха и доехала до 1530.
 # Снижаемся — не добрал газ, даёт больше. Подымаемся — это нос: газ
@@ -9320,25 +9309,9 @@ def _skorost_ramki(dx_px, now):
 
 
 def _nizhe_linii(depression_deg):
-    """Оставлено для старых тестов. Закон нос по этому запасу не ставит.
-
-    9° — середина дальних заходов, не уставка. Угол задаёт пара
-    «нос + газ» по высоте, см. _nos_na_kurs.
-    """
-    if depression_deg is None:
-        return 0.0
-    dep = float(depression_deg)
-    if dep >= PN_AIM_STEEP_DEG:
-        return 0.0
-    if dep <= 22.0:
-        return 9.0
-    shirina = PN_AIM_STEEP_DEG - 22.0
-    dolya = (PN_AIM_STEEP_DEG - dep) / shirina
-    if dolya < 0.0:
-        dolya = 0.0
-    if dolya > 1.0:
-        dolya = 1.0
-    return 9.0 * dolya
+    """Оставлено для совместимости. Закон нос по этому запасу не ставит."""
+    del depression_deg
+    return 0.0
 
 
 def _tau_nadyozhen(tau_s, n_tochek, sigma_s=None):
@@ -9602,50 +9575,6 @@ def _gaz_po_energii(base, alt_m, tau_s, n_tau, sigma_s, vario_cms,
 
 
 
-def _dobor_nosa_u_sbrosa(opora, cel, range_m):
-    """Сколько градусов добавить к носу, когда близко газ уже ниже стика.
-
-    Далеко, без дальности или сброс меньше мёртвой зоны — ноль.
-    Больше трёх градусов не просим: это помощь сбросу, не новый клевок.
-    """
-    if opora is None or cel is None or range_m is None:
-        return 0.0
-    if float(range_m) >= PN_PITCH_BLIZKO_M:
-        return 0.0
-    sbro = float(opora) - float(cel)
-    if sbro <= PN_PITCH_BLIZKO_GAZ:
-        return 0.0
-    dob = sbro / PN_PITCH_BLIZKO_PER_PWM
-    if dob > PN_PITCH_BLIZKO_MAX:
-        return PN_PITCH_BLIZKO_MAX
-    if dob < 0.0:
-        return 0.0
-    return dob
-
-
-def _primenit_nos_u_sbrosa(opora, cel, range_m, k):
-    """Подвести добавку носа к сбросу газа. Не быстрее наклона тангажа.
-
-    Добавка входит в желаемый угол на этом же кадре. Когда сброс
-    кончился или цель снова далеко, она спадает к нулю и нос
-    возвращается к картинке, а не остаётся клюнутым.
-    """
-    global _pn_nos_blizko, _pn_nos_ugol
-    nuzhno = _dobor_nosa_u_sbrosa(opora, cel, range_m)
-    shag = PN_PITCH_SLEW * (k / NOMINAL_FPS)
-    if _pn_nos_blizko < nuzhno - shag:
-        _pn_nos_blizko += shag
-    elif _pn_nos_blizko > nuzhno + shag:
-        _pn_nos_blizko -= shag
-    else:
-        _pn_nos_blizko = nuzhno
-    if _pn_nos_blizko < 0.0:
-        _pn_nos_blizko = 0.0
-        _pn_nos_ugol = None
-    elif _pn_nos_blizko > PN_PITCH_BLIZKO_MAX:
-        _pn_nos_blizko = PN_PITCH_BLIZKO_MAX
-    return _pn_nos_blizko
-
 
 def _ryaskan_na_kurs(bank_deg, dx_px):
     """Рыскание в сторону крена. Курс им не строится.
@@ -9701,50 +9630,6 @@ def _gaz_po_vysote(hover, alt_m, tau_s, vario_cms):
         pwm = niz
     return pwm
 
-
-def _gaz_po_linii(opora, vario_cms, aim_below=0.0, los_rate=None,
-                  age_s=None, hover=None):
-    """Газ под выбранный нос: высота стоит.
-
-    Опора — стик входа, но не ниже ховера. Ниже ховера высота не
-    стоит ни при каком носе: пилот мог залочить, не добавив газ, и
-    весь заход сел бы. Ховер — пол, не замена. Выше входа по путевой
-    не поднимаем. Снижаемся — не добрал газ, даёт больше. Подымаемся
-    — это нос: газ вверх не идёт и вниз сам не режет, иначе дерётся
-    с добором носа. Перелёт — можно убавить, если не снижаемся.
-    Первые две секунды скорость линии не слушаем. Нет опоры или
-    вариометра — None.
-    """
-    if opora is None or vario_cms is None:
-        return None
-    var = float(vario_cms)
-    opora = float(opora)
-    if hover is not None and float(hover) > opora:
-        opora = float(hover)
-    pwm = float(opora)
-    # Снижение при цели у центра — глиссада (эталон close: газ ниже,
-    # 1230–1290), не недобор газа. Газ добираем только когда нос уже
-    # ниже цели, а борт всё равно проседает.
-    aim = 0.0 if aim_below is None else float(aim_below)
-    if var < -GAZ_VARIO_DEAD_CMS and aim >= PN_AIM_NIZHE_DEG:
-        nedobor = (-var - GAZ_VARIO_DEAD_CMS) / 100.0
-        pwm = float(opora) + GAZ_VARIO_PWM_PER_MPS * nedobor
-    # Набор высоты — нос, не газ. Ручку на опоре оставляем.
-    perelet = aim_below is not None and float(aim_below) < -1.0
-    if (not perelet and los_rate is not None and age_s is not None
-            and float(age_s) >= 2.0
-            and float(los_rate) > LOS_RATE_DEADBAND_DPS):
-        perelet = True
-    if (perelet and var >= -GAZ_VARIO_DEAD_CMS
-            and pwm > float(opora) - GAZ_PERELET_PWM):
-        pwm = float(opora) - GAZ_PERELET_PWM
-    verh = float(opora) + GAZ_VYSHE
-    niz = float(opora) - GAZ_NIZHE
-    if pwm > verh:
-        pwm = verh
-    if pwm < niz:
-        pwm = niz
-    return pwm
 
 
 def _kadr_oshibka(net, deadband):

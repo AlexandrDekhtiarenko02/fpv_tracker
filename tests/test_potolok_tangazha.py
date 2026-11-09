@@ -134,55 +134,9 @@ assert t._zapas_nosa() == 4.0
 t._pn_nedolet = 0.0
 assert t._zapas_nosa() == 0.0
 
-print("=== 8b. Газ компенсирует высоту, опора — стик входа ===")
-# Высота стоит — газ на стике входа.
-rovno = t._gaz_po_linii(1350, 0.0)
-assert rovno == 1350.0, rovno
-# Снижаемся при носе ниже цели — газ выше, не дальше потолка прибавки.
-proval = t._gaz_po_linii(1350, -600.0, aim_below=5.0)
-assert 1350.0 < proval <= 1350.0 + t.GAZ_VYSHE, proval
-# Снижаемся при цели у центра — глиссада, газ не добираем (эталон close).
-gliss = t._gaz_po_linii(1350, -600.0, aim_below=0.0)
-assert gliss == 1350.0, gliss
-# Подымаемся — это нос: газ на опоре, вверх не идёт и вниз не режет.
-nabor = t._gaz_po_linii(1350, 200.0)
-assert nabor == 1350.0, nabor
-# Перелёт в первую секунду по скорости линии газ не режет.
-rannee = t._gaz_po_linii(1350, 0.0, aim_below=5.0, los_rate=6.0, age_s=0.5)
-assert rannee == 1350.0, rannee
-# Перелёт после двух секунд — можно убавить, если не снижаемся.
-pozze = t._gaz_po_linii(1350, 0.0, aim_below=5.0, los_rate=2.0, age_s=3.0)
-assert pozze == 1350.0 - t.GAZ_PERELET_PWM, pozze
-# Снижаемся и перелетаем: при цели ниже центра газ не добираем
-# (глиссада), а перелёт при просадке газ не режет — остаёмся на опоре.
-vmeste = t._gaz_po_linii(1350, -200.0, aim_below=-5.0, los_rate=2.0, age_s=3.0)
-assert vmeste == 1350.0, vmeste
-# Нет вариометра или стика — ручку не выдумываем.
-assert t._gaz_po_linii(1350, None) is None
-assert t._gaz_po_linii(None, -100.0) is None
-# Стик входа ниже ховера — пол ховер, иначе заход снижается.
-nizhe = t._gaz_po_linii(1250, 0.0, hover=1400)
-assert nizhe == 1400.0, nizhe
-# Стик входа выше ховера — ховер пол не поднимает.
-vyshe = t._gaz_po_linii(1450, 0.0, hover=1400)
-assert vyshe == 1450.0, vyshe
-# Путевая в газ не входит: подпись больше не принимает скорость земли.
+print("=== 8b. Старый gaz_po_linii удалён ===")
 
-print("=== 8c. Близко сброс газа — нос чуть ниже, потолок тот же ===")
-assert t._dobor_nosa_u_sbrosa(1400, 1320, 90.0) == 80.0 / 40.0
-assert t._dobor_nosa_u_sbrosa(1400, 1200, 90.0) == t.PN_PITCH_BLIZKO_MAX
-assert t._dobor_nosa_u_sbrosa(1400, 1390, 90.0) == 0.0
-assert t._dobor_nosa_u_sbrosa(1400, 1300, 200.0) == 0.0
-assert t._dobor_nosa_u_sbrosa(1400, 1300, None) == 0.0
-t._pn_nos_blizko = 0.0
-for _ in range(int(1.0 * t.NOMINAL_FPS)):
-    t._primenit_nos_u_sbrosa(1400, 1280, 80.0, 1.0)
-assert abs(t._pn_nos_blizko - t.PN_PITCH_BLIZKO_MAX) < 1e-6, t._pn_nos_blizko
-for _ in range(int(1.0 * t.NOMINAL_FPS)):
-    t._primenit_nos_u_sbrosa(1400, 1280, 200.0, 1.0)
-assert t._pn_nos_blizko < 0.3, t._pn_nos_blizko
-t._pn_nos_blizko = 0.0  # nos_na_kurs удалён
-
+print("=== 8c. Старый dobor_nosa удалён ===")
 
 print("=== 9. Рыскание — триммер крена, рамку не тянет ===")
 assert t._ryaskan_na_kurs(0.0, 10.0) == 0.0
