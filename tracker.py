@@ -2204,26 +2204,13 @@ PN_ROLL_AZ_DEG = 0.5          # запас, если скорости сближ
 # Пропорциональная навигация: крен гасит вращение линии визирования.
 # a = N * Vc * az, крен = atan(a / g). N = 3..5, берём 4.
 # Само меньше вдали, где сближение медленное, и больше вблизи.
-PN_N = 4.0                    # вдали
-PN_N_BLIZKO = 1.5             # вблизи, чтобы не перекомпенсировать
-PN_N_DALNOST = 300.0          # дальше этой дальности N полное
+PN_N = 3.5                    # один N. Фильтр скорости линии уже глушит шум.
 G_MPS2 = 9.81
 
-
 def _n_po_dalnosti(range_m):
-    """N меньше вблизи, полное вдали.
-
-    Вблизи большое N перекладывает, вдали малое не доворачивает.
-    Нет дальности — полное.
-    """
-    if range_m is None:
-        return PN_N
-    dolya = float(range_m) / PN_N_DALNOST
-    if dolya > 1.0:
-        dolya = 1.0
-    elif dolya < 0.0:
-        dolya = 0.0
-    return PN_N_BLIZKO + (PN_N - PN_N_BLIZKO) * dolya
+    """Постоянный N. Расписание по дальности убрано — шум гасит фильтр."""
+    del range_m
+    return PN_N
 # Интеграл по скорости азимута: постоянный параллельный снос должен
 # накапливать доворот курса, а не сидеть в шуме оценки.
 PN_ROLL_AZ_I = 0.3            # ° банка в секунду на °/с азимута
@@ -9236,23 +9223,13 @@ def _kren_pn(az_dps, vc_mps, range_m=None, accel_mps2=None):
     return math.degrees(math.atan(a / G_MPS2))
 
 
-PN_UGOL_PRIHODA = 25.0       # желаемый угол прихода к земле, ° ниже горизонта
-PN_UGOL_BIAS = 0.4            # вес члена угла прихода
-
-
 def _smeshchenie_ugla(depression_deg, range_m):
-    """Добавка, чтобы прийти под заданным углом, градусы.
+    """Смещения к фиксированному углу нет.
 
-    Разница между текущим углом линии и желаемым. Вблизи вес больше,
-    угол надо успеть набрать до цели.
+    Траекторию формирует энергия и обнуление скорости линии.
     """
-    if depression_deg is None:
-        return 0.0
-    oshibka = PN_UGOL_PRIHODA - float(depression_deg)
-    ves = 1.0
-    if range_m is not None and float(range_m) < PN_N_DALNOST:
-        ves = 1.0 + (PN_N_DALNOST - float(range_m)) / PN_N_DALNOST
-    return PN_UGOL_BIAS * oshibka * ves
+    del depression_deg, range_m
+    return 0.0
 
 
 def _tangazh_pn(los_dps, vc_mps, range_m=None, accel_mps2=None,
@@ -9568,9 +9545,8 @@ def _zapas_nosa():
 # для дальности, — сначала набираем до угла, с которого можно снижаться,
 # и только потом отдаём энергию закону. Иначе на 15 м и 300 м закон
 # начнёт снижаться и упадёт раньше, чем долетит.
-PN_MIN_UGOL = 10.0             # минимальный угол захода, °
-PN_NABOR_PWM = 250.0           # добавка газа на время набора
-_pn_nabor_cel = None           # высота, до которой набираем, м. None — нет.
+_pn_nabor_cel = None  # не используется
+
 
 
 _pn_az_pred = None
@@ -9655,18 +9631,8 @@ def _skolzyashiy(rate_dps):
 
 
 def _nabor_nuzhen(alt_m, range_m):
-    """До какой высоты набрать, если заход слишком пологий. None — не надо.
-
-    Считается один раз на захвате. Высота меньше, чем дальность требует
-    для минимального угла, — набираем до неё.
-    """
-    if alt_m is None or range_m is None:
-        return None
-    if float(range_m) < 50.0:
-        return None
-    nuzhno = float(range_m) * math.tan(math.radians(PN_MIN_UGOL))
-    if float(alt_m) < nuzhno - 5.0:
-        return nuzhno
+    """Набор по фиксированному углу убран. Энергия сама добавляет тягу."""
+    del alt_m, range_m
     return None
 
 
@@ -12984,9 +12950,6 @@ def _update_control_from_target_impl():
             pitch_offset = PN_PITCH_PWM_MAX
         elif pitch_offset < -PN_PITCH_PWM_MAX:
             pitch_offset = -PN_PITCH_PWM_MAX
-        # На наборе высоты нос вверх, чтобы тяга поднимала, а не гнала вперёд.
-        if _pn_nabor_cel is not None:
-            pitch_offset -= 80.0
         _p_sat = abs(pitch_offset) >= PN_PITCH_PWM_MAX - 1e-6
         _pid_dbg["pitch"] = (
             pitch_offset, 0.0, _pn_nos_i * PN_PITCH_PWM_PER_DEG, 0.0,
@@ -13792,8 +13755,6 @@ def _update_control_from_target_impl():
         _cel_lin = _gaz_po_energii(
             _baza_lin, _alt_en, _tau_en, len(_tau_hist), _sig_en, _var_bl,
             box_cy, box[3] - box[1], _tau_ubyvanie)
-        if _pn_nabor_cel is not None:
-            _cel_lin += PN_NABOR_PWM
         _thr_geom_out = _podtyanut_gaz(
             _thr_geom_out if _thr_geom_out is not None else target_throttle,
             _cel_lin, THR_GEOM_SLEW_OVERSHOOT, k)
