@@ -9225,25 +9225,30 @@ def _skorost_sblizheniya(closure):
     return float(rng) / float(tau)
 
 
-def _kren_pn(az_dps, vc_mps, range_m=None):
+def _kren_pn(az_dps, vc_mps, range_m=None, accel_mps2=None):
     """Крен по пропорциональной навигации, градусы.
 
     Боковое ускорение N * скорость сближения * скорость азимута,
-    крен из него через g. N меньше вблизи. Скорости нет — скромная.
+    крен из него через g. N меньше вблизи. Дополненный член —
+    половина N на ускорение цели поперёк линии, чтобы манёвр цели
+    не догонять с запаздыванием. Скорости нет — скромная.
     """
     az_rad = math.radians(float(az_dps))
     vc = 10.0 if vc_mps is None else max(1.0, float(vc_mps))
-    a = _n_po_dalnosti(range_m) * vc * az_rad
+    n = _n_po_dalnosti(range_m)
+    a = n * vc * az_rad
+    if accel_mps2 is not None:
+        a += 0.5 * n * float(accel_mps2)
     return math.degrees(math.atan(a / G_MPS2))
 
 
-def _tangazh_pn(los_dps, vc_mps, range_m=None):
+def _tangazh_pn(los_dps, vc_mps, range_m=None, accel_mps2=None):
     """Тангаж по пропорциональной навигации, градусы.
 
     Гасит вертикальное вращение линии визирования, как крен гасит
-    азимут. N меньше вблизи.
+    азимут. N меньше вблизи. Дополненный член на ускорение цели.
     """
-    return _kren_pn(los_dps, vc_mps, range_m)
+    return _kren_pn(los_dps, vc_mps, range_m, accel_mps2)
 
 
 def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k,
@@ -9308,7 +9313,9 @@ def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k,
             izb_az = az_f - math.copysign(mertvaya, az_f)
             # Крен по пропорциональной навигации: гасит вращение линии
             # визирования, размер растёт со скоростью сближения.
-            az_dob = ROLL_SIGN * _kren_pn(izb_az, vc_mps, range_m) * az_w
+            az_dob = ROLL_SIGN * _kren_pn(
+                izb_az, vc_mps, range_m,
+                _uskorenie_celi(az, range_m, now, "az")) * az_w
             # Интеграл по избытку азимута, с тем же весом: параллельный
             # полёт в центре доворачивается, явная рамка интеграл не копит.
             _pn_az_i += izb_az * PN_ROLL_AZ_I * az_w * dt_s
@@ -9542,6 +9549,45 @@ PN_MIN_UGOL = 10.0             # минимальный угол захода, �
 PN_NABOR_PWM = 250.0           # добавка газа на время набора
 GAZ_NA_MPS = 20.0              # ШИМ на каждый лишний м/с снижения
 _pn_nabor_cel = None           # высота, до которой набираем, м. None — нет.
+
+
+_pn_az_pred = None
+_pn_az_pred_t = 0.0
+_pn_los_pred = None
+_pn_los_pred_t = 0.0
+_pn_az_acc = 0.0
+_pn_los_acc = 0.0
+
+
+def _uskorenie_celi(rate_dps, range_m, now, key):
+    """Ускорение цели поперёк линии, м/с², или None.
+
+    Дальность на сглаженную производную скорости линии. Это вторая
+    производная угла — шумно, поэтому сглаживаем и режем по потолку.
+    key — 'az' или 'los', состояние по оси своё.
+    """
+    global _pn_az_pred, _pn_az_pred_t, _pn_los_pred, _pn_los_pred_t
+    global _pn_az_acc, _pn_los_acc
+    if key == "az":
+        pred, pred_t, acc = _pn_az_pred, _pn_az_pred_t, _pn_az_acc
+    else:
+        pred, pred_t, acc = _pn_los_pred, _pn_los_pred_t, _pn_los_acc
+    uskor = None
+    if rate_dps is not None and pred is not None and pred_t > 0.0:
+        dt = now - pred_t
+        if 0.0 < dt <= 0.5:
+            acc += 0.3 * ((float(rate_dps) - float(pred)) / dt - acc)
+            if range_m is not None:
+                uskor = float(range_m) * math.radians(acc)
+                if uskor > 15.0:
+                    uskor = 15.0
+                elif uskor < -15.0:
+                    uskor = -15.0
+    if key == "az":
+        _pn_az_pred, _pn_az_pred_t, _pn_az_acc = rate_dps, now, acc
+    else:
+        _pn_los_pred, _pn_los_pred_t, _pn_los_acc = rate_dps, now, acc
+    return uskor
 
 
 def _nabor_nuzhen(alt_m, range_m):
@@ -12860,9 +12906,10 @@ def _update_control_from_target_impl():
         # ветки, здесь его нет.
         _vc_pn = _skorost_sblizheniya(closure)
         _los_pn = _los_bl if _los_bl is not None else 0.0
+        _rng_pn = closure.get("range_m") if isinstance(closure, dict) else None
         _ugol_pn = _tangazh_pn(
-            _los_pn, _vc_pn,
-            closure.get("range_m") if isinstance(closure, dict) else None)
+            _los_pn, _vc_pn, _rng_pn,
+            _uskorenie_celi(_los_pn, _rng_pn, now_mono, "los"))
         pitch_offset = (PITCH_PWM_TO_FC_ANGLE_SIGN
                         * _ugol_pn * PN_PITCH_PWM_PER_DEG)
         if pitch_offset > PN_PITCH_PWM_MAX:
