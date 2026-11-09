@@ -9511,6 +9511,42 @@ def _zapas_nosa():
     return baza
 
 
+# Газ на ветке навигации ведёт энергию, не курс. Курс закрывает
+# пропорциональная навигация. Газ делает так, чтобы высота и дальность
+# кончились вместе: снижение быстрее, чем alt/tau — тяги мало, добавляем.
+# Сближение быстрее, чем кончается высота — снимаем.
+GAZ_NA_MPS = 20.0              # ШИМ на каждый лишний м/с снижения
+GAZ_ENERG_MAX = 150.0          # потолок поправки, ШИМ
+
+
+def _gaz_po_energii(base, alt_m, tau_s, n_tau, sigma_s, vario_cms,
+                     box_cy, box_h, ubyv):
+    """Газ, при котором высота и дальность кончаются вместе.
+
+    База — висение. Снижаемся быстрее, чем надо, чтобы дотянуть —
+    добавляем тягу. Высота кончается медленнее дальности — снимаем.
+    Сравнения нет — база как есть.
+    """
+    del ubyv
+    if alt_m is None or tau_s is None or vario_cms is None:
+        return float(base)
+    if not _tau_nadyozhen(tau_s, n_tau, sigma_s):
+        return float(base)
+    alt = float(alt_m)
+    tau = float(tau_s)
+    if alt <= 1.0 or tau <= 0.2:
+        return float(base)
+    nuzhno = alt / tau
+    fakt = -float(vario_cms) / 100.0
+    izb = fakt - nuzhno
+    dob = izb * GAZ_NA_MPS
+    if dob > GAZ_ENERG_MAX:
+        dob = GAZ_ENERG_MAX
+    elif dob < -GAZ_ENERG_MAX:
+        dob = -GAZ_ENERG_MAX
+    return float(base) + dob
+
+
 def _gaz_ot_zapasa(aim_below, base):
     """Газ от фактического запаса под целью, не от тангажа и не от желаемого.
 
@@ -13576,13 +13612,23 @@ def _update_control_from_target_impl():
             _gaz_vhod = float(base_thr)
         _dep_lin = (closure.get("depression_deg")
                     if isinstance(closure, dict) else None)
-        # Газ навигация не задаёт: скорость сближения для неё вход, не
-        # результат. Держим базу — висение этого борта, иначе стик входа.
+        # Газ ведёт энергию: высота и дальность кончаются вместе.
+        # Курс закрывает навигация, тягу она не задаёт.
         _baza_lin = _hover_s_napryazheniem()
         if _baza_lin is None:
             _baza_lin = (float(_gaz_vhod) if _gaz_vhod is not None
                          else float(base_thr))
-        _cel_lin = _baza_lin
+        _alt_en = None
+        with state_lock:
+            _alt_en_syroy = app_state.get("alt_cm")
+        if _alt_en_syroy is not None:
+            _alt_en = float(_alt_en_syroy) / 100.0
+        _tau_en = (closure.get("tau_s") if isinstance(closure, dict) else None)
+        _sig_en = (closure.get("tau_sigma_s")
+                   if isinstance(closure, dict) else None)
+        _cel_lin = _gaz_po_energii(
+            _baza_lin, _alt_en, _tau_en, len(_tau_hist), _sig_en, _var_bl,
+            box_cy, box[3] - box[1], _tau_ubyvanie)
         _thr_geom_out = _podtyanut_gaz(
             _thr_geom_out if _thr_geom_out is not None else target_throttle,
             _cel_lin, THR_GEOM_SLEW_OVERSHOOT, k)
