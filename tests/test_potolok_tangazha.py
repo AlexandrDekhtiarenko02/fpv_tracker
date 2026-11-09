@@ -103,98 +103,9 @@ assert uroven < 0.0, uroven
 assert t._kren_k_gorizontu(0.0, 0.0) == 0.0
 assert t._kren_k_gorizontu(100.0, None) == 20.0
 
-print("=== 8. Тангаж: запас из сравнения высоты и дальности ===")
-t._pn_nos_i = 0.0
-t._pn_nos_tek = None
-t._pn_nos_ugol = None
-t._pn_nos_blizko = 0.0
-t._pn_nedolet = 5.0
-# Запас посчитан, цель в центре: нос опускается на него.
-t._pn_nos_ugol = None
-t._pn_nos_tek = None
-pwm_n = t._nos_na_kurs(0.0, now, 10.0, 10.0, 0.0, now, 1.0, 8.0)
-assert pwm_n > 0.0, pwm_n
-assert t._zapas_nosa() == 5.0
-# Запас набран, высота стоит: стик отпущен.
-dpp = t.CAMERA_VFOV_DEG / float(t.MAIN_H)
-dy_zapas = -5.0 / dpp
-t._pn_nos_ugol = 23.0
-t._pn_nos_tek = 23.0
-derzh = t._nos_na_kurs(0.0, now, 23.0, 18.0, dy_zapas, now, 1.0, 8.0, 0.0)
-assert derzh == 0.0, derzh
-# Поставил и отпустил: картинка на запасе, высота ровная — pwm=0,
-# уставка привязана к факту, не жмёт фантом.
-t._pn_nos_ugol = 30.0
-t._pn_nos_tek = 30.0
-otp = t._nos_na_kurs(0.0, now, 27.0, 18.0, dy_zapas, now, 1.0, 8.0, 0.0)
-assert otp == 0.0, otp
-assert abs(t._pn_nos_ugol - 27.0) < 1e-6, t._pn_nos_ugol
-# Запаса нет, цель в центре: вниз не дожимаем.
-t._pn_nedolet = 0.0
-t._pn_nos_ugol = None
-t._pn_nos_tek = 32.0
-krut = t._nos_na_kurs(0.0, now, 32.0, 18.0, 0.0, now, 1.0, 26.0, 0.0)
-assert abs(krut) < 8.0, krut
-# Запаса нет и снижение: нос не клюём к 45°.
-t._pn_nos_ugol = 18.0
-t._pn_nos_tek = 18.0
-now_cl = 3500.0
-for _ in range(int(2.0 * t.NOMINAL_FPS)):
-    now_cl += 1.0 / t.NOMINAL_FPS
-    t._nos_na_kurs(0.0, now_cl, 18.0, 18.0, 0.0, now_cl, 1.0, 26.0, -400.0)
-assert t._pn_nos_ugol <= 18.0 + 1e-6, t._pn_nos_ugol
-# Всплеск скорости линии нос не клюёт, запас уже набран.
-t._pn_nedolet = 5.0
-t._pn_nos_ugol = 23.0
-t._pn_nos_tek = 23.0
-now_v = 4000.0
-for _ in range(int(1.5 * t.NOMINAL_FPS)):
-    now_v += 1.0 / t.NOMINAL_FPS
-    t._nos_na_kurs(6.0, now_v, 23.0, 18.0, dy_zapas, now_v, 1.0, 8.0, 0.0)
-assert abs(t._pn_nos_ugol - 23.0) < 0.3, t._pn_nos_ugol
-# Подымается при запасе — носа мало, угол растёт.
-t._pn_nos_ugol = 23.0
-t._pn_nos_tek = 23.0
-now_c = 5000.0
-for _ in range(int(1.0 * t.NOMINAL_FPS)):
-    now_c += 1.0 / t.NOMINAL_FPS
-    t._nos_na_kurs(0.0, now_c, 23.0, 18.0, dy_zapas, now_c, 1.0, 8.0, 80.0)
-assert t._pn_nos_ugol > 24.5, t._pn_nos_ugol
-# Снижается глубже запаса — нос лишний, угол убывает.
-dy_glubzhe = -(5.0 + 6.0) / dpp
-t._pn_nos_ugol = 34.0
-t._pn_nos_tek = 34.0
-now_s = 6000.0
-for _ in range(int(1.0 * t.NOMINAL_FPS)):
-    now_s += 1.0 / t.NOMINAL_FPS
-    t._nos_na_kurs(0.0, now_s, 34.0, 18.0, dy_glubzhe, now_s, 1.0, 8.0, -80.0)
-assert t._pn_nos_ugol < 32.5, t._pn_nos_ugol
-# Снижается ровно на запасе — нос не трогаем, это газ.
-t._pn_nos_ugol = 23.0
-t._pn_nos_tek = 23.0
-now_m = 6500.0
-for _ in range(int(1.0 * t.NOMINAL_FPS)):
-    now_m += 1.0 / t.NOMINAL_FPS
-    t._nos_na_kurs(0.0, now_m, 23.0, 18.0, dy_zapas, now_m, 1.0, 8.0, -80.0)
-assert abs(t._pn_nos_ugol - 23.0) < 0.3, t._pn_nos_ugol
-# Потолок 45° не поднимается.
-t._pn_nos_ugol = 44.5
-t._pn_nos_tek = 44.5
-now_p = 7000.0
-for _ in range(int(2.0 * t.NOMINAL_FPS)):
-    now_p += 1.0 / t.NOMINAL_FPS
-    t._nos_na_kurs(0.0, now_p, 44.5, 18.0, 0.0, now_p, 1.0, 8.0, 200.0)
-assert t._pn_nos_ugol <= t.PN_PITCH_ABS_MAX + 1e-6, t._pn_nos_ugol
-# Газ от фактического запаса. База — висение. Запас режет потолок.
-t._pn_nedolet = 5.0
-assert t._gaz_ot_zapasa(5.0, 1260) == 1260 + t.GAZ_NA_ZAPAS * 5.0
-t._pn_nedolet = 0.0
-assert t._gaz_ot_zapasa(9.0, 1400) == 1400
-t._pn_nedolet = 5.0
-assert t._gaz_ot_zapasa(0.0, 1300) == 1300
-assert t._gaz_ot_zapasa(20.0, 1260) == 1260 + t.GAZ_NA_ZAPAS * 5.0
-assert t._gaz_ot_zapasa(5.0, 1400) == 1400.0 + t.GAZ_NA_ZAPAS * 5.0
-t._pn_nedolet = 0.0
+print("=== 8. Старый nos/gaz_ot_zapasa удалён ===")
+# _nos_na_kurs и _gaz_ot_zapasa больше не существуют.
+# Живой тангаж — PN, живой газ — энергия.
 
 print("=== 8d. Недолет и перелет: высота и дальность вместе ===")
 # 40 м, 10 с — нужно 4 м/с. Снижаемся 7 м/с: izb=3 → непрерывная поправка.
@@ -270,23 +181,8 @@ assert abs(t._pn_nos_blizko - t.PN_PITCH_BLIZKO_MAX) < 1e-6, t._pn_nos_blizko
 for _ in range(int(1.0 * t.NOMINAL_FPS)):
     t._primenit_nos_u_sbrosa(1400, 1280, 200.0, 1.0)
 assert t._pn_nos_blizko < 0.3, t._pn_nos_blizko
-t._pn_nos_blizko = 3.0
-t._pn_nos_ugol = 30.0
-t._pn_nos_tek = 33.0
-now_b = 7000.0
-for _ in range(int(1.0 * t.NOMINAL_FPS)):
-    now_b += 1.0 / t.NOMINAL_FPS
-    t._nos_na_kurs(0.0, now_b, 30.0, 16.0, dy_zapas, now_b, 1.0, 18.0, 0.0)
-assert abs(t._pn_nos_tek - 33.0) < 0.5, t._pn_nos_tek
-t._pn_nos_blizko = 3.0
-t._pn_nos_ugol = 44.0
-t._pn_nos_tek = 44.0
-now_c = 8000.0
-for _ in range(10):
-    now_c += 1.0 / t.NOMINAL_FPS
-    t._nos_na_kurs(2.0, now_c, 44.0, 16.0, dy_zapas, now_c, 1.0, 18.0, 0.0)
-assert t._pn_nos_tek <= t.PN_PITCH_ABS_MAX + 1e-6, t._pn_nos_tek
-t._pn_nos_blizko = 0.0
+t._pn_nos_blizko = 0.0  # nos_na_kurs удалён
+
 
 print("=== 9. Рыскание — триммер крена, рамку не тянет ===")
 assert t._ryaskan_na_kurs(0.0, 10.0) == 0.0

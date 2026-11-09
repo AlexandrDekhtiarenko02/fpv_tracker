@@ -2197,8 +2197,6 @@ COLLISION_ROLL_MAX = 28.0
 # снова кадр. Горизонт — когда тихие положение, бег и курс.
 # В эталоне 17–18 |dx|~7, крен 3–5°. 0.7°/px сверх 4 px; бег поднимает
 # потолок до 16°, не до позднего удара 22°.
-PN_ROLL_HOLD_PX = 12.0
-PN_ROLL_HOLD_DEG = 0.40
 PN_ROLL_HOLD_MAX = 12.0
 PN_ROLL_AZ_DEG = 0.5          # запас, если скорости сближения нет
 # Пропорциональная навигация: крен гасит вращение линии визирования.
@@ -2220,15 +2218,7 @@ def _n_po_vremeni(tau_s):
     return PN_N * math.tanh(float(tau_s) / 6.0)
 # Интеграл по скорости азимута: постоянный параллельный снос должен
 # накапливать доворот курса, а не сидеть в шуме оценки.
-PN_ROLL_AZ_I = 0.3            # ° банка в секунду на °/с азимута
-PN_ROLL_AZ_I_MAX = 3.0        # потолок накопленного добора, °
 PN_ROLL_AZ_YAW_MAX_DPS = 25.0 # своё рыскание быстрее — az не берём
-PN_ROLL_RATE_DEAD_PX_S = 25.0  # ниже — шум удержания, не бег рамки
-PN_ROLL_RATE_DEG = 0.10        # ° крена на px/с сверх мёртвой зоны
-PN_ROLL_RATE_MAX = 8.0         # вклад скорости сам по себе
-PN_ROLL_HOLD_FAST = 16.0       # потолок, только пока рамка бежит
-PN_ROLL_HOLD_I = 0.15
-PN_ROLL_HOLD_I_MAX = 6.0
 PN_ROLL_BANK_SLEW = 12.0
 PN_ROLL_I_HALF_S = 4.0
 PN_ROLL_PWM_PER_DEG = 6.0
@@ -2274,7 +2264,6 @@ PN_PITCH_PWM_MAX = 80.0
 # Газ за фактическим запасом под целью. База — висение этого борта,
 # не число из чужого лога: вес разный, висение разное. Нет висения —
 # стик входа. Прибавка за нос — наклон, не уровень.
-GAZ_NA_ZAPAS = 10.0            # ШИМ на градус фактического запаса
 # Близко к цели сброс газа без носа — дуга. На z08 logs-24 газ ушёл
 # 1413→1333 около 100 м, стик тангажа остался в центре. Несколько градусов
 # вниз вместе со сбросом, не новый клевок и не подъём потолка 45°.
@@ -9611,95 +9600,6 @@ def _gaz_po_energii(base, alt_m, tau_s, n_tau, sigma_s, vario_cms,
     return float(base) + dob
 
 
-def _gaz_ot_zapasa(aim_below, base):
-    """Газ от фактического запаса под целью, не от тангажа и не от желаемого.
-
-    База — висение этого борта, иначе стик входа. Нос ещё не опустился —
-    газ на базе. Сел на запас режима — на 10 ШИМ выше за каждый градус.
-    Выше запаса режима не добавляем: лишний нос в конце не должен
-    разгонять тягу. Константы из чужого лога здесь нет.
-    """
-    zapas = _zapas_nosa()
-    aim = 0.0 if aim_below is None else float(aim_below)
-    if aim < 0.0:
-        aim = 0.0
-    if aim > zapas:
-        aim = zapas
-    return float(base) + GAZ_NA_ZAPAS * aim
-
-
-def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k,
-                 depression_deg=None, vario_cms=None, min_ugol=0.0,
-                 vozrast_s=None):
-    """Стик тангажа: поставил угол — отпустил. Acro держит.
-
-    Запас ниже цели задаёт скорость и берётся из режима захвата,
-    не из текущего угла линии. Угол пойман — стик в центр.
-    Подымаемся в режиме скорости — носа мало. Снижаемся глубже
-    запаса — нос лишний. На линии запас ноль, добирать нечего.
-    """
-    global _pn_nos_i, _pn_nos_tek, _pn_nos_ugol
-    del los, los_ts, pitch_lock, min_ugol, vozrast_s, depression_deg
-    if pitch_deg is None:
-        return 0.0
-    pitch_deg = float(pitch_deg)
-    if _pn_nos_ugol is None:
-        _pn_nos_ugol = pitch_deg
-    if _pn_nos_tek is None:
-        _pn_nos_tek = pitch_deg
-    dpp = CAMERA_VFOV_DEG / float(MAIN_H)
-    aim_below = 0.0 if dy_px is None else -float(dy_px) * dpp
-    zapas = _zapas_nosa()
-    dt_s = k / NOMINAL_FPS
-    vysota_ok = (vario_cms is None
-                 or abs(float(vario_cms)) <= PN_VARIO_DEAD_CMS)
-    # Запас ещё не набран — опускаем. На крутой линии zapas = 0,
-    # цель у центра это уже то, что нужно.
-    if aim_below < zapas - PN_ZAPAS_POL_DEG:
-        _pn_nos_ugol += PN_NOS_NIZHE_DPS * dt_s
-    if vario_cms is not None and abs(float(vario_cms)) > PN_VARIO_DEAD_CMS:
-        if float(vario_cms) > PN_VARIO_DEAD_CMS and zapas > PN_ZAPAS_POL_DEG:
-            # Набор на пологой линии — носа мало. На крутой запас уже
-            # снят, добор здесь снова разгоняет конец захода.
-            _pn_nos_ugol += PN_NOS_TRIM_DPS * dt_s
-        elif aim_below > zapas + 3.0:
-            _pn_nos_ugol -= PN_NOS_TRIM_DPS * dt_s
-    kartinka_ok = abs(aim_below - zapas) <= PN_ZAPAS_POL_DEG
-    # Картинка уже та, высота не просит — принимаем угол, который
-    # держит acro. Иначе фантомная уставка выше факта снова жмёт стик.
-    if kartinka_ok and vysota_ok and _pn_nos_blizko <= 0.0:
-        _pn_nos_ugol = pitch_deg
-        _pn_nos_tek = pitch_deg
-        return 0.0
-    if _pn_nos_ugol > PN_PITCH_ABS_MAX:
-        _pn_nos_ugol = PN_PITCH_ABS_MAX
-    elif _pn_nos_ugol < 0.0:
-        _pn_nos_ugol = 0.0
-    zhel = _pn_nos_ugol + _pn_nos_blizko
-    if zhel > PN_PITCH_ABS_MAX:
-        zhel = PN_PITCH_ABS_MAX
-    elif zhel < 0.0:
-        zhel = 0.0
-    shag = PN_PITCH_SLEW * (k / NOMINAL_FPS)
-    if _pn_nos_tek < zhel - shag:
-        _pn_nos_tek += shag
-    elif _pn_nos_tek > zhel + shag:
-        _pn_nos_tek -= shag
-    else:
-        _pn_nos_tek = zhel
-    err = _pn_nos_tek - pitch_deg
-    # Угол пойман — стик в центр (acro держит). Пока ещё добираем
-    # запас ниже цели, не отпускаем: иначе ugol ползёт, а стик молчит.
-    still_dumping = aim_below < zapas - PN_ZAPAS_POL_DEG
-    if abs(err) <= PN_NOS_HOLD_DEG and not still_dumping:
-        return 0.0
-    pwm = (PITCH_PWM_TO_FC_ANGLE_SIGN
-           * err * PN_PITCH_PWM_PER_DEG)
-    if pwm > PN_PITCH_PWM_MAX:
-        return PN_PITCH_PWM_MAX
-    if pwm < -PN_PITCH_PWM_MAX:
-        return -PN_PITCH_PWM_MAX
-    return pwm
 
 
 def _dobor_nosa_u_sbrosa(opora, cel, range_m):
