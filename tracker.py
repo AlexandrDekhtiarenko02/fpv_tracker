@@ -9570,7 +9570,6 @@ def _zapas_nosa():
 # начнёт снижаться и упадёт раньше, чем долетит.
 PN_MIN_UGOL = 10.0             # минимальный угол захода, °
 PN_NABOR_PWM = 250.0           # добавка газа на время набора
-GAZ_NA_MPS = 20.0              # ШИМ на каждый лишний м/с снижения
 _pn_nabor_cel = None           # высота, до которой набираем, м. None — нет.
 
 
@@ -9691,7 +9690,10 @@ def _gaz_po_energii(base, alt_m, tau_s, n_tau, sigma_s, vario_cms,
     nuzhno = alt / tau
     fakt = -float(vario_cms) / 100.0
     izb = fakt - nuzhno
-    return float(base) + izb * GAZ_NA_MPS
+    # Мягкая реакция вместо жёсткого ШИМ/м/с.
+    # На малых ошибках почти линейно (~12 PWM/м/с), на больших насыщается.
+    dob = 80.0 * math.tanh(izb / 4.0)
+    return float(base) + dob
 
 
 def _gaz_ot_zapasa(aim_below, base):
