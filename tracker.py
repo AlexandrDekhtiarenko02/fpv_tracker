@@ -9341,7 +9341,7 @@ def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k,
             # визирования, размер растёт со скоростью сближения.
             az_dob = ROLL_SIGN * _kren_pn(
                 izb_az, vc_mps, range_m,
-                _uskorenie_celi(az, range_m, now, "az")) * az_w
+                _skolzyashiy(az)) * az_w
             # Интеграл по избытку азимута, с тем же весом: параллельный
             # полёт в центре доворачивается, явная рамка интеграл не копит.
             _pn_az_i += izb_az * PN_ROLL_AZ_I * az_w * dt_s
@@ -9585,7 +9585,25 @@ _pn_az_acc = 0.0
 _pn_los_acc = 0.0
 
 
-def _uskorenie_celi(rate_dps, range_m, now, key):
+PN_SMC_K = 6.0               # усиление скользящего режима, м/с²
+PN_SMC_EPS = 1.5              # пограничный слой, °/с. Уже — дрожание.
+
+
+def _skolzyashiy(rate_dps):
+    """Член скользящего режима, м/с².
+
+    Поверхность — скорость линии визирования. Гонит её в ноль, не измеряя
+    ускорение цели. Знак заменён на насыщение: внутри слоя команда
+    пропорциональна, за слоем постоянна. Иначе стик дрожит.
+    """
+    if rate_dps is None:
+        return 0.0
+    s = float(rate_dps) / PN_SMC_EPS
+    if s > 1.0:
+        s = 1.0
+    elif s < -1.0:
+        s = -1.0
+    return PN_SMC_K * s
     """Ускорение цели поперёк линии, м/с², или None.
 
     Дальность на сглаженную производную скорости линии. Это вторая
@@ -12935,7 +12953,7 @@ def _update_control_from_target_impl():
         _rng_pn = closure.get("range_m") if isinstance(closure, dict) else None
         _ugol_pn = _tangazh_pn(
             _los_pn, _vc_pn, _rng_pn,
-            _uskorenie_celi(_los_pn, _rng_pn, now_mono, "los"),
+            _skolzyashiy(_los_pn),
             closure.get("depression_deg") if isinstance(closure, dict) else None)
         pitch_offset = (PITCH_PWM_TO_FC_ANGLE_SIGN
                         * _ugol_pn * PN_PITCH_PWM_PER_DEG)
