@@ -2200,7 +2200,12 @@ COLLISION_ROLL_MAX = 28.0
 PN_ROLL_HOLD_PX = 12.0
 PN_ROLL_HOLD_DEG = 0.40
 PN_ROLL_HOLD_MAX = 12.0
-PN_ROLL_AZ_DEG = 0.5          # ° крена на °/с курса сверх его собственного шума
+PN_ROLL_AZ_DEG = 0.5          # запас, если скорости сближения нет
+# Пропорциональная навигация: крен гасит вращение линии визирования.
+# a = N * Vc * az, крен = atan(a / g). N = 3..5, берём 4.
+# Само меньше вдали, где сближение медленное, и больше вблизи.
+PN_N = 4.0
+G_MPS2 = 9.81
 # Интеграл по скорости азимута: постоянный параллельный снос должен
 # накапливать доворот курса, а не сидеть в шуме оценки.
 PN_ROLL_AZ_I = 0.3            # ° банка в секунду на °/с азимута
@@ -9184,7 +9189,36 @@ def _stolknovenie_pwm(skorost, ts, now, deadband, gain, limit, sign):
     return pwm
 
 
-def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k, yaw_rate_dps=None):
+def _skorost_sblizheniya(closure):
+    """Скорость сближения, м/с. Дальность делённая на время до контакта.
+
+    Нет годной пары — None, крен возьмёт скромную.
+    """
+    if not isinstance(closure, dict):
+        return None
+    rng = closure.get("range_m")
+    tau = closure.get("tau_s")
+    if rng is None or tau is None:
+        return None
+    if float(tau) <= 0.2:
+        return None
+    return float(rng) / float(tau)
+
+
+def _kren_pn(az_dps, vc_mps):
+    """Крен по пропорциональной навигации, градусы.
+
+    Боковое ускорение N * скорость сближения * скорость азимута,
+    крен из него через g. Скорости нет — скромная, чтобы не пропасть.
+    """
+    az_rad = math.radians(float(az_dps))
+    vc = 10.0 if vc_mps is None else max(1.0, float(vc_mps))
+    a = PN_N * vc * az_rad
+    return math.degrees(math.atan(a / G_MPS2))
+
+
+def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k,
+                  yaw_rate_dps=None, vc_mps=None):
     """Стик, который правит курс, а не только держит крестик.
 
     В центре кадра главный сигнал — скорость азимута (az_rate -> 0):
@@ -9235,7 +9269,7 @@ def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k, yaw_rate_dps=None):
     if dx_abs <= PN_ROLL_HOLD_PX:
         az_w = 1.0
     else:
-        az_w = max(0.25, 1.0 - (dx_abs - PN_ROLL_HOLD_PX) / 40.0)
+        az_w = max(0.1, 1.0 - (dx_abs - PN_ROLL_HOLD_PX) / 18.0)
     if az_svezh and yaw_ok and az is not None:
         az_f = float(az)
         # Мёртвая зона — шум самой оценки, не порог пилота. Ниже неё
@@ -9243,7 +9277,9 @@ def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k, yaw_rate_dps=None):
         mertvaya = _az_sigma if _az_sigma > 0.5 else 0.5
         if abs(az_f) > mertvaya:
             izb_az = az_f - math.copysign(mertvaya, az_f)
-            az_dob = ROLL_SIGN * izb_az * PN_ROLL_AZ_DEG * az_w
+            # Крен по пропорциональной навигации: гасит вращение линии
+            # визирования, размер растёт со скоростью сближения.
+            az_dob = ROLL_SIGN * _kren_pn(izb_az, vc_mps) * az_w
             # Интеграл по избытку азимута, с тем же весом: параллельный
             # полёт в центре доворачивается, явная рамка интеграл не копит.
             _pn_az_i += izb_az * PN_ROLL_AZ_I * az_w * dt_s
@@ -12634,7 +12670,7 @@ def _update_control_from_target_impl():
             _yaw_r = float(_gz[2]) * GYRO_UNIT_DPS
         col_r = _kren_na_kurs(
             _az_skorost, _az_skorost_ts, _bank, dx_raw, now_mono, k,
-            _yaw_r) * trust_k
+            _yaw_r, _skorost_sblizheniya(closure)) * trust_k
         roll_integral = 0.0
         roll_offset = 0.0
         _pid_dbg["roll"] = (
