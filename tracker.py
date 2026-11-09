@@ -9462,12 +9462,6 @@ _pn_nabor_cel = None  # не используется
 
 
 
-_pn_az_pred = None
-_pn_az_pred_t = 0.0
-_pn_los_pred = None
-_pn_los_pred_t = 0.0
-_pn_az_acc = 0.0
-_pn_los_acc = 0.0
 
 
 PN_FILTR_TAU = 0.15           # сглаживание скорости линии, с. Было 0.4 — вместе с окном 2.0 давало ~1.4 с лага.
