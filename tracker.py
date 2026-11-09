@@ -8918,6 +8918,7 @@ def reset_tracking(to_acq=False):
     global roll_integral, pitch_integral, yaw_integral
     global _pn_bank_i, _pn_bank_tek, _pn_dx_pred, _pn_dx_t, _pn_dx_rate
     global _pn_nos_i, _pn_nos_tek, _pn_nos_blizko, _pn_nos_ugol, _pn_rezhim, _pn_nedolet, _pn_baza, _pn_nabor_cel
+    global _filtr_los
     global smoothed_pitch_deg
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
@@ -9037,6 +9038,7 @@ def reset_tracking(to_acq=False):
     _pn_nos_ugol = None
     _pn_rezhim = None
     _pn_nedolet = 0.0
+    _filtr_los = {"los": None, "az": None, "t_los": None, "t_az": None}
     _pn_baza = None
     _pn_nabor_cel = None
 
@@ -9470,7 +9472,7 @@ _pn_los_acc = 0.0
 
 PN_FILTR_TAU = 0.4            # сглаживание скорости линии, с. Меньше — резче и шумнее.
 
-_filtr_los = {"los": None, "az": None, "t": None}
+_filtr_los = {"los": None, "az": None, "t_los": None, "t_az": None}
 
 
 def _skorost_gladkaya(rate_dps, key, now):
@@ -9479,20 +9481,22 @@ def _skorost_gladkaya(rate_dps, key, now):
     На дальней дистанции угол мал, а его производная прыгает, и тангаж
     местит стик. Фильтр первого порядка глушит дрожь, закон не трогает.
     Постоянная 0.4 с — компромисс, лаг ещё не портит промах.
+    Свой таймер на каждую ось: общий t замораживал вторую ось.
     """
     if rate_dps is None:
         return None
     st = _filtr_los
-    if st["t"] is None or st[key] is None:
+    tkey = "t_" + key
+    if st.get(tkey) is None or st.get(key) is None:
         st[key] = float(rate_dps)
-        st["t"] = now
+        st[tkey] = now
         return st[key]
-    dt = max(0.0, now - st["t"])
-    st["t"] = now
+    dt = max(0.0, now - st[tkey])
+    st[tkey] = now
     a = dt / (PN_FILTR_TAU + dt) if (PN_FILTR_TAU + dt) > 0 else 1.0
     st[key] = st[key] + a * (float(rate_dps) - st[key])
     return st[key]
-PN_SMC_K = 6.0               # усиление скользящего режима, м/с²
+PN_SMC_K = 1.5               # усиление скользящего режима, м/с². Было 6.0 — насыщало крен до порога 0.5 °/с.
 PN_SMC_EPS = 1.5              # пограничный слой, °/с. Уже — дрожание.
 
 
@@ -9511,35 +9515,6 @@ def _skolzyashiy(rate_dps):
     elif s < -1.0:
         s = -1.0
     return PN_SMC_K * s
-    """Ускорение цели поперёк линии, м/с², или None.
-
-    Дальность на сглаженную производную скорости линии. Это вторая
-    производная угла — шумно, поэтому сглаживаем и режем по потолку.
-    key — 'az' или 'los', состояние по оси своё.
-    """
-    global _pn_az_pred, _pn_az_pred_t, _pn_los_pred, _pn_los_pred_t
-    global _pn_az_acc, _pn_los_acc
-    if key == "az":
-        pred, pred_t, acc = _pn_az_pred, _pn_az_pred_t, _pn_az_acc
-    else:
-        pred, pred_t, acc = _pn_los_pred, _pn_los_pred_t, _pn_los_acc
-    uskor = None
-    if rate_dps is not None and pred is not None and pred_t > 0.0:
-        dt = now - pred_t
-        if 0.0 < dt <= 0.5:
-            acc += 0.3 * ((float(rate_dps) - float(pred)) / dt - acc)
-            if range_m is not None:
-                uskor = float(range_m) * math.radians(acc)
-                if uskor > 15.0:
-                    uskor = 15.0
-                elif uskor < -15.0:
-                    uskor = -15.0
-    if key == "az":
-        _pn_az_pred, _pn_az_pred_t, _pn_az_acc = rate_dps, now, acc
-    else:
-        _pn_los_pred, _pn_los_pred_t, _pn_los_acc = rate_dps, now, acc
-    return uskor
-
 
 def _nabor_pwm(alt_m, range_m):
     """Добавка газа на пологом дальнем заходе, PWM.
