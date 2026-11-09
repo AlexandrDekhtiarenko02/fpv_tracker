@@ -284,15 +284,15 @@ for _ in range(int(2.0 * t.NOMINAL_FPS)):
     now_p += 1.0 / t.NOMINAL_FPS
     t._nos_na_kurs(0.0, now_p, 44.5, 18.0, 0.0, now_p, 1.0, 8.0, 200.0)
 assert t._pn_nos_ugol <= t.PN_PITCH_ABS_MAX + 1e-6, t._pn_nos_ugol
-# Газ от фактического запаса. Нос на запасе — уровень дальнего.
-# Нос на цели — уровень линии. Выше запаса режима не добавляем.
-assert t._gaz_ot_zapasa(t.PN_ZAPAS_DEG) == t.GAZ_NA_LINII + t.GAZ_NA_ZAPAS * t.PN_ZAPAS_DEG
+# Газ от фактического запаса. База — висение, не константа.
+# Нос на запасе — база плюс 10 ШИМ на градус. Нос на цели — база.
+assert t._gaz_ot_zapasa(t.PN_ZAPAS_DEG, 1260) == 1260 + t.GAZ_NA_ZAPAS * t.PN_ZAPAS_DEG
 t._pn_rezhim = "line"
-assert t._gaz_ot_zapasa(9.0) == t.GAZ_NA_LINII
+assert t._gaz_ot_zapasa(9.0, 1400) == 1400
 t._pn_rezhim = "speed"
-assert t._gaz_ot_zapasa(0.0) == t.GAZ_NA_LINII
-assert t._gaz_ot_zapasa(20.0) == t.GAZ_NA_LINII + t.GAZ_NA_ZAPAS * t.PN_ZAPAS_DEG
-assert t._gaz_ot_zapasa(5.0, hover=1400) == 1400.0 + t.GAZ_NA_ZAPAS * 5.0
+assert t._gaz_ot_zapasa(0.0, 1300) == 1300
+assert t._gaz_ot_zapasa(20.0, 1260) == 1260 + t.GAZ_NA_ZAPAS * t.PN_ZAPAS_DEG
+assert t._gaz_ot_zapasa(5.0, 1400) == 1400.0 + t.GAZ_NA_ZAPAS * 5.0
 t._pn_rezhim = "speed"
 
 print("=== 8b. Газ компенсирует высоту, опора — стик входа ===")

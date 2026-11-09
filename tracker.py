@@ -2247,10 +2247,9 @@ PN_PITCH_I_DEG_PER_S = 0.6
 PN_PITCH_I_MAX = 4.0
 PN_PITCH_PWM_PER_DEG = 8.0
 PN_PITCH_PWM_MAX = 80.0
-# Газ за фактическим запасом под целью. Ноль запаса — уровень ближнего
-# эталона. 9° — около 1350, как на дальнем. Абсолютный тангаж сюда не входит.
-# Пол — висение, если оно известно и выше: ниже висения заход садится.
-GAZ_NA_LINII = 1260.0
+# Газ за фактическим запасом под целью. База — висение этого борта,
+# не число из чужого лога: вес разный, висение разное. Нет висения —
+# стик входа. Прибавка за нос — наклон, не уровень.
 GAZ_NA_ZAPAS = 10.0            # ШИМ на градус фактического запаса
 # Близко к цели сброс газа без носа — дуга. На z08 logs-24 газ ушёл
 # 1413→1333 около 100 м, стик тангажа остался в центре. Несколько градусов
@@ -9407,12 +9406,13 @@ def _zapas_nosa():
     return 0.0
 
 
-def _gaz_ot_zapasa(aim_below, hover=None):
+def _gaz_ot_zapasa(aim_below, base):
     """Газ от фактического запаса под целью, не от тангажа и не от желаемого.
 
-    Нос ещё не опустился — газ на уровне линии. Сел на запас режима —
-    уровень дальнего эталона. Выше запаса режима не добавляем: лишний
-    нос в конце не должен разгонять тягу. Пол — висение, если известно.
+    База — висение этого борта, иначе стик входа. Нос ещё не опустился —
+    газ на базе. Сел на запас режима — на 10 ШИМ выше за каждый градус.
+    Выше запаса режима не добавляем: лишний нос в конце не должен
+    разгонять тягу. Константы из чужого лога здесь нет.
     """
     zapas = _zapas_nosa()
     aim = 0.0 if aim_below is None else float(aim_below)
@@ -9420,10 +9420,7 @@ def _gaz_ot_zapasa(aim_below, hover=None):
         aim = 0.0
     if aim > zapas:
         aim = zapas
-    base = GAZ_NA_LINII
-    if hover is not None and float(hover) > base:
-        base = float(hover)
-    return base + GAZ_NA_ZAPAS * aim
+    return float(base) + GAZ_NA_ZAPAS * aim
 
 
 def _nos_na_kurs(los, los_ts, pitch_deg, pitch_lock, dy_px, now, k,
@@ -13458,11 +13455,14 @@ def _update_control_from_target_impl():
             _gaz_vhod = float(base_thr)
         _dep_lin = (closure.get("depression_deg")
                     if isinstance(closure, dict) else None)
-        # Газ от фактического запаса под целью. Желаемый запас и
-        # тангаж уровень не задают: нос ещё не опустился — газ на
-        # линии, нос вернулся на цель — тяга падает, хотя угол большой.
+        # Газ от фактического запаса под целью. База — висение этого
+        # борта, иначе стик входа. Тангаж и чужое число уровень не задают.
         _aim_lin = -(box_cy - CENTER_Y) * CAMERA_VFOV_DEG / float(MAIN_H)
-        _cel_lin = _gaz_ot_zapasa(_aim_lin, _hover_s_napryazheniem())
+        _baza_lin = _hover_s_napryazheniem()
+        if _baza_lin is None:
+            _baza_lin = (float(_gaz_vhod) if _gaz_vhod is not None
+                         else float(base_thr))
+        _cel_lin = _gaz_ot_zapasa(_aim_lin, _baza_lin)
         del _dep_lin
         _thr_geom_out = _podtyanut_gaz(
             _thr_geom_out if _thr_geom_out is not None else target_throttle,
