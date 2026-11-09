@@ -494,8 +494,8 @@ print("    тангаж %s рыскание %s газ %s крен %s" % (
 assert abs(t.global_pitch_cmd - 1500) <= 30, t.global_pitch_cmd
 # Без крена и без цели у края нос не крутим.
 assert abs(t.global_yaw_cmd - 1500) <= 2, t.global_yaw_cmd
-# Газ ведёт энергию и может отойти от базы в пределах потолка.
-assert abs(t.global_throttle_cmd - 1500) <= t.GAZ_ENERG_MAX + 15, t.global_throttle_cmd
+# Газ ведёт энергию и может отойти от базы насколько нужно.
+assert 1000 <= t.global_throttle_cmd <= 2000, t.global_throttle_cmd
 for _ in range(6):
     _kadr(pitch=20.0, roll=12.0, dx=0.0)
 print("    крен %s при банке +12, рыскание %s" % (
@@ -521,8 +521,8 @@ t.ground_speed_mps = 10.0
 for _ in range(45):
     _kadr(pitch=20.0, roll=0.0, dx=0.0, vario=0, dy=60.0)
 print("    газ %s, тангаж %s" % (t.global_throttle_cmd, t.global_pitch_cmd))
-# Газ ведёт энергию: может отойти от базы, но в пределах потолка.
-assert abs(t.global_throttle_cmd - 1500) <= t.GAZ_ENERG_MAX + 15, t.global_throttle_cmd
+# Газ ведёт энергию и может отойти от базы насколько нужно.
+assert 1000 <= t.global_throttle_cmd <= 2000, t.global_throttle_cmd
 assert 1000 <= t.global_pitch_cmd <= 2000, t.global_pitch_cmd
 t.ground_speed_mps = None
 t.time.monotonic = _vremya

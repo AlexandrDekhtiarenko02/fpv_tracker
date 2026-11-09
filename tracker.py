@@ -9516,7 +9516,6 @@ def _zapas_nosa():
 # кончились вместе: снижение быстрее, чем alt/tau — тяги мало, добавляем.
 # Сближение быстрее, чем кончается высота — снимаем.
 GAZ_NA_MPS = 20.0              # ШИМ на каждый лишний м/с снижения
-GAZ_ENERG_MAX = 150.0          # потолок поправки, ШИМ
 
 
 def _gaz_po_energii(base, alt_m, tau_s, n_tau, sigma_s, vario_cms,
@@ -9539,12 +9538,7 @@ def _gaz_po_energii(base, alt_m, tau_s, n_tau, sigma_s, vario_cms,
     nuzhno = alt / tau
     fakt = -float(vario_cms) / 100.0
     izb = fakt - nuzhno
-    dob = izb * GAZ_NA_MPS
-    if dob > GAZ_ENERG_MAX:
-        dob = GAZ_ENERG_MAX
-    elif dob < -GAZ_ENERG_MAX:
-        dob = -GAZ_ENERG_MAX
-    return float(base) + dob
+    return float(base) + izb * GAZ_NA_MPS
 
 
 def _gaz_ot_zapasa(aim_below, base):
