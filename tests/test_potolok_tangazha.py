@@ -295,7 +295,7 @@ assert t._gaz_ot_zapasa(20.0, 1260) == 1260 + t.GAZ_NA_ZAPAS * t.PN_ZAPAS_DEG
 assert t._gaz_ot_zapasa(5.0, 1400) == 1400.0 + t.GAZ_NA_ZAPAS * 5.0
 t._pn_rezhim = "speed"
 
-print("=== 8d. Недолет: высота кончается раньше дальности ===")
+print("=== 8d. Недолет и перелет: высота и дальность вместе ===")
 # 40 м, 10 с — нужно 4 м/с. Снижаемся 7 м/с: лишние 2 выше мёртвой зоны.
 ned = t._nedolet_deg(40.0, 10.0, 20, 1.0, -700.0, 240.0, 40.0)
 assert abs(ned - 4.0) < 1e-6, ned
@@ -311,9 +311,17 @@ assert plo == 0.0, plo
 # Потолок добавки.
 pot = t._nedolet_deg(40.0, 10.0, 20, 1.0, -2000.0, 240.0, 40.0)
 assert pot == t.PN_NEDOLET_MAX_DEG, pot
+# Перелет: снижаемся 1 м/с при нужных 4, время убывает — убавка.
+per = t._nedolet_deg(40.0, 10.0, 20, 1.0, -100.0, 240.0, 40.0, ubyv=-1.0)
+assert abs(per - (-2.0)) < 1e-6, per
+# То же, но время не убывает — пологий дальний, не трогаем.
+dal = t._nedolet_deg(40.0, 10.0, 20, 1.0, -100.0, 240.0, 40.0, ubyv=0.5)
+assert dal == 0.0, dal
 t._pn_rezhim = "speed"
 t._pn_nedolet = 4.0
 assert t._zapas_nosa() == t.PN_ZAPAS_DEG + 4.0
+t._pn_nedolet = -t.PN_ZAPAS_DEG
+assert t._zapas_nosa() == 0.0
 t._pn_nedolet = 0.0
 
 print("=== 8b. Газ компенсирует высоту, опора — стик входа ===")

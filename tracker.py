@@ -2233,6 +2233,11 @@ PN_ZAPAS_POL_DEG = 1.0         # ближе этого к запасу — ка�
 PN_NEDOLET_DEAD_MPS = 1.0      # быстрее нужного на столько — уже недолет
 PN_NEDOLET_DEG_PER_MPS = 2.0   # градус запаса на каждый лишний м/с
 PN_NEDOLET_MAX_DEG = 6.0       # добавка не больше этого, всего 15°
+# Перелет: снижаемся медленнее нужного. Порог выше, чем у недолета,
+# чтобы шум барометра не клевал нос туда-сюда. Убавляем, только когда
+# время до контакта убывает: иначе это пологий дальний заход, где
+# запас пилот держал специально.
+PN_PERELET_DEAD_MPS = 2.0
 # Рамка у края кадра обрезается, размер врёт, tau мусор. Ближе этого
 # к краю время до контакта для недолета не берём.
 PN_NEDOLET_KRAI_PX = 20.0
@@ -9410,14 +9415,13 @@ def _konec_zahoda(range_m, alt_m, tau_s, n_tau, tau_sigma):
 
 
 def _nedolet_deg(alt_m, tau_s, n_tau, sigma_s, vario_cms,
-                 box_cy=None, box_h=None):
-    """Сколько градусов добавить к запасу, если высота кончается раньше.
+                 box_cy=None, box_h=None, ubyv=None):
+    """На сколько градусов поправить запас, чтобы высота и дальность кончились вместе.
 
-    Нужное снижение — высота / время до контакта: столько, чтобы оба
-    кончились вместе. Снижаемся заметно быстрее — недолет, носа мало.
-    Время ненадёжно, высоты нет или рамка у края кадра — ноль: там
-    размер обрезан и tau мусор, уставку режима не трогаем.
-    Перелёт здесь не лечится: его снимает конец захода.
+    Плюс — недолет: снижаемся быстрее, чем высота / время, носа мало.
+    Минус — перелет: снижаемся медленнее, и только если время до
+    контакта убывает. Иначе это пологий дальний заход, запас не трогаем.
+    Ноль — летит в цель, или времени нет, или рамка у края кадра.
     """
     if alt_m is None or tau_s is None or vario_cms is None:
         return 0.0
@@ -9435,13 +9439,18 @@ def _nedolet_deg(alt_m, tau_s, n_tau, sigma_s, vario_cms,
         return 0.0
     nuzhno = alt / tau
     fakt = -float(vario_cms) / 100.0
-    lishnee = fakt - nuzhno - PN_NEDOLET_DEAD_MPS
-    if lishnee <= 0.0:
-        return 0.0
-    dob = lishnee * PN_NEDOLET_DEG_PER_MPS
-    if dob > PN_NEDOLET_MAX_DEG:
-        return PN_NEDOLET_MAX_DEG
-    return dob
+    if fakt - nuzhno > PN_NEDOLET_DEAD_MPS:
+        dob = (fakt - nuzhno - PN_NEDOLET_DEAD_MPS) * PN_NEDOLET_DEG_PER_MPS
+        if dob > PN_NEDOLET_MAX_DEG:
+            return PN_NEDOLET_MAX_DEG
+        return dob
+    if (nuzhno - fakt > PN_PERELET_DEAD_MPS
+            and ubyv is not None and float(ubyv) < 0.0):
+        ubav = (nuzhno - fakt - PN_PERELET_DEAD_MPS) * PN_NEDOLET_DEG_PER_MPS
+        if ubav > PN_ZAPAS_DEG:
+            return -PN_ZAPAS_DEG
+        return -ubav
+    return 0.0
 
 
 def _zapas_nosa():
@@ -9449,10 +9458,13 @@ def _zapas_nosa():
 
     Режим выбирается на захвате и держится. Пока геометрии нет —
     запас не выдумываем. Конец захода снимает скорость. Недолет
-    добавляет к запасу, газ идёт за ним.
+    добавляет к запасу, перелет убавляет, но не ниже нуля.
     """
     if _pn_rezhim == "speed":
-        return PN_ZAPAS_DEG + _pn_nedolet
+        zapas = PN_ZAPAS_DEG + _pn_nedolet
+        if zapas < 0.0:
+            return 0.0
+        return zapas
     return 0.0
 
 
@@ -12716,13 +12728,13 @@ def _update_control_from_target_impl():
                        if isinstance(closure, dict) else None)
             if _konec_zahoda(_dal_bl, _alt_bl, _tau_bl, len(_tau_hist), _sig_bl):
                 _pn_rezhim = "line"
-        # Недолет: высота кончается раньше дальности. Добавляем запас,
-        # газ идёт за ним. Рамка у края или tau ненадёжен — ноль.
+        # Недолет добавляет запас, перелет убавляет. Рамка у края,
+        # tau ненадёжен или время не убывает — ноль.
         _pn_nedolet = 0.0
         if _pn_rezhim == "speed":
             _pn_nedolet = _nedolet_deg(
                 _alt_bl, _tau_bl, len(_tau_hist), _sig_bl, _var_bl,
-                box_cy, box[3] - box[1])
+                box_cy, box[3] - box[1], _tau_ubyvanie)
         # Добор носа ближе 110 м по старому газу снят: он добавлял нос
         # там, где в конце его как раз надо возвращать на цель.
         pitch_offset = _nos_na_kurs(
