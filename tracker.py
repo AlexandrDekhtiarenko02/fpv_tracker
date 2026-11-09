@@ -2221,6 +2221,13 @@ PN_ROLL_PWM_MAX = 110.0
 # Снижаемся быстрее нужного — высоты не хватит, нос ниже, газ за ним.
 # В цель или перелёт — нос на цели. Порогов дальности и угла нет:
 # они были границей двух эталонов, а не законом.
+# Запас на заход. Пилот выбирал его по заходу и держал: на дальнем
+# нос ниже цели, на ближнем на цели. Это не alt/tau — то сравнение
+# говорит «в цель», пока пилот держит запас ради скорости.
+# Подбор по эталонам: дальность на захвате больше 200 м отделяет
+# заходы с запасом от заходов без, ошибка 4° против 8° без него.
+PN_BAZA_RANGE_M = 200.0
+PN_BAZA_DEG = 8.0
 PN_ZAPAS_POL_DEG = 1.0         # ближе этого к запасу — картинка уже та
 # Недолет: снижаемся быстрее, чем высота / время до контакта.
 # Высота кончится раньше дальности. Добавляем запас, газ идёт за ним.
@@ -5078,8 +5085,8 @@ _pn_rezhim = None
 # Добавка запаса на недолет, градусы. Считается каждый кадр из
 # высоты, времени до контакта и вариометра. Ноль — летит в цель.
 _pn_nedolet = 0.0
-
-# Сглаженное значение fc_pitch_deg для расчёта компенсации тангажа.
+# Запас на заход по геометрии захвата. None — ещё не выбран.
+_pn_baza = None
 smoothed_pitch_deg = 0.0
 # Тангаж в момент захвата — начало отсчёта для компенсации. None означает
 # «лока нет»: при следующем захвате отсчёт начнётся заново.
@@ -8920,7 +8927,7 @@ def reset_tracking(to_acq=False):
     global smooth_throttle_out, throttle_integral, prev_ady
     global roll_integral, pitch_integral, yaw_integral
     global _pn_bank_i, _pn_bank_tek, _pn_dx_pred, _pn_dx_t, _pn_dx_rate
-    global _pn_nos_i, _pn_nos_tek, _pn_nos_blizko, _pn_nos_ugol, _pn_rezhim, _pn_nedolet
+    global _pn_nos_i, _pn_nos_tek, _pn_nos_blizko, _pn_nos_ugol, _pn_rezhim, _pn_nedolet, _pn_baza
     global smoothed_pitch_deg
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
@@ -9040,6 +9047,7 @@ def reset_tracking(to_acq=False):
     _pn_nos_ugol = None
     _pn_rezhim = None
     _pn_nedolet = 0.0
+    _pn_baza = None
 
     smoothed_pitch_deg = 0.0
 
@@ -9447,11 +9455,14 @@ def _nedolet_deg(alt_m, tau_s, n_tau, sigma_s, vario_cms,
 def _zapas_nosa():
     """Сколько градусов нос ниже цели.
 
-    Целиком из сравнения высоты и дальности. Пока его нет — нос на цели.
+    База выбрана на захвате по дальности: дальний заход держит запас
+    ради скорости, ближний — нос на цели. Сравнение высоты и дальности
+    добавляет сверху, если высота кончается раньше.
     """
+    baza = 0.0 if _pn_baza is None else _pn_baza
     if _pn_nedolet > 0.0:
-        return _pn_nedolet
-    return 0.0
+        return baza + _pn_nedolet
+    return baza
 
 
 def _gaz_ot_zapasa(aim_below, base):
@@ -11717,7 +11728,7 @@ def _update_control_from_target_impl():
     global _hover_pwm, _thr_geom_out, _geom_mode_log, _gaz_vhod
     global roll_integral, pitch_integral, yaw_integral
     global _pn_bank_i, _pn_bank_tek, _pn_dx_pred, _pn_dx_t, _pn_dx_rate
-    global _pn_nos_i, _pn_nos_tek, _pn_nos_blizko, _pn_nos_ugol, _pn_rezhim, _pn_nedolet
+    global _pn_nos_i, _pn_nos_tek, _pn_nos_blizko, _pn_nos_ugol, _pn_rezhim, _pn_nedolet, _pn_baza
     global smoothed_pitch_deg
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
@@ -11926,6 +11937,7 @@ def _update_control_from_target_impl():
         _pn_nos_ugol = None
         _pn_rezhim = None
         _pn_nedolet = 0.0
+        _pn_baza = None
         # SHADOW-состояние — своё, отдельное от live-интеграторов выше, но
         # сбрасывается по тому же событию (новый/потерянный захват): иначе
         # диагностика windup тянула бы накопление прошлой цели в новую.
@@ -12704,8 +12716,11 @@ def _update_control_from_target_impl():
         _aim_bl = -(box_cy - CENTER_Y) * CAMERA_VFOV_DEG / float(MAIN_H)
         _age_bl = (None if _tracked_since_t is None
                    else now_mono - _tracked_since_t)
-        # Запас носа — из сравнения высоты и дальности, каждый кадр.
-        # Порогов угла и дальности нет. Пока сравнения нет — плавно к нулю.
+        # Запас на заход — один раз, по дальности захвата. Дальше его
+        # держим: пилот так и делал, а alt/tau говорит «в цель».
+        if _pn_baza is None and _dal_bl is not None:
+            _pn_baza = PN_BAZA_DEG if float(_dal_bl) > PN_BAZA_RANGE_M else 0.0
+        # Сравнение высоты и дальности добавляет, если высота кончается раньше.
         _alt_bl = None
         with state_lock:
             _alt_syroy = app_state.get("alt_cm")

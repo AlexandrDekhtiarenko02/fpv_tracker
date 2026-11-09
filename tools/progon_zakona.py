@@ -34,10 +34,14 @@ def progon(path):
     zapas_sum = 0.0
     gaz_sum = 0.0
     pilot_gaz_sum = 0.0
+    pilot_aim_sum = 0.0
     nedolet = 0
     vcel = 0
     net = 0
+    t._pn_baza = None
     for _, r in o.iterrows():
+        if t._pn_baza is None and not pd.isna(r.range_m):
+            t._pn_baza = t.PN_BAZA_DEG if r.range_m > t.PN_BAZA_RANGE_M else 0.0
         alt = None if pd.isna(r.alt_cm) else r.alt_cm / 100.0
         tau = None if pd.isna(r.tau_s) else r.tau_s
         sig = None if pd.isna(r.tau_sigma_s) else r.tau_sigma_s
@@ -54,16 +58,19 @@ def progon(path):
         else:
             vcel += 1
         t._pn_nedolet = z
+        zapas = t._zapas_nosa()
         aim = 0.0 if pd.isna(r.dy_raw) else -r.dy_raw * dpp
         base = r.base_thr if not pd.isna(r.base_thr) else 1300.0
         gaz = t._gaz_ot_zapasa(aim, base)
-        zapas_sum += z
+        zapas_sum += zapas
         gaz_sum += gaz
         pilot_gaz_sum += r.rc_t if not pd.isna(r.rc_t) else base
+        pilot_aim_sum += aim
         n += 1
     return {
         "n": n,
         "zapas": zapas_sum / n,
+        "pilot_aim": pilot_aim_sum / n,
         "nedolet": 100 * nedolet / n,
         "vcel": 100 * vcel / n,
         "net": 100 * net / n,
@@ -79,15 +86,14 @@ def main():
     files = sorted(glob.glob(os.path.join(sys.argv[1], "*/строки.csv")))
     if not files:
         files = sorted(glob.glob(os.path.join(sys.argv[1], "*.csv")))
-    print(f"{'захват':<22s} {'запас':>6s} {'недолет':>8s} {'в цель':>7s} "
-          f"{'нет tau':>8s} {'газ':>6s} {'пилот':>7s}")
+    print(f"{'захват':<22s} {'пилот':>7s} {'закон':>7s} {'ошибка':>7s}")
     for f in files:
         r = progon(f)
         if r is None:
             continue
         name = os.path.basename(os.path.dirname(f))[-18:]
-        print(f"{name:<22s} {r['zapas']:6.1f} {r['nedolet']:7.0f}% "
-              f"{r['vcel']:6.0f}% {r['net']:7.0f}% {r['gaz']:6.0f} {r['pilot']:7.0f}")
+        print(f"{name:<22s} {r['pilot_aim']:7.1f} {r['zapas']:7.1f} "
+              f"{abs(r['zapas']-r['pilot_aim']):7.1f}")
     return 0
 
 
