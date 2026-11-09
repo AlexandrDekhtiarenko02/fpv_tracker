@@ -5092,6 +5092,7 @@ _pn_rezhim = None
 _pn_nedolet = 0.0
 # Запас на заход по геометрии захвата. None — ещё не выбран.
 _pn_baza = None
+_pn_nabor_cel = None
 smoothed_pitch_deg = 0.0
 # Тангаж в момент захвата — начало отсчёта для компенсации. None означает
 # «лока нет»: при следующем захвате отсчёт начнётся заново.
@@ -8932,7 +8933,7 @@ def reset_tracking(to_acq=False):
     global smooth_throttle_out, throttle_integral, prev_ady
     global roll_integral, pitch_integral, yaw_integral
     global _pn_bank_i, _pn_bank_tek, _pn_dx_pred, _pn_dx_t, _pn_dx_rate
-    global _pn_nos_i, _pn_nos_tek, _pn_nos_blizko, _pn_nos_ugol, _pn_rezhim, _pn_nedolet, _pn_baza
+    global _pn_nos_i, _pn_nos_tek, _pn_nos_blizko, _pn_nos_ugol, _pn_rezhim, _pn_nedolet, _pn_baza, _pn_nabor_cel
     global smoothed_pitch_deg
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
@@ -9053,6 +9054,7 @@ def reset_tracking(to_acq=False):
     _pn_rezhim = None
     _pn_nedolet = 0.0
     _pn_baza = None
+    _pn_nabor_cel = None
 
     smoothed_pitch_deg = 0.0
 
@@ -9515,7 +9517,30 @@ def _zapas_nosa():
 # пропорциональная навигация. Газ делает так, чтобы высота и дальность
 # кончились вместе: снижение быстрее, чем alt/tau — тяги мало, добавляем.
 # Сближение быстрее, чем кончается высота — снимаем.
+# Набор высоты на захвате. Если заход слишком пологий — высота мала
+# для дальности, — сначала набираем до угла, с которого можно снижаться,
+# и только потом отдаём энергию закону. Иначе на 15 м и 300 м закон
+# начнёт снижаться и упадёт раньше, чем долетит.
+PN_MIN_UGOL = 10.0             # минимальный угол захода, °
+PN_NABOR_PWM = 250.0           # добавка газа на время набора
 GAZ_NA_MPS = 20.0              # ШИМ на каждый лишний м/с снижения
+_pn_nabor_cel = None           # высота, до которой набираем, м. None — нет.
+
+
+def _nabor_nuzhen(alt_m, range_m):
+    """До какой высоты набрать, если заход слишком пологий. None — не надо.
+
+    Считается один раз на захвате. Высота меньше, чем дальность требует
+    для минимального угла, — набираем до неё.
+    """
+    if alt_m is None or range_m is None:
+        return None
+    if float(range_m) < 50.0:
+        return None
+    nuzhno = float(range_m) * math.tan(math.radians(PN_MIN_UGOL))
+    if float(alt_m) < nuzhno - 5.0:
+        return nuzhno
+    return None
 
 
 def _gaz_po_energii(base, alt_m, tau_s, n_tau, sigma_s, vario_cms,
@@ -11804,7 +11829,7 @@ def _update_control_from_target_impl():
     global _hover_pwm, _thr_geom_out, _geom_mode_log, _gaz_vhod
     global roll_integral, pitch_integral, yaw_integral
     global _pn_bank_i, _pn_bank_tek, _pn_dx_pred, _pn_dx_t, _pn_dx_rate
-    global _pn_nos_i, _pn_nos_tek, _pn_nos_blizko, _pn_nos_ugol, _pn_rezhim, _pn_nedolet, _pn_baza
+    global _pn_nos_i, _pn_nos_tek, _pn_nos_blizko, _pn_nos_ugol, _pn_rezhim, _pn_nedolet, _pn_baza, _pn_nabor_cel
     global smoothed_pitch_deg
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
     global launch_phase, launch_counter, prev_controllable_for_launch
@@ -12014,6 +12039,7 @@ def _update_control_from_target_impl():
         _pn_rezhim = None
         _pn_nedolet = 0.0
         _pn_baza = None
+        _pn_nabor_cel = None
         # SHADOW-состояние — своё, отдельное от live-интеграторов выше, но
         # сбрасывается по тому же событию (новый/потерянный захват): иначе
         # диагностика windup тянула бы накопление прошлой цели в новую.
@@ -12823,6 +12849,9 @@ def _update_control_from_target_impl():
             pitch_offset = PN_PITCH_PWM_MAX
         elif pitch_offset < -PN_PITCH_PWM_MAX:
             pitch_offset = -PN_PITCH_PWM_MAX
+        # На наборе высоты нос вверх, чтобы тяга поднимала, а не гнала вперёд.
+        if _pn_nabor_cel is not None:
+            pitch_offset -= 80.0
         _p_sat = abs(pitch_offset) >= PN_PITCH_PWM_MAX - 1e-6
         _pid_dbg["pitch"] = (
             pitch_offset, 0.0, _pn_nos_i * PN_PITCH_PWM_PER_DEG, 0.0,
@@ -13606,8 +13635,13 @@ def _update_control_from_target_impl():
             _gaz_vhod = float(base_thr)
         _dep_lin = (closure.get("depression_deg")
                     if isinstance(closure, dict) else None)
+        # Набор высоты, если заход слишком пологий. Считаем один раз.
+        if _pn_nabor_cel is None and _dal_bl is not None and _alt_bl is not None:
+            _pn_nabor_cel = _nabor_nuzhen(_alt_bl, _dal_bl)
+        if _pn_nabor_cel is not None and _alt_bl is not None and _alt_bl >= _pn_nabor_cel:
+            _pn_nabor_cel = None
         # Газ ведёт энергию: высота и дальность кончаются вместе.
-        # Курс закрывает навигация, тягу она не задаёт.
+        # На наборе — добавка, чтобы набрать высоту для угла захода.
         _baza_lin = _hover_s_napryazheniem()
         if _baza_lin is None:
             _baza_lin = (float(_gaz_vhod) if _gaz_vhod is not None
@@ -13623,6 +13657,8 @@ def _update_control_from_target_impl():
         _cel_lin = _gaz_po_energii(
             _baza_lin, _alt_en, _tau_en, len(_tau_hist), _sig_en, _var_bl,
             box_cy, box[3] - box[1], _tau_ubyvanie)
+        if _pn_nabor_cel is not None:
+            _cel_lin += PN_NABOR_PWM
         _thr_geom_out = _podtyanut_gaz(
             _thr_geom_out if _thr_geom_out is not None else target_throttle,
             _cel_lin, THR_GEOM_SLEW_OVERSHOOT, k)
