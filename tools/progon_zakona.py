@@ -75,13 +75,22 @@ def progon(path):
 def osi(name, df):
     def mae(a, b):
         return (a - b).abs().mean()
+    # Крен по знаку и размаху, не по среднему: пилот кладёт туда-сюда,
+    # среднее съедается. Считаем, где пилот реально отклонил стик.
+    rul = df[df.pilot_kren.abs() > 5]
+    if len(rul):
+        znak = (rul.kren * rul.pilot_kren > 0).mean()
+        razmah = rul.kren.abs().mean() / max(1.0, rul.pilot_kren.abs().mean())
+    else:
+        znak, razmah = 0.0, 0.0
     print(f"\n{name}  строк {len(df)}")
     print(f"  тангаж  пилот {df.aim.mean():6.1f}°  закон {df.zapas.mean():6.1f}°  "
           f"ошибка {mae(df.zapas, df.aim):5.1f}°")
     print(f"  газ     пилот {df.pilot_gaz.mean():6.0f}   закон {df.gaz.mean():6.0f}   "
           f"ошибка {mae(df.gaz, df.pilot_gaz):5.0f}")
-    print(f"  крен    пилот {df.pilot_kren.mean():6.1f}   закон {df.kren.mean():6.1f}   "
-          f"ошибка {mae(df.kren, df.pilot_kren):5.1f}")
+    print(f"  крен    знак {100*znak:3.0f}%  размах x{razmah:4.1f}  "
+          f"пилот {rul.pilot_kren.abs().mean() if len(rul) else 0:5.1f}  "
+          f"закон {rul.kren.abs().mean() if len(rul) else 0:5.1f}")
     print(f"  рыскание пилот {df.pilot_rysk.mean():6.1f}   закон {df.rysk.mean():6.1f}   "
           f"ошибка {mae(df.rysk, df.pilot_rysk):5.1f}")
 
