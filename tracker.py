@@ -2249,21 +2249,15 @@ PN_ROLL_PWM_MAX = 110.0
 # говорит «в цель», пока пилот держит запас ради скорости.
 # Подбор по эталонам: дальность на захвате больше 200 м отделяет
 # заходы с запасом от заходов без, ошибка 4° против 8° без него.
-PN_BAZA_RANGE_M = 200.0
-PN_BAZA_DEG = 8.0
 PN_ZAPAS_POL_DEG = 1.0         # ближе этого к запасу — картинка уже та
 # Недолет: снижаемся быстрее, чем высота / время до контакта.
 # Высота кончится раньше дальности. Добавляем запас, газ идёт за ним.
 # Мёртвая зона — чтобы шум барометра не клевал. Потолок — чтобы
 # недолет не уводил нос к 45°.
-PN_NEDOLET_DEAD_MPS = 1.0      # быстрее нужного на столько — уже недолет
-PN_NEDOLET_DEG_PER_MPS = 2.0   # градус запаса на каждый лишний м/с
-PN_NEDOLET_MAX_DEG = 6.0       # добавка не больше этого, всего 15°
 # Перелет: снижаемся медленнее нужного. Порог выше, чем у недолета,
 # чтобы шум барометра не клевал нос туда-сюда. Убавляем, только когда
 # время до контакта убывает: иначе это пологий дальний заход, где
 # запас пилот держал специально.
-PN_PERELET_DEAD_MPS = 2.0
 # Рамка у края кадра обрезается, размер врёт, tau мусор. Ближе этого
 # к краю время до контакта для недолета не берём.
 PN_NEDOLET_KRAI_PX = 20.0
@@ -9541,12 +9535,16 @@ def _nedolet_deg(alt_m, tau_s, n_tau, sigma_s, vario_cms,
         return None
     nuzhno = alt / tau
     fakt = -float(vario_cms) / 100.0
-    if fakt - nuzhno > PN_NEDOLET_DEAD_MPS:
-        dob = (fakt - nuzhno - PN_NEDOLET_DEAD_MPS) * PN_NEDOLET_DEG_PER_MPS
-        if dob > PN_NEDOLET_MAX_DEG:
-            return PN_NEDOLET_MAX_DEG
-        return dob
-    if nuzhno - fakt > PN_PERELET_DEAD_MPS and not (ubyv is not None and float(ubyv) < 0.0):
+    # Непрерывная поправка: избыточное снижение → нос ниже.
+    # Без мёртвых зон и жёсткого потолка — шум гасится фильтрами tau/vario.
+    izb = fakt - nuzhno
+    if izb > 0.0:
+        # Непрерывная поправка: избыточное снижение → нос ниже.
+        # Мягкий потолок через tanh, без жёстких мёртвых зон.
+        dob = 8.0 * math.tanh(izb / 3.0)
+        return max(0.0, dob)
+    # Перелёт без сближения — не трогаем (пологий дальний заход).
+    if izb < 0.0 and not (ubyv is not None and float(ubyv) < 0.0):
         return None
     return 0.0
 
@@ -9558,10 +9556,8 @@ def _zapas_nosa():
     ради скорости, ближний — нос на цели. Сравнение высоты и дальности
     добавляет сверху, если высота кончается раньше.
     """
-    baza = 0.0 if _pn_baza is None else _pn_baza
-    if _pn_nedolet > 0.0:
-        return baza + _pn_nedolet
-    return baza
+    # Только непрерывная поправка от alt/tau. Фиксированного запаса на захвате нет.
+    return max(0.0, float(_pn_nedolet) if _pn_nedolet is not None else 0.0)
 
 
 # Газ на ветке навигации ведёт энергию, не курс. Курс закрывает
@@ -12953,8 +12949,7 @@ def _update_control_from_target_impl():
                    else now_mono - _tracked_since_t)
         # Запас на заход — один раз, по дальности захвата. Дальше его
         # держим: пилот так и делал, а alt/tau говорит «в цель».
-        if _pn_baza is None and _dal_bl is not None:
-            _pn_baza = PN_BAZA_DEG if float(_dal_bl) > PN_BAZA_RANGE_M else 0.0
+        # Фиксированный запас на захвате убран — только непрерывный расчёт.
         # Сравнение высоты и дальности добавляет, если высота кончается раньше.
         _alt_bl = None
         with state_lock:
