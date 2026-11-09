@@ -9541,10 +9541,27 @@ def _skolzyashiy(rate_dps):
     return uskor
 
 
-def _nabor_nuzhen(alt_m, range_m):
-    """Набор по фиксированному углу убран. Энергия сама добавляет тягу."""
-    del alt_m, range_m
-    return None
+def _nabor_pwm(alt_m, range_m):
+    """Добавка газа на пологом дальнем заходе, PWM.
+
+    Только когда ещё далеко и высота мала для дальности.
+    На самом заходе (дальность уже небольшая) — ноль.
+    Считается из геометрии, без фиксированного угла и PWM.
+    """
+    if alt_m is None or range_m is None:
+        return 0.0
+    rng = float(range_m)
+    alt = float(alt_m)
+    # Ближе 120 м — уже заход, набор не трогаем.
+    if rng < 120.0 or alt <= 1.0:
+        return 0.0
+    # Высота, при которой угол линии был бы ~8°.
+    nuzhno = rng * math.tan(math.radians(8.0))
+    deficit = nuzhno - alt
+    if deficit < 5.0:
+        return 0.0
+    # Мягко: до ~150 PWM на большой дефицит, без жёсткого скачка.
+    return 150.0 * math.tanh(deficit / 40.0)
 
 
 def _gaz_po_energii(base, alt_m, tau_s, n_tau, sigma_s, vario_cms,
@@ -13470,10 +13487,6 @@ def _update_control_from_target_impl():
         _dep_lin = (closure.get("depression_deg")
                     if isinstance(closure, dict) else None)
         # Набор высоты, если заход слишком пологий. Считаем один раз.
-        if _pn_nabor_cel is None and _dal_bl is not None and _alt_bl is not None:
-            _pn_nabor_cel = _nabor_nuzhen(_alt_bl, _dal_bl)
-        if _pn_nabor_cel is not None and _alt_bl is not None and _alt_bl >= _pn_nabor_cel:
-            _pn_nabor_cel = None
         # Газ ведёт энергию: высота и дальность кончаются вместе.
         # На наборе — добавка, чтобы набрать высоту для угла захода.
         _baza_lin = _hover_s_napryazheniem()
@@ -13491,6 +13504,9 @@ def _update_control_from_target_impl():
         _cel_lin = _gaz_po_energii(
             _baza_lin, _alt_en, _tau_en, len(_tau_hist), _sig_en, _var_bl,
             box_cy, box[3] - box[1], _tau_ubyvanie)
+        # Набор только на дальнем пологом. На заходе — ноль.
+        _dal_nab = (closure.get("range_m") if isinstance(closure, dict) else None)
+        _cel_lin += _nabor_pwm(_alt_en, _dal_nab)
         _thr_geom_out = _podtyanut_gaz(
             _thr_geom_out if _thr_geom_out is not None else target_throttle,
             _cel_lin, THR_GEOM_SLEW_OVERSHOOT, k)
