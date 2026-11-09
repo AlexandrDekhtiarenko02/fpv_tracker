@@ -9339,9 +9339,10 @@ def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k,
             izb_az = az_f - math.copysign(mertvaya, az_f)
             # Крен по пропорциональной навигации: гасит вращение линии
             # визирования, размер растёт со скоростью сближения.
+            az_glad = _skorost_gladkaya(az, "az", now)
             az_dob = ROLL_SIGN * _kren_pn(
                 izb_az, vc_mps, range_m,
-                _skolzyashiy(az)) * az_w
+                _skolzyashiy(az_glad)) * az_w
             # Интеграл по избытку азимута, с тем же весом: параллельный
             # полёт в центре доворачивается, явная рамка интеграл не копит.
             _pn_az_i += izb_az * PN_ROLL_AZ_I * az_w * dt_s
@@ -9585,6 +9586,30 @@ _pn_az_acc = 0.0
 _pn_los_acc = 0.0
 
 
+PN_FILTR_TAU = 0.4            # сглаживание скорости линии, с. Меньше — резче и шумнее.
+
+_filtr_los = {"los": None, "az": None, "t": None}
+
+
+def _skorost_gladkaya(rate_dps, key, now):
+    """Скорость линии без высокочастотного шума.
+
+    На дальней дистанции угол мал, а его производная прыгает, и тангаж
+    местит стик. Фильтр первого порядка глушит дрожь, закон не трогает.
+    Постоянная 0.4 с — компромисс, лаг ещё не портит промах.
+    """
+    if rate_dps is None:
+        return None
+    st = _filtr_los
+    if st["t"] is None or st[key] is None:
+        st[key] = float(rate_dps)
+        st["t"] = now
+        return st[key]
+    dt = max(0.0, now - st["t"])
+    st["t"] = now
+    a = dt / (PN_FILTR_TAU + dt) if (PN_FILTR_TAU + dt) > 0 else 1.0
+    st[key] = st[key] + a * (float(rate_dps) - st[key])
+    return st[key]
 PN_SMC_K = 6.0               # усиление скользящего режима, м/с²
 PN_SMC_EPS = 1.5              # пограничный слой, °/с. Уже — дрожание.
 
@@ -12949,7 +12974,8 @@ def _update_control_from_target_impl():
         # вращение линии визирования. Запас носа ради скорости — с другой
         # ветки, здесь его нет.
         _vc_pn = _skorost_sblizheniya(closure)
-        _los_pn = _los_bl if _los_bl is not None else 0.0
+        _los_pn = _skorost_gladkaya(
+            _los_bl if _los_bl is not None else 0.0, "los", now_mono)
         _rng_pn = closure.get("range_m") if isinstance(closure, dict) else None
         _ugol_pn = _tangazh_pn(
             _los_pn, _vc_pn, _rng_pn,
