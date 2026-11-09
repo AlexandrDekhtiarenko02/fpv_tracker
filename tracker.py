@@ -2207,10 +2207,17 @@ PN_ROLL_AZ_DEG = 0.5          # запас, если скорости сближ
 PN_N = 3.5                    # один N. Фильтр скорости линии уже глушит шум.
 G_MPS2 = 9.81
 
-def _n_po_dalnosti(range_m):
-    """Постоянный N. Расписание по дальности убрано — шум гасит фильтр."""
-    del range_m
-    return PN_N
+def _n_po_vremeni(tau_s):
+    """N от оставшегося времени, не от дальности.
+
+    Когда времени мало, большой N перекомпенсирует любую ошибку
+    или задержку. Когда времени много — полное N.
+    Нет tau — базовое.
+    """
+    if tau_s is None or tau_s <= 0.2:
+        return PN_N
+    # На 8 с почти полное, на 2 с около половины, дальше мягко к нулю.
+    return PN_N * math.tanh(float(tau_s) / 6.0)
 # Интеграл по скорости азимута: постоянный параллельный снос должен
 # накапливать доворот курса, а не сидеть в шуме оценки.
 PN_ROLL_AZ_I = 0.3            # ° банка в секунду на °/с азимута
@@ -9206,17 +9213,18 @@ def _skorost_sblizheniya(closure):
     return float(rng) / float(tau)
 
 
-def _kren_pn(az_dps, vc_mps, range_m=None, accel_mps2=None):
+def _kren_pn(az_dps, vc_mps, range_m=None, accel_mps2=None, tau_s=None):
     """Крен по пропорциональной навигации, градусы.
 
     Боковое ускорение N * скорость сближения * скорость азимута,
-    крен из него через g. N меньше вблизи. Второй член — скользящий
-    режим: давит скорость линии в ноль, не измеряя ускорение цели.
+    крен из него через g. N считается от оставшегося времени.
+    Второй член — скользящий режим: давит скорость линии в ноль.
     Скорости нет — скромная.
     """
+    del range_m
     az_rad = math.radians(float(az_dps))
     vc = 10.0 if vc_mps is None else max(1.0, float(vc_mps))
-    n = _n_po_dalnosti(range_m)
+    n = _n_po_vremeni(tau_s)
     a = n * vc * az_rad
     if accel_mps2 is not None:
         a += 0.5 * n * float(accel_mps2)
@@ -9233,7 +9241,7 @@ def _smeshchenie_ugla(depression_deg, range_m):
 
 
 def _tangazh_pn(los_dps, vc_mps, range_m=None, accel_mps2=None,
-                depression_deg=None):
+                depression_deg=None, tau_s=None):
     """Тангаж по пропорциональной навигации, градусы.
 
     Гасит вертикальное вращение линии визирования, как крен гасит
@@ -9243,13 +9251,13 @@ def _tangazh_pn(los_dps, vc_mps, range_m=None, accel_mps2=None,
     В тангаж её ставить нельзя — ракета компенсирует углом атаки,
     коптер тягой, и формула дала бы десятки градусов носа вверх.
     """
-    ugol = _kren_pn(los_dps, vc_mps, range_m, accel_mps2)
+    ugol = _kren_pn(los_dps, vc_mps, range_m, accel_mps2, tau_s)
     ugol += _smeshchenie_ugla(depression_deg, range_m)
     return ugol
 
 
 def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k,
-                  yaw_rate_dps=None, vc_mps=None, range_m=None):
+                  yaw_rate_dps=None, vc_mps=None, range_m=None, tau_s=None):
     """Стик, который правит курс, а не только держит крестик.
 
     В центре кадра главный сигнал — скорость азимута (az_rate -> 0):
@@ -9313,7 +9321,7 @@ def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k,
             az_glad = _skorost_gladkaya(az, "az", now)
             az_dob = ROLL_SIGN * _kren_pn(
                 izb_az, vc_mps, range_m,
-                _skolzyashiy(az_glad)) * az_w
+                _skolzyashiy(az_glad), tau_s) * az_w
             # Интеграл по избытку азимута, с тем же весом: параллельный
             # полёт в центре доворачивается, явная рамка интеграл не копит.
             _pn_az_i += izb_az * PN_ROLL_AZ_I * az_w * dt_s
@@ -12833,7 +12841,8 @@ def _update_control_from_target_impl():
         col_r = _kren_na_kurs(
             _az_skorost, _az_skorost_ts, _bank, dx_raw, now_mono, k,
             _yaw_r, _skorost_sblizheniya(closure),
-            closure.get("range_m") if isinstance(closure, dict) else None) * trust_k
+            closure.get("range_m") if isinstance(closure, dict) else None,
+            closure.get("tau_s") if isinstance(closure, dict) else None) * trust_k
         roll_integral = 0.0
         roll_offset = 0.0
         _pid_dbg["roll"] = (
@@ -12943,7 +12952,8 @@ def _update_control_from_target_impl():
         _ugol_pn = _tangazh_pn(
             _los_pn, _vc_pn, _rng_pn,
             _skolzyashiy(_los_pn),
-            closure.get("depression_deg") if isinstance(closure, dict) else None)
+            closure.get("depression_deg") if isinstance(closure, dict) else None,
+            _tau_bl)
         pitch_offset = (PITCH_PWM_TO_FC_ANGLE_SIGN
                         * _ugol_pn * PN_PITCH_PWM_PER_DEG)
         if pitch_offset > PN_PITCH_PWM_MAX:
