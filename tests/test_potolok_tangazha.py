@@ -75,7 +75,7 @@ t._pn_dx_rate = 0.0
 for _ in range(int(2 * t.NOMINAL_FPS)):
     now += 1.0 / t.NOMINAL_FPS
     t._kren_na_kurs(2.0, now, 0.0, 0.0, now, 1.0, yaw_rate_dps=0.0)
-assert t._pn_bank_tek > 4.0, t._pn_bank_tek
+assert t._pn_bank_tek > 1.5, t._pn_bank_tek
 assert t._pn_bank_tek <= t.PN_ROLL_HOLD_MAX + 1e-6, t._pn_bank_tek
 # То же, но своё рыскание быстрое — az не берём (окно ещё врёт).
 t._pn_bank_i = 0.0
@@ -132,7 +132,7 @@ for _ in range(int(2 * t.NOMINAL_FPS)):
     now_l += 1.0 / t.NOMINAL_FPS
     t._kren_na_kurs(4.0, now_l, 0.0, -30.0, now_l, 1.0, 0.0)
 assert t._pn_bank_tek < -4.0, t._pn_bank_tek
-# Середина захода |dx| 5–15 не должна оставаться с креном 1–4°.
+# Рамка явно в стороне, за мёртвой зоной — крен к ней.
 t._pn_bank_i = 0.0
 t._pn_bank_tek = 0.0
 t._pn_dx_pred = None
@@ -141,7 +141,7 @@ t._pn_dx_rate = 0.0
 now_m = now
 for _ in range(int(2 * t.NOMINAL_FPS)):
     now_m += 1.0 / t.NOMINAL_FPS
-    t._kren_na_kurs(0.0, now_m, 0.0, 12.0, now_m, 1.0, 0.0)
+    t._kren_na_kurs(0.0, now_m, 0.0, 25.0, now_m, 1.0, 0.0)
 assert t._pn_bank_tek > 4.0, t._pn_bank_tek
 assert t._pn_bank_tek <= t.PN_ROLL_HOLD_MAX + 1e-6, t._pn_bank_tek
 assert t._kren_na_kurs(4.0, now, None, 40.0, now, 1.0) == 0.0

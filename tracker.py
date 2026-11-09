@@ -2197,14 +2197,14 @@ COLLISION_ROLL_MAX = 28.0
 # снова кадр. Горизонт — когда тихие положение, бег и курс.
 # В эталоне 17–18 |dx|~7, крен 3–5°. 0.7°/px сверх 4 px; бег поднимает
 # потолок до 16°, не до позднего удара 22°.
-PN_ROLL_HOLD_PX = 4.0
-PN_ROLL_HOLD_DEG = 0.70
+PN_ROLL_HOLD_PX = 12.0
+PN_ROLL_HOLD_DEG = 0.40
 PN_ROLL_HOLD_MAX = 12.0
-PN_ROLL_AZ_DEG = 1.0          # ° крена на °/с курса сверх его собственного шума
+PN_ROLL_AZ_DEG = 0.5          # ° крена на °/с курса сверх его собственного шума
 # Интеграл по скорости азимута: постоянный параллельный снос должен
 # накапливать доворот курса, а не сидеть в шуме оценки.
-PN_ROLL_AZ_I = 0.8            # ° банка в секунду на °/с азимута
-PN_ROLL_AZ_I_MAX = 8.0        # потолок накопленного добора, °
+PN_ROLL_AZ_I = 0.3            # ° банка в секунду на °/с азимута
+PN_ROLL_AZ_I_MAX = 3.0        # потолок накопленного добора, °
 PN_ROLL_AZ_YAW_MAX_DPS = 25.0 # своё рыскание быстрее — az не берём
 PN_ROLL_RATE_DEAD_PX_S = 25.0  # ниже — шум удержания, не бег рамки
 PN_ROLL_RATE_DEG = 0.10        # ° крена на px/с сверх мёртвой зоны
@@ -9240,7 +9240,7 @@ def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k, yaw_rate_dps=None):
         az_f = float(az)
         # Мёртвая зона — шум самой оценки, не порог пилота. Ниже неё
         # это дрожание окна, а не курс.
-        mertvaya = _az_sigma if _az_sigma > 0.2 else 0.2
+        mertvaya = _az_sigma if _az_sigma > 0.5 else 0.5
         if abs(az_f) > mertvaya:
             izb_az = az_f - math.copysign(mertvaya, az_f)
             az_dob = ROLL_SIGN * izb_az * PN_ROLL_AZ_DEG * az_w
