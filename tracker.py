@@ -2200,10 +2200,9 @@ COLLISION_ROLL_MAX = 28.0
 PN_ROLL_HOLD_PX = 4.0
 PN_ROLL_HOLD_DEG = 0.70
 PN_ROLL_HOLD_MAX = 12.0
-PN_ROLL_AZ_DEAD_DPS = 1.0     # эталон: |az| до 1 °/с пилот не трогает
-PN_ROLL_AZ_DEG = 2.5          # ° крена на °/с курса. Эталон: пилот на 1–2 °/с стик почти не кладёт
+PN_ROLL_AZ_DEG = 1.0          # ° крена на °/с курса сверх его собственного шума
 # Интеграл по скорости азимута: постоянный параллельный снос должен
-# накапливать доворот курса, а не сидеть в мёртвой зоне.
+# накапливать доворот курса, а не сидеть в шуме оценки.
 PN_ROLL_AZ_I = 0.8            # ° банка в секунду на °/с азимута
 PN_ROLL_AZ_I_MAX = 8.0        # потолок накопленного добора, °
 PN_ROLL_AZ_YAW_MAX_DPS = 25.0 # своё рыскание быстрее — az не берём
@@ -2218,13 +2217,10 @@ PN_ROLL_I_HALF_S = 4.0
 PN_ROLL_PWM_PER_DEG = 6.0
 PN_ROLL_PWM_MAX = 110.0
 # Нос ниже цели — ради скорости, не ради выравнивания вектора.
-# Режим выбирается на захвате и держится: на дальнем эталоне запас
-# ~9° при любом угле линии, на ближнем нос на цели. Мгновенный угол
-# линии режим не переключает — дальний заход с линии 23° всё равно
-# набирал запас. Снимается скорость только когда реально близко.
-# Газ идёт за фактическим запасом, не за тангажем и не за желаемым:
-# иначе в конце тяга растёт вместе с углом и выходит перелёт.
-PN_ZAPAS_DEG = 5.0             # нос ниже цели в режиме скорости
+# Сколько ниже — считает сравнение высоты и дальности: alt / tau.
+# Снижаемся быстрее нужного — высоты не хватит, нос ниже, газ за ним.
+# В цель или перелёт — нос на цели. Порогов дальности и угла нет:
+# они были границей двух эталонов, а не законом.
 PN_ZAPAS_POL_DEG = 1.0         # ближе этого к запасу — картинка уже та
 # Недолет: снижаемся быстрее, чем высота / время до контакта.
 # Высота кончится раньше дальности. Добавляем запас, газ идёт за ним.
@@ -2241,11 +2237,6 @@ PN_PERELET_DEAD_MPS = 2.0
 # Рамка у края кадра обрезается, размер врёт, tau мусор. Ближе этого
 # к краю время до контакта для недолета не берём.
 PN_NEDOLET_KRAI_PX = 20.0
-PN_REZHIM_DEP = 20.0           # на захвате положе — режим скорости
-PN_REZHIM_RANGE_M = 220.0      # на захвате дальше — режим скорости
-PN_KONEC_RANGE_M = 70.0        # ближе этого и низко — скорость снята
-PN_KONEC_ALT_M = 25.0
-PN_KONEC_TAU_S = 4.0           # надёжное время до контакта короче — конец
 PN_AIM_NIZHE_DEG = 2.0         # старый порог газа по линии, нос его не держит
 PN_AIM_KRUTO_DEG = 12.0
 PN_AIM_STEEP_DEG = 30.0
@@ -4980,6 +4971,7 @@ _los_aim_tek = 0.0
 _los_aim_x_tek = 0.0
 _az_skorost = 0.0
 _az_skorost_ts = 0.0
+_az_sigma = 0.0            # шум оценки азимута, °/с. Мёртвая зона крена.
 _az_nakop = 0.0
 _az_pred = None
 _az_hist = collections.deque(maxlen=256)
@@ -9238,8 +9230,11 @@ def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k, yaw_rate_dps=None):
         az_w = max(0.25, 1.0 - (dx_abs - PN_ROLL_HOLD_PX) / 40.0)
     if az_svezh and yaw_ok and az is not None:
         az_f = float(az)
-        if abs(az_f) > PN_ROLL_AZ_DEAD_DPS:
-            izb_az = az_f - math.copysign(PN_ROLL_AZ_DEAD_DPS, az_f)
+        # Мёртвая зона — шум самой оценки, не порог пилота. Ниже неё
+        # это дрожание окна, а не курс.
+        mertvaya = _az_sigma if _az_sigma > 0.2 else 0.2
+        if abs(az_f) > mertvaya:
+            izb_az = az_f - math.copysign(mertvaya, az_f)
             az_dob = ROLL_SIGN * izb_az * PN_ROLL_AZ_DEG * az_w
             # Интеграл по избытку азимута, с тем же весом: параллельный
             # полёт в центре доворачивается, явная рамка интеграл не копит.
@@ -9416,27 +9411,27 @@ def _konec_zahoda(range_m, alt_m, tau_s, n_tau, tau_sigma):
 
 def _nedolet_deg(alt_m, tau_s, n_tau, sigma_s, vario_cms,
                  box_cy=None, box_h=None, ubyv=None):
-    """На сколько градусов поправить запас, чтобы высота и дальность кончились вместе.
+    """Запас носа из сравнения высоты и дальности. None — пока не знаем.
 
     Плюс — недолет: снижаемся быстрее, чем высота / время, носа мало.
-    Минус — перелет: снижаемся медленнее, и только если время до
-    контакта убывает. Иначе это пологий дальний заход, запас не трогаем.
-    Ноль — летит в цель, или времени нет, или рамка у края кадра.
+    Ноль — в цель, или перелет при убывающем времени: нос на цели.
+    None — времени нет, рамка у края, или перелет без сближения:
+    это пологий дальний заход, запас не трогаем.
     """
     if alt_m is None or tau_s is None or vario_cms is None:
-        return 0.0
+        return None
     if box_cy is not None and box_h is not None:
         pol = float(box_h) / 2.0
         verh = float(box_cy) - pol
         niz = float(box_cy) + pol
         if verh < PN_NEDOLET_KRAI_PX or niz > MAIN_H - PN_NEDOLET_KRAI_PX:
-            return 0.0
+            return None
     if not _tau_nadyozhen(tau_s, n_tau, sigma_s):
-        return 0.0
+        return None
     alt = float(alt_m)
     tau = float(tau_s)
     if alt <= 1.0 or tau <= 0.2:
-        return 0.0
+        return None
     nuzhno = alt / tau
     fakt = -float(vario_cms) / 100.0
     if fakt - nuzhno > PN_NEDOLET_DEAD_MPS:
@@ -9444,27 +9439,18 @@ def _nedolet_deg(alt_m, tau_s, n_tau, sigma_s, vario_cms,
         if dob > PN_NEDOLET_MAX_DEG:
             return PN_NEDOLET_MAX_DEG
         return dob
-    if (nuzhno - fakt > PN_PERELET_DEAD_MPS
-            and ubyv is not None and float(ubyv) < 0.0):
-        ubav = (nuzhno - fakt - PN_PERELET_DEAD_MPS) * PN_NEDOLET_DEG_PER_MPS
-        if ubav > PN_ZAPAS_DEG:
-            return -PN_ZAPAS_DEG
-        return -ubav
+    if nuzhno - fakt > PN_PERELET_DEAD_MPS and not (ubyv is not None and float(ubyv) < 0.0):
+        return None
     return 0.0
 
 
 def _zapas_nosa():
-    """Сколько градусов нос ниже цели в текущем режиме.
+    """Сколько градусов нос ниже цели.
 
-    Режим выбирается на захвате и держится. Пока геометрии нет —
-    запас не выдумываем. Конец захода снимает скорость. Недолет
-    добавляет к запасу, перелет убавляет, но не ниже нуля.
+    Целиком из сравнения высоты и дальности. Пока его нет — нос на цели.
     """
-    if _pn_rezhim == "speed":
-        zapas = PN_ZAPAS_DEG + _pn_nedolet
-        if zapas < 0.0:
-            return 0.0
-        return zapas
+    if _pn_nedolet > 0.0:
+        return _pn_nedolet
     return 0.0
 
 
@@ -10298,7 +10284,7 @@ def _reset_geometry_history(reason):
     той же командой, а не дёргаться из-за тайминг-паузы в трекере.
     """
     global geometry_epoch
-    global _tau_ubyvanie, _az_nakop, _az_pred, _az_skorost, _az_skorost_ts
+    global _tau_ubyvanie, _az_nakop, _az_pred, _az_skorost, _az_skorost_ts, _az_sigma
     global _los_ugol, _los_skorost, _los_skorost_ts
     global prev_box_size_px, box_growth_smoothed
     global _rassh_nakop, _flow_rasshirenie
@@ -10323,6 +10309,7 @@ def _reset_geometry_history(reason):
     _az_pred = None
     _az_skorost = 0.0
     _az_skorost_ts = 0.0
+    _az_sigma = 0.0
     _los_ugol = None
     _los_skorost = 0.0
     _los_skorost_ts = 0.0
@@ -11717,7 +11704,7 @@ def _update_control_from_target_impl():
     global global_yaw_cmd, global_pitch_cmd, global_roll_cmd, global_throttle_cmd, override_active
     global _slew_roll, _slew_pitch, _slew_yaw, _pitch_pri_loke
     global _los_ugol, _los_t, _los_skorost, _los_aim_tek, _glide_ves_tek
-    global _los_aim_x_tek, _az_skorost, _az_nakop, _az_pred
+    global _los_aim_x_tek, _az_skorost, _az_nakop, _az_pred, _az_sigma
     global _los_skorost_ts, _az_skorost_ts
     global _tau_ubyvanie
     global _pn_nos_ugol
@@ -12314,6 +12301,11 @@ def _update_control_from_target_impl():
                 _az_skorost = sum(
                     (_xs[i] - _mx) * (_ys[i] - _my) for i in range(_n)) / _den
                 _az_skorost_ts = now_mono
+                _ost = [_ys[i] - (_my + _az_skorost * (_xs[i] - _mx))
+                        for i in range(_n)]
+                _s_ost = math.sqrt(
+                    sum(o * o for o in _ost) / max(1, _n - 2))
+                _az_sigma = _s_ost / math.sqrt(_den)
 
     # --- СКОРОСТЬ УГЛА ВИЗИРОВАНИЯ ---
     #
@@ -12712,29 +12704,22 @@ def _update_control_from_target_impl():
         _aim_bl = -(box_cy - CENTER_Y) * CAMERA_VFOV_DEG / float(MAIN_H)
         _age_bl = (None if _tracked_since_t is None
                    else now_mono - _tracked_since_t)
-        # Режим запаса — один раз на захват, по геометрии захвата.
-        # Снимается только когда реально близко, не от угла линии.
-        if _pn_rezhim is None:
-            _pn_rezhim = _vybrat_rezhim(_dep_bl, _dal_bl)
-        if _pn_rezhim == "speed":
-            _alt_bl = None
-            with state_lock:
-                _alt_syroy = app_state.get("alt_cm")
-            if _alt_syroy is not None:
-                _alt_bl = float(_alt_syroy) / 100.0
-            _tau_bl = (closure.get("tau_s")
-                       if isinstance(closure, dict) else None)
-            _sig_bl = (closure.get("tau_sigma_s")
-                       if isinstance(closure, dict) else None)
-            if _konec_zahoda(_dal_bl, _alt_bl, _tau_bl, len(_tau_hist), _sig_bl):
-                _pn_rezhim = "line"
-        # Недолет добавляет запас, перелет убавляет. Рамка у края,
-        # tau ненадёжен или время не убывает — ноль.
-        _pn_nedolet = 0.0
-        if _pn_rezhim == "speed":
-            _pn_nedolet = _nedolet_deg(
-                _alt_bl, _tau_bl, len(_tau_hist), _sig_bl, _var_bl,
-                box_cy, box[3] - box[1], _tau_ubyvanie)
+        # Запас носа — из сравнения высоты и дальности, каждый кадр.
+        # Порогов угла и дальности нет. Пока сравнения нет — плавно к нулю.
+        _alt_bl = None
+        with state_lock:
+            _alt_syroy = app_state.get("alt_cm")
+        if _alt_syroy is not None:
+            _alt_bl = float(_alt_syroy) / 100.0
+        _tau_bl = (closure.get("tau_s") if isinstance(closure, dict) else None)
+        _sig_bl = (closure.get("tau_sigma_s") if isinstance(closure, dict) else None)
+        _cel_zapas = _nedolet_deg(
+            _alt_bl, _tau_bl, len(_tau_hist), _sig_bl, _var_bl,
+            box_cy, box[3] - box[1], _tau_ubyvanie)
+        if _cel_zapas is None:
+            _pn_nedolet *= 0.5 ** (k / NOMINAL_FPS / 2.0)
+        else:
+            _pn_nedolet = _cel_zapas
         # Добор носа ближе 110 м по старому газу снят: он добавлял нос
         # там, где в конце его как раз надо возвращать на цель.
         pitch_offset = _nos_na_kurs(
