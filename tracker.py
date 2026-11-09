@@ -9258,91 +9258,28 @@ def _tangazh_pn(los_dps, vc_mps, range_m=None, accel_mps2=None,
 
 def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k,
                   yaw_rate_dps=None, vc_mps=None, range_m=None, tau_s=None):
-    """Стик, который правит курс, а не только держит крестик.
+    """Крен по чистому PN: гасит скорость азимута.
 
-    В центре кадра главный сигнал — скорость азимута (az_rate -> 0):
-    перекрестье на цели ещё не значит, что курс столкновения есть.
-    Чем дальше рамка от центра, тем меньше вес азимута: явная ошибка
-    в кадре не должна менять знак из-за курса. Раньше az включался
-    только при |dx|<=4 px, и параллельный пролёт с нулевой ошибкой
-    не доворачивался вовсе.
-
-    Вычитать yaw из az нельзя — останется бег крестика. Горизонт, когда
-    тихие положение, бег и курс. Стик в ACRO задаёт скорость; у нужного
-    крена отпускается. Без крена с полётника команда ноль.
+    Пиксельный hold, бег рамки и интеграл по азимуту убраны.
+    Команда — только банк из N * Vc * λ_dot, с защитным slew и лимитом.
     """
-    global _pn_bank_i, _pn_az_i, _pn_bank_tek, _pn_dx_pred, _pn_dx_t, _pn_dx_rate
+    global _pn_bank_tek
+    del dx_px
     if bank_deg is None:
         return 0.0
-    dt_s = k / NOMINAL_FPS
-    tiho = dx_px is not None and abs(float(dx_px)) <= PN_ROLL_HOLD_PX
-    err = 0.0
-    if dx_px is not None and not tiho:
-        err = float(dx_px) - math.copysign(PN_ROLL_HOLD_PX, float(dx_px))
-    rate = _skorost_ramki(dx_px, now)
-    if err != 0.0:
-        _pn_bank_i *= 0.5 ** (dt_s / PN_ROLL_I_HALF_S)
-        _pn_bank_i += err * PN_ROLL_HOLD_I * dt_s
-        if _pn_bank_i > PN_ROLL_HOLD_I_MAX:
-            _pn_bank_i = PN_ROLL_HOLD_I_MAX
-        elif _pn_bank_i < -PN_ROLL_HOLD_I_MAX:
-            _pn_bank_i = -PN_ROLL_HOLD_I_MAX
-    else:
-        _pn_bank_i *= 0.5 ** dt_s
-    rate_dob = 0.0
-    # Бег рамки — и вне центра, и в тишине: малый dx при уводе это курс.
-    if abs(rate) > PN_ROLL_RATE_DEAD_PX_S:
-        izb = rate - math.copysign(PN_ROLL_RATE_DEAD_PX_S, rate)
-        rate_dob = ROLL_SIGN * izb * PN_ROLL_RATE_DEG
-        if rate_dob > PN_ROLL_RATE_MAX:
-            rate_dob = PN_ROLL_RATE_MAX
-        elif rate_dob < -PN_ROLL_RATE_MAX:
-            rate_dob = -PN_ROLL_RATE_MAX
-    az_dob = 0.0
     az_svezh = (az_ts > 0.0) and ((now - az_ts) <= LOS_RATE_STALE_S)
     yaw_ok = (yaw_rate_dps is None
               or abs(float(yaw_rate_dps)) <= PN_ROLL_AZ_YAW_MAX_DPS)
-    # В центре азимут ведёт курс. Далеко от центра рамка важнее:
-    # иначе 4 °/с против 30 px перекладывают крен не в ту сторону.
-    dx_abs = 0.0 if dx_px is None else abs(float(dx_px))
-    if dx_abs <= PN_ROLL_HOLD_PX:
-        az_w = 1.0
-    else:
-        az_w = max(0.1, 1.0 - (dx_abs - PN_ROLL_HOLD_PX) / 18.0)
+    zhel = 0.0
     if az_svezh and yaw_ok and az is not None:
-        az_f = float(az)
-        # Мёртвая зона — шум самой оценки, не порог пилота. Ниже неё
-        # это дрожание окна, а не курс.
         mertvaya = _az_sigma if _az_sigma > 0.5 else 0.5
-        if abs(az_f) > mertvaya:
-            izb_az = az_f - math.copysign(mertvaya, az_f)
-            # Крен по пропорциональной навигации: гасит вращение линии
-            # визирования, размер растёт со скоростью сближения.
+        if abs(float(az)) > mertvaya:
+            izb_az = float(az) - math.copysign(mertvaya, float(az))
             az_glad = _skorost_gladkaya(az, "az", now)
-            az_dob = ROLL_SIGN * _kren_pn(
+            zhel = ROLL_SIGN * _kren_pn(
                 izb_az, vc_mps, range_m,
-                _skolzyashiy(az_glad), tau_s) * az_w
-            # Интеграл по избытку азимута, с тем же весом: параллельный
-            # полёт в центре доворачивается, явная рамка интеграл не копит.
-            _pn_az_i += izb_az * PN_ROLL_AZ_I * az_w * dt_s
-            if _pn_az_i > PN_ROLL_AZ_I_MAX:
-                _pn_az_i = PN_ROLL_AZ_I_MAX
-            elif _pn_az_i < -PN_ROLL_AZ_I_MAX:
-                _pn_az_i = -PN_ROLL_AZ_I_MAX
-        else:
-            # В мёртвой зоне интеграл медленно сбрасывается.
-            _pn_az_i *= 0.5 ** (dt_s / 2.0)
-    else:
-        _pn_az_i *= 0.5 ** dt_s
-    zhel = (ROLL_SIGN * (err * PN_ROLL_HOLD_DEG + _pn_bank_i)
-            + rate_dob + az_dob + ROLL_SIGN * _pn_az_i)
-    potolok = PN_ROLL_HOLD_MAX
-    if abs(rate) > PN_ROLL_RATE_DEAD_PX_S:
-        potolok = PN_ROLL_HOLD_FAST
-    if zhel > potolok:
-        zhel = potolok
-    elif zhel < -potolok:
-        zhel = -potolok
+                _skolzyashiy(az_glad), tau_s)
+    # Защитный slew и абсолютный потолок
     shag = PN_ROLL_BANK_SLEW * (k / NOMINAL_FPS)
     if _pn_bank_tek < zhel - shag:
         _pn_bank_tek += shag
@@ -9350,6 +9287,10 @@ def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k,
         _pn_bank_tek -= shag
     else:
         _pn_bank_tek = zhel
+    if _pn_bank_tek > PN_ROLL_HOLD_MAX:
+        _pn_bank_tek = PN_ROLL_HOLD_MAX
+    elif _pn_bank_tek < -PN_ROLL_HOLD_MAX:
+        _pn_bank_tek = -PN_ROLL_HOLD_MAX
     pwm = (_pn_bank_tek - float(bank_deg)) * PN_ROLL_PWM_PER_DEG
     if pwm > PN_ROLL_PWM_MAX:
         return PN_ROLL_PWM_MAX
