@@ -9242,13 +9242,39 @@ def _kren_pn(az_dps, vc_mps, range_m=None, accel_mps2=None):
     return math.degrees(math.atan(a / G_MPS2))
 
 
-def _tangazh_pn(los_dps, vc_mps, range_m=None, accel_mps2=None):
+PN_UGOL_PRIHODA = 25.0       # желаемый угол прихода к земле, ° ниже горизонта
+PN_UGOL_BIAS = 0.4            # вес члена угла прихода
+
+
+def _smeshchenie_ugla(depression_deg, range_m):
+    """Добавка, чтобы прийти под заданным углом, градусы.
+
+    Разница между текущим углом линии и желаемым. Вблизи вес больше,
+    угол надо успеть набрать до цели.
+    """
+    if depression_deg is None:
+        return 0.0
+    oshibka = PN_UGOL_PRIHODA - float(depression_deg)
+    ves = 1.0
+    if range_m is not None and float(range_m) < PN_N_DALNOST:
+        ves = 1.0 + (PN_N_DALNOST - float(range_m)) / PN_N_DALNOST
+    return PN_UGOL_BIAS * oshibka * ves
+
+
+def _tangazh_pn(los_dps, vc_mps, range_m=None, accel_mps2=None,
+                depression_deg=None):
     """Тангаж по пропорциональной навигации, градусы.
 
     Гасит вертикальное вращение линии визирования, как крен гасит
     азимут. N меньше вблизи. Дополненный член на ускорение цели.
+    Смещение угла прихода тянет траекторию к заданному углу к земле.
+    Постоянные +2° — компенсация гравитации, чтобы вертикальный канал
+    не проигрывал тяжести.
     """
-    return _kren_pn(los_dps, vc_mps, range_m, accel_mps2)
+    ugol = _kren_pn(los_dps, vc_mps, range_m, accel_mps2)
+    ugol += _smeshchenie_ugla(depression_deg, range_m)
+    ugol += 2.0
+    return ugol
 
 
 def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k,
@@ -12909,7 +12935,8 @@ def _update_control_from_target_impl():
         _rng_pn = closure.get("range_m") if isinstance(closure, dict) else None
         _ugol_pn = _tangazh_pn(
             _los_pn, _vc_pn, _rng_pn,
-            _uskorenie_celi(_los_pn, _rng_pn, now_mono, "los"))
+            _uskorenie_celi(_los_pn, _rng_pn, now_mono, "los"),
+            closure.get("depression_deg") if isinstance(closure, dict) else None)
         pitch_offset = (PITCH_PWM_TO_FC_ANGLE_SIGN
                         * _ugol_pn * PN_PITCH_PWM_PER_DEG)
         if pitch_offset > PN_PITCH_PWM_MAX:
