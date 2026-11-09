@@ -514,18 +514,15 @@ def _podmena_blizko(*a, **kw):
     return out
 
 
-# Близко, добор носа по старому газу снят. Надёжного времени нет —
-# запас не выдумываем, нос на цели.
+# На ветке навигации тангаж гасит вращение линии, газ — база.
+# Запаса носа нет, поэтому стик входа не разгоняется.
 t._estimate_closure = _podmena_blizko
 t.ground_speed_mps = 10.0
-tek_do = t._pn_nos_tek
 for _ in range(45):
     _kadr(pitch=20.0, roll=0.0, dx=0.0, vario=0, dy=60.0)
-print("    близко нос %.2f (было %.2f), добавка %.2f, газ %s" % (
-    t._pn_nos_tek, tek_do, t._pn_nos_blizko, t.global_throttle_cmd))
-assert t._pn_nos_blizko == 0.0, t._pn_nos_blizko
-assert t._pn_nos_tek <= t.PN_PITCH_ABS_MAX
+print("    газ %s, тангаж %s" % (t.global_throttle_cmd, t.global_pitch_cmd))
 assert abs(t.global_throttle_cmd - 1500) <= 15, t.global_throttle_cmd
+assert 1000 <= t.global_pitch_cmd <= 2000, t.global_pitch_cmd
 t.ground_speed_mps = None
 t.time.monotonic = _vremya
 t._estimate_closure = _zamena

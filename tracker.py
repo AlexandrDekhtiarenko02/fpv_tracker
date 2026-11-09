@@ -9217,6 +9217,16 @@ def _kren_pn(az_dps, vc_mps):
     return math.degrees(math.atan(a / G_MPS2))
 
 
+def _tangazh_pn(los_dps, vc_mps):
+    """Тангаж по пропорциональной навигации, градусы.
+
+    Гасит вертикальное вращение линии визирования, как крен гасит
+    азимут. Нос ниже цели ради скорости здесь ни при чём: навигация
+    про курс, не про разгон.
+    """
+    return _kren_pn(los_dps, vc_mps)
+
+
 def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k,
                   yaw_rate_dps=None, vc_mps=None):
     """Стик, который правит курс, а не только держит крестик.
@@ -12771,13 +12781,18 @@ def _update_control_from_target_impl():
             _pn_nedolet *= 0.5 ** (k / NOMINAL_FPS / 2.0)
         else:
             _pn_nedolet = _cel_zapas
-        # Добор носа ближе 110 м по старому газу снят: он добавлял нос
-        # там, где в конце его как раз надо возвращать на цель.
-        pitch_offset = _nos_na_kurs(
-            _los_skorost, _los_skorost_ts, _pitch_tek_pot, _pitch_pri_loke,
-            box_cy - CENTER_Y, now_mono, k,
-            closure.get("depression_deg") if isinstance(closure, dict) else None,
-            _var_bl)
+        # Тангаж по пропорциональной навигации: гасит вертикальное
+        # вращение линии визирования. Запас носа ради скорости — с другой
+        # ветки, здесь его нет.
+        _vc_pn = _skorost_sblizheniya(closure)
+        _los_pn = _los_bl if _los_bl is not None else 0.0
+        _ugol_pn = _tangazh_pn(_los_pn, _vc_pn)
+        pitch_offset = (PITCH_PWM_TO_FC_ANGLE_SIGN
+                        * _ugol_pn * PN_PITCH_PWM_PER_DEG)
+        if pitch_offset > PN_PITCH_PWM_MAX:
+            pitch_offset = PN_PITCH_PWM_MAX
+        elif pitch_offset < -PN_PITCH_PWM_MAX:
+            pitch_offset = -PN_PITCH_PWM_MAX
         _p_sat = abs(pitch_offset) >= PN_PITCH_PWM_MAX - 1e-6
         _pid_dbg["pitch"] = (
             pitch_offset, 0.0, _pn_nos_i * PN_PITCH_PWM_PER_DEG, 0.0,
@@ -13561,15 +13576,13 @@ def _update_control_from_target_impl():
             _gaz_vhod = float(base_thr)
         _dep_lin = (closure.get("depression_deg")
                     if isinstance(closure, dict) else None)
-        # Газ от фактического запаса под целью. База — висение этого
-        # борта, иначе стик входа. Тангаж и чужое число уровень не задают.
-        _aim_lin = -(box_cy - CENTER_Y) * CAMERA_VFOV_DEG / float(MAIN_H)
+        # Газ навигация не задаёт: скорость сближения для неё вход, не
+        # результат. Держим базу — висение этого борта, иначе стик входа.
         _baza_lin = _hover_s_napryazheniem()
         if _baza_lin is None:
             _baza_lin = (float(_gaz_vhod) if _gaz_vhod is not None
                          else float(base_thr))
-        _cel_lin = _gaz_ot_zapasa(_aim_lin, _baza_lin)
-        del _dep_lin
+        _cel_lin = _baza_lin
         _thr_geom_out = _podtyanut_gaz(
             _thr_geom_out if _thr_geom_out is not None else target_throttle,
             _cel_lin, THR_GEOM_SLEW_OVERSHOOT, k)
