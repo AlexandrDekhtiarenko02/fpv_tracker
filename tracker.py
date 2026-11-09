@@ -4979,7 +4979,6 @@ _az_hist = collections.deque(maxlen=256)
 # хода не измерили, добавлять газ не за что.
 _tau_ubyvanie = 0.0
 _tau_hist = collections.deque(maxlen=256)
-_range_hist = collections.deque(maxlen=256)
 # Совпадение на момент последнего разрешённого роста рамки. None означает
 # «росла ещё не проверяли».
 _score_do_rosta = None
@@ -9326,49 +9325,6 @@ def _nizhe_linii(depression_deg):
     return 9.0 * dolya
 
 
-def _tau_ot_dalnosti(range_m, range_sigma_m, now_mono):
-    """Время до контакта из дальности, если она надёжнее оптики.
-
-    Дальность по высоте и углу гладкая, оптический tau прыгает, потому
-    что это единица на шум роста рамки. Берём дальность, только когда её
-    погрешность мала и она явно убывает. Иначе None — остаётся оптика.
-    """
-    if range_m is None or range_sigma_m is None:
-        return None
-    R = float(range_m)
-    sig = float(range_sigma_m)
-    if R <= 5.0 or sig / R > 0.25:
-        return None
-    _range_hist.append((now_mono, R))
-    while _range_hist and (now_mono - _range_hist[0][0]) > 2.0:
-        _range_hist.popleft()
-    if len(_range_hist) < 8:
-        return None
-    if _range_hist[-1][0] - _range_hist[0][0] < 1.0:
-        return None
-    xs = [a for a, _ in _range_hist]
-    ys = [b for _, b in _range_hist]
-    n = len(xs)
-    mx = sum(xs) / n
-    my = sum(ys) / n
-    den = sum((x - mx) ** 2 for x in xs)
-    if den < 1e-6:
-        return None
-    naklon = sum((xs[i] - mx) * (ys[i] - my) for i in range(n)) / den
-    if naklon >= -0.5:
-        return None
-    ost = [ys[i] - (my + naklon * (xs[i] - mx)) for i in range(n)]
-    s_ost = math.sqrt(sum(o * o for o in ost) / max(1, n - 2))
-    se = s_ost / math.sqrt(den)
-    if abs(se / naklon) > 0.5:
-        return None
-    tau = R / -naklon
-    if tau <= 0.2 or tau > 60.0:
-        return None
-    sig_tau = tau * math.hypot(sig / R, se / -naklon)
-    return tau, sig_tau
-
-
 def _tau_nadyozhen(tau_s, n_tochek, sigma_s=None):
     """Оптическому времени можно верить в управлении, а не только в логе.
 
@@ -10347,7 +10303,6 @@ def _reset_geometry_history(reason):
     geometry_epoch += 1
     _tau_ubyvanie = 0.0
     _tau_hist.clear()
-    _range_hist.clear()
     _dep_hist.clear()
     _az_hist.clear()
     _az_nakop = 0.0
@@ -12272,14 +12227,6 @@ def _update_control_from_target_impl():
     # переключаться в режим сближения и как вести газ. Считать её надо ДО
     # того, как она понадобится, — раньше она стояла ниже по коду.
     closure = _estimate_closure(box_w_main, box_h_main, box_cy, now_mono, k)
-    # Дальность гладкая — tau из неё ровный. Берём, только когда она
-    # надёжнее оптики. Иначе оптический tau проходит как был.
-    if isinstance(closure, dict):
-        _geom = _tau_ot_dalnosti(
-            closure.get("range_m"), closure.get("range_sigma_m"), now_mono)
-        if _geom is not None:
-            closure["tau_s"] = _geom[0]
-            closure["tau_sigma_s"] = _geom[1]
 
     # Режим сближения — только по времени до контакта. Запасного признака по
     # доле кадра больше нет: он был недостижим по построению (см. настройку).
