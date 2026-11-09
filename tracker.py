@@ -2204,8 +2204,26 @@ PN_ROLL_AZ_DEG = 0.5          # запас, если скорости сближ
 # Пропорциональная навигация: крен гасит вращение линии визирования.
 # a = N * Vc * az, крен = atan(a / g). N = 3..5, берём 4.
 # Само меньше вдали, где сближение медленное, и больше вблизи.
-PN_N = 4.0
+PN_N = 4.0                    # вдали
+PN_N_BLIZKO = 1.5             # вблизи, чтобы не перекомпенсировать
+PN_N_DALNOST = 300.0          # дальше этой дальности N полное
 G_MPS2 = 9.81
+
+
+def _n_po_dalnosti(range_m):
+    """N меньше вблизи, полное вдали.
+
+    Вблизи большое N перекладывает, вдали малое не доворачивает.
+    Нет дальности — полное.
+    """
+    if range_m is None:
+        return PN_N
+    dolya = float(range_m) / PN_N_DALNOST
+    if dolya > 1.0:
+        dolya = 1.0
+    elif dolya < 0.0:
+        dolya = 0.0
+    return PN_N_BLIZKO + (PN_N - PN_N_BLIZKO) * dolya
 # Интеграл по скорости азимута: постоянный параллельный снос должен
 # накапливать доворот курса, а не сидеть в шуме оценки.
 PN_ROLL_AZ_I = 0.3            # ° банка в секунду на °/с азимута
@@ -9207,30 +9225,29 @@ def _skorost_sblizheniya(closure):
     return float(rng) / float(tau)
 
 
-def _kren_pn(az_dps, vc_mps):
+def _kren_pn(az_dps, vc_mps, range_m=None):
     """Крен по пропорциональной навигации, градусы.
 
     Боковое ускорение N * скорость сближения * скорость азимута,
-    крен из него через g. Скорости нет — скромная, чтобы не пропасть.
+    крен из него через g. N меньше вблизи. Скорости нет — скромная.
     """
     az_rad = math.radians(float(az_dps))
     vc = 10.0 if vc_mps is None else max(1.0, float(vc_mps))
-    a = PN_N * vc * az_rad
+    a = _n_po_dalnosti(range_m) * vc * az_rad
     return math.degrees(math.atan(a / G_MPS2))
 
 
-def _tangazh_pn(los_dps, vc_mps):
+def _tangazh_pn(los_dps, vc_mps, range_m=None):
     """Тангаж по пропорциональной навигации, градусы.
 
     Гасит вертикальное вращение линии визирования, как крен гасит
-    азимут. Нос ниже цели ради скорости здесь ни при чём: навигация
-    про курс, не про разгон.
+    азимут. N меньше вблизи.
     """
-    return _kren_pn(los_dps, vc_mps)
+    return _kren_pn(los_dps, vc_mps, range_m)
 
 
 def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k,
-                  yaw_rate_dps=None, vc_mps=None):
+                  yaw_rate_dps=None, vc_mps=None, range_m=None):
     """Стик, который правит курс, а не только держит крестик.
 
     В центре кадра главный сигнал — скорость азимута (az_rate -> 0):
@@ -9291,7 +9308,7 @@ def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k,
             izb_az = az_f - math.copysign(mertvaya, az_f)
             # Крен по пропорциональной навигации: гасит вращение линии
             # визирования, размер растёт со скоростью сближения.
-            az_dob = ROLL_SIGN * _kren_pn(izb_az, vc_mps) * az_w
+            az_dob = ROLL_SIGN * _kren_pn(izb_az, vc_mps, range_m) * az_w
             # Интеграл по избытку азимута, с тем же весом: параллельный
             # полёт в центре доворачивается, явная рамка интеграл не копит.
             _pn_az_i += izb_az * PN_ROLL_AZ_I * az_w * dt_s
@@ -12736,7 +12753,8 @@ def _update_control_from_target_impl():
             _yaw_r = float(_gz[2]) * GYRO_UNIT_DPS
         col_r = _kren_na_kurs(
             _az_skorost, _az_skorost_ts, _bank, dx_raw, now_mono, k,
-            _yaw_r, _skorost_sblizheniya(closure)) * trust_k
+            _yaw_r, _skorost_sblizheniya(closure),
+            closure.get("range_m") if isinstance(closure, dict) else None) * trust_k
         roll_integral = 0.0
         roll_offset = 0.0
         _pid_dbg["roll"] = (
@@ -12842,7 +12860,9 @@ def _update_control_from_target_impl():
         # ветки, здесь его нет.
         _vc_pn = _skorost_sblizheniya(closure)
         _los_pn = _los_bl if _los_bl is not None else 0.0
-        _ugol_pn = _tangazh_pn(_los_pn, _vc_pn)
+        _ugol_pn = _tangazh_pn(
+            _los_pn, _vc_pn,
+            closure.get("range_m") if isinstance(closure, dict) else None)
         pitch_offset = (PITCH_PWM_TO_FC_ANGLE_SIGN
                         * _ugol_pn * PN_PITCH_PWM_PER_DEG)
         if pitch_offset > PN_PITCH_PWM_MAX:
