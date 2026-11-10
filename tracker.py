@@ -2221,7 +2221,7 @@ def _n_po_vremeni(tau_s):
 PN_ROLL_AZ_YAW_MAX_DPS = 25.0 # своё рыскание быстрее — az не берём
 PN_ROLL_BANK_SLEW = 12.0
 PN_ROLL_I_HALF_S = 4.0
-PN_ROLL_PWM_PER_DEG = 6.0
+PN_ROLL_PWM_PER_DEG = 9.0
 PN_ROLL_PWM_MAX = 110.0
 # Нос ниже цели — ради скорости, не ради выравнивания вектора.
 # Сколько ниже — считает сравнение высоты и дальности: alt / tau.
@@ -2252,8 +2252,8 @@ PN_PITCH_ABS_MAX = 45.0
 PN_PITCH_SLEW = 12.0
 PN_PITCH_I_DEG_PER_S = 0.6
 PN_PITCH_I_MAX = 4.0
-PN_PITCH_PWM_PER_DEG = 0.8
-PN_PITCH_PWM_MAX = 30.0
+PN_PITCH_PWM_PER_DEG = 2.0
+PN_PITCH_PWM_MAX = 50.0
 # Газ за фактическим запасом под целью. База — висение этого борта,
 # не число из чужого лога: вес разный, висение разное. Нет висения —
 # стик входа. Прибавка за нос — наклон, не уровень.
@@ -9473,7 +9473,7 @@ LOS_RATE_LAW_MAX_DPS = 8.0
 # Мёртвая зона скорости линии для тангажа. Пилот на 2–3 °/с почти не двигает
 # стик (в эталонах rc_p-1500 ≈ 0..15). Ниже порога закон молчит, чтобы
 # артефакт старта и шум не уводили нос.
-LOS_RATE_PITCH_DEADBAND_DPS = 2.5
+LOS_RATE_PITCH_DEADBAND_DPS = 1.0
 
 _filtr_los = {"los": None, "az": None, "t_los": None, "t_az": None}
 
