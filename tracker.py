@@ -2146,6 +2146,9 @@ LOS_AZ_DEADBAND_DPS = 0.5
 # самого расчёта.
 LOS_FIT_WINDOW_S = 1.6
 LOS_FIT_MIN_POINTS = 8
+# Минимальный размах окна по времени. Точки могут набраться быстро,
+# но на коротком промежутке наклон врёт. У tau такая проверка есть.
+LOS_FIT_MIN_SPAN_S = 0.8
 
 # Газ по углу визирования ВЫКЛЮЧЕН: эту работу забрал прицел (см. выше).
 # Держать угол газом — значит лечить геометрию энергией, и в поле это дало
@@ -2162,7 +2165,7 @@ LOS_RATE_ALPHA = 0.08
 # Больше — считаем нулём (см. пояснение у _los_skorost_ts). Взят чуть
 # больше окна оценщика LOS_FIT_WINDOW_S: если за это время новую точку
 # так и не приняли, дальше держать старую бессмысленно.
-LOS_RATE_STALE_S = LOS_FIT_WINDOW_S + 0.5
+LOS_RATE_STALE_S = 0.6  # было окно+0.5 (~2.1 с): λ̇ залипала на 1–2 с
 # Мёртвая зона. Замеренная скорость роста на промахе +2.13 °/с, так что 0.3
 # отсекает шум, не трогая полезный сигнал.
 LOS_RATE_DEADBAND_DPS = 0.3
@@ -12304,7 +12307,9 @@ def _update_control_from_target_impl():
             _dep_hist.append((now_mono, float(_dep_tek)))
             while _dep_hist and (now_mono - _dep_hist[0][0]) > LOS_FIT_WINDOW_S:
                 _dep_hist.popleft()
-            if len(_dep_hist) >= LOS_FIT_MIN_POINTS:
+            _razmah = (_dep_hist[-1][0] - _dep_hist[0][0]) if len(_dep_hist) >= 2 else 0.0
+            if (len(_dep_hist) >= LOS_FIT_MIN_POINTS
+                    and _razmah >= LOS_FIT_MIN_SPAN_S):
                 _xs = [a for a, _ in _dep_hist]
                 _ys = [b for _, b in _dep_hist]
                 _n = len(_xs)
