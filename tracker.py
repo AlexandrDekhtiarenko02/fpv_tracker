@@ -9979,8 +9979,12 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
         popravka = min(PITCH_BIAS_MAX,
                        max(0.0, PITCH_BIAS_PER_MS * skorost + PITCH_BIAS_BASE))
     out["pitch_bias_deg"] = popravka
-    depression = float(fc_pitch) - CAMERA_TILT_DEG + off_deg + popravka
-    out["depression_deg"] = depression
+    # Bias не входит в угол, по которому считается скорость линии.
+    # Он прыгает (0 → +12° когда optflow оживает) и даёт ложные 20 °/с
+    # в λ̇ на ровном месте. Для дальности bias остаётся.
+    depression_clean = float(fc_pitch) - CAMERA_TILT_DEG + off_deg
+    depression = depression_clean + popravka
+    out["depression_deg"] = depression_clean
 
     alt_m = alt_cm / 100.0
     # Годность высоты — от ИЗМЕРЕННОГО шума барометра, а не от круглого числа.
