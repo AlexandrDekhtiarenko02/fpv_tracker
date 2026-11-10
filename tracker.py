@@ -9982,12 +9982,13 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
         popravka = min(PITCH_BIAS_MAX,
                        max(0.0, PITCH_BIAS_PER_MS * skorost + PITCH_BIAS_BASE))
     out["pitch_bias_deg"] = popravka
-    # Bias не входит в угол, по которому считается скорость линии.
-    # Он прыгает (0 → +12° когда optflow оживает) и даёт ложные 20 °/с
-    # в λ̇ на ровном месте. Для дальности bias остаётся.
-    depression_clean = float(fc_pitch) - CAMERA_TILT_DEG + off_deg
-    depression = depression_clean + popravka
-    out["depression_deg"] = depression_clean
+    # Bias остаётся в depression_deg: его читают пороги газа
+    # (_blizko_i_vysoko, _derzhat_nos), калиброванные по углу с поправкой.
+    # Для скорости линии — отдельное поле без bias: прыжок 0→+12°
+    # давал ложные 20 °/с в λ̇.
+    depression = float(fc_pitch) - CAMERA_TILT_DEG + off_deg + popravka
+    out["depression_deg"] = depression
+    out["los_angle_deg"] = float(fc_pitch) - CAMERA_TILT_DEG + off_deg
 
     alt_m = alt_cm / 100.0
     # Годность высоты — от ИЗМЕРЕННОГО шума барометра, а не от круглого числа.
@@ -12280,7 +12281,7 @@ def _update_control_from_target_impl():
     # весь хвост окна разом, а не одну разность, и на наклон влияет слабо.
     # Тем же способом считается время до контакта, и там это уже проверено.
     if _dep_hist is not None:
-        _dep_tek = closure.get("depression_deg")
+        _dep_tek = closure.get("los_angle_deg")
         # ВО ВРЕМЯ БЫСТРОГО ВРАЩЕНИЯ УГОЛ ВИЗИРОВАНИЯ НЕ СЧИТАЕМ.
         #
         # Он складывается из тангажа полётника и положения цели в кадре, и
@@ -12301,8 +12302,10 @@ def _update_control_from_target_impl():
         # 16 °/с, а в клевке доходила до 90.
         if (_dep_tek is not None and _gyro_y_sgl is not None
                 and abs(_gyro_y_sgl) > LOS_MAX_VRASH_DPS):
+            # Точку не добавляем, но историю не чистим: гвард ложно
+            # срабатывает на шуме гироскопа (92–100 % случаев), и clear()
+            # вместе с MIN_SPAN=0.8 давал 19–37 % слепого времени.
             _dep_tek = None
-            _dep_hist.clear()
         if _dep_tek is not None:
             _dep_hist.append((now_mono, float(_dep_tek)))
             while _dep_hist and (now_mono - _dep_hist[0][0]) > LOS_FIT_WINDOW_S:
