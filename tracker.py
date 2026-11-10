@@ -9369,40 +9369,6 @@ def _tau_zakrytie_godno(tau_s, ubyv, n_tochek):
     return True
 
 
-def _vybrat_rezhim(depression_deg, range_m):
-    """Режим запаса на захват. Один раз, по геометрии захвата.
-
-    Пологая линия или большая дальность — скорость: нос ниже цели.
-    Крутая и близкая — нос на цели. Чего нет, то не решает.
-    """
-    dep = None if depression_deg is None else float(depression_deg)
-    dal = None if range_m is None else float(range_m)
-    if dep is not None and dep < PN_REZHIM_DEP:
-        return "speed"
-    if dal is not None and dal > PN_REZHIM_RANGE_M:
-        return "speed"
-    if dep is not None and dep >= PN_REZHIM_DEP and (dal is None or dal <= PN_REZHIM_RANGE_M):
-        return "line"
-    return None
-
-
-def _konec_zahoda(range_m, alt_m, tau_s, n_tau, tau_sigma):
-    """Скорость снимается, только когда реально близко.
-
-    Угол линии сюда не входит: на дальнем эталоне линия доходила до 30°,
-    а запас пилот держал. Конец — короткая дальность при малой высоте
-    или надёжное время до контакта короче порога финала.
-    """
-    if (range_m is not None and alt_m is not None
-            and float(range_m) < PN_KONEC_RANGE_M
-            and float(alt_m) < PN_KONEC_ALT_M):
-        return True
-    if (tau_s is not None and float(tau_s) < PN_KONEC_TAU_S
-            and _tau_nadyozhen(tau_s, n_tau, tau_sigma)):
-        return True
-    return False
-
-
 def _nedolet_deg(alt_m, tau_s, n_tau, sigma_s, vario_cms,
                  box_cy=None, box_h=None, ubyv=None):
     """Запас носа из сравнения высоты и дальности. None — пока не знаем.
