@@ -9465,6 +9465,11 @@ _pn_nabor_cel = None  # не используется
 
 
 PN_FILTR_TAU = 0.30           # сглаживание скорости линии, с. Срез ниже полосы раскачки 1.2 Гц.
+# Верхний предел скорости линии, которую закон готов принять.
+# Сразу после лока оценка по короткому окну даёт 15–17 °/с на скачке
+# depression (рассинхрон MSP и кадра). Медиана реальных заходов ~2.9 °/с,
+# 90-й процентиль ~8. Выше 8 °/с — почти всегда артефакт старта, не геометрия.
+LOS_RATE_LAW_MAX_DPS = 8.0
 
 _filtr_los = {"los": None, "az": None, "t_los": None, "t_az": None}
 
@@ -12660,6 +12665,13 @@ def _update_control_from_target_impl():
         _vc_pn = _skorost_sblizheniya(closure)
         _los_pn = _skorost_gladkaya(
             _los_bl if _los_bl is not None else 0.0, "los", now_mono)
+        # Не пускаем в закон артефакт старта: 15–17 °/с сразу после лока
+        # упирают тангаж в +80 и дают клевок. Реальные заходы редко выше 8.
+        if _los_pn is not None:
+            if _los_pn > LOS_RATE_LAW_MAX_DPS:
+                _los_pn = LOS_RATE_LAW_MAX_DPS
+            elif _los_pn < -LOS_RATE_LAW_MAX_DPS:
+                _los_pn = -LOS_RATE_LAW_MAX_DPS
         _rng_pn = closure.get("range_m") if isinstance(closure, dict) else None
         _ugol_pn = _tangazh_pn(
             _los_pn, _vc_pn, _rng_pn,
