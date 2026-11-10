@@ -2252,8 +2252,8 @@ PN_PITCH_ABS_MAX = 45.0
 PN_PITCH_SLEW = 12.0
 PN_PITCH_I_DEG_PER_S = 0.6
 PN_PITCH_I_MAX = 4.0
-PN_PITCH_PWM_PER_DEG = 8.0
-PN_PITCH_PWM_MAX = 80.0
+PN_PITCH_PWM_PER_DEG = 0.8
+PN_PITCH_PWM_MAX = 30.0
 # Газ за фактическим запасом под целью. База — висение этого борта,
 # не число из чужого лога: вес разный, висение разное. Нет висения —
 # стик входа. Прибавка за нос — наклон, не уровень.
@@ -9470,6 +9470,10 @@ PN_FILTR_TAU = 0.30           # сглаживание скорости лини
 # depression (рассинхрон MSP и кадра). Медиана реальных заходов ~2.9 °/с,
 # 90-й процентиль ~8. Выше 8 °/с — почти всегда артефакт старта, не геометрия.
 LOS_RATE_LAW_MAX_DPS = 8.0
+# Мёртвая зона скорости линии для тангажа. Пилот на 2–3 °/с почти не двигает
+# стик (в эталонах rc_p-1500 ≈ 0..15). Ниже порога закон молчит, чтобы
+# артефакт старта и шум не уводили нос.
+LOS_RATE_PITCH_DEADBAND_DPS = 2.5
 
 _filtr_los = {"los": None, "az": None, "t_los": None, "t_az": None}
 
@@ -12668,14 +12672,16 @@ def _update_control_from_target_impl():
         # Не пускаем в закон артефакт старта: 15–17 °/с сразу после лока
         # упирают тангаж в +80 и дают клевок. Реальные заходы редко выше 8.
         if _los_pn is not None:
-            if _los_pn > LOS_RATE_LAW_MAX_DPS:
+            if abs(_los_pn) < LOS_RATE_PITCH_DEADBAND_DPS:
+                _los_pn = 0.0
+            elif _los_pn > LOS_RATE_LAW_MAX_DPS:
                 _los_pn = LOS_RATE_LAW_MAX_DPS
             elif _los_pn < -LOS_RATE_LAW_MAX_DPS:
                 _los_pn = -LOS_RATE_LAW_MAX_DPS
         _rng_pn = closure.get("range_m") if isinstance(closure, dict) else None
         _ugol_pn = _tangazh_pn(
             _los_pn, _vc_pn, _rng_pn,
-            _skolzyashiy(_los_pn),
+            None,  # без SMC: он упирал тангаж в упор уже на 3 °/с
             closure.get("depression_deg") if isinstance(closure, dict) else None,
             _tau_bl)
         pitch_offset = (PITCH_PWM_TO_FC_ANGLE_SIGN
