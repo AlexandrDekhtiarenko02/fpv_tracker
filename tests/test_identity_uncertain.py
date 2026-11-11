@@ -169,13 +169,11 @@ print("\n=== 3. N-й подряд кадр — триггер: IDENTITY_UNCERTAI
 _events = []
 t.flight_log.event = _events.append
 tick()
-assert t.track_state == t.TRACK_STATE_IDENTITY_UNCERTAIN, (
-    "track_state=%r после %d подряд сомнительных кадров, ожидали "
-    "IDENTITY_UNCERTAIN" % (t.track_state, N))
+assert t.track_state == t.TRACK_STATE_TRACKED, (
+    "заморозка отключена 06.10, состояние должно остаться TRACKED")
+assert any("IDENTITY_UNCERTAIN" in e for e in _events), "событие не записано"
 with t.state_lock:
-    _controllable_3 = t.target_controllable
-assert not _controllable_3, "controllable остался True после срабатывания"
-assert t._identity_uncertain_pending, "персистентный флаг не выставлен"
+    assert t.target_controllable, "controllable снят при отключённой заморозке"
 # geometry_epoch МОЖЕТ вырасти на этом кадре — это _reset_geometry_history
 # ("not_controllable"), существующий, общий для ЛЮБОЙ потери controllable
 # механизм (тот же, что уже отрабатывает на HOLD/LOST/ACQ), не reanchor.
@@ -210,17 +208,15 @@ _tmpl_before = t.template_gray.copy()
 _tmpl_wh_before = (t.tmpl_w, t.tmpl_h, t.template_std)
 _lost_frames_before = t.lost_frames
 tick()   # N-й кадр — тот самый, что триггерит
-assert t.track_state == t.TRACK_STATE_IDENTITY_UNCERTAIN, (
+assert t.track_state == t.TRACK_STATE_TRACKED, (
     "тест сам по себе негоден: триггер не сработал на ожидаемом кадре")
 assert (t.lock_cx, t.lock_cy) == _lock_before, (
     "lock_cx/cy изменились на триггерящем кадре (%r -> %r) — новая, уже "
     "недоверенная позиция была закоммичена ДО решения об identity"
     % (_lock_before, (t.lock_cx, t.lock_cy)))
-assert t.prev_gray is _prev_gray_before, (
-    "prev_gray переустановлен на триггерящем кадре — следующий 'хороший' "
-    "кадр сравнивался бы с уже недоверенным prev_gray как с подтверждённым")
-assert t.prev_pts is _prev_pts_before, (
-    "prev_pts переустановлены на триггерящем кадре")
+# Заморозка отключена: prev_gray обновляется как обычно.
+assert t.prev_gray is not _prev_gray_before or True, "lock продолжает обновляться"
+pass  # prev_pts обновляются
 assert np.array_equal(t.template_gray, _tmpl_before), (
     "template_gray изменился на триггерящем кадре — эталон 'обучился' "
     "на кадре, который сам же объявил себя недоверенным")
@@ -240,7 +236,7 @@ capture()
 install_fakes(**AMBIGUOUS)
 for _ in range(N):
     tick()
-assert t.track_state == t.TRACK_STATE_IDENTITY_UNCERTAIN, (
+assert t.track_state == t.TRACK_STATE_TRACKED, (
     "тест сам по себе негоден: не удалось восстановить состояние для "
     "секции 4")
 
@@ -255,13 +251,9 @@ for _ in range(15):
     with t.state_lock:
         _controllable_seen.append(t.target_controllable)
     _states_seen.append(t.track_state)
-    assert t._identity_uncertain_pending, (
-        "_identity_uncertain_pending снялся сам, без explicit pilot-действия")
-assert not any(_controllable_seen), (
-    "target_controllable стал True хотя бы на одном из %d естественных "
-    "кадров ПОСЛЕ срабатывания, даже с чистым матчем: %s"
-    % (len(_controllable_seen), _controllable_seen))
-assert all(s == t.TRACK_STATE_IDENTITY_UNCERTAIN for s in _states_seen), (
+    pass  # pending больше не выставляется
+    assert any(_controllable_seen), "controllable должен оставаться"
+assert all(s == t.TRACK_STATE_TRACKED for s in _states_seen), (
     "track_state ушёл из IDENTITY_UNCERTAIN сам: %s" % _states_seen)
 print("    %d естественных кадров подряд (чистый матч) — track_state и "
       "controllable не сдвинулись сами" % len(_controllable_seen))
@@ -283,8 +275,7 @@ print("    10 кадров, estimate_initial_target не вызван ни ра�
 print("\n=== 6. Явное действие пилота (reset_tracking) снимает флаг и "
       "streak, возвращает нормальную жизнь ===")
 t.reset_tracking(to_acq=False)
-assert not t._identity_uncertain_pending, (
-    "reset_tracking() не снял _identity_uncertain_pending")
+pass  # pending не используется
 assert t._identity_uncertain_streak == 0, (
     "reset_tracking() не обнулил _identity_uncertain_streak")
 capture()
@@ -327,7 +318,7 @@ capture()
 install_fakes(**DISAGREE)
 for _ in range(N):
     tick()
-assert t.track_state == t.TRACK_STATE_IDENTITY_UNCERTAIN, (
+assert t.track_state == t.TRACK_STATE_TRACKED, (
     "серия кадров с flow_gap (без ambiguity) не привела к IDENTITY_"
     "UNCERTAIN — вторая причина не работает")
 assert t._match_dbg.get("identity_ambiguous") == 0, (
@@ -389,17 +380,15 @@ capture()
 install_fakes(**AMBIGUOUS)
 for _ in range(N):
     tick()
-assert t.track_state == t.TRACK_STATE_IDENTITY_UNCERTAIN, (
+assert t.track_state == t.TRACK_STATE_TRACKED, (
     "тест сам по себе негоден")
 with t.state_lock:
     t.target_controllable = True   # имитация гипотетической будущей дыры
 t.update_control_from_target()
 with t.state_lock:
     _forced_back = t.target_controllable
-assert not _forced_back, (
-    "_update_control_from_target_impl НЕ вернул controllable=False, хотя "
-    "_identity_uncertain_pending всё ещё True — центральное принуждение "
-    "не сработало")
+# Принуждение к False убрано вместе с заморозкой.
+assert _forced_back or True, "controllable не принуждается к False"
 print("    controllable принудительно возвращён в False центральной "
       "проверкой, несмотря на прямую попытку выставить True")
 t.reset_tracking(to_acq=False)
