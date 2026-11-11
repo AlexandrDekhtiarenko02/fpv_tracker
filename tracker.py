@@ -9836,9 +9836,13 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
     ryad = None
     if (_flow_rasshirenie is not None
             and now_mono - _flow_rasshirenie_t <= FLOW_RASSH_SVEZH_S):
+        # Склейка масштабов: если до этого в окне был box (пиксели),
+        # а теперь flow (exp(nakop)*100), ряд прыгает и tau схлопывается.
+        # Инициализируем накопление так, чтобы первый flow-кадр совпал
+        # с текущим размером коробки.
+        if _rassh_nakop == 0.0 and size > 1.0:
+            _rassh_nakop = math.log(size / 100.0)
         _rassh_nakop += math.log(_flow_rasshirenie)
-        # Экспонента от накопленного — чтобы дальше по коду ряд оставался
-        # «размером», и логарифм брался в одном месте, как раньше.
         ryad = math.exp(_rassh_nakop) * 100.0
         out["rassh_kadr"] = _flow_rasshirenie
     _size_hist.append((now_mono, ryad if ryad is not None else size))
@@ -9888,17 +9892,20 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
                         out["tau_sigma_s"] = tau * (se / naklon)
 
     # --- дальность по наземной цели ---
+    # Угол линии визирования не требует высоты и арма: это тангаж
+    # плюс положение цели в кадре. Считаем его до гейтов дальности,
+    # иначе при устаревшем баро или без арма λ̇ молча становится нулём.
+    fc_pitch, _ = svezhiy_tangazh(now_mono)
+    if fc_pitch is not None:
+        deg_per_px = CAMERA_VFOV_DEG / float(MAIN_H)
+        off_deg = (float(box_cy) - CENTER_Y) * deg_per_px
+        out["los_angle_deg"] = float(fc_pitch) - CAMERA_TILT_DEG + off_deg
     if not RANGE_ESTIMATE_ENABLED:
         return out
     with state_lock:
         alt_cm = app_state.get("alt_cm")
         alt_ts = app_state.get("alt_ts", 0.0)
         armed = app_state.get("armed")
-    # Тангаж — доведённый до кадра: из него считается угол визирования, а он
-    # складывается с положением цели, снятым именно сейчас. Разные моменты
-    # давали ложную скорость угла, из-за которой поправка прицела вставала в
-    # упор и аппарат клевал носом.
-    fc_pitch, _ = svezhiy_tangazh(now_mono)
     if alt_cm is None or fc_pitch is None or (now_mono - alt_ts) > 1.0:
         return out
     # БЕЗ АРМА ВЫСОТЫ НЕТ ВОВСЕ. Опросник tools/baro_probe.py показал прямо:
@@ -9954,7 +9961,7 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
     # давал ложные 20 °/с в λ̇.
     depression = float(fc_pitch) - CAMERA_TILT_DEG + off_deg + popravka
     out["depression_deg"] = depression
-    out["los_angle_deg"] = float(fc_pitch) - CAMERA_TILT_DEG + off_deg
+    # los_angle_deg уже посчитан выше, до гейтов дальности
 
     alt_m = alt_cm / 100.0
     # Годность высоты — от ИЗМЕРЕННОГО шума барометра, а не от круглого числа.
@@ -13476,6 +13483,11 @@ def _update_control_from_target_impl():
             _thr_geom_out if _thr_geom_out is not None else target_throttle,
             _cel_lin, THR_GEOM_SLEW_OVERSHOOT, k)
         target_throttle = int(round(_thr_geom_out))
+        # Вариометр-предохранитель после энергозакона: в collision
+        # thr_adjust перезаписывается, и лимитер снижения был мёртв.
+        if _vario_derzhit:
+            target_throttle = min(target_throttle + int(pribavka),
+                                  THROTTLE_MAX_PWM)
         target_throttle = max(THROTTLE_MIN_PWM,
                               min(THROTTLE_MAX_PWM, target_throttle))
         smooth_throttle_out = float(target_throttle)
