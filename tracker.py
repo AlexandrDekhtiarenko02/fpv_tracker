@@ -8919,7 +8919,7 @@ def reset_tracking(to_acq=False):
     global filtered_dx_yaw, prev_adx, prev_ady_ctrl
     global smooth_throttle_out, throttle_integral, prev_ady
     global roll_integral, pitch_integral, yaw_integral
-    global _pn_bank_i, _pn_bank_tek, _pn_dx_pred, _pn_dx_t, _pn_dx_rate
+    global _pn_bank_i, _pn_az_i, _pn_bank_tek, _pn_dx_pred, _pn_dx_t, _pn_dx_rate
     global _pn_nos_i, _pn_nos_tek, _pn_nos_blizko, _pn_nos_ugol, _pn_rezhim, _pn_nedolet, _pn_baza, _pn_nabor_cel
     global _filtr_los
     global smoothed_pitch_deg
@@ -10207,6 +10207,7 @@ def _reset_geometry_history(reason):
     global geometry_epoch
     global _tau_ubyvanie, _az_nakop, _az_pred, _az_skorost, _az_skorost_ts, _az_sigma
     global _los_ugol, _los_skorost, _los_skorost_ts
+    global _filtr_los
     global prev_box_size_px, box_growth_smoothed
     global _rassh_nakop, _flow_rasshirenie
     global _score_do_rosta, _tau_hold_val, _tau_hold_t
@@ -10234,6 +10235,10 @@ def _reset_geometry_history(reason):
     _los_ugol = None
     _los_skorost = 0.0
     _los_skorost_ts = 0.0
+    _filtr_los["los"] = None
+    _filtr_los["az"] = None
+    _filtr_los["t_los"] = None
+    _filtr_los["t_az"] = None
     prev_box_size_px = None
     box_growth_smoothed = 0.0
     _size_hist.clear()
@@ -12680,7 +12685,13 @@ def _update_control_from_target_impl():
         _fc_p, _ = svezhiy_tangazh(now_mono)
         if _fc_p is None:
             _fc_p = 0.0
-        _zhel = PITCH_PWM_TO_FC_ANGLE_SIGN * _ugol_pn
+        # Опора — угол линии визирования, не горизонт. PN-поправка
+        # добавляется к нему. Раньше _zhel = PN, и в мёртвой зоне
+        # (λ̇≈0) закон тянул нос к 0° — выравнивал из пикирования.
+        _opora = closure.get("los_angle_deg") if isinstance(closure, dict) else None
+        if _opora is None:
+            _opora = float(_fc_p)
+        _zhel = float(_opora) + PITCH_PWM_TO_FC_ANGLE_SIGN * _ugol_pn
         if _zhel > PN_PITCH_ABS_MAX:
             _zhel = PN_PITCH_ABS_MAX
         elif _zhel < -PN_PITCH_ABS_MAX:
