@@ -9843,7 +9843,12 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
         # а теперь flow (exp(nakop)*100), ряд прыгает и tau схлопывается.
         # Инициализируем накопление так, чтобы первый flow-кадр совпал
         # с текущим размером коробки.
-        if _rassh_nakop == 0.0 and size > 1.0:
+        # Ресид на каждом переходе stale→fresh, не один раз за лок.
+        # Если flow мигал, накопление отстало от реального роста.
+        _byl_box = (len(_size_hist) > 0 and _rassh_nakop == 0.0)
+        if _byl_box and size > 1.0:
+            _rassh_nakop = math.log(max(1.0, _size_hist[-1][1]) / 100.0)
+        elif _rassh_nakop == 0.0 and size > 1.0:
             _rassh_nakop = math.log(size / 100.0)
         _rassh_nakop += math.log(_flow_rasshirenie)
         ryad = math.exp(_rassh_nakop) * 100.0
@@ -12203,7 +12208,17 @@ def _update_control_from_target_impl():
     _az_tek = None
     if fc_yaw_tek is not None:
         # Азимут = курс аппарата плюс смещение цели по горизонтали.
-        _az_tek = float(fc_yaw_tek) + (box_cx - CENTER_X) / PX_NA_GRAD_GOR
+        # Крен крутит картинку: часть dx утекает в высоту.
+        # Поворачиваем ошибку на -roll перед переводом в градусы.
+        _dx_raw = box_cx - CENTER_X
+        _dy_raw = box_cy - CENTER_Y
+        _roll = 0.0
+        with state_lock:
+            _r = app_state.get("fc_roll_deg")
+        if _r is not None:
+            _roll = math.radians(float(_r))
+        _dx_corr = _dx_raw * math.cos(_roll) + _dy_raw * math.sin(_roll)
+        _az_tek = float(fc_yaw_tek) + _dx_corr / PX_NA_GRAD_GOR
     if _az_tek is not None:
         # Курс замкнут по кругу: копим РАЗВЁРНУТОЕ значение, иначе один
         # переход через ноль портит окно целиком.
@@ -12667,9 +12682,13 @@ def _update_control_from_target_impl():
         # Не пускаем в закон артефакт старта: 15–17 °/с сразу после лока
         # упирают тангаж в +80 и дают клевок. Реальные заходы редко выше 8.
         if _los_pn is not None:
-            if abs(_los_pn) < LOS_RATE_PITCH_DEADBAND_DPS:
+            # Вычитающая мёртвая зона, как у крена: на границе команда
+            # непрерывна, а не прыгает с нуля.
+            if abs(_los_pn) <= LOS_RATE_PITCH_DEADBAND_DPS:
                 _los_pn = 0.0
-            elif _los_pn > LOS_RATE_LAW_MAX_DPS:
+            else:
+                _los_pn -= math.copysign(LOS_RATE_PITCH_DEADBAND_DPS, _los_pn)
+            if _los_pn > LOS_RATE_LAW_MAX_DPS:
                 _los_pn = LOS_RATE_LAW_MAX_DPS
             elif _los_pn < -LOS_RATE_LAW_MAX_DPS:
                 _los_pn = -LOS_RATE_LAW_MAX_DPS
@@ -12684,7 +12703,10 @@ def _update_control_from_target_impl():
         # команда скорости, и нос ехал, пока λ̇ не войдёт в мёртвую зону.
         _fc_p, _ = svezhiy_tangazh(now_mono)
         if _fc_p is None:
-            _fc_p = 0.0
+            # Пропал attitude — держим последнюю команду, не прыгаем к нулю.
+            _fc_p = getattr(_update_control_from_target_impl, "_last_fc_p", 0.0)
+        else:
+            _update_control_from_target_impl._last_fc_p = float(_fc_p)
         # Опора — угол линии визирования, не горизонт. PN-поправка
         # добавляется к нему. Раньше _zhel = PN, и в мёртвой зоне
         # (λ̇≈0) закон тянул нос к 0° — выравнивал из пикирования.
@@ -13491,6 +13513,11 @@ def _update_control_from_target_impl():
         if _baza_lin is None:
             _baza_lin = (float(_gaz_vhod) if _gaz_vhod is not None
                          else float(base_thr))
+        # В пикировании вертикальная тяга падает как cos. Поднимаем базу.
+        _fc_nak, _ = svezhiy_tangazh(now_mono)
+        _baza_nak = _visenie_na_naklone(_baza_lin, _fc_nak)
+        if _baza_nak is not None:
+            _baza_lin = _baza_nak
         _alt_en = None
         with state_lock:
             _alt_en_syroy = app_state.get("alt_cm")
