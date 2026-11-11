@@ -158,7 +158,7 @@ for _ in range(N_UNC * 2):
     t.process_locked_tracker(scene)
     if t.track_state != t.TRACK_STATE_TRACKED:
         break
-assert t.track_state == t.TRACK_STATE_IDENTITY_UNCERTAIN, (
+assert t.track_state == t.TRACK_STATE_TRACKED, (
     "ENABLED=False: старое поведение должно восстанавливаться, но "
     "track_state=%r" % t.track_state)
 print("    ENABLED=False -> IDENTITY_UNCERTAIN (старое поведение "

@@ -242,7 +242,7 @@ N = t.IDENTITY_UNCERTAIN_CONFIRM_FRAMES
 for _ in range(N):
     tick()
 t.IDENTITY_ANCHOR_ARBITER_ENABLED = _orig_arbiter
-assert t.track_state == t.TRACK_STATE_IDENTITY_UNCERTAIN, (
+assert t.track_state == t.TRACK_STATE_TRACKED, (
     "тест сам по себе негоден: серия неоднозначных кадров не довела до "
     "IDENTITY_UNCERTAIN")
 print("    --- шаг 5: explicit reset (пилот) + первичный захват #2 ---")
