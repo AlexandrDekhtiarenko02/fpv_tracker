@@ -9257,7 +9257,6 @@ def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k,
     if az_svezh and yaw_ok and az is not None:
         mertvaya = _az_sigma if _az_sigma > 0.5 else 0.5
         if abs(float(az)) > mertvaya:
-            izb_az = float(az) - math.copysign(mertvaya, float(az))
             az_glad = _skorost_gladkaya(az, "az", now)
             # Оба члена по сглаженному: сырой и сглаженный на смене знака
             # смотрят в разные стороны ~0.2 с, команда крена неверного знака.
