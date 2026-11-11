@@ -9206,7 +9206,7 @@ def _kren_pn(az_dps, vc_mps, range_m=None, accel_mps2=None, tau_s=None):
     """
     del range_m
     az_rad = math.radians(float(az_dps))
-    vc = 10.0 if vc_mps is None else max(1.0, float(vc_mps))
+    vc = 10.0 if vc_mps is None else max(1.0, min(60.0, float(vc_mps)))
     n = _n_po_vremeni(tau_s)
     a = n * vc * az_rad
     if accel_mps2 is not None:
@@ -9259,8 +9259,11 @@ def _kren_na_kurs(az, az_ts, bank_deg, dx_px, now, k,
         if abs(float(az)) > mertvaya:
             izb_az = float(az) - math.copysign(mertvaya, float(az))
             az_glad = _skorost_gladkaya(az, "az", now)
+            # Оба члена по сглаженному: сырой и сглаженный на смене знака
+            # смотрят в разные стороны ~0.2 с, команда крена неверного знака.
+            izb_glad = az_glad - math.copysign(mertvaya, az_glad) if abs(az_glad) > mertvaya else 0.0
             zhel = ROLL_SIGN * _kren_pn(
-                izb_az, vc_mps, range_m,
+                izb_glad, vc_mps, range_m,
                 _skolzyashiy(az_glad), tau_s)
     # Защитный slew и абсолютный потолок
     shag = PN_ROLL_BANK_SLEW * (k / NOMINAL_FPS)
@@ -11634,7 +11637,7 @@ def _update_control_from_target_impl():
     global smooth_throttle_out, throttle_integral, prev_ady
     global _hover_pwm, _thr_geom_out, _geom_mode_log, _gaz_vhod
     global roll_integral, pitch_integral, yaw_integral
-    global _pn_bank_i, _pn_bank_tek, _pn_dx_pred, _pn_dx_t, _pn_dx_rate
+    global _pn_bank_i, _pn_bank_tek, _pn_az_i, _pn_dx_pred, _pn_dx_t, _pn_dx_rate
     global _pn_nos_i, _pn_nos_tek, _pn_nos_blizko, _pn_nos_ugol, _pn_rezhim, _pn_nedolet, _pn_baza, _pn_nabor_cel
     global smoothed_pitch_deg
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed, stable_track_frames
@@ -12210,7 +12213,9 @@ def _update_control_from_target_impl():
         _az_hist.append((now_mono, _az_nakop))
         while _az_hist and (now_mono - _az_hist[0][0]) > LOS_FIT_WINDOW_S:
             _az_hist.popleft()
-        if len(_az_hist) >= LOS_FIT_MIN_POINTS:
+        _az_razmah = (_az_hist[-1][0] - _az_hist[0][0]) if len(_az_hist) >= 2 else 0.0
+        if (len(_az_hist) >= LOS_FIT_MIN_POINTS
+                and _az_razmah >= LOS_FIT_MIN_SPAN_S):
             _xs = [a for a, _ in _az_hist]
             _ys = [b for _, b in _az_hist]
             _n = len(_xs)
