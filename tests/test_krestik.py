@@ -18,7 +18,7 @@ assert fn, "не нашёл draw_overlay_on_frame"
 telo = ast.get_source_segment(src, fn[0]) or ""
 
 assert "draw_crosshair(frame)" in telo, "перекрестье не рисуется вовсе"
-assert "if not (vis and box is not None):" in telo, (
+assert "if not (vis and box is not None)" in telo, (
     "перекрестье рисуется безусловно — на захвате оно будет сбивать")
 
 # Рисование обязано стоять ПОСЛЕ чтения состояния, иначе условие не на чем

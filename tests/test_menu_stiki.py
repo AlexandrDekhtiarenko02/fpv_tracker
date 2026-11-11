@@ -87,7 +87,7 @@ assert vybr == ["Tools"], (vybr, t._menu_stroki())
 t._menu_tick(4000.6, stiki(), False)
 t._menu_tick(4000.8, stiki(kren=2000), False)
 imena = [s[0] for s in t._menu_stroki()]
-assert imena == ["Update", "Restart", "Record  off", "Clear logs", "Wi-Fi"], imena
+assert imena == ["Update", "Restart", "Record  off", "Pilot log  off", "Clear logs", "Wi-Fi"], imena
 vyzovy = []
 t._menu_zapustit(lambda: vyzovy.append(1) or "ok")
 import time as _time
