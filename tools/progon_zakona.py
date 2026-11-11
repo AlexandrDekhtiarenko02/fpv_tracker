@@ -54,12 +54,24 @@ def progon(path):
         kren = t._kren_na_kurs(
             az, now, bank, dx, now, 1.0,
             vc_mps=vc, range_m=rng, tau_s=tau)
-        # тангаж
+        # тангаж — живой путь: опора LOS + PN, замкнуто по углу
         los_glad = t._skorost_gladkaya(los if los is not None else 0.0, "los", now)
-        ugol = t._tangazh_pn(
-            los_glad, vc, rng,
-            t._skolzyashiy(los_glad), None, tau)
-        tang = t.PITCH_PWM_TO_FC_ANGLE_SIGN * ugol * t.PN_PITCH_PWM_PER_DEG
+        if los_glad is not None and abs(los_glad) > t.LOS_RATE_PITCH_DEADBAND_DPS:
+            los_glad -= (t.LOS_RATE_PITCH_DEADBAND_DPS if los_glad > 0 else -t.LOS_RATE_PITCH_DEADBAND_DPS)
+        else:
+            los_glad = 0.0
+        ugol_pn = t._tangazh_pn(los_glad, vc, rng, None, None, tau)
+        fc_p = 0.0 if pd.isna(r.fc_pitch) else float(r.fc_pitch)
+        # опора — угол линии, если есть; иначе текущий тангаж
+        opora = None
+        if not pd.isna(r.get("los_angle_deg", float("nan"))):
+            opora = float(r.los_angle_deg)
+        if opora is None:
+            opora = fc_p
+        zhel = opora + t.PITCH_PWM_TO_FC_ANGLE_SIGN * ugol_pn
+        zhel = max(-t.PN_PITCH_ABS_MAX, min(t.PN_PITCH_ABS_MAX, zhel))
+        tang = (zhel - fc_p) * t.PN_PITCH_PWM_PER_DEG
+        tang = max(-t.PN_PITCH_PWM_MAX, min(t.PN_PITCH_PWM_MAX, tang))
         # газ
         gaz = t._gaz_po_energii(HOVER, alt, tau, 20, sig, var, cy, bh, None)
         # рыскание
