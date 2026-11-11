@@ -2742,7 +2742,7 @@ _FLIGHT_LOG_COLUMNS = (
     "pitch_after_trust,pitch_before_slew,pitch_after_slew,"
     "launch_pwm,cruise_pwm,rate_damp,roll_damp,pitch_comb,col_p,col_r,"
     "yaw_filt,yaw_weight,yaw_pd,yaw_ff,yaw_i,yaw_off,yaw_sat,"
-    "los_rate,los_aim_px,az_rate,los_aim_x_px,tau_ubyv,rost_ot_zahvata,final_hold,doverie,base_thr,thr_adjust,thr_i,rc_fresh,"
+    "los_rate,los_aim_px,az_rate,los_aim_x_px,tau_ubyv,rost_ot_zahvata,rassh_kadr,final_hold,doverie,base_thr,thr_adjust,thr_i,rc_fresh,"
     "cmd_roll,cmd_pitch,cmd_yaw,cmd_thr,"
     "sent_r,sent_p,sent_t,sent_y,"
     "fc_roll,fc_pitch,fc_yaw,att_age_ms,"
@@ -18004,6 +18004,7 @@ def _capture_flight_row(cb_t0):
             g("los_rate"), g("los_aim_px"), g("az_rate"), g("los_aim_x_px"),
             g("tau_ubyv"),
             g("rost_ot_zahvata"),
+            g("rassh_kadr"),
             g("final_hold"),
             g("doverie"),
             c.get("base_thr"), g("thr_adjust"), g("thr_i"), g("rc_fresh"),

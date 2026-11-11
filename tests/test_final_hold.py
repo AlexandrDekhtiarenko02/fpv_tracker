@@ -88,23 +88,23 @@ def derzhi_finala(rost, dy_px=0):
 
 
 t._final_zamorozhen = False
-print("=== 1. До порога контур рулит по углу, рамка около центра молчит ===")
+print("=== 1. Команда следует положению цели в кадре, не абсолютному тангажу ===")
+# Новый закон: желаемый = угол LOS + PN. fc_pitch сокращается,
+# команда зависит от положения цели в кадре (off_deg) и PN.
+# Цель ниже в кадре → больше команда вниз. Абсолютный pitch не влияет.
 for _ in range(5):
     zahod(rost=1.5, dy_px=0, pitch=20.0)
-na_ugle, _ = zahod(rost=1.5, dy_px=0, pitch=20.0)
-u_ramki, _ = zahod(rost=1.5, dy_px=40, pitch=20.0)
-nizhe = None
-for _ in range(8):
-    nizhe, _ = zahod(rost=1.5, dy_px=0, pitch=12.0)
-vyshe = None
-for _ in range(8):
-    vyshe, _ = zahod(rost=1.5, dy_px=0, pitch=28.0)
-print("    на угле %d, рамка +40 px %d, нос выше курса %d, нос ниже %d"
-      % (na_ugle, u_ramki, nizhe, vyshe))
-assert abs(na_ugle - u_ramki) <= 8, (
-    "рамка в 40 px сдвинула тангаж: курс снова ведёт коробка")
-assert nizhe > 1520, "нос выше курса, а стик его не опускает: %s" % nizhe
-assert vyshe < 1480, "нос ниже курса, а стик его не поднимает: %s" % vyshe
+centr, _ = zahod(rost=1.5, dy_px=0, pitch=20.0)
+nizhe, _ = zahod(rost=1.5, dy_px=60, pitch=20.0)
+vyshe, _ = zahod(rost=1.5, dy_px=-60, pitch=20.0)
+# Тот же кадр, другой pitch — команда не должна сильно меняться
+drugoy_pitch, _ = zahod(rost=1.5, dy_px=0, pitch=35.0)
+print("    центр %d, цель ниже %d, цель выше %d, pitch 35° %d"
+      % (centr, nizhe, vyshe, drugoy_pitch))
+assert nizhe > centr, "цель ниже, а команда не растёт: %d vs %d" % (nizhe, centr)
+assert vyshe < centr, "цель выше, а команда не падает: %d vs %d" % (vyshe, centr)
+assert abs(drugoy_pitch - centr) < 15, (
+    "абсолютный pitch сдвинул команду: %d vs %d" % (drugoy_pitch, centr))
 
 print("\n=== 2. За порогом команда замирает (после подтверждения по времени) ===")
 t._final_zamorozhen = False
@@ -186,10 +186,10 @@ t.FINAL_HOLD_ENABLED = False
 t._final_zamorozhen = False
 t.lock_w0 = t.lock_h0 = 20.0
 a, _ = zahod(rost=t.FINAL_HOLD_ROST + 2.0, dy_px=0, pitch=20.0)
-b, _ = zahod(rost=t.FINAL_HOLD_ROST + 2.0, dy_px=0, pitch=10.0)
+b, _ = zahod(rost=t.FINAL_HOLD_ROST + 2.0, dy_px=50, pitch=20.0)
 t.FINAL_HOLD_ENABLED = True
-print("    при выключенной заморозке команда снова меняется: %d -> %d" % (a, b))
-assert a != b, "выключатель не работает"
+print("    при выключенной заморозке команда следует цели: %d -> %d" % (a, b))
+assert a != b, "выключатель не работает: команда не следует за целью"
 
 print("\n=== 5. Замораживается СРЕДНЕЕ, а не мгновение ===")
 # Выброс ровно в кадре пересечения порога не должен решать судьбу захода:
@@ -248,8 +248,8 @@ t.pitch_integral = 0.0
 t.prev_ady_ctrl = 0.0
 t._pitch_pri_loke = None
 a, _ = zahod(rost=1.3, dy_px=0, pitch=20.0)
-b, _ = zahod(rost=1.3, dy_px=0, pitch=10.0)
-print("    после снятия команда снова меняется: %d -> %d" % (a, b))
+b, _ = zahod(rost=1.3, dy_px=50, pitch=20.0)
+print("    после снятия команда снова следует цели: %d -> %d" % (a, b))
 assert a != b, "новый заход всё ещё заморожен"
 
 print("\n=== 6. Копилка чистится между заходами ===")
