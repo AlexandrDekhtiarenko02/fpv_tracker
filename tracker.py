@@ -5109,6 +5109,7 @@ _size_hist = collections.deque(maxlen=256)
 # наклона постоянная и не нужна.
 _flow_rasshirenie = None
 _flow_rasshirenie_t = 0.0
+_ryad_iz_flow = False
 _rassh_nakop = 0.0
 
 # Интегратор внутреннего контура каскадного газа.
@@ -9773,7 +9774,7 @@ def _alt_sigma_cm():
         / float(n))
 
 
-def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
+def _estimate_closure(box_w, box_h, box_cy, now_mono, k, box_cx=None):
     """Оценка сближения с целью. Возвращает словарь измерений.
 
     tau_s     — время до контакта, с. Из скорости роста коробки за окно
@@ -9834,24 +9835,22 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
     # Ряд один и тот же по смыслу: ln(размера) с точностью до постоянной.
     # Накопленный логарифм расширения — это тот же ln(размера), только
     # измеренный непрерывно, а не тремя ступенями масштаба.
-    global _rassh_nakop
+    global _rassh_nakop, _ryad_iz_flow
     ryad = None
     if (_flow_rasshirenie is not None
             and now_mono - _flow_rasshirenie_t <= FLOW_RASSH_SVEZH_S):
-        # Склейка масштабов: если до этого в окне был box (пиксели),
-        # а теперь flow (exp(nakop)*100), ряд прыгает и tau схлопывается.
-        # Инициализируем накопление так, чтобы первый flow-кадр совпал
-        # с текущим размером коробки.
-        # Ресид на каждом переходе stale→fresh, не один раз за лок.
-        # Если flow мигал, накопление отстало от реального роста.
-        _byl_box = (len(_size_hist) > 0 and _rassh_nakop == 0.0)
-        if _byl_box and size > 1.0:
+        # Ресид на каждом переходе box→flow, не один раз за лок.
+        # Флаг _ryad_iz_flow помнит источник предыдущего кадра.
+        if not _ryad_iz_flow and len(_size_hist) > 0:
             _rassh_nakop = math.log(max(1.0, _size_hist[-1][1]) / 100.0)
         elif _rassh_nakop == 0.0 and size > 1.0:
             _rassh_nakop = math.log(size / 100.0)
         _rassh_nakop += math.log(_flow_rasshirenie)
         ryad = math.exp(_rassh_nakop) * 100.0
         out["rassh_kadr"] = _flow_rasshirenie
+        _ryad_iz_flow = True
+    else:
+        _ryad_iz_flow = False
     _size_hist.append((now_mono, ryad if ryad is not None else size))
     while _size_hist and (now_mono - _size_hist[0][0]) > TAU_FIT_WINDOW_S:
         _size_hist.popleft()
@@ -9905,7 +9904,16 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k):
     fc_pitch, _ = svezhiy_tangazh(now_mono)
     if fc_pitch is not None:
         deg_per_px = CAMERA_VFOV_DEG / float(MAIN_H)
-        off_deg = (float(box_cy) - CENTER_Y) * deg_per_px
+        # Крен крутит картинку: dx утекает в высоту.
+        _dx = (float(box_cx) - CENTER_X) if box_cx is not None else 0.0
+        _dy = float(box_cy) - CENTER_Y
+        _roll = 0.0
+        with state_lock:
+            _r = app_state.get("fc_roll_deg")
+        if _r is not None:
+            _roll = math.radians(float(_r))
+        _dy_corr = -_dx * math.sin(_roll) + _dy * math.cos(_roll)
+        off_deg = _dy_corr * deg_per_px
         out["los_angle_deg"] = float(fc_pitch) - CAMERA_TILT_DEG + off_deg
     if not RANGE_ESTIMATE_ENABLED:
         return out
@@ -10213,7 +10221,7 @@ def _reset_geometry_history(reason):
     global _los_ugol, _los_skorost, _los_skorost_ts
     global _filtr_los
     global prev_box_size_px, box_growth_smoothed
-    global _rassh_nakop, _flow_rasshirenie
+    global _rassh_nakop, _flow_rasshirenie, _ryad_iz_flow
     global _score_do_rosta, _tau_hold_val, _tau_hold_t
     global prev_box_cx, prev_box_cy, target_vx_smoothed, target_vy_smoothed
     global stable_track_frames
@@ -10247,6 +10255,7 @@ def _reset_geometry_history(reason):
     box_growth_smoothed = 0.0
     _size_hist.clear()
     _rassh_nakop = 0.0
+    _ryad_iz_flow = False
     _flow_rasshirenie = None
     _score_do_rosta = None
     _tau_hold_val = None
@@ -12158,7 +12167,7 @@ def _update_control_from_target_impl():
     # Оценка сближения. ТЕПЕРЬ ВХОДИТ В ЗАКОН: время до контакта решает, когда
     # переключаться в режим сближения и как вести газ. Считать её надо ДО
     # того, как она понадобится, — раньше она стояла ниже по коду.
-    closure = _estimate_closure(box_w_main, box_h_main, box_cy, now_mono, k)
+    closure = _estimate_closure(box_w_main, box_h_main, box_cy, now_mono, k, box_cx)
 
     # Режим сближения — только по времени до контакта. Запасного признака по
     # доле кадра больше нет: он был недостижим по построению (см. настройку).

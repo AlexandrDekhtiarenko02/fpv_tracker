@@ -215,7 +215,7 @@ assert (t.lock_cx, t.lock_cy) == _lock_before, (
     "недоверенная позиция была закоммичена ДО решения об identity"
     % (_lock_before, (t.lock_cx, t.lock_cy)))
 # Заморозка отключена: prev_gray обновляется как обычно.
-assert t.prev_gray is not _prev_gray_before or True, "lock продолжает обновляться"
+assert t.prev_gray is not _prev_gray_before, "prev_gray должен обновиться"
 pass  # prev_pts обновляются
 assert np.array_equal(t.template_gray, _tmpl_before), (
     "template_gray изменился на триггерящем кадре — эталон 'обучился' "
@@ -388,7 +388,7 @@ t.update_control_from_target()
 with t.state_lock:
     _forced_back = t.target_controllable
 # Принуждение к False убрано вместе с заморозкой.
-assert _forced_back or True, "controllable не принуждается к False"
+assert _forced_back, "controllable должен остаться"
 print("    controllable принудительно возвращён в False центральной "
       "проверкой, несмотря на прямую попытку выставить True")
 t.reset_tracking(to_acq=False)

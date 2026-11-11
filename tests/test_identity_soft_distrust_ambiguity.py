@@ -166,7 +166,7 @@ for i in range(N + 2):
         _controllable_arbiter_off.append(t.target_controllable)
 t.IDENTITY_ANCHOR_ARBITER_ENABLED = _orig_arbiter
 print("    controllable при arbiter OFF:", _controllable_arbiter_off)
-assert _controllable_arbiter_off[-1] or True, (
+assert _controllable_arbiter_off[-1], (
     "с отключённым arbiter'ом sustained ambiguity должна была снять "
     "controllable через дебаунс — не сработало, значит защита была не "
     "arbiter-gate'ом, а чем-то другим: %s" % _controllable_arbiter_off)

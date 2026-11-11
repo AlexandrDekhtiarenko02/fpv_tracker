@@ -137,7 +137,7 @@ for i in range(t.IDENTITY_ANCHOR_CHECK_CONFIRM_N):
     t.process_locked_tracker(scene)
     with t.state_lock:
         _controllable_seen_c.append(t.target_controllable)
-assert any(_controllable_seen_c) or True, (
+assert any(_controllable_seen_c), (
     "controllable стал True хотя бы раз за серию неудачных замеров: %s"
     % _controllable_seen_c)
 assert t.track_state == t.TRACK_STATE_TRACKED, (
@@ -189,7 +189,7 @@ assert all(s == t.TRACK_STATE_TRACKED for s in _states_d), (
     "track_state покинул TRACKED раньше времени: %s" % _states_d)
 assert all(_controllable_d[:N_SOFT - 1]), (
     "controllable упал раньше N_SOFT=%d кадров: %s" % (N_SOFT, _controllable_d))
-assert any(_controllable_d[N_SOFT - 1:]) or True, (
+assert any(_controllable_d[N_SOFT - 1:]), (
     "controllable НЕ упал по достижении soft-порога N_SOFT=%d: %s"
     % (N_SOFT, _controllable_d))
 print("    controllable=False начиная с кадра %d (single-signal gap "
