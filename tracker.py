@@ -1709,7 +1709,7 @@ FINAL_HOLD_ABORT_PX = 40.0
 # секунды: достаточно, чтобы одиночный выброс не решал судьбу захода, и
 # достаточно мало, чтобы среднее оставалось тем манёвром, который шёл
 # непосредственно перед финалом, а не предыдущим.
-FINAL_OKNO_KADROV = 8
+FINAL_OKNO_S = 0.4  # было 8 кадров; при 20 fps = 0.4 с, при 30 = 0.27
 # ПЕРЕКЛЮЧАЕМСЯ ПО ВРЕМЕНИ ДО КОНТАКТА, а не по доле кадра.
 #
 # Замерено по 46 заходам: доля кадра доходила до порога 0.18 лишь в 1.2%
@@ -2211,14 +2211,16 @@ G_MPS2 = 9.81
 def _n_po_vremeni(tau_s):
     """N от оставшегося времени, не от дальности.
 
-    Когда времени мало, большой N перекомпенсирует любую ошибку
-    или задержку. Когда времени много — полное N.
-    Нет tau — базовое.
+    Когда времени мало, большой N перекомпенсирует. Пол не ниже 2,
+    чтобы терминаль не выключалась. Нет tau — скромное, не полное:
+    мусорный tau не должен давать максимальное усиление.
     """
-    if tau_s is None or tau_s <= 0.2:
-        return PN_N
-    # На 8 с почти полное, на 2 с около половины, дальше мягко к нулю.
-    return PN_N * math.tanh(float(tau_s) / 6.0)
+    if tau_s is None:
+        return 2.0
+    if tau_s <= 0.2:
+        return max(2.0, PN_N * 0.5)
+    n = PN_N * math.tanh(float(tau_s) / 6.0)
+    return max(2.0, n)
 # Интеграл по скорости азимута: постоянный параллельный снос должен
 # накапливать доворот курса, а не сидеть в шуме оценки.
 PN_ROLL_AZ_YAW_MAX_DPS = 25.0 # своё рыскание быстрее — az не берём
@@ -4992,7 +4994,7 @@ _final_komandy = (1500, 1500, 1500)
 # траектория дальше — если да, hold отпускается (см. FINAL_HOLD_ABORT_PX).
 _final_dx0 = None
 _final_dy0 = None
-_final_okno = collections.deque(maxlen=FINAL_OKNO_KADROV)
+_final_okno = collections.deque()  # чистится по времени FINAL_OKNO_S
 # Момент, когда PID увидел controllable=True после not-controllable. Нужен
 # заморозке: до FINAL_MIN_ZAHOD_AGE_S оценщик tau ещё в переходном
 # процессе, и его первые значения не имеют права необратимо замораживать
@@ -5110,6 +5112,7 @@ _size_hist = collections.deque(maxlen=256)
 _flow_rasshirenie = None
 _flow_rasshirenie_t = 0.0
 _ryad_iz_flow = False
+_bias_slew = 0.0
 _rassh_nakop = 0.0
 
 # Интегратор внутреннего контура каскадного газа.
@@ -9207,7 +9210,7 @@ def _kren_pn(az_dps, vc_mps, range_m=None, accel_mps2=None, tau_s=None):
     """
     del range_m
     az_rad = math.radians(float(az_dps))
-    vc = 10.0 if vc_mps is None else max(1.0, min(60.0, float(vc_mps)))
+    vc = 20.0 if vc_mps is None else max(1.0, min(60.0, float(vc_mps)))
     n = _n_po_vremeni(tau_s)
     a = n * vc * az_rad
     if accel_mps2 is not None:
@@ -9775,6 +9778,7 @@ def _alt_sigma_cm():
 
 
 def _estimate_closure(box_w, box_h, box_cy, now_mono, k, box_cx=None):
+    global _bias_slew
     """Оценка сближения с целью. Возвращает словарь измерений.
 
     tau_s     — время до контакта, с. Из скорости роста коробки за окно
@@ -9914,7 +9918,7 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k, box_cx=None):
             _roll = math.radians(float(_r))
         _dy_corr = -_dx * math.sin(_roll) + _dy * math.cos(_roll)
         off_deg = _dy_corr * deg_per_px
-        out["los_angle_deg"] = float(fc_pitch) - CAMERA_TILT_DEG + off_deg
+        out["los_angle_deg"] = float(fc_pitch) - CAMERA_TILT_DEG + off_deg + _bias_slew
     if not RANGE_ESTIMATE_ENABLED:
         return out
     with state_lock:
@@ -9970,6 +9974,14 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k, box_cx=None):
         popravka = min(PITCH_BIAS_MAX,
                        max(0.0, PITCH_BIAS_PER_MS * skorost + PITCH_BIAS_BASE))
     out["pitch_bias_deg"] = popravka
+    # Slew-ограниченный bias для угла линии: не прыгает 0→12°.
+    _shag = 1.0 * (k / NOMINAL_FPS)  # макс 1 °/с
+    if _bias_slew < popravka - _shag:
+        _bias_slew += _shag
+    elif _bias_slew > popravka + _shag:
+        _bias_slew -= _shag
+    else:
+        _bias_slew = popravka
     # Bias остаётся в depression_deg: его читают пороги газа
     # (_blizko_i_vysoko, _derzhat_nos), калиброванные по углу с поправкой.
     # Для скорости линии — отдельное поле без bias: прыжок 0→+12°
@@ -13190,7 +13202,9 @@ def _update_control_from_target_impl():
     # Копилка последних команд — из неё берётся то, что замораживается.
     # Веса — доверие к слежению в тот кадр: кадр, где эталон еле совпадал,
     # не должен решать судьбу захода наравне с чистым.
-    _final_okno.append((target_roll, target_pitch, target_yaw, trust_k))
+    _final_okno.append((now_mono, target_roll, target_pitch, target_yaw, trust_k))
+    while _final_okno and (now_mono - _final_okno[0][0]) > FINAL_OKNO_S:
+        _final_okno.popleft()
 
     # ПРИЗНАК ФИНАЛА — ВРЕМЯ ДО КОНТАКТА, а рост рамки лишь запасной.
     #
@@ -13274,10 +13288,10 @@ def _update_control_from_target_impl():
             # исправить его уже нечем: в том и смысл заморозки, что дальше
             # контур молчит. Среднее по последним кадрам этот случай убирает
             # целиком и стоит десяти строк.
-            _ves = sum(w for _, _, _, w in _final_okno)
+            _ves = sum(w for _, _, _, _, w in _final_okno)
             if _ves > 1e-6:
                 _final_komandy = tuple(
-                    int(round(sum(k[i] * k[3] for k in _final_okno) / _ves))
+                    int(round(sum(k[i + 1] * k[4] for k in _final_okno) / _ves))
                     for i in range(3))
             else:
                 _final_komandy = (target_roll, target_pitch, target_yaw)
