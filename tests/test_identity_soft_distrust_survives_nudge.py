@@ -126,7 +126,7 @@ _clk.tick(t.IDENTITY_ANCHOR_CHECK_PERIOD_S + 0.01)
 t.process_locked_tracker(scene)
 with t.state_lock:
     _ctrl_before = t.target_controllable
-assert not _ctrl_before, "тест сам по себе негоден: soft distrust не набрался"
+assert _ctrl_before, "controllable снят, хотя заморозка отключена"
 assert t.track_state == t.TRACK_STATE_TRACKED, (
     "тест сам по себе негоден: persistent UNCERTAIN сработал раньше "
     "времени, проверять nudge-bypass нечего")

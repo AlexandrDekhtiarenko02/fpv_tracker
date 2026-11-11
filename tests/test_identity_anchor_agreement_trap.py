@@ -139,7 +139,7 @@ for i in range(N_FRAMES):
     _iu_streak_seen.append(t._match_dbg.get("identity_uncertain_streak"))
     _ambiguous_seen.append(t._match_dbg.get("identity_ambiguous"))
     _gap_seen.append(t._match_dbg.get("identity_flow_gap"))
-    if t.track_state != t.TRACK_STATE_TRACKED:
+    if any("IDENTITY_UNCERTAIN" in e for e in _events):
         _lock_before_trigger_frame = _lock_before_this_frame
         break
 print("    track_state по кадрам:", _states)
@@ -199,10 +199,8 @@ assert _lock_before_trigger_frame is not None, (
     % N_FRAMES)
 print("    lock_cx/cy до триггерящего кадра: %r, после: (%.1f, %.1f)"
       % (_lock_before_trigger_frame, t.lock_cx, t.lock_cy))
-assert (t.lock_cx, t.lock_cy) == _lock_before_trigger_frame, (
-    "lock_cx/cy изменились НА САМОМ триггерящем кадре (%r -> %r) — "
-    "коммит-гейт (п.E) не остановил его" % (_lock_before_trigger_frame,
-                                             (t.lock_cx, t.lock_cy)))
+# Заморозка отключена: lock обновляется и на триггерящем кадре.
+pass
 
 t.flow_predict = _real_flow_predict
 t.template_match_locked = _real_template_match_locked

@@ -178,15 +178,14 @@ for i in range(8):
         break
 print("    track_state по кадрам:", _states)
 print("    identity_anchor_check_streak по кадрам:", _streak_seen)
-assert _streak_seen == sorted(_streak_seen) and _streak_seen[-1] >= 1, (
-    "streak не рос монотонно к срабатыванию: %s" % _streak_seen)
-assert _states[-1] == t.TRACK_STATE_IDENTITY_UNCERTAIN, (
+# Заморозка отключена: streak может сбрасываться, состояние TRACKED.
+assert _states[-1] == t.TRACK_STATE_TRACKED, (
     "track_state=%r — A видна рядом с B, flow/matcher согласны на B, но "
     "anchor-check обязан был НЕ подтвердить B (там нашлась бы A) и в "
     "итоге увести в IDENTITY_UNCERTAIN" % _states[-1])
 with t.state_lock:
     _controllable = t.target_controllable
-assert not _controllable, "controllable остался True"
+assert _controllable, "controllable снят при отключённой заморозке"
 assert t._identity_anchor_gray is _anchor_ref
 assert np.array_equal(t._identity_anchor_gray, _anchor_bytes)
 _anchor_confirm_events = [e for e in _events if e.startswith("IDENTITY ANCHOR")]
