@@ -12674,8 +12674,18 @@ def _update_control_from_target_impl():
             None,  # без SMC: он упирал тангаж в упор уже на 3 °/с
             closure.get("depression_deg") if isinstance(closure, dict) else None,
             _tau_bl)
-        pitch_offset = (PITCH_PWM_TO_FC_ANGLE_SIGN
-                        * _ugol_pn * PN_PITCH_PWM_PER_DEG)
+        # Замкнуто по углу, как крен: закон даёт желаемый тангаж,
+        # PWM — от ошибки относительно fc_pitch. Раньше это была
+        # команда скорости, и нос ехал, пока λ̇ не войдёт в мёртвую зону.
+        _fc_p, _ = svezhiy_tangazh(now_mono)
+        if _fc_p is None:
+            _fc_p = 0.0
+        _zhel = PITCH_PWM_TO_FC_ANGLE_SIGN * _ugol_pn
+        if _zhel > PN_PITCH_ABS_MAX:
+            _zhel = PN_PITCH_ABS_MAX
+        elif _zhel < -PN_PITCH_ABS_MAX:
+            _zhel = -PN_PITCH_ABS_MAX
+        pitch_offset = (_zhel - float(_fc_p)) * PN_PITCH_PWM_PER_DEG
         if pitch_offset > PN_PITCH_PWM_MAX:
             pitch_offset = PN_PITCH_PWM_MAX
         elif pitch_offset < -PN_PITCH_PWM_MAX:
