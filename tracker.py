@@ -1980,7 +1980,7 @@ GLIDE_MIN_PITCH_DEG = 15.0
 # Время до контакта, при котором наклон нужен целиком. Совпадает с верхней
 # границей газа (TAU_THROTTLE_HI_S): обе оси считают заход затянутым по
 # одному признаку, поэтому не тянут в разные стороны.
-GLIDE_TAU_FULL_S = 9.0
+GLIDE_TAU_FULL_S = 6.0   # синхронно с TAU_THROTTLE_HI_S
 # Время, ниже которого наклон снят полностью. Совпадает с порогом режима
 # сближения (CLOSING_TAU_S): в финальных секундах ось тангажа принадлежит
 # только прицеливанию, и добавлять к ней нечего.
@@ -13558,6 +13558,9 @@ def _update_control_from_target_impl():
         # Набор только на дальнем пологом. На заходе — ноль.
         _dal_nab = (closure.get("range_m") if isinstance(closure, dict) else None)
         _cel_lin += _nabor_pwm(_alt_en, _dal_nab)
+        # τ-буксир и прочие thr_adjust должны дойти до команды.
+        # Раньше перезаписывались энергозаконом (как vario до A6).
+        _cel_lin += thr_adjust
         _thr_geom_out = _podtyanut_gaz(
             _thr_geom_out if _thr_geom_out is not None else target_throttle,
             _cel_lin, THR_GEOM_SLEW_OVERSHOOT, k)
