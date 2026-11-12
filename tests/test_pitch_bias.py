@@ -56,10 +56,10 @@ print("\n=== 4. Без скорости не поправляем вовсе ===
 src = io.open(os.path.join(_ROOT, "tracker.py"), encoding="utf-8").read()
 i = src.index("out[\"pitch_bias_deg\"] = popravka")
 kusok = src[i - 900:i]
-assert "if skorost is None" in kusok and "popravka = 0.0" in kusok, (
-    "при неизвестной скорости поправка обязана быть нулевой, иначе она "
-    "поедет туда, где её измерить было нечем")
-print("    да, при неизвестной скорости поправка нулевая")
+assert "if skorost is None" in kusok and "popravka = 8.0" in kusok, (
+    "при неизвестной скорости нужен фолбэк ~8°, иначе равновесие тангажа "
+    "на 10° ниже центра и нос держится в горизонте")
+print("    да, при неизвестной скорости фолбэк 8°")
 
 print("\n=== 5. Поправка ограничена сверху ===")
 p = min(t.PITCH_BIAS_MAX,

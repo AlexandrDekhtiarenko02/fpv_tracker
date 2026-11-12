@@ -2200,7 +2200,7 @@ COLLISION_ROLL_MAX = 28.0
 # снова кадр. Горизонт — когда тихие положение, бег и курс.
 # В эталоне 17–18 |dx|~7, крен 3–5°. 0.7°/px сверх 4 px; бег поднимает
 # потолок до 16°, не до позднего удара 22°.
-PN_ROLL_HOLD_MAX = 12.0
+PN_ROLL_HOLD_MAX = 20.0   # было 12; 12° = 2.1 м/с², на пересечении не хватает
 PN_ROLL_AZ_DEG = 0.5          # запас, если скорости сближения нет
 # Пропорциональная навигация: крен гасит вращение линии визирования.
 # a = N * Vc * az, крен = atan(a / g). N = 3..5, берём 4.
@@ -9973,7 +9973,11 @@ def _estimate_closure(box_w, box_h, box_cy, now_mono, k, box_cx=None):
     elif ground_speed_mps is not None:
         skorost = ground_speed_mps
     if skorost is None:
-        popravka = 0.0
+        # Нет GPS и нет бега земли — занижение тангажа неизвестно.
+        # Без фолбэка равновесие команды = цель на CAMERA_TILT ниже центра,
+        # и нос держится почти в горизонте, пока рамка не уедет к краю.
+        # 8° почти снимает 10° наклона камеры, оставляя ~2° запаса вниз.
+        popravka = 8.0
     else:
         popravka = min(PITCH_BIAS_MAX,
                        max(0.0, PITCH_BIAS_PER_MS * skorost + PITCH_BIAS_BASE))

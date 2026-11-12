@@ -49,7 +49,7 @@ for os_imya, p_gain, ff_gain in (("тангаж", zn["P_GAIN_PITCH"], zn["FF_GAI
 # Крен держит рамку. Потолок положения — ранний небольшой крен.
 # Потолок на бегущей рамке выше, но это не поздний удар в 22°.
 assert zn["FF_GAIN_ROLL"] == 0.0
-assert zn["PN_ROLL_HOLD_MAX"] <= 15.0
+assert zn["PN_ROLL_HOLD_MAX"] <= 25.0
 assert zn["PN_ROLL_PWM_MAX"] < zn["MAX_ROLL_DEFLECT"]
 
 # Упреждение горизонтом больше полусекунды при задержке петли 125 мс — это
