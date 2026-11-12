@@ -43,7 +43,7 @@ assert t.TAU_THROTTLE_HI_S - t.TAU_THROTTLE_LO_S >= 3.0, (
     "мёртвая зона %.1f с слишком узка — газ снова начнёт подруливать "
     "постоянно, как по пикселям"
     % (t.TAU_THROTTLE_HI_S - t.TAU_THROTTLE_LO_S))
-for tau in (t.TAU_THROTTLE_LO_S, 5.0, 7.0, t.TAU_THROTTLE_HI_S):
+for tau in (t.TAU_THROTTLE_LO_S, 4.0, 5.5, t.TAU_THROTTLE_HI_S):
     a = popravka(tau)
     print("    tau %.1f с -> поправка %+.0f" % (tau, a))
     assert a == 0.0, "внутри границ газ обязан молчать"
