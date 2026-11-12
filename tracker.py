@@ -9408,13 +9408,17 @@ def _nedolet_deg(alt_m, tau_s, n_tau, sigma_s, vario_cms,
     # Без мёртвых зон и жёсткого потолка — шум гасится фильтрами tau/vario.
     izb = fakt - nuzhno
     if izb > 0.0:
-        # Непрерывная поправка: избыточное снижение → нос ниже.
-        # Мягкий потолок через tanh, без жёстких мёртвых зон.
+        # Избыточное снижение → нос ниже.
         dob = 8.0 * math.tanh(izb / 3.0)
         return max(0.0, dob)
-    # Перелёт без сближения — не трогаем (пологий дальний заход).
-    if izb < 0.0 and not (ubyv is not None and float(ubyv) < 0.0):
-        return None
+    if izb < 0.0:
+        # Недобор снижения (или набор) → нос ВВЕРХ.
+        # Раньше возвращали 0/None — контур не умел поднимать нос,
+        # и на перелёте это была положительная обратная связь.
+        if ubyv is not None and float(ubyv) >= 0.0:
+            return None  # нет сближения — не трогаем пологий
+        dob = -6.0 * math.tanh(-izb / 3.0)
+        return min(0.0, dob)
     return 0.0
 
 
@@ -9426,7 +9430,10 @@ def _zapas_nosa():
     добавляет сверху, если высота кончается раньше.
     """
     # Только непрерывная поправка от alt/tau. Фиксированного запаса на захвате нет.
-    return max(0.0, float(_pn_nedolet) if _pn_nedolet is not None else 0.0)
+    # Двусторонний: плюс — нос ниже, минус — нос выше.
+    if _pn_nedolet is None:
+        return 0.0
+    return max(-6.0, min(8.0, float(_pn_nedolet)))
 
 
 # Газ на ветке навигации ведёт энергию, не курс. Курс закрывает
@@ -12747,12 +12754,20 @@ def _update_control_from_target_impl():
         # Интеграл стационарной ошибки: если нос систематически выше линии,
         # копим и доворачиваем вниз. Раньше обнулялся и логировался, но не накапливался.
         _err_ugol = float(_opora) - float(_fc_p)
-        if abs(_err_ugol) > 1.0:
+        # Анти-windup: пока выход в упоре, интеграл не копим.
+        # Иначе он доматывает до ±4° в упор и потом отдаёт перелёт.
+        _v_upore = abs(pitch_offset) >= PN_PITCH_PWM_MAX - 1.0 if 'pitch_offset' in dir() else False
+        # pitch_offset ещё не посчитан на этом кадре — смотрим прошлый.
+        _v_upore = abs(getattr(_update_control_from_target_impl, "_last_po", 0.0)) >= PN_PITCH_PWM_MAX - 1.0
+        if not _v_upore and abs(_err_ugol) > 1.0:
             _pn_nos_i += math.copysign(PN_PITCH_I_DEG_PER_S, _err_ugol) * (k / NOMINAL_FPS)
             if _pn_nos_i > PN_PITCH_I_MAX:
                 _pn_nos_i = PN_PITCH_I_MAX
             elif _pn_nos_i < -PN_PITCH_I_MAX:
                 _pn_nos_i = -PN_PITCH_I_MAX
+        elif _v_upore and _pn_nos_i * _err_ugol < 0:
+            # Знак ошибки против интеграла — отпускаем.
+            _pn_nos_i *= 0.9
         else:
             _pn_nos_i *= 0.95 ** k
         _zhel = (float(_opora) + _zapas + _pn_nos_i
@@ -12767,6 +12782,7 @@ def _update_control_from_target_impl():
         elif pitch_offset < -PN_PITCH_PWM_MAX:
             pitch_offset = -PN_PITCH_PWM_MAX
         _p_sat = abs(pitch_offset) >= PN_PITCH_PWM_MAX - 1e-6
+        _update_control_from_target_impl._last_po = float(pitch_offset)
         _pid_dbg["pitch"] = (
             pitch_offset, 0.0, _pn_nos_i * PN_PITCH_PWM_PER_DEG, 0.0,
             pitch_offset, _p_sat)
@@ -12856,8 +12872,9 @@ def _update_control_from_target_impl():
     # времени до контакта сюда не добавляется: это второй регулятор
     # с другой целью на той же оси.
     if COLLISION_ENABLED:
-        # Опора угла без trust; PN и демпфер — с trust.
-        combined_pitch = pitch_offset + rate_damp_pwm * trust_k + col_p
+        # Опора и демпфер без trust. Trust резал демпфер именно
+        # когда картинка шумела — демпфирование слабело в худший момент.
+        combined_pitch = pitch_offset + rate_damp_pwm + col_p
     else:
         combined_pitch = (pitch_offset * trust_k + launch_pitch_pwm
                           + cruise_pitch_pwm + rate_damp_pwm + col_p)
@@ -12991,7 +13008,13 @@ def _update_control_from_target_impl():
         # поэтому фазы не съедает. Сглаживание же запаздывает всегда, и при
         # нынешнем запасе в 39° фильтр с постоянной 0.12 с забрал бы его
         # целиком — вместо мягкости вышла бы раскачка.
-        shag_p = min(PITCH_SLEW_PWM_PER_S * _dolya, PITCH_SLEW_MAX_STEP)
+        # Асимметричный slew тангажа: к цели быстрее, от цели плавнее.
+        # Иначе 0.1–0.3 с на обратный ход — и есть перелёт.
+        _k_celi = abs(target_pitch - 1500) > abs(_slew_pitch - 1500)
+        if _k_celi:
+            shag_p = min(PITCH_SLEW_PWM_PER_S * 1.6 * _dolya, 50.0)
+        else:
+            shag_p = min(PITCH_SLEW_PWM_PER_S * 0.6 * _dolya, 18.0)
         shag_r = min(ROLL_SLEW_PWM_PER_S * _dolya, ROLL_SLEW_MAX_STEP)
         shag_y = min(YAW_SLEW_PWM_PER_S * _dolya, YAW_SLEW_MAX_STEP)
         _slew_roll = _ogranich_skorost(_slew_roll, target_roll, shag_r)
