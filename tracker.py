@@ -12741,7 +12741,22 @@ def _update_control_from_target_impl():
         _opora = closure.get("los_angle_deg") if isinstance(closure, dict) else None
         if _opora is None:
             _opora = float(_fc_p)
-        _zhel = float(_opora) + PITCH_PWM_TO_FC_ANGLE_SIGN * _ugol_pn
+        # Запас носа из alt/tau: если снижаемся быстрее, чем высота/время,
+        # нос ниже цели. Раньше считался, но в команду не входил.
+        _zapas = _zapas_nosa()
+        # Интеграл стационарной ошибки: если нос систематически выше линии,
+        # копим и доворачиваем вниз. Раньше обнулялся и логировался, но не накапливался.
+        _err_ugol = float(_opora) - float(_fc_p)
+        if abs(_err_ugol) > 1.0:
+            _pn_nos_i += math.copysign(PN_PITCH_I_DEG_PER_S, _err_ugol) * (k / NOMINAL_FPS)
+            if _pn_nos_i > PN_PITCH_I_MAX:
+                _pn_nos_i = PN_PITCH_I_MAX
+            elif _pn_nos_i < -PN_PITCH_I_MAX:
+                _pn_nos_i = -PN_PITCH_I_MAX
+        else:
+            _pn_nos_i *= 0.95 ** k
+        _zhel = (float(_opora) + _zapas + _pn_nos_i
+                 + PITCH_PWM_TO_FC_ANGLE_SIGN * _ugol_pn)
         if _zhel > PN_PITCH_ABS_MAX:
             _zhel = PN_PITCH_ABS_MAX
         elif _zhel < -PN_PITCH_ABS_MAX:
@@ -12834,12 +12849,15 @@ def _update_control_from_target_impl():
 
     # ДИАГНОСТИКА ANTI-WINDUP (см. пояснение у крена выше) — тот же
     # снимок pitch_offset * trust_k, что входит в combined_pitch ниже.
-    _pid_dbg["pitch_after_trust"] = pitch_offset * trust_k
+    # Trust режет только PN-приращение, не опору угла.
+    # Иначе при trust 0.66 удержание линии визирования слабеет в полтора раза.
+    _pid_dbg["pitch_after_trust"] = pitch_offset
     # На курсе столкновения тангаж — только удержание угла. Наклон по
     # времени до контакта сюда не добавляется: это второй регулятор
     # с другой целью на той же оси.
     if COLLISION_ENABLED:
-        combined_pitch = pitch_offset * trust_k + rate_damp_pwm + col_p
+        # Опора угла без trust; PN и демпфер — с trust.
+        combined_pitch = pitch_offset + rate_damp_pwm * trust_k + col_p
     else:
         combined_pitch = (pitch_offset * trust_k + launch_pitch_pwm
                           + cruise_pitch_pwm + rate_damp_pwm + col_p)
