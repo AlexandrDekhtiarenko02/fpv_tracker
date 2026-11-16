@@ -13603,8 +13603,22 @@ def _update_control_from_target_impl():
         # Набор только на дальнем пологом. На заходе — ноль.
         _dal_nab = (closure.get("range_m") if isinstance(closure, dict) else None)
         _cel_lin += _nabor_pwm(_alt_en, _dal_nab)
-        # τ-буксир и прочие thr_adjust должны дойти до команды.
-        # Раньше перезаписывались энергозаконом (как vario до A6).
+        # Газ не обгоняет тангаж. Если τ убывает, но нос ещё не опущен
+        # (ошибка > 2°) — не добавляем. Если τ растёт — только снижаем.
+        # Высоту не используем: баро скачет.
+        _los_g = closure.get("los_angle_deg") if isinstance(closure, dict) else None
+        _fc_g = None
+        with state_lock:
+            _fc_g = app_state.get("fc_pitch_deg")
+        _err_g = None
+        if _los_g is not None and _fc_g is not None:
+            _err_g = float(_los_g) - float(_fc_g)
+        _tau_ub = _tau_ubyvanie if _tau_ubyvanie is not None else 0.0
+        if thr_adjust > 0.0:
+            if _tau_ub < -0.3 and (_err_g is None or _err_g > 2.0):
+                thr_adjust = 0.0
+        elif thr_adjust < 0.0 and _tau_ub > 0.3:
+            thr_adjust = min(thr_adjust, -20.0)
         _cel_lin += thr_adjust
         _thr_geom_out = _podtyanut_gaz(
             _thr_geom_out if _thr_geom_out is not None else target_throttle,
