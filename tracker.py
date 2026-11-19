@@ -12203,6 +12203,17 @@ def _update_control_from_target_impl():
     # Режим сближения — только по времени до контакта. Запасного признака по
     # доле кадра больше нет: он был недостижим по построению (см. настройку).
     _tau_now = closure.get("tau_s") if isinstance(closure, dict) else None
+    # τ от потока для газовой цепи: коробка на мелкой цели врёт в 2.5×,
+    # и _tau_soglasovan бракует 66% кадров. Поток и дальность из одного
+    # источника → soglasovan проходит по построению.
+    _tau_flow = None
+    if (isinstance(closure, dict) and ground_speed_mps is not None
+            and ground_speed_mps > 1.0):
+        _rng = closure.get("range_m")
+        if _rng is not None and float(_rng) > 5.0:
+            _tau_flow = float(_rng) / float(ground_speed_mps)
+    # Для газа используем τ_flow если есть, иначе коробочный.
+    _tau_gaz = _tau_flow if _tau_flow is not None else _tau_now
     # УБЫВАНИЕ ВРЕМЕНИ ДО КОНТАКТА — наклон по окну, как и всё остальное.
     #
     # Отличает «цель далеко» от «не закрываемся». На нормальном сближении
@@ -12400,7 +12411,7 @@ def _update_control_from_target_impl():
     # заход затянутым и даём полный вес. Но только пока цель мелкая: если
     # коробка уже крупная, мы близко, и слепой наклон там опаснее всего.
     if GLIDE_ENABLED and not OBSERVE_ONLY:
-        if _tau_now is None:
+        if _tau_gaz is None:
             # НЕИЗВЕСТНОСТЬ — НЕ ПОВОД ДАВАТЬ ПОЛНЫЙ НАКЛОН.
             #
             # Раньше здесь стояла единица: «времени нет, значит цель далеко,
@@ -12412,20 +12423,22 @@ def _update_control_from_target_impl():
             # Молчать в неизвестности правильнее: настоящий затянутый заход
             # даст время через секунду, и наклон придёт плавно.
             ves = 0.0
-        elif _tau_now <= GLIDE_TAU_OFF_S:
+        elif _tau_gaz <= GLIDE_TAU_OFF_S:
             ves = 0.0
-        elif _tau_now >= GLIDE_TAU_FULL_S:
+        elif _tau_gaz >= GLIDE_TAU_FULL_S:
             ves = 1.0
         else:
-            ves = ((_tau_now - GLIDE_TAU_OFF_S)
+            ves = ((_tau_gaz - GLIDE_TAU_OFF_S)
                    / max(0.1, GLIDE_TAU_FULL_S - GLIDE_TAU_OFF_S))
         # Плохое время — не повод наклонять. Окна ещё нет, погрешность
         # сравнима с самим tau, или оптика разошлась с дальностью и
         # путевой больше чем в 2.5 раза: вес в ноль, slew уведёт пол плавно.
+        # Для газа используем τ_flow — он согласован с потоком по построению.
         _sig_gl = closure.get("tau_sigma_s") if isinstance(closure, dict) else None
         _rng_gl = closure.get("range_m") if isinstance(closure, dict) else None
-        if not (_tau_nadyozhen(_tau_now, len(_tau_hist), _sig_gl)
-                and _tau_soglasovan(_tau_now, _rng_gl, ground_speed_mps)):
+        _tau_check = _tau_gaz if _tau_flow is not None else _tau_now
+        if not (_tau_nadyozhen(_tau_check, len(_tau_hist), _sig_gl)
+                and _tau_soglasovan(_tau_check, _rng_gl, ground_speed_mps)):
             ves = 0.0
         # ВЕС МЕНЯЕТСЯ ПЛАВНО. Переключение наклона скачком — это ступенька
         # в 120 PWM за кадр, то есть тот самый рывок, от которого и лечимся.
@@ -13479,7 +13492,7 @@ def _update_control_from_target_impl():
             if (_tracked_since_t is not None
                     and (now_mono - _tracked_since_t) >= 1.0):
                 _cel_gaz = _gaz_po_vysote(
-                    _hover_s_napryazheniem(), _alt_pv, _tau_now, _var_pv)
+                    _hover_s_napryazheniem(), _alt_pv, _tau_gaz, _var_pv)
 
         # Пол висения и геометрическая убавка применяются ПОСЛЕ процентного
         # окна. Окно в 15% как раз и держало ручку в 1-5%: перелёт оно
@@ -13555,7 +13568,7 @@ def _update_control_from_target_impl():
         _srez_cel = _srez_gaza(
             base_thr,
             closure.get("range_m") if isinstance(closure, dict) else None,
-            _tau_now if isinstance(closure, dict) else None,
+            _tau_gaz if isinstance(closure, dict) else None,
             _pitch_dlya_gaza, _pitch_pri_loke, _var_g,
             _gyro_y_sgl is not None and _gyro_y_sgl > THR_SREZ_NOS_DPS)
         if _srez_cel is not None and target_throttle > _srez_cel:
@@ -13662,7 +13675,7 @@ def _update_control_from_target_impl():
         _zrel_gaz = (_tracked_since_t is not None
                      and (now_mono - _tracked_since_t) >= 1.0)
         _cel_gaz = (_gaz_po_vysote(_hover_s_napryazheniem(),
-                                   _alt_pv, _tau_now, _var_pv)
+                                   _alt_pv, _tau_gaz, _var_pv)
                     if _zrel_gaz else None)
         if _cel_gaz is not None:
             _thr_geom_out = _podtyanut_gaz(
