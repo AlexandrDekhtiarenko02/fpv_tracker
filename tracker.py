@@ -902,7 +902,7 @@ TRUST_ENABLED = True
 TRUST_EMA_ALPHA = 0.05
 # До чего урезаем в худшем случае. Не до нуля: полностью глухой контур в
 # финале хуже, чем вялый — он перестанет реагировать вообще.
-TRUST_MIN = 0.35
+TRUST_MIN = 0.50
 # Расхождение матча с потоком, до которого доверие полное. Выше — падает
 # обратно пропорционально. Мерится прямо, а не относительно своего уровня: у
 # расхождения есть естественный ноль, и «согласны» — это не «как обычно».
@@ -9189,10 +9189,14 @@ def _stolknovenie_pwm(skorost, ts, now, deadband, gain, limit, sign):
 
 
 def _skorost_sblizheniya(closure):
-    """Скорость сближения, м/с. Дальность делённая на время до контакта.
+    """Скорость сближения, м/с.
 
-    Нет годной пары — None, крен возьмёт скромную.
+    Приоритет: оптический поток (ground_speed). Коробка на мелкой
+    цели завышает сближение в 2-2.5 раза. Поток живой на 98% кадров.
+    Нет потока — fallback на range/tau, нет и его — None.
     """
+    if ground_speed_mps is not None and ground_speed_mps > 1.0:
+        return float(ground_speed_mps)
     if not isinstance(closure, dict):
         return None
     rng = closure.get("range_m")
@@ -9411,29 +9415,22 @@ def _nedolet_deg(alt_m, tau_s, n_tau, sigma_s, vario_cms,
         # Избыточное снижение → нос ниже.
         dob = 8.0 * math.tanh(izb / 3.0)
         return max(0.0, dob)
-    if izb < 0.0:
-        # Недобор снижения (или набор) → нос ВВЕРХ.
-        # Раньше возвращали 0/None — контур не умел поднимать нос,
-        # и на перелёте это была положительная обратная связь.
-        if ubyv is not None and float(ubyv) >= 0.0:
-            return None  # нет сближения — не трогаем пологий
-        dob = -6.0 * math.tanh(-izb / 3.0)
-        return min(0.0, dob)
+    # Отрицательная ветка убрана: на пологом заходе (izb<0) нос вверх
+    # уменьшает снижение быстрее чем торможение поднимает nuzhno,
+    # и PN тратит авторитет на борьбу с тримом. Возвращаем 0.
     return 0.0
 
 
 def _zapas_nosa():
     """Сколько градусов нос ниже цели.
 
-    База выбрана на захвате по дальности: дальний заход держит запас
-    ради скорости, ближний — нос на цели. Сравнение высоты и дальности
-    добавляет сверху, если высота кончается раньше.
+    Только положительный запас: нос ниже цели, когда снижаемся быстрее
+    чем alt/tau. Отрицательная ветка (нос вверх) убрана — на пологом
+    заходе она гасила PN-поправку и держала траекторию горизонтальной.
     """
-    # Только непрерывная поправка от alt/tau. Фиксированного запаса на захвате нет.
-    # Двусторонний: плюс — нос ниже, минус — нос выше.
     if _pn_nedolet is None:
         return 0.0
-    return max(-6.0, min(8.0, float(_pn_nedolet)))
+    return max(0.0, min(8.0, float(_pn_nedolet)))
 
 
 # Газ на ветке навигации ведёт энергию, не курс. Курс закрывает
@@ -10652,13 +10649,17 @@ def _srez_gaza(rc_t, range_m, tau_s, pitch_deg, pitch_lock, vario_cms,
     return min(float(rc_t), float(potolok))
 
 
-def _pribavka_zapreshchena(pitch_deg, pitch_lock, vario_cms):
-    """Вверх газ не добавляем только когда нос уже ниже захвата.
+def _pribavka_zapreshchena(pitch_deg, pitch_lock, vario_cms, izb=None):
+    """Вверх газ не добавляем только когда нос уже ниже захвата
+    И глиссада не положе требуемой.
 
-    Отрицательный вариометр не запрещает прибавку: набор нужен,
-    чтобы вытянуть заход, если борт уже просел.
+    Если izb<0 (снижаемся медленнее чем alt/tau) — прибавка нужна,
+    даже если нос ниже захвата. Иначе на пологом заходе газ мёртв.
     """
     del vario_cms
+    # Пологая глиссада — не запрещаем
+    if izb is not None and float(izb) < 0.0:
+        return False
     if (pitch_deg is not None and pitch_lock is not None
             and float(pitch_deg) > float(pitch_lock) + THR_PRIBAVKA_BAN_DEG):
         return True
@@ -13216,8 +13217,15 @@ def _update_control_from_target_impl():
         _var_g_ts = app_state.get("alt_ts", 0.0)
     if not _var_g_ts or (now_mono - _var_g_ts) > VARIO_FRESH_S:
         _var_g = None
+    # izb = fakt - nuzhno; <0 means glide too shallow, need more thrust
+    _izb_g = None
+    if (isinstance(closure, dict) and closure.get("alt_m") and closure.get("tau_s")
+        and _var_g is not None):
+        _nuzh = float(closure["alt_m"]) / max(0.5, float(closure["tau_s"]))
+        _fakt = -float(_var_g) / 100.0
+        _izb_g = _fakt - _nuzh
     if thr_adjust > 0.0 and _pribavka_zapreshchena(
-            _pitch_dlya_gaza, _pitch_pri_loke, _var_g):
+            _pitch_dlya_gaza, _pitch_pri_loke, _var_g, _izb_g):
         thr_adjust = 0.0
 
     # --- ФИНАЛ: ДЕРЖИМ ПОСЛЕДНЮЮ КОМАНДУ ---
