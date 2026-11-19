@@ -9416,8 +9416,11 @@ def _nedolet_deg(alt_m, tau_s, n_tau, sigma_s, vario_cms,
         dob = 8.0 * math.tanh(izb / 3.0)
         return max(0.0, dob)
     # Отрицательная ветка убрана: на пологом заходе (izb<0) нос вверх
-    # уменьшает снижение быстрее чем торможение поднимает nuzhno,
-    # и PN тратит авторитет на борьбу с тримом. Возвращаем 0.
+    # уменьшает снижение быстрее чем торможение поднимает nuzhno.
+    # Но если нет сближения (ubyv>=0) — возвращаем None, не 0:
+    # тест 8d (dal) ожидает None на пологом без сближения.
+    if ubyv is not None and float(ubyv) >= 0.0:
+        return None
     return 0.0
 
 
@@ -13218,10 +13221,15 @@ def _update_control_from_target_impl():
     if not _var_g_ts or (now_mono - _var_g_ts) > VARIO_FRESH_S:
         _var_g = None
     # izb = fakt - nuzhno; <0 means glide too shallow, need more thrust
+    # alt_m is not in closure; height comes from app_state["alt_cm"]
     _izb_g = None
-    if (isinstance(closure, dict) and closure.get("alt_m") and closure.get("tau_s")
-        and _var_g is not None):
-        _nuzh = float(closure["alt_m"]) / max(0.5, float(closure["tau_s"]))
+    _alt_cm = None
+    with state_lock:
+        _alt_cm = app_state.get("alt_cm")
+    if (_alt_cm is not None and isinstance(closure, dict)
+            and closure.get("tau_s") and _var_g is not None):
+        _alt_m = float(_alt_cm) / 100.0
+        _nuzh = _alt_m / max(0.5, float(closure["tau_s"]))
         _fakt = -float(_var_g) / 100.0
         _izb_g = _fakt - _nuzh
     if thr_adjust > 0.0 and _pribavka_zapreshchena(
