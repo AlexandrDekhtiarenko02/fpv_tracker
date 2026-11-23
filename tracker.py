@@ -9050,6 +9050,8 @@ def reset_tracking(to_acq=False):
     _pn_rezhim = None
     _pn_nedolet = 0.0
     _filtr_los = {"los": None, "az": None, "t_los": None, "t_az": None}
+    _ab_los = {"x": None, "v": None, "t": None}
+    _ab_az = {"x": None, "v": None, "t": None}
     _pn_baza = None
     _pn_nabor_cel = None
 
@@ -9462,6 +9464,12 @@ LOS_RATE_LAW_MAX_DPS = 4.0
 LOS_RATE_PITCH_DEADBAND_DPS = 0.3
 
 _filtr_los = {"los": None, "az": None, "t_los": None, "t_az": None}
+# Alpha-beta: оценка угла и скорости на текущий момент, не в середине окна.
+# α≈0.35 на 24 Гц даёт τ≈0.1 с вместо 0.5 с от окна.
+AB_ALPHA = 0.35
+AB_BETA = AB_ALPHA * AB_ALPHA / (2.0 - AB_ALPHA)  # ~0.074
+_ab_los = {"x": None, "v": None, "t": None}
+_ab_az = {"x": None, "v": None, "t": None}
 
 
 def _skorost_gladkaya(rate_dps, key, now):
@@ -9489,6 +9497,27 @@ PN_SMC_K = 1.5               # усиление скользящего режи�
 PN_SMC_EPS = 1.5              # пограничный слой, °/с. Уже — дрожание.
 
 
+
+def _ab_rate(meas, st, now):
+    """Alpha-beta: возвращает скорость (°/с) на текущий момент."""
+    if meas is None:
+        return None
+    m = float(meas)
+    if st["x"] is None or st["t"] is None:
+        st["x"] = m
+        st["v"] = 0.0
+        st["t"] = now
+        return 0.0
+    dt = max(1e-3, now - st["t"])
+    st["t"] = now
+    # predict
+    x_pred = st["x"] + st["v"] * dt
+    # residual
+    r = m - x_pred
+    # update
+    st["x"] = x_pred + AB_ALPHA * r
+    st["v"] = st["v"] + (AB_BETA / dt) * r
+    return st["v"]
 def _skolzyashiy(rate_dps):
     """Член скользящего режима, м/с².
 
@@ -12293,8 +12322,10 @@ def _update_control_from_target_impl():
             _my = sum(_ys) / _n
             _den = sum((x - _mx) ** 2 for x in _xs)
             if _den > 1e-6:
-                _az_skorost = sum(
+                _az_win = sum(
                     (_xs[i] - _mx) * (_ys[i] - _my) for i in range(_n)) / _den
+                _az_ab = _ab_rate(_az_tek, _ab_az, now_mono)
+                _az_skorost = _az_ab if _az_ab is not None else _az_win
                 _az_skorost_ts = now_mono
                 _ost = [_ys[i] - (_my + _az_skorost * (_xs[i] - _mx))
                         for i in range(_n)]
@@ -12368,8 +12399,12 @@ def _update_control_from_target_impl():
                 _my = sum(_ys) / _n
                 _den = sum((x - _mx) ** 2 for x in _xs)
                 if _den > 1e-6:
-                    _los_skorost = sum(
+                    _los_win = sum(
                         (_xs[i] - _mx) * (_ys[i] - _my) for i in range(_n)) / _den
+                    # Alpha-beta даёт скорость на текущий момент (~0.1 с задержки
+                    # вместо ~0.5 с от окна). Окно остаётся как fallback.
+                    _los_ab = _ab_rate(_dep_tek, _ab_los, now_mono)
+                    _los_skorost = _los_ab if _los_ab is not None else _los_win
                     _los_skorost_ts = now_mono
 
     # РЕЖИМ СБЛИЖЕНИЯ ВКЛЮЧАЕТСЯ НЕ С ПЕРВОГО КАДРА.
